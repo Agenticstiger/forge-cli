@@ -53,6 +53,8 @@ ignore:
   # image. NOT REACHABLE in this image: the Debian slim base does not run OpenSSL
   # in FIPS mode (the Dockerfile installs and configures no FIPS provider, and
   # fluid_build never asks for one), so hashlib's FIPS enforcement is never in
-  # play. EPSS 0.5% (42nd percentile). Remove once python:3.14-slim ships CPython
-  # 3.14.11 (re-run grype to confirm).
+  # play. EPSS 0.5% (42nd percentile). The Dockerfile pins its base by digest, so
+  # a newer python:3.14-slim changes nothing here by itself. Remove this entry when
+  # the pinned digest moves, through the Dependabot docker PR, to an image with
+  # CPython 3.14.11 or later (re-run grype to confirm), and not before.
   - vulnerability: CVE-2026-119170

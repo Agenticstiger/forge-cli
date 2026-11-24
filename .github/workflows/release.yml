@@ -10,8 +10,10 @@
 #   2. Every release is cryptographically signed.
 #      `pypa/gh-action-pypi-publish` uploads each wheel with a Sigstore
 #      attestation (`attestations: true`). `actions/attest-build-provenance`
-#      attaches an in-toto SLSA build provenance to every artifact. Both
-#      use GitHub OIDC — no long-lived secrets.
+#      attaches an in-toto SLSA build provenance to the wheel, the sdist and
+#      the GHCR image; the wheel's and sdist's bundles are also attached to the
+#      GitHub Release as `<file>.intoto.jsonl`. All use GitHub OIDC — no
+#      long-lived secrets.
 #
 #   3. Release notes come from CHANGELOG.md, not git log.
 #      The GitHub Release body is extracted from the matching `## [X.Y.Z]`
@@ -54,9 +56,13 @@
 #   gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z -f skip_testpypi=true
 #
 # A tag cut before this input existed (v0.19.0 and earlier) has no skip_testpypi
-# in its own release.yml, so it is dispatched with --ref main instead. The gate
-# refuses a start ref that does not contain the tag's commit, and warns that
-# the provenance names the start ref when it is not the tag.
+# in its own release.yml. It was once dispatched with --ref main, but main's
+# release.yml installs its build tools from requirements/release-tools.txt, and
+# a tag cut before that file existed does not have it. Such a tag is dispatched
+# with --ref <tag> instead, which runs the tag's own release.yml (and so cannot
+# skip TestPyPI). The gate refuses a start ref that does not contain the tag's
+# commit, and warns that the provenance names the start ref when it is not the
+# tag.
 #
 # verify-pypi (install + smoke from real PyPI) still runs; it is the only
 # index install check on that path.
@@ -249,9 +255,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install build tools
-        run: |
-          pip install --upgrade pip build twine
+      # Hash-locked: requirements/release-tools.in names pip, build, twine and
+      # cyclonedx-bom, and release-tools.txt carries every wheel hash.
+      # --require-hashes refuses anything that is not in the file. The SBOM step
+      # below uses cyclonedx-bom from the same file.
+      - name: Install build tools (hash-locked)
+        run: python -m pip install --require-hashes -r requirements/release-tools.txt
 
       - name: Build wheel and sdist
         env:
@@ -261,13 +270,53 @@ jobs:
       - name: Strict metadata check
         run: twine check --strict dist/*
 
-      - name: Attest build provenance (SLSA)
-        # Creates an in-toto attestation proving each dist artifact was built
-        # by this workflow / this commit. Verifiable via `gh attestation verify`
-        # or the Sigstore CLI.
+      # Fails before anything is signed if dist/ is not exactly one wheel and one
+      # sdist, so the two attest steps below each match one file.
+      - name: Check dist/ holds one wheel and one sdist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          if [ "${#wheels[@]}" -ne 1 ] || [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel and one sdist in dist/"
+            ls -l dist
+            exit 1
+          fi
+
+      # One attestation per distribution file, so each file gets a bundle of its
+      # own that can ride along with it as a release asset. Each is an in-toto
+      # attestation proving the file was built by this workflow / this commit,
+      # verifiable via `gh attestation verify`.
+      - name: Attest build provenance of the wheel (SLSA)
+        id: attest-wheel
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
-          subject-path: "dist/*"
+          subject-path: "dist/*.whl"
+
+      - name: Attest build provenance of the sdist (SLSA)
+        id: attest-sdist
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      # The bundle is a Sigstore bundle holding the signed SLSA provenance. It is
+      # named <file>.intoto.jsonl, the name OpenSSF Scorecard's Signed-Releases
+      # check looks for among the release assets, and kept out of dist/ so the
+      # PyPI upload sees only distribution files. Same approach as
+      # pypa/virtualenv's release workflow.
+      - name: Collect the provenance bundles
+        env:
+          WHEEL_BUNDLE: ${{ steps.attest-wheel.outputs.bundle-path }}
+          SDIST_BUNDLE: ${{ steps.attest-sdist.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          mkdir provenance
+          cp "${WHEEL_BUNDLE}" "provenance/$(basename "${wheels[0]}").intoto.jsonl"
+          cp "${SDIST_BUNDLE}" "provenance/$(basename "${sdists[0]}").intoto.jsonl"
+          ls -l provenance
 
       - name: Isolated wheel install and verify
         run: |
@@ -307,7 +356,6 @@ jobs:
         # venv built above). Shipped as a release artifact for supply-chain
         # transparency — what JFrog Xray / CRA-minded consumers expect.
         run: |
-          pip install "cyclonedx-bom==7.3.0"
           cyclonedx-py environment /tmp/test-install \
             --of JSON --output-file sbom.cdx.json
 
@@ -323,6 +371,14 @@ jobs:
         with:
           name: dist
           path: dist/
+          retention-days: 30
+
+      - name: Upload provenance bundles
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: provenance
+          path: provenance/
+          if-no-files-found: error
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────────
@@ -613,6 +669,12 @@ jobs:
             echo "gh attestation verify ./dpf/*.whl --repo Agenticstiger/forge-cli"
             echo '```'
             echo
+            echo 'Each distribution file below has its provenance beside it, in a file'
+            echo 'named after it with the suffix .intoto.jsonl. To verify a downloaded file:'
+            echo '```bash'
+            echo 'gh attestation verify <file> --repo Agenticstiger/forge-cli --bundle <file>.intoto.jsonl'
+            echo '```'
+            echo
             echo "$NOTES"
           } > release-notes.md
 
@@ -620,6 +682,12 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: sbom
+
+      - name: Download provenance bundles
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: provenance
+          path: provenance/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
@@ -630,6 +698,7 @@ jobs:
           prerelease: ${{ needs.quality-gate.outputs.is_prerelease == 'true' }}
           files: |
             dist/*
+            provenance/*.intoto.jsonl
             sbom.cdx.json
 
   # ──────────────────────────────────────────────────────────────
@@ -644,7 +713,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: write          # push the image and its attestation to GHCR
+      id-token: write          # Sigstore / OIDC
+      attestations: write      # SLSA build provenance
     env:
       REGISTRY: ghcr.io
       IMAGE_NAME: ${{ github.repository }}
@@ -721,6 +792,7 @@ jobs:
         run: ./grype forge-cli:scan --fail-on high --only-fixed
 
       - name: Build and push Docker image
+        id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
@@ -732,3 +804,26 @@ jobs:
             PROFILE=${{ needs.quality-gate.outputs.profile }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The attestation subject is the registry name in lowercase, which is how
+      # GHCR stores it, while github.repository keeps the owner's capitals.
+      - name: Name the image for attestation
+        id: image
+        env:
+          REGISTRY_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: echo "name=${REGISTRY_IMAGE,,}" >> "${GITHUB_OUTPUT}"
+
+      # Signs a SLSA build provenance for the pushed image's digest with the
+      # run's OIDC identity and stores it in GHCR beside the image, so
+      #   gh attestation verify oci://ghcr.io/agenticstiger/forge-cli:<tag> \
+      #     -R Agenticstiger/forge-cli
+      # passes for every tag the push moved (they all name this digest).
+      # create-storage-record is off: it needs `artifact-metadata: write` and
+      # is not read by `gh attestation verify`.
+      - name: Attest image build provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false

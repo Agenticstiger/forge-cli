@@ -1,0 +1,8 @@
+# Source for requirements/release-tools.txt: the tools the release workflow's
+# build job installs before it builds and checks the distribution files, and
+# the SBOM generator it runs on the built wheel. Regenerate with
+# scripts/ci/compile_requirements.sh and review the diff.
+pip
+build
+twine
+cyclonedx-bom==7.3.0

@@ -17,7 +17,14 @@
 # listed only from 3.14. The gate ran before the push, so no vulnerable image was
 # published, and therefore no 0.16.0 image was published at all. 3.14 is already
 # in pyproject's classifiers and in ci.yml's test matrix.
-FROM python:3.14-slim AS base
+#
+# The base is pinned by the digest of the multi-architecture index (CPython
+# 3.14.10 at the time of pinning), so a retag of python:3.14-slim upstream changes
+# nothing here until the digest is bumped in a reviewed change. The tag stays
+# beside the digest so Dependabot (see .github/dependabot.yml) proposes the next
+# digest. To refresh by hand: `crane digest python:3.14-slim`. The apt-get upgrade
+# below still takes the current Debian security patches at build time.
+FROM python:3.14-slim@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
