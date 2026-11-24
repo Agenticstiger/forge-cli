@@ -28,6 +28,7 @@ from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     validate_iceberg_sink,
 )
 from fluid_build.providers._iceberg_catalog import resolve_iceberg_catalog
+from fluid_build.util.env_templates import EnvTemplateError
 
 pytestmark = [pytest.mark.unit]
 
@@ -146,10 +147,12 @@ def _props_path(tmp_path: Path) -> Path:
     return tmp_path / ".fluid" / "debezium" / "bronze.o" / "b1" / "application.properties"
 
 
-def _preflight_failure(caplog) -> str:
-    # The runner returns 1; the message is in its error log.
-    text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "iceberg sink preflight failed" in text, text
+def _refusal(capsys) -> str:
+    # The dispatcher resolves every placeholder first: an unset or empty variable is
+    # a typed error it prints, and it returns 1 before any runner is reached.
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert _VAR in text, text
     return text
 
 
@@ -162,26 +165,17 @@ def _preflight_failure(caplog) -> str:
 @pytest.mark.parametrize("bucket", [_FULL, _PARTIAL], ids=["full", "partial"])
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
 def test_kc_dispatch_refuses_a_bucket_that_does_not_resolve(
-    fake_connect, tmp_path, monkeypatch, caplog, catalog, bucket, value
+    fake_connect, tmp_path, monkeypatch, capsys, catalog, bucket, value
 ):
     _set(monkeypatch, value)
     extra = {"uri": "jdbc:postgresql://pg:5432/iceberg"} if catalog == "jdbc" else {}
-    # A Kafka Connect BigQuery sink reads the warehouse only to auto-create
-    # tables, so it is refused only with auto-create on.
     binding = _binding(catalog, bucket, **extra)
     contract = _contract(binding, "kafka-connect", auto_create=catalog == "bigquery")
-    with caplog.at_level(logging.INFO):
-        rc = _dispatch(contract, tmp_path, monkeypatch)
+    rc = _dispatch(contract, tmp_path, monkeypatch)
     assert rc == 1
     # Nothing reached the cluster: no sink in another bucket, no source.
     assert fake_connect == []
-    text = _preflight_failure(caplog)
-    assert f"{_VAR} is unset or empty in the runner's environment" in text
-    assert repr(bucket) in text
-    assert "requires binding.location.warehouse" not in text
-    # `fluid validate` only warns about this, so the refusal does not send
-    # the operator there.
-    assert "see `fluid validate`" not in text
+    assert "acme--lake" not in _refusal(capsys)
 
 
 @pytest.mark.parametrize(
@@ -206,7 +200,9 @@ def test_kc_dispatch_derives_from_the_resolved_bucket(
 def test_kc_dispatch_a_set_warehouse_ignores_the_bucket_variable(
     fake_connect, tmp_path, monkeypatch
 ):
-    _set(monkeypatch, None)
+    # The variable is set (an unset one is refused whatever the warehouse says); the
+    # warehouse the contract sets still wins over the bucket it would derive.
+    _set(monkeypatch, "prod")
     binding = _binding("dynamodb", _PARTIAL, warehouse="s3://ops/wh/")
     assert _dispatch(_contract(binding, "kafka-connect"), tmp_path, monkeypatch) == 0
     assert _sink_warehouse(fake_connect) == "s3://ops/wh/"
@@ -217,8 +213,10 @@ def test_the_dispatcher_scope_ends_with_the_run(fake_connect, tmp_path, monkeypa
     _set(monkeypatch, None)
     contract = _contract(_binding("dynamodb", _PARTIAL), "kafka-connect")
     assert _dispatch(contract, tmp_path, monkeypatch) == 1
-    resolved = base._resolve_env_placeholders(contract)
-    assert iceberg_sink_preflight(resolved, "b1") is None
+    with pytest.raises(EnvTemplateError):
+        base._resolve_env_placeholders(contract)
+    refusal = iceberg_sink_preflight(contract, "b1")
+    assert refusal is not None and _VAR in refusal
 
 
 # ---------------------------------------------------------------------------
@@ -229,17 +227,14 @@ def test_the_dispatcher_scope_ends_with_the_run(fake_connect, tmp_path, monkeypa
 @pytest.mark.parametrize("bucket", [_FULL, _PARTIAL], ids=["full", "partial"])
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
 def test_debezium_dispatch_refuses_a_bucket_that_does_not_resolve(
-    tmp_path, monkeypatch, caplog, bucket, value
+    tmp_path, monkeypatch, capsys, bucket, value
 ):
     _set(monkeypatch, value)
     contract = _contract(_binding("dynamodb", bucket), "debezium")
-    with caplog.at_level(logging.INFO):
-        rc = _dispatch(contract, tmp_path, monkeypatch)
+    rc = _dispatch(contract, tmp_path, monkeypatch)
     assert rc == 1
     assert not _props_path(tmp_path).exists()
-    text = _preflight_failure(caplog)
-    assert f"{_VAR} is unset or empty in the runner's environment" in text
-    assert "acme--lake" not in text
+    assert "acme--lake" not in _refusal(capsys)
 
 
 def test_debezium_dispatch_derives_from_the_resolved_bucket(tmp_path, monkeypatch):
@@ -293,19 +288,16 @@ def test_bigquery_env_bucket_derive_and_validate(monkeypatch, value, warehouse, 
 
 @pytest.mark.parametrize("bucket", [_FULL, _PARTIAL], ids=["full", "partial"])
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
-def test_kc_bigquery_without_autocreate_runs_and_names_no_other_bucket(
-    fake_connect, tmp_path, monkeypatch, caplog, bucket, value
+def test_kc_bigquery_without_autocreate_names_no_other_bucket(
+    fake_connect, tmp_path, monkeypatch, capsys, bucket, value
 ):
+    # The sink would not read the warehouse here, but the contract names a variable
+    # that is not set: the run is refused, never pushed to a bucket it does not name.
     _set(monkeypatch, value)
     contract = _contract(_binding("bigquery", bucket), "kafka-connect")
-    with caplog.at_level(logging.INFO):
-        rc = _dispatch(contract, tmp_path, monkeypatch)
-    assert rc == 0, caplog.text
-    sinks = [cfg for _name, cfg in fake_connect if cfg.get("iceberg.catalog.type") == "bigquery"]
-    assert len(sinks) == 1, fake_connect
-    # No warehouse in a bucket the contract does not name (acme--lake, gs://).
-    pushed = sinks[0].get("iceberg.catalog.warehouse", "")
-    assert pushed in ("",), sinks[0]
+    assert _dispatch(contract, tmp_path, monkeypatch) == 1
+    assert fake_connect == []
+    assert "acme--lake" not in _refusal(capsys)
 
 
 def test_bigquery_partial_bucket_with_an_empty_variable_derives_none(monkeypatch):
@@ -365,11 +357,11 @@ def test_kafka_connect_bigquery_no_warehouse_warning_is_unchanged():
         ("bigquery", "gs://ops-lake/wh"),
     ],
 )
-@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
 def test_kc_dispatch_keeps_an_override_warehouse(
-    fake_connect, tmp_path, monkeypatch, caplog, catalog, warehouse, value
+    fake_connect, tmp_path, monkeypatch, caplog, catalog, warehouse
 ):
-    _set(monkeypatch, value)
+    # With the bucket variable set, the override warehouse still wins over the derived one.
+    _set(monkeypatch, "prod")
     extra = {"uri": "jdbc:postgresql://pg:5432/iceberg"} if catalog == "jdbc" else {}
     contract = _contract(
         _binding(catalog, _FULL, **extra),

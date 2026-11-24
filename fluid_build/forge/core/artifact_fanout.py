@@ -892,8 +892,13 @@ def _spark_jobs(
     from fluid_build.streaming.compiler import managed_lane_enabled
 
     try:
+        # ``generate artifacts`` runs where the bundle is built, which may not hold the
+        # variables the deploy environment does (a Spark job's values known only at apply
+        # time are deferred below); and it reads every contract's builds to find the Spark
+        # ones. So an unset variable is left as written here (``unset="defer"``), not an error:
+        # ``fluid apply`` renders the same contract strictly.
         contract = resolve_env_templates_in_contract(
-            load_contract_with_overlay(str(source), overlay_env, logger)
+            load_contract_with_overlay(str(source), overlay_env, logger), unset="defer"
         )
         if not managed_lane_enabled(contract):
             return []

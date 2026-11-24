@@ -415,10 +415,24 @@ def _flat(text: str) -> str:
     return " ".join(text.split())
 
 
-def test_diff_without_boto3_fails_with_the_aws_extra(block, cli, monkeypatch):
+@pytest.fixture
+def scratch_contract(tmp_path):
+    """The example contract with its Lake Formation principals written out.
+
+    The example names ``{{ env.AWS_ACCOUNT_ID }}`` and an unset variable is refused up
+    front; these tests leave the variable unset so the provider has to resolve the
+    account id itself, so the principals carry a literal account.
+    """
+    text = SCRATCH_CONTRACT.read_text(encoding="utf-8")
+    path = tmp_path / "contract.fluid.yaml"
+    path.write_text(text.replace("{{ env.AWS_ACCOUNT_ID }}", "123456789012"), encoding="utf-8")
+    return path
+
+
+def test_diff_without_boto3_fails_with_the_aws_extra(block, cli, monkeypatch, scratch_contract):
     block("boto3")
     monkeypatch.delenv("AWS_ACCOUNT_ID", raising=False)
-    rc, out = cli("diff", str(SCRATCH_CONTRACT), "--no-live")
+    rc, out = cli("diff", str(scratch_contract), "--no-live")
     assert rc == 1
     flat = _flat(out)
     assert "boto3 is not installed" in flat
@@ -426,7 +440,9 @@ def test_diff_without_boto3_fails_with_the_aws_extra(block, cli, monkeypatch):
     assert "None-fluid-staging" not in out
 
 
-def test_diff_without_credentials_fails_clearly_not_with_a_none_bucket(cli, monkeypatch):
+def test_diff_without_credentials_fails_clearly_not_with_a_none_bucket(
+    cli, monkeypatch, scratch_contract
+):
     boto3 = pytest.importorskip("boto3")
     monkeypatch.delenv("AWS_ACCOUNT_ID", raising=False)
 
@@ -434,15 +450,15 @@ def test_diff_without_credentials_fails_clearly_not_with_a_none_bucket(cli, monk
         raise RuntimeError("Unable to locate credentials")
 
     monkeypatch.setattr(boto3, "client", no_credentials)
-    rc, out = cli("diff", str(SCRATCH_CONTRACT), "--no-live")
+    rc, out = cli("diff", str(scratch_contract), "--no-live")
     assert rc == 1
     assert "The AWS account id could not be resolved" in _flat(out)
     assert "None-fluid-staging" not in out
 
 
-def test_verify_without_boto3_names_the_aws_extra(block, cli):
+def test_verify_without_boto3_names_the_aws_extra(block, cli, scratch_contract):
     block("boto3")
-    rc, out = cli("verify", str(SCRATCH_CONTRACT))
+    rc, out = cli("verify", str(scratch_contract))
     assert rc == 1
     flat = _flat(out)
     assert "boto3 is not installed" in flat
@@ -450,14 +466,16 @@ def test_verify_without_boto3_names_the_aws_extra(block, cli):
     assert "None-fluid-staging" not in out
 
 
-def test_verify_without_credentials_reports_them_not_a_none_bucket(cli, monkeypatch):
+def test_verify_without_credentials_reports_them_not_a_none_bucket(
+    cli, monkeypatch, scratch_contract
+):
     boto3 = pytest.importorskip("boto3")
 
     def no_credentials(*_a, **_k):
         raise RuntimeError("Unable to locate credentials")
 
     monkeypatch.setattr(boto3, "client", no_credentials)
-    rc, out = cli("verify", str(SCRATCH_CONTRACT))
+    rc, out = cli("verify", str(scratch_contract))
     assert rc == 1
     assert "Unable to locate credentials" in _flat(out)
     assert "None-fluid-staging" not in out

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.providers._planner_base import BasePlanner
 from fluid_build.util.contract import is_externally_run_build
+from fluid_build.util.env_templates import render_text
 
 from ..util import warehouse as _warehouse
 from ..util.logging import format_event
@@ -27,17 +28,14 @@ def _resolve_env_templates(value: str) -> str:
     """
     Resolve ``{{ env.VAR }}`` templates from environment variables.
 
-    Unresolvable templates (missing env var) are left as-is so the
-    caller can decide whether to error or fall back.
+    Unresolvable templates (missing env var) are left as-is so the caller can decide
+    whether to error or fall back. The single-string primitive of the one resolver
+    (:mod:`fluid_build.util.env_templates`); the stages that deploy render a contract
+    strictly before they get here.
     """
-    if not isinstance(value, str) or "{{" not in value:
+    if not isinstance(value, str):
         return value
-
-    def _replacer(m: re.Match) -> str:
-        var = m.group(1).strip()
-        return os.environ.get(var, m.group(0))  # keep original if unset
-
-    return re.sub(r"\{\{\s*env\.(\S+?)\s*\}\}", _replacer, value)
+    return render_text(value, strip=False)
 
 
 def _glue_cataloged(binding: Mapping[str, Any], exposure: Mapping[str, Any]) -> bool:

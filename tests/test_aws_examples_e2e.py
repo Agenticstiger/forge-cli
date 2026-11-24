@@ -34,6 +34,7 @@ import pytest
 import yaml
 
 from fluid_build.cli import main
+from fluid_build.util.env_templates import placeholder_names
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
@@ -130,6 +131,17 @@ def _no_aws(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 
+def _export_example_env(example: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Export what the example's own ``{{ env.NAME }}`` placeholders name.
+
+    A command refuses a contract that names a variable nobody set, so the example runs
+    the way its user runs it. ``_no_aws`` has already stripped the real AWS variables.
+    """
+    values = {"AWS_ACCOUNT_ID": "123456789012", "AWS_REGION": "eu-west-1"}
+    for name in placeholder_names(_load_yaml(_contract_path(example))):
+        monkeypatch.setenv(name, values.get(name, "example-value"))
+
+
 def test_expected_example_dirs_are_present() -> None:
     """Each pinned example ships a contract, a README, and nothing missing."""
     for example in AWS_EXAMPLES:
@@ -150,25 +162,29 @@ def test_contract_targets_aws(example: str) -> None:
 
 
 @pytest.mark.parametrize("example", EXAMPLE_IDS)
-def test_contract_validates_offline(example: str, _no_aws: None) -> None:
+def test_contract_validates_offline(
+    example: str, _no_aws: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``fluid validate --offline --strict`` accepts the contract (exit 0).
 
     Strict, because an aws binding whose ``accessPolicy`` no Lake Formation
     grant enforces is a warning, and a shipped example must not carry one.
     """
+    _export_example_env(example, monkeypatch)
     rc = main(["validate", str(_contract_path(example)), "--offline", "--quiet", "--strict"])
     assert rc == 0, f"{example}: fluid validate returned {rc}"
 
 
 @pytest.mark.parametrize("example", EXAMPLE_IDS)
 def test_generate_iac_emits_expected_aws_resources_offline(
-    example: str, tmp_path: Path, _no_aws: None
+    example: str, tmp_path: Path, _no_aws: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``fluid generate iac`` emits a valid, credential-free ``main.tf.json``.
 
     Runs with all AWS credentials stripped (``_no_aws``) into an isolated
     ``tmp_path`` — a green assertion here is proof no live AWS is required.
     """
+    _export_example_env(example, monkeypatch)
     rc = main(["generate", "iac", str(_contract_path(example)), "--out", str(tmp_path)])
     assert rc == 0, f"{example}: fluid generate iac returned {rc}"
 

@@ -60,10 +60,11 @@ def _resolve_env_placeholders(value: Any) -> Any:
     """Resolve ``{{ env.NAME }}`` placeholders against the current environment.
 
     Recurses into lists and dicts. Non-string/list/dict values are returned
-    unchanged. A missing env var resolves to the empty string (not ``None``)
-    so downstream YAML dumps and command-line args don't carry a literal
-    ``None`` token. The secret policy renders the contract as written the same
-    way (``util.binding_paths.resolve_env_placeholders``) to trace a host.
+    unchanged. A variable that is unset or empty is an error
+    (:class:`~fluid_build.util.env_templates.EnvTemplateError`, naming every one):
+    a build never runs against a bucket, a host or a path with a name missing.
+    The secret policy renders the contract as written the same way
+    (``util.binding_paths.resolve_env_placeholders``) to trace a host.
     """
     return resolve_env_placeholders(value)
 
@@ -732,12 +733,18 @@ def _execute_acquisition_build(
     # Secrets policy: this is the runtime path; values stay in process
     # memory and never get serialised to a remote catalog, so we resolve
     # everything (including secret-shaped vars). Catalog-export paths use
-    # ``cli/_common.py::resolve_contract_env_templates`` instead, which
+    # ``_contract_loader.resolve_contract_env_templates`` instead, which
     # leaves sensitive placeholders literal.
     unresolved_contract = contract if as_written is None else as_written
     unresolved_build = build
-    build = _resolve_env_placeholders(build)
-    contract = _resolve_env_placeholders(contract)
+    from fluid_build.util.env_templates import EnvTemplateError
+
+    try:
+        build = _resolve_env_placeholders(build)
+        contract = _resolve_env_placeholders(contract)
+    except EnvTemplateError as exc:
+        _print_typed_error(exc)
+        return 1
 
     module_path, function_name = entry
     import contextlib
@@ -746,8 +753,7 @@ def _execute_acquisition_build(
     module = importlib.import_module(module_path, package="fluid_build.build_runners")
     runner_fn = getattr(module, function_name)
     # The Iceberg sink preflight reads a bucket's ``{{ env.X }}`` template as
-    # written: the resolution above turned an unset ``X`` into "", which would
-    # point the sink at a bucket the contract does not name.
+    # written (``contract_as_written``), not as the resolution above rendered it.
     scope: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
     if engine in ("kafka-connect", "debezium"):
         from .kafka_connect.iceberg_sink_validation import contract_as_written
@@ -821,8 +827,11 @@ def _execute_embedded_sql_build_snowflake(
 
 
 def _print_typed_error(exc: Any) -> None:
-    """A ``FluidUserError`` as the build output shows it: what, why, fix."""
+    """A ``FluidUserError`` as the build output shows it: what, where (when it names a place),
+    why, fix."""
     cprint(f"   ❌ {exc.what}", markup=False)
+    if getattr(exc, "where", None):
+        cprint(f"      in: {exc.where}", markup=False)
     cprint(f"      why: {exc.why}", markup=False)
     cprint(f"      fix: {exc.fix}", markup=False)
 
@@ -1091,8 +1100,14 @@ def _execute_embedded_sql_build(
     # secrets note in ``_execute_acquisition_build``. Credential-named ones are
     # registered with the redactor first, so an error quoting one is masked.
     _register_placeholder_secrets(build, contract)
-    build = _resolve_env_placeholders(build)
-    contract = _resolve_env_placeholders(contract)
+    from fluid_build.util.env_templates import EnvTemplateError
+
+    try:
+        build = _resolve_env_placeholders(build)
+        contract = _resolve_env_placeholders(contract)
+    except EnvTemplateError as exc:
+        _print_typed_error(exc)
+        return 1
     platform = embedded_sql_platform(build)
 
     cprint(f"\n{'─' * 60}")

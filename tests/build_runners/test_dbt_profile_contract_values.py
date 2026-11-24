@@ -25,6 +25,7 @@ from fluid_build.build_runners.dbt.profiles import (
     _build_generated_dbt_profile,
     _create_temp_dbt_profiles_dir,
 )
+from fluid_build.util.env_templates import EnvTemplateError
 
 pytestmark = pytest.mark.unit
 
@@ -210,7 +211,7 @@ REFUSED_NAMES = [
     # past where a pattern would end it, and reads the token.
     ("{{ env_var('DATABRICKS_SCHEMA', 'x\\') }}') ~ env_var('DATABRICKS_TOKEN') ~ ('') }}", {}),
     ("{{ env_var('DBX_CATALOG', '$DATABRICKS_TOKEN') }}", {}),
-    ("{{ env_var('DATABRICKS_TOKEN', 'a{{ env.UNSET_PART }}b') }}", {}),
+    ("{{ env_var('DATABRICKS_TOKEN', 'a{{ env.UNSET_PART }}b') }}", {"UNSET_PART": "x"}),
     # A placeholder may name the variable env_var reads.
     ("{{ env_var('{{ env.WHICH }}') }}", {"WHICH": "DATABRICKS_TOKEN"}),
     # Credentials whose names the redactor's rule misses; the dotenv policy's
@@ -456,12 +457,23 @@ class TestDatabricksNames:
 
     def test_no_value_keeps_the_environment_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DATABRICKS_CATALOG", "operator_catalog")
-        # An unset placeholder resolves to nothing, as before.
-        build = _build("databricks", catalog="{{ env.UNSET_CATALOG }}", schema="")
+        build = _build("databricks", catalog="", schema="")
 
         output = _output(_build_generated_dbt_profile(build, {}))
 
         assert (output["catalog"], output["schema"]) == ("operator_catalog", "default")
+
+    def test_an_unset_placeholder_is_refused_naming_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DATABRICKS_CATALOG", "operator_catalog")
+        monkeypatch.delenv("UNSET_CATALOG", raising=False)
+        build = _build("databricks", catalog="{{ env.UNSET_CATALOG }}", schema="")
+
+        with pytest.raises(EnvTemplateError) as caught:
+            _build_generated_dbt_profile(build, {})
+
+        assert caught.value.extras["missing"] == ["UNSET_CATALOG"]
 
     @pytest.mark.parametrize("value,env,rendered", [(v, e, r) for v, e, _, r in ALLOWED_NAMES])
     def test_dbt_reads_an_allowed_form_as_the_name_it_says(

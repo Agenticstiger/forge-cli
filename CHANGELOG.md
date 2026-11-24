@@ -50,6 +50,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumes) logs it at DEBUG, and so it does its `workspace_ref_root_ignored` and
   `ref_root_env_ignored` warnings: they are that contract's author's, who still gets them when
   composing it.
+- **A `{{ env.NAME }}` whose variable is unset or empty is an error, in every stage that renders
+  a contract.** Four resolvers read the placeholder and disagreed: `fluid generate iac` wrote
+  `"bucket": "{{ env.S3_BUCKET }}"` into `main.tf.json` and exited 0, `fluid diff` read
+  `{{ env.DIR }}/x.parquet` as `/x.parquet` and called it a file "to be created", and a build ran
+  against an empty host, path or bucket. They are one resolver now (`util/env_templates.py`). It
+  raises one error that lists every missing variable and the fields that write it, before
+  anything is emitted or run, for `fluid generate iac`, `fluid diff`, `fluid apply` (the OpenTofu
+  and the native engine, and the Spark runs), `fluid verify`, `fluid generate vector`, and the
+  acquisition, embedded-SQL and dbt builds. A variable set to the empty string
+  counts as unset. `fluid validate` warns about each such variable
+  (`contract_env_placeholder_unset`) and fails under `--strict`. A placeholder whose name looks
+  like a credential (`password`, `secret`, `token`, `key`) is still never rendered into a contract
+  that is written out, and is not reported as missing. `fluid publish`, the catalog exports, the
+  validation report, `fluid generate artifacts` (which runs where the bundle is built, not where
+  it is deployed) and the preload of a contract embedded in a plan leave the placeholder of an unset
+  or empty variable as written, by name (`UNSET_DEFER`): `tests/test_env_templates_defer_sites.py` lists them.
 
 ### Deprecated
 
@@ -75,6 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- **An unset or empty `{{ env.NAME }}` now stops the command.** A contract that relied on a
+  variable rendering as nothing (an optional prefix, a path whose variable was never exported) now
+  fails naming it: export the variable, or delete the placeholder. That includes a region written
+  as `{{ env.AWS_REGION }}`, which deployed in the environment's own region when the variable was
+  unset. `fluid validate` shows the same list as a warning ahead of time.
 - **A split contract's digest changes once.** If an upstream keeps parts of its contract in `$ref`
   fragments, the digest that `fluid contract digest` prints, and that `fluid apply`'s federation
   gate computes, is now of the composed contract. Re-pin `consumes[].upstreamDigest` for such an

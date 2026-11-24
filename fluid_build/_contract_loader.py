@@ -647,17 +647,19 @@ def _normalize_contract_aliases(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def resolve_contract_env_templates(value: Any) -> Any:
-    """Recursively resolve ``{{ env.VAR }}`` placeholders in every string leaf.
+    """Recursively resolve ``{{ env.VAR }}`` placeholders in every string leaf, deferring
+    the ones whose variable is unset.
 
-    ``plan``/``apply``/``verify`` resolve these per-string at the Snowflake
-    provider boundary (``providers/snowflake/plan/planner.py``), but ``publish``
-    forwards the raw contract dict to the catalog adapter — so without this
-    pass, raw placeholders like ``{{ env.SNOWFLAKE_DATABASE }}`` land in the
-    DMM server block and render in the UI as-is.
-
-    Unresolved placeholders (env var missing) are left intact so callers can
-    decide whether to error, warn, or fall back — matching the per-string
-    helper's behavior.
+    ``plan``/``apply``/``verify`` render a contract strictly
+    (:func:`fluid_build.cli._common.resolve_env_templates_in_contract`), but
+    ``publish`` forwards the raw contract dict to the catalog adapter, and a
+    catalog shows the template of a variable this machine does not hold. So
+    without this pass raw placeholders like ``{{ env.SNOWFLAKE_DATABASE }}``
+    land in the DMM server block and render in the UI as-is, and with it an
+    unset variable's placeholder is left as written: the named
+    ``UNSET_DEFER`` of :mod:`fluid_build.util.env_templates`, which is the one
+    resolver. Also the preload of a contract a plan embeds, whose builds render
+    it strictly when they run, and the validation report.
 
     Defense-in-depth: placeholders whose *name* looks like a credential
     (``{{ env.SNOWFLAKE_PASSWORD }}``, ``{{ env.DMM_API_KEY }}``, etc.) are
@@ -667,43 +669,13 @@ def resolve_contract_env_templates(value: Any) -> Any:
     per-variable-per-call so operators notice the unresolved placeholder
     rather than assume resolution succeeded.
     """
-    # Lazy imports keep the CLI startup graph lean — this helper is only
+    # Lazy import keeps the CLI startup graph lean — this helper is only
     # called from publish/apply/verify paths, not from `fluid --help`.
-    from fluid_build.observability.secret_redactor import is_sensitive_key_name
-    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE
+    from fluid_build.util.env_templates import UNSET_DEFER, render_contract
 
-    publish_logger = logging.getLogger("fluid.cli.publish")
-    seen_sensitive: set[str] = set()
-
-    def _replace(match: re.Match[str]) -> str:
-        var_name = match.group(1).strip()
-        if is_sensitive_key_name(var_name):
-            if var_name not in seen_sensitive:
-                seen_sensitive.add(var_name)
-                publish_logger.warning(
-                    "Refusing to resolve sensitive-looking env placeholder "
-                    "'{{ env.%s }}' in contract body; leaving literal. "
-                    "Catalog adapters forward contract YAML downstream — "
-                    "secrets must not ride along. If this value is not a "
-                    "secret, rename the env variable to something outside "
-                    "the password/secret/token/key family.",
-                    var_name,
-                )
-            return match.group(0)
-        return os.environ.get(var_name, match.group(0))
-
-    def _resolve_string(text: str) -> str:
-        if "{{" not in text:
-            return text
-        return ENV_TEMPLATE_RE.sub(_replace, text).strip()
-
-    def _walk(node: Any) -> Any:
-        if isinstance(node, dict):
-            return {k: _walk(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [_walk(item) for item in node]
-        if isinstance(node, str):
-            return _resolve_string(node)
-        return node
-
-    return _walk(value)
+    return render_contract(
+        value,
+        unset=UNSET_DEFER,
+        purpose="Catalog adapters forward contract YAML downstream",
+        logger=logging.getLogger("fluid.cli.publish"),
+    )
