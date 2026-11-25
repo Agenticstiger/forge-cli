@@ -449,6 +449,22 @@ def test_the_exact_days_and_order_count_the_rows_where_both_dates_are_known():
         ]
 
 
+def test_the_order_counts_a_return_after_before_and_on_the_day_of_its_loan():
+    # The default loans are all returned after the day they were borrowed; these are not.
+    plan = _plan()
+    rows = loans()
+    gaps = {9: -3, 10: -1, 14: -2, 11: 0, 13: 0}
+    for n, gap in gaps.items():
+        assert rows[n]["returned_on"] is not None
+        rows[n]["returned_on"] = _day(n % 28 + gap)
+    drawn, encoded = _draw(plan, rows)
+    exact = release.measure_counts(plan, encoded, list(range(len(rows))), drawn.tables)
+    known = [d for d in (_days(row, "borrowed_on", "returned_on") for row in rows) if d is not None]
+    after, before, same = exact["pair/order/borrowed_on/returned_on"]
+    assert (before, same) == (3, 2)
+    assert after == len(known) - 5 > 0
+
+
 def test_a_pair_is_two_parts_of_their_own_charged_the_table_sensitivity():
     plan = _plan()
     drawn, _ = _draw(plan)
