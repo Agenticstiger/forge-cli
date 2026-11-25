@@ -67,3 +67,26 @@ def test_a_plain_predicate_still_parses_with_its_columns():
     assert flt.name == "analysts_rows"
     assert row_filters_for({"exposeId": "x"}) == ()
     assert row_filters_for(_expose("region = 'EU'") | {"policy": {"authz": {}}}) == ()
+
+
+@pytest.mark.parametrize(
+    ("dialect", "where", "refused"),
+    [
+        # A double-quoted name is a string on BigQuery and Databricks, so the filter would
+        # compare two strings there and keep every row.
+        ("bigquery", "\"region\" <> 'US'", True),
+        ("databricks", "\"region\" <> 'US'", True),
+        ("bigquery", "region IS NOT NULL AND \"region\" <> 'US'", True),
+        ("athena", "\"region\" <> 'US'", False),
+        (None, "\"region\" <> 'US'", False),
+        ("bigquery", "region <> 'US' AND consent", False),
+        ("databricks", "region <> 'US' AND consent", False),
+    ],
+)
+def test_a_filter_is_checked_as_the_platforms_engine_reads_it(dialect, where, refused):
+    if refused:
+        with pytest.raises(UnsupportedBindingError, match="reads other columns on this engine"):
+            row_filters_for(_expose(where), dialect=dialect)
+    else:
+        (flt,) = row_filters_for(_expose(where), dialect=dialect)
+        assert flt.where == where

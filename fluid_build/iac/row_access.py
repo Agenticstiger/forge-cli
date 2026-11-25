@@ -28,7 +28,7 @@ the predicate and nothing else.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from ..providers._row_filters import RowFilter, RowFilterError, parse_row_filters
 from .base import UnsupportedBindingError
@@ -39,8 +39,12 @@ def _where(exposure: Mapping[str, Any], index: int) -> str:
     return policy_where(exposure, index, "rowFilters")
 
 
-def row_filters_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[RowFilter, ...]:
-    """The expose's row filters, or ``()``; a malformed one is refused."""
+def row_filters_for(
+    exposure: Mapping[str, Any], index: int = 0, *, dialect: Optional[str] = None
+) -> Tuple[RowFilter, ...]:
+    """The expose's row filters, or ``()``; a malformed one is refused, and so is one the
+    platform's engine (``dialect``, a sqlglot dialect name) would read with other
+    columns than declared, since the predicate is written into its policy as it stands."""
     policy = exposure.get("policy") if isinstance(exposure, Mapping) else None
     authz = policy.get("authz") if isinstance(policy, Mapping) else None
     raw = authz.get("rowFilters") if isinstance(authz, Mapping) else None
@@ -50,7 +54,9 @@ def row_filters_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[RowFil
     names = (col.get("name") for col in schema if isinstance(col, Mapping))
     declared = {name for name in names if isinstance(name, str)}
     try:
-        return parse_row_filters(raw, declared=declared, where_at=_where(exposure, index))
+        return parse_row_filters(
+            raw, declared=declared, where_at=_where(exposure, index), dialect=dialect
+        )
     except RowFilterError as exc:
         raise UnsupportedBindingError("row-filter", str(exc), exc.hints) from exc
 

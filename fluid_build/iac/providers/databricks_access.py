@@ -421,7 +421,7 @@ def compile_enforcement(
     except UnsupportedBindingError as exc:
         raise _refusal("column-restriction-invalid", f"{where}: {exc}", *exc.remediation) from exc
     try:
-        filters = row_filters_for(exposure, index)
+        filters = row_filters_for(exposure, index, dialect="databricks")
     except UnsupportedBindingError as exc:
         raise _refusal("row-filter-invalid", f"{where}: {exc}", *exc.remediation) from exc
     except Exception as exc:  # noqa: BLE001 — the shared reader's parser can raise its own

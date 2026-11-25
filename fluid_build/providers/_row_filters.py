@@ -31,6 +31,7 @@ predicate is parsed. Without sqlglot a predicate is refused, never passed unchec
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Collection, List, Mapping, Optional, Tuple
 
@@ -154,16 +155,43 @@ def predicate_columns(tree: Any) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(col.name for col in tree.args["where"].find_all(exp.Column)))
 
 
+def check_engine_reading(where: str, at: str, dialect: Optional[str]) -> None:
+    """Refuse ``where`` when the engine ``dialect`` names reads other columns in it than
+    the standard parse does, or ``None`` (no engine) to check nothing.
+
+    Every occurrence counts, not only the names: a double-quoted name is a string on
+    BigQuery and Spark, so ``"region" <> 'US'`` compares two strings there and the filter
+    keeps every row, and ``region IS NOT NULL AND "region" <> 'US'`` names ``region``
+    either way but reads as ``region IS NOT NULL``."""
+    if dialect is None:
+        return
+    from sqlglot import expressions as exp
+
+    def occurrences(tree: Any) -> Counter[str]:
+        return Counter(col.name for col in tree.args["where"].find_all(exp.Column))
+
+    if occurrences(parse_predicate(where, at)) != occurrences(
+        parse_predicate(where, at, dialect=dialect)
+    ):
+        raise RowFilterError(
+            f"{at}.where reads other columns on this engine than as declared, so it cannot "
+            "be applied as written here (a double-quoted name, for one, is a string on "
+            "BigQuery and Spark).",
+            ("Write the column names bare.",),
+        )
+
+
 def parse_row_filters(
-    raw: Any, *, declared: Collection[Any], where_at: str
+    raw: Any, *, declared: Collection[Any], where_at: str, dialect: Optional[str] = None
 ) -> Tuple[RowFilter, ...]:
     """The filters ``raw`` (an expose's ``policy.authz.rowFilters``) declares, or ``()``.
 
     ``declared`` holds the expose's ``contract.schema`` column names, and ``where_at``
-    names the list in a refusal (``exposes[<id>].policy.authz.rowFilters``). A value
-    that is not a list of filters, or a filter that cannot be applied as written, is
-    refused with :class:`RowFilterError`: a filter skipped would serve the rows it
-    was written to withhold.
+    names the list in a refusal (``exposes[<id>].policy.authz.rowFilters``). With
+    ``dialect`` (a sqlglot dialect name) each predicate is also checked as that engine
+    reads it (:func:`check_engine_reading`). A value that is not a list of filters, or a
+    filter that cannot be applied as written, is refused with :class:`RowFilterError`: a
+    filter skipped would serve the rows it was written to withhold.
     """
     if raw is None:
         return ()
@@ -206,6 +234,7 @@ def parse_row_filters(
             raise RowFilterError(f"{at}.name {name!r} names another filter of this expose too.")
         seen_names.add(name)
         columns = predicate_columns(parse_predicate(where, at))
+        check_engine_reading(where, at, dialect)
         unknown = [c for c in columns if c not in declared]
         if unknown:
             raise RowFilterError(
@@ -219,6 +248,7 @@ def parse_row_filters(
 __all__ = [
     "RowFilter",
     "RowFilterError",
+    "check_engine_reading",
     "derived_name",
     "parse_predicate",
     "parse_row_filters",

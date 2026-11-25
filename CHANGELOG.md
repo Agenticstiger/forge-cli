@@ -403,6 +403,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pageinspect functions read raw pages, filtered rows included; `pgrowlocks` reports locked rows;
   and `pg_prepared_statement` and `pg_cursor` show other requests' statements on the shared
   connection. The `pg_prepared_statements` and `pg_cursors` views are refused by name.
+- **The IaC emitters check each row filter as the platform's engine reads it.** BigQuery and
+  Databricks read a double-quoted name as a string, so a filter written that way compared two
+  strings and its policy kept every row. `fluid generate iac` and `fluid apply` now refuse such a
+  filter for BigQuery and Unity Catalog, and check Lake Formation filters as Athena reads them,
+  with the same check the MCP output port makes.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -603,6 +608,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names or strings written with Unicode escapes (`U&"..."`). It also refuses `set_config`, the
   pageinspect functions, `pgrowlocks`, `pg_prepared_statement`, `pg_cursor` and the
   `pg_prepared_statements` and `pg_cursors` views.
+- **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
+  read the name as a string. Write the column name bare.
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so

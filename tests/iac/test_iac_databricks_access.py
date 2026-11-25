@@ -708,3 +708,14 @@ def test_emit_stays_pure_and_still_emits_the_module_for_fluid_apply(monkeypatch)
 
     resources = IAC_PLUGINS["databricks"].emit(contract())
     assert "databricks_sql_table" in resources and "databricks_grant" in resources
+
+
+def test_a_filter_databricks_would_read_with_other_columns_is_refused():
+    """Databricks SQL reads a double-quoted name as a string, so the row filter function
+    would compare two strings and return every row."""
+    doc = contract(
+        restrictions=None, filters=[{"principal": ANALYSTS, "where": "\"region\" = 'eu'"}]
+    )
+    error = refusal(doc)
+    assert error.kind == "databricks-row-filter-invalid"
+    assert "reads other columns on this engine" in str(error)

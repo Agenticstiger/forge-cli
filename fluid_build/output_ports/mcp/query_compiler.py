@@ -60,7 +60,6 @@ Borrow-before-build — intentional divergence (per /borrow-before-build):
 from __future__ import annotations
 
 import re
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
@@ -69,6 +68,7 @@ from fluid_build.output_ports.mcp.auth import PRINCIPAL_ATTR
 from fluid_build.providers._row_filters import (
     RowFilter,
     RowFilterError,
+    check_engine_reading,
     parse_predicate,
     parse_row_filters,
 )
@@ -715,19 +715,12 @@ def _qualified_predicate(row_filter: RowFilter, at: str, read: Optional[str]) ->
         tree = parse_predicate(row_filter.where, at, dialect=read)
     except RowFilterError as exc:
         raise RowFilterUnavailable(f"{exc} (as this engine reads it)") from exc
+    # The check the IaC emitters make before they write a predicate into a policy.
+    try:
+        check_engine_reading(row_filter.where, at, read)
+    except RowFilterError as exc:
+        raise RowFilterUnavailable(str(exc)) from exc
     columns = list(tree.args["where"].find_all(exp.Column))
-    # Every occurrence counts, not only the names: ``region IS NOT NULL AND "region"
-    # <> 'US'`` names ``region`` either way, but BigQuery reads its second ``"region"``
-    # as a string and the predicate as ``region IS NOT NULL``.
-    standard = parse_predicate(row_filter.where, at)
-    if Counter(c.name for c in columns) != Counter(
-        c.name for c in standard.args["where"].find_all(exp.Column)
-    ):
-        raise RowFilterUnavailable(
-            f"{at}.where reads other columns on this engine than as declared, so it cannot "
-            "be applied as written here (a double-quoted name, for one, is a string on "
-            "BigQuery and Spark)."
-        )
     offsets: List[int] = []
     for column in columns:
         if any(column.args.get(part) for part in ("table", "db", "catalog")):
