@@ -24,6 +24,7 @@ from fluid_build.profiler import _stats, disclosure, document, history
 from fluid_build.profiler._stats import (
     Request,
     RequestColumn,
+    RequestDatePair,
     RequestTable,
     load_backend,
 )
@@ -604,6 +605,34 @@ def test_a_request_profile_writes_no_history(tmp_path):
     result = _profile(tmp_path, _contract(), _stations(), request=asked)
     assert "history" not in result.document["tables"][TABLE]
     assert not any("history" in what for what, _ in result.not_measured)
+
+
+def test_a_default_profile_leaves_the_window_pair_to_the_history(stations):
+    result, _ = stations
+    pairs = result.document["tables"][TABLE].get("datePairs", [])
+    assert not any({pair["start"], pair["end"]} == {"valid_from", "valid_to"} for pair in pairs)
+    said = dict(result.not_measured)
+    what = f"date pair valid_from to valid_to of {TABLE}"
+    assert what in said
+    assert "validity window" in said[what] and "history" in said[what]
+
+
+def test_a_request_that_asks_the_window_pair_gets_it(tmp_path):
+    asked = Request(
+        contract_digest=None,
+        fractional_bits=16,
+        tables=(
+            RequestTable(
+                TABLE,
+                True,
+                (RequestColumn("valid_from", "timestamp"), RequestColumn("valid_to", "timestamp")),
+                date_pairs=(RequestDatePair("valid_from", "valid_to"),),
+            ),
+        ),
+    )
+    result = _profile(tmp_path, _contract(), _stations(), request=asked)
+    pairs = result.document["tables"][TABLE].get("datePairs", [])
+    assert [(pair["start"], pair["end"]) for pair in pairs] == [("valid_from", "valid_to")]
 
 
 def test_a_window_that_is_not_one_of_dates_names_why_and_writes_none(tmp_path):
