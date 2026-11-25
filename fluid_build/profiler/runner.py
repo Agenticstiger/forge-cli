@@ -1016,17 +1016,21 @@ def _relationship_dates(
     """The ``relationships[]`` entries, each with its dates, structural classes and exposure.
 
     A relationship the profile counts keeps its counted entry; one only a request asks dates or
-    exposure of gets an entry of its own. The asks left out come back with why.
+    exposure of gets an entry of its own. The asks left out come back with why. Each parent
+    table's one counted lifetime is chosen first, over every relationship into it.
     """
     from fluid_build.profiler import request as asked_for
 
+    asks = [
+        asked_for.relationship_dates_asks(request, rel) if request is not None else (None, None)
+        for rel in relationships
+    ]
+    dates.choose_lifetimes(stage, relationships, [exposure for _, exposure in asks])
     docs: List[Dict[str, Any]] = []
     notes: List[Tuple[str, str]] = []
     for position, rel in enumerate(relationships):
         entry = counted_entries[position][0] if position in counted_entries else None
-        asked_dates, asked_exposure = (
-            asked_for.relationship_dates_asks(request, rel) if request is not None else (None, None)
-        )
+        asked_dates, asked_exposure = asks[position]
         if request is not None and not (asked_dates or asked_exposure or entry is not None):
             continue
         with _timed(stage.timings, "measure", rel.child):

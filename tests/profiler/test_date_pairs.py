@@ -691,29 +691,42 @@ def _expected_exposure(entry, customers, orders):
     )
 
 
+def _by_lifetime(entry: Dict[str, Any]) -> Dict[tuple, Dict[str, Any]]:
+    return {(each["start"], each.get("end")): each for each in entry["exposure"]}
+
+
+def _withheld_whole_exposure(exposure: Dict[str, Any]) -> bool:
+    """Both counts withheld under ``D``, with the band every such exposure shares."""
+    return all(
+        exposure[key]["status"] == disclosure.SECONDARY
+        and "value" not in exposure[key]
+        and exposure[key]["sampleSize"] == {"min": 0}
+        for key in ("children", "activeDays")
+    )
+
+
 def test_exposure_states_children_and_active_days_inside_the_published_span(tmp_path):
     customers, orders = _customers(), _orders()
     result = _profile_shop(tmp_path, _shop_contract(), orders=orders, customers=customers)
-    exposure = {
-        (each["start"], each.get("end")): each for each in _relationship(result)["exposure"]
-    }
-    alone, lifetime = exposure[("signup", None)], exposure[("signup", "left_on")]
+    exposure = _by_lifetime(_relationship(result))
+    # The table counts one lifetime: a pair a rule orders comes before a column alone.
+    lifetime = exposure.pop(("signup", "left_on"))
+    assert ("signup", None) in exposure
+    assert all(_withheld_whole_exposure(each) for each in exposure.values())
     # The window is the outer edges of the published span of the parent's start column.
     (span,) = [
         each
         for each in result.document["tables"]["customers"]["columns"]["signup"]["statistics"]
         if each["definition"] == "marginalHistogram/1"
     ]
-    assert alone["window"] == {"start": span["bins"][0], "end": span["bins"][-1]}
-    assert lifetime["window"] == alone["window"]
-    rule = disclosure.ACRO_DEFAULT
-    for entry in (alone, lifetime):
-        children, days = _expected_exposure(entry, customers, orders)
-        assert entry["children"]["definition"] == "count/1"
-        assert entry["children"]["value"] == disclosure.round_count(children, rule)
-        assert entry["activeDays"]["value"] == days
-    # The lifetime ends where the end column says, so it is active for fewer days than alone.
-    assert lifetime["activeDays"]["value"] < alone["activeDays"]["value"]
+    assert lifetime["window"] == {"start": span["bins"][0], "end": span["bins"][-1]}
+    assert exposure[("signup", None)]["window"] == lifetime["window"]
+    children, days = _expected_exposure(lifetime, customers, orders)
+    assert lifetime["children"]["definition"] == "count/1"
+    assert lifetime["children"]["value"] == disclosure.round_count(
+        children, disclosure.ACRO_DEFAULT
+    )
+    assert lifetime["activeDays"]["value"] == days
     load_profile_text(result.canonical.decode("utf-8"))
 
 
@@ -878,7 +891,7 @@ def test_a_relationship_no_joined_row_holds_both_dates_of_is_written_withheld(tm
     load_profile_text(result.canonical.decode("utf-8"))
 
 
-# -- exposures of one parent table, differenced --------------------------------------------
+# -- one lifetime's exposure per parent table ----------------------------------------------
 
 
 def _closed(count: int) -> List[Dict[str, Any]]:
@@ -891,63 +904,189 @@ def _closed(count: int) -> List[Dict[str, Any]]:
     return rows
 
 
-def _active_days_of(result) -> Dict[tuple, Dict[str, Any]]:
+def test_a_parent_table_counts_the_exposure_of_one_lifetime(tmp_path):
+    # (signup) and (signup, left_on) differ by the days of the one closed customer only: the
+    # difference of the two sums would be one record's date, so one of them is counted.
+    result = _profile_shop(tmp_path, _shop_contract(), customers=_closed(1))
+    exposure = _by_lifetime(_relationship(result))
+    counted = exposure.pop(("signup", "left_on"))
+    assert counted["children"]["status"] == counted["activeDays"]["status"] == "F"
+    assert ("signup", None) in exposure
+    assert all(_withheld_whole_exposure(each) for each in exposure.values())
+    load_profile_text(result.canonical.decode("utf-8"))
+
+
+def test_every_relationship_into_a_table_counts_the_same_lifetime(tmp_path):
+    contract = _shop_contract()
+    orders = contract["exposes"][1]
+    orders["semantics"]["relationships"].append(
+        {**orders["semantics"]["relationships"][0], "name": "buyer"}
+    )
+    result = _profile_shop(tmp_path, contract, customers=_closed(1))
+    counted = []
+    for entry in result.document["relationships"]:
+        exposure = _by_lifetime(entry)
+        counted.append(exposure.pop(("signup", "left_on")))
+        assert all(_withheld_whole_exposure(each) for each in exposure.values())
+    assert len(counted) == 2
+    # The same parents on the same window: the second relationship repeats the first's days.
+    assert counted[0]["activeDays"]["status"] == "F"
+    assert counted[0]["activeDays"] == counted[1]["activeDays"]
+
+
+def test_a_request_counts_the_lifetime_that_comes_first_in_the_contract_order(tmp_path):
+    def ask(*exposure: RequestExposure) -> Request:
+        return _request(
+            RequestTable(
+                "customers",
+                False,
+                (
+                    RequestColumn("customer_id", "number"),
+                    RequestColumn("signup", "timestamp", (), ("marginalHistogram/1",)),
+                    RequestColumn("left_on", "timestamp", (), ("marginalHistogram/1",)),
+                ),
+            ),
+            RequestTable("orders", False, (RequestColumn("customer_id", "number"),)),
+            relationships=[
+                RequestRelationship(
+                    RequestEnd("customers", ("customer_id",)),
+                    RequestEnd("orders", ("customer_id",)),
+                    (),
+                    exposure=exposure,
+                )
+            ],
+        )
+
+    # Listed second, the pair with an end still comes before a column alone.
+    result = _profile_shop(
+        tmp_path,
+        _shop_contract(),
+        request=ask(RequestExposure("signup", None), RequestExposure("signup", "left_on")),
+    )
+    exposure = _by_lifetime(_relationship(result))
+    assert list(exposure) == [("signup", None), ("signup", "left_on")]
+    assert exposure[("signup", "left_on")]["activeDays"]["status"] == "F"
+    assert _withheld_whole_exposure(exposure[("signup", None)])
+    # Two columns alone: the schema's order, not the request's.
+    result = _profile_shop(
+        tmp_path,
+        _shop_contract(),
+        request=ask(RequestExposure("left_on", None), RequestExposure("signup", None)),
+    )
+    exposure = _by_lifetime(_relationship(result))
+    assert exposure[("signup", None)]["activeDays"]["status"] == "F"
+    assert _withheld_whole_exposure(exposure[("left_on", None)])
+
+
+# -- four exposures of three dates ---------------------------------------------------------
+
+#: The one bed that never sprouts, and the day it is harvested.
+UNSPROUTED, HARVESTED = 17, date(2023, 7, 19)
+
+
+def _garden_contract() -> Dict[str, Any]:
+    beds: Dict[str, Any] = {
+        "exposeId": "beds",
+        "contract": {
+            "schema": [
+                {"name": "bed_id", "type": "int"},
+                {"name": "planted", "type": "date"},
+                {"name": "sprouted", "type": "date"},
+                {"name": "harvested", "type": "date"},
+            ],
+            "invariants": [
+                {"id": "sprouts", "check": "sprouted IS NULL OR sprouted >= planted"},
+                {"id": "grows", "check": "harvested IS NULL OR harvested >= planted"},
+                {
+                    "id": "ripens",
+                    "check": "harvested IS NULL OR sprouted IS NULL OR harvested >= sprouted",
+                },
+            ],
+        },
+    }
+    waterings = {
+        "exposeId": "waterings",
+        "contract": {
+            "schema": [{"name": "watering_id", "type": "int"}, {"name": "bed_id", "type": "int"}]
+        },
+        "semantics": {
+            "relationships": [
+                {
+                    "name": "bed",
+                    "to": "beds",
+                    "fromColumns": ["bed_id"],
+                    "toColumns": ["bed_id"],
+                    "cardinality": "many_to_one",
+                }
+            ]
+        },
+    }
+    return {"fluidVersion": "0.7.7", "kind": "DataProduct", "id": "g", "exposes": [beds, waterings]}
+
+
+def _beds() -> List[Dict[str, Any]]:
+    rows = []
+    for number in range(300):
+        planted = date(2023, 1, 1) + timedelta(days=(number * 7) % 340)
+        sprouted = planted + timedelta(days=number % 11)
+        harvested = sprouted + timedelta(days=20 + (number * 13) % 150)
+        rows.append(
+            {
+                "bed_id": number,
+                "planted": planted.isoformat(),
+                "sprouted": sprouted.isoformat(),
+                "harvested": harvested.isoformat() if number % 2 == 0 else None,
+            }
+        )
+    rows[UNSPROUTED].update(planted="2023-06-01", sprouted=None, harvested=HARVESTED.isoformat())
+    return rows
+
+
+def _profile_garden(tmp_path, contract: Dict[str, Any]):
+    waterings = [{"watering_id": number, "bed_id": number % 300} for number in range(900)]
+    return profile_exposes(
+        contract,
+        [
+            ExposeSource("beds", _write(tmp_path / "b.ndjson", _beds())),
+            ExposeSource("waterings", _write(tmp_path / "w.ndjson", waterings)),
+        ],
+        backend=load_backend(),
+    )
+
+
+def _counts(exposure: Dict[tuple, Dict[str, Any]], key: str) -> Dict[tuple, Optional[int]]:
+    """Each lifetime's published count *key*, ``None`` where it is withheld."""
     return {
-        (each["start"], each.get("end")): each["activeDays"]
-        for each in _relationship(result)["exposure"]
+        lifetime: int(each[key]["value"]) if each[key]["status"] == "F" else None
+        for lifetime, each in exposure.items()
     }
 
 
-def test_an_exposure_that_differs_from_another_by_one_parent_is_withheld(tmp_path):
-    # (signup) and (signup, left_on) differ by the days of the one closed parent only: the
-    # difference of the two sums would be one record's date.
-    result = _profile_shop(tmp_path, _shop_contract(), customers=_closed(1))
-    days = _active_days_of(result)
-    assert days[("signup", None)]["status"] == "F"
-    assert days[("signup", "left_on")]["status"] != "F"
-    assert "value" not in days[("signup", "left_on")]
-    load_profile_text(result.canonical.decode("utf-8"))
-
-
-def test_exposures_that_differ_by_many_parents_with_spread_days_are_both_published(tmp_path):
-    result = _profile_shop(tmp_path, _shop_contract(), customers=_closed(30))
-    days = _active_days_of(result)
-    assert days[("signup", None)]["status"] == "F"
-    assert days[("signup", "left_on")]["status"] == "F"
-    load_profile_text(result.canonical.decode("utf-8"))
-
-
-def test_exposures_that_differ_by_too_few_parents_are_withheld_by_the_count_rule(tmp_path):
-    result = _profile_shop(tmp_path, _shop_contract(), customers=_closed(9))
-    days = _active_days_of(result)
-    assert days[("signup", "left_on")]["status"] == "A"
-
-
-def test_the_same_exposure_through_two_relationships_publishes_both(tmp_path):
-    contract = _shop_contract()
-    orders = contract["exposes"][1]
-    orders["semantics"]["relationships"].append(
-        {**orders["semantics"]["relationships"][0], "name": "buyer"}
+def test_four_exposures_of_three_dates_do_not_give_one_parents_date_back(tmp_path):
+    # Published together, (planted) - (planted, harvested) - (sprouted) + (sprouted, harvested)
+    # is the days from the one unsprouted bed's harvest to the window's end, and
+    # (planted) - (planted, sprouted) - (sprouted) the exact number of beds that sprouted.
+    result = _profile_garden(tmp_path, _garden_contract())
+    exposure = _by_lifetime(_relationship(result))
+    combinations = (
+        [
+            ("planted", None),
+            ("planted", "harvested"),
+            ("sprouted", None),
+            ("sprouted", "harvested"),
+        ],
+        [("planted", None), ("planted", "sprouted"), ("sprouted", None)],
     )
-    result = _profile_shop(tmp_path, contract, customers=_closed(1))
-    entries = result.document["relationships"]
-    assert len(entries) == 2
-    for entry in entries:
-        alone = {(each["start"], each.get("end")): each for each in entry["exposure"]}
-        assert alone[("signup", None)]["activeDays"]["status"] == "F"
-    # The second relationship repeats the first's (signup) exposure: identical days, no new fact.
-    assert entries[0]["exposure"][0]["activeDays"] == entries[1]["exposure"][0]["activeDays"]
-
-
-def test_the_difference_is_checked_against_every_published_exposure_of_the_table(tmp_path):
-    # The (signup, left_on) exposure is withheld against (signup) in the first relationship, so
-    # the second relationship's copy of it is withheld too, and its (signup) is published.
-    contract = _shop_contract()
-    orders = contract["exposes"][1]
-    orders["semantics"]["relationships"].append(
-        {**orders["semantics"]["relationships"][0], "name": "buyer"}
-    )
-    result = _profile_shop(tmp_path, contract, customers=_closed(1))
-    for entry in result.document["relationships"]:
-        by_key = {(each["start"], each.get("end")): each for each in entry["exposure"]}
-        assert by_key[("signup", "left_on")]["activeDays"]["status"] != "F"
+    assert {lifetime for each in combinations for lifetime in each} <= set(exposure)
+    days, children = _counts(exposure, "activeDays"), _counts(exposure, "children")
+    # The first pair a rule orders is the one lifetime counted; every other is withheld whole.
+    assert [each for each, value in days.items() if value is not None] == [("planted", "sprouted")]
+    assert [each for each, value in children.items() if value is not None] == [
+        ("planted", "sprouted")
+    ]
+    for lifetime, each in exposure.items():
+        assert lifetime == ("planted", "sprouted") or _withheld_whole_exposure(each)
+    # So neither combination can be formed, and no two children counts can be set side by side.
+    for combination in combinations:
+        assert any(days[lifetime] is None for lifetime in combination)
+    load_profile_text(result.canonical.decode("utf-8"))

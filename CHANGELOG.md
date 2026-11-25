@@ -27,10 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   children and checks it is at least 1, and no parent lacks a child. A pair with a timestamp
   column, a value that is not a whole day, and an exposure with no window are named under Not
   measured with the reason. A pair no record holds both dates of is written like a small one, its
-  order withheld whole, so the list of pairs says nothing about it. An exposure beside another of the
-  same parent table is checked on the difference of their days: the parents they treat differently
-  must pass the count and sum rules, or its days are withheld. A private release forms none of
-  these and names them as before.
+  order withheld whole, so the list of pairs says nothing about it. A parent table publishes the
+  exposure of one lifetime, the same under every relationship into it: the first lifetime with an
+  end, else the first DATE column alone, in the schema's order. Every other lifetime's exposure is
+  written withheld whole (`D`), since sums over the same parents can be added and subtracted to give
+  one parent's date back. A private release forms none of these and names them as before.
 - **`fluid profile` publishes a table's calendar, its monthly periods and statistics counted per
   entity.** Each DATE and timestamp column (a request lists the columns it wants) gets `month`,
   `dayOfWeek` and, on a timestamp only, `hourOfWeek` as level histograms read in UTC, counted in

@@ -52,6 +52,12 @@ otherwise; with neither the exposure is not formed. The days follow the engine's
 last millisecond of its day, both ends of the window count their day, and a parent whose end is
 missing or before its start is active to the window's last day.
 
+**One lifetime per parent table.** Exposures of one parent table are sums over the same parents,
+so a few of them can be added and subtracted to give one parent's date back. A parent table
+therefore publishes the exposure of one lifetime, under every relationship into it, and writes the
+exposure of every other lifetime withheld whole, ``D``. The lifetime is chosen from the contract,
+the request and the published document, never from the records (:func:`choose_lifetimes`).
+
 Nothing here names a value: a reason names a table, columns, a relationship and a rule.
 """
 
@@ -61,6 +67,7 @@ from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass, field
 from fractions import Fraction
+from functools import partial
 from itertools import combinations
 from typing import (
     TYPE_CHECKING,
@@ -101,6 +108,7 @@ __all__ = [
     "PairContext",
     "RelationshipAsks",
     "checked",
+    "choose_lifetimes",
     "declared_empty_levels",
     "histogram",
     "read_milliseconds",
@@ -159,6 +167,9 @@ _TOO_MANY = f"a profile holds at most {MOST_ENTRIES} of them"
 #: A column as a rule names it: the relationship it is read through (``None``: the row's own) and
 #: its name.
 Ref = Tuple[Optional[str], str]
+
+#: A parent's lifetime: its start column and its end column (``None``: the start alone).
+Lifetime = Tuple[str, Optional[str]]
 
 _EMPTIED = {
     ">=": frozenset({"before"}),
@@ -713,8 +724,8 @@ class DateStage:
     timings: Optional["StageTimings"]
     #: Each table's date columns, read once for the pairs, relationships and exposures.
     shared: Dict[str, TableDates] = field(default_factory=dict)
-    #: Each parent table's published ``activeDays`` by parent row (see :func:`_differences_pass`).
-    exposed: Dict[str, List[Dict[int, int]]] = field(default_factory=dict)
+    #: The one lifetime of each parent table whose exposure is counted (:func:`choose_lifetimes`).
+    lifetimes: Dict[str, Lifetime] = field(default_factory=dict)
 
     def pair_context(self, table: str) -> PairContext:
         """What a pair of *table* is counted and written with."""
@@ -1109,9 +1120,10 @@ def relationship_extras(
     With *asks*' dates and exposure (a request's lists) only those are formed, else every
     parent and child DATE pair and each parent lifetime the contract orders. ``asks.counted`` says
     the relationship's children per parent are published, which ``structural`` describes. The
-    second value is each ask left out with why: ``(what, reason)``. ``stage.exposed`` holds, for
-    each parent table, the active days of each parent in every ``activeDays`` published so far
-    (the exposures of every relationship share it: see :func:`_differences_pass`).
+    second value is each ask left out with why: ``(what, reason)``. Only the lifetime
+    ``stage.lifetimes`` names for the parent table is counted (:func:`choose_lifetimes`, which the
+    runner calls once before the first relationship); every other lifetime's exposure is written
+    withheld.
     """
     sides = _sides(stage, relationship)
     extras: Dict[str, Any] = {}
@@ -1127,9 +1139,7 @@ def relationship_extras(
     return extras, notes
 
 
-def _lifetimes(
-    dates: TableDates, held: FrozenSet[str], checks: Sequence[str]
-) -> List[Tuple[str, Optional[str]]]:
+def _lifetimes(dates: TableDates, held: FrozenSet[str], checks: Sequence[str]) -> List[Lifetime]:
     """The parent lifetimes a profile states without a request: each DATE column alone, and each
     ordered pair of DATE columns a rule says does not end before it starts."""
     names = [
@@ -1137,7 +1147,7 @@ def _lifetimes(
         for each in dates.plan.columns
         if each.domain == "timestamp" and each.date and each.name not in held
     ]
-    found: List[Tuple[str, Optional[str]]] = [(name, None) for name in names]
+    found: List[Lifetime] = [(name, None) for name in names]
     for first, second in combinations(names, 2):
         for start, end in ((first, second), (second, first)):
             says = frozenset().union(
@@ -1148,6 +1158,54 @@ def _lifetimes(
     return found
 
 
+def _default_lifetimes(stage: DateStage, table: str, dates: TableDates) -> List[Lifetime]:
+    """The lifetimes of *table* an exposure is formed over without a request."""
+    return _lifetimes(dates, stage.held_of(table), _check_texts(stage.raw_exposes[table]))
+
+
+def _rank(lifetime: Lifetime, places: Mapping[str, int]) -> Tuple[int, int, int]:
+    """Where *lifetime* stands in the fixed order a table's counted lifetime is chosen in: each
+    lifetime with an end before each start alone, by the places of their columns in the schema."""
+    start, end = lifetime
+    return (1, places[start], 0) if end is None else (0, places[start], places[end])
+
+
+def choose_lifetimes(
+    stage: DateStage,
+    relationships: Sequence["Relationship"],
+    asked: Sequence[Optional[Sequence[Lifetime]]],
+) -> None:
+    """Choose the one lifetime of each parent table whose exposure is counted, into ``stage.lifetimes``.
+
+    Every exposure of a parent table is a sum over the same parents, so a signed combination of a
+    few of them can give one parent's date back. With three dates ``a``, ``b`` and ``c``,
+    ``(a) - (a, c) - (b) + (b, c)`` is the days from ``c`` to the window's end of the parents with
+    ``a`` and ``c`` and no ``b``: one record's date when one parent is such. A check of each pair
+    of exposures does not see that, and a check of a few cannot see every whole-number
+    combination. So a parent table publishes the exposure of one lifetime, under every
+    relationship into it (the same parents and the same window give the same days), and the
+    exposure of every other lifetime is written withheld whole.
+
+    The choice reads the contract, the request and the published document, never the records:
+    among the lifetimes the relationships into a table form (*asked* holds each relationship's
+    requested lifetimes, ``None`` for the defaults), the first with an end, else the first start
+    alone, by the schema's order. (A table that declares a validity window has no relationship
+    read into it, since a parent there has a row per version, so it has no exposure.)
+    """
+    formed: Dict[str, Set[Lifetime]] = {}
+    for relationship, lifetimes in zip(relationships, asked, strict=True):
+        table = relationship.parent
+        plan, read = stage.by_expose[table]
+        dates = table_dates(stage.shared, plan, read, stage.backend)
+        listed = _default_lifetimes(stage, table, dates) if lifetimes is None else list(lifetimes)
+        for start, end in listed[:MOST_ENTRIES]:
+            if _exposure_reason(stage, table, dates, start, end)[0] is None:
+                formed.setdefault(table, set()).add((start, end))
+    for table, candidates in formed.items():
+        places = {each.name: place for place, each in enumerate(stage.by_expose[table][0].columns)}
+        stage.lifetimes[table] = min(candidates, key=partial(_rank, places=places))
+
+
 def _safe_emptied(text: str, start: Ref, end: Ref) -> FrozenSet[str]:
     try:
         return _emptied(fs.parse(text), start, end)
@@ -1156,10 +1214,10 @@ def _safe_emptied(text: str, start: Ref, end: Ref) -> FrozenSet[str]:
 
 
 def _exposure_reason(
-    stage: DateStage, sides: _Sides, start: str, end: Optional[str]
+    stage: DateStage, table: str, dates: TableDates, start: str, end: Optional[str]
 ) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
-    """Why a lifetime forms no exposure (or its window when it does): ``(reason, window)``."""
-    table, held, dates = sides.parent, stage.held_of(sides.parent), sides.parent_dates
+    """Why a lifetime of *table* forms no exposure (or its window when it does): ``(reason, window)``."""
+    held = stage.held_of(table)
     reason = dates.why_not(start, held, table, _EXPOSURE_DATE) or (
         dates.why_not(end, held, table, _EXPOSURE_DATE) if end is not None else None
     )
@@ -1208,31 +1266,21 @@ def _exposure_entry(
         "start": start,
         **({"end": end} if end is not None else {}),
         "children": _children_metric(stage.backend, stage.rule, stage.tallies[0], children),
-        "activeDays": _days_metric(
-            stage.backend,
-            stage.rule,
-            stage.tallies[0],
-            days,
-            stage.exposed.setdefault(sides.parent, []),
-        ),
+        "activeDays": _days_metric(stage.backend, stage.rule, stage.tallies[0], days),
         "window": {"start": str(window[0]), "end": str(window[1])},
     }
 
 
 def _exposure(
-    stage: DateStage, sides: _Sides, asked: Optional[Sequence[Tuple[str, Optional[str]]]]
+    stage: DateStage, sides: _Sides, asked: Optional[Sequence[Lifetime]]
 ) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
     """The relationship's ``exposure`` entries and each lifetime left out, with why.
 
-    ``stage.exposed`` holds the active days of each parent (by row) in every ``activeDays`` of
-    this parent table published so far, and gains this relationship's.
+    Only the parent table's lifetime in ``stage.lifetimes`` is counted and checked; every other
+    lifetime the relationship forms is written withheld whole (:func:`_withheld_exposure`).
     """
     lifetimes = (
-        _lifetimes(
-            sides.parent_dates,
-            stage.held_of(sides.parent),
-            _check_texts(stage.raw_exposes[sides.parent]),
-        )
+        _default_lifetimes(stage, sides.parent, sides.parent_dates)
         if asked is None
         else list(asked)
     )
@@ -1240,16 +1288,43 @@ def _exposure(
     if len(lifetimes) > MOST_ENTRIES:
         notes.append((f"exposure of {sides.link} past the first {MOST_ENTRIES}", _TOO_MANY))
         lifetimes = lifetimes[:MOST_ENTRIES]
+    counted = stage.lifetimes.get(sides.parent)
     entries: List[Dict[str, Any]] = []
     for start, end in lifetimes:
         span = start if end is None else f"{start} to {end}"
-        reason, window = _exposure_reason(stage, sides, start, end)
+        reason, window = _exposure_reason(stage, sides.parent, sides.parent_dates, start, end)
         if reason is not None:
             notes.append((f"exposure {sides.parent}.{span} of {sides.link}", reason))
             continue
         assert window is not None
-        entries.append(_exposure_entry(stage, sides, (start, end), window))
+        if (start, end) == counted:
+            entries.append(_exposure_entry(stage, sides, (start, end), window))
+        else:
+            entries.append(_withheld_exposure(stage, (start, end), window))
     return entries, notes
+
+
+def _withheld_exposure(
+    stage: DateStage, lifetime: Lifetime, window: Tuple[int, int]
+) -> Dict[str, Any]:
+    """The exposure of a lifetime other than its table's counted one: withheld whole, ``D``.
+
+    Nothing is counted for it. Both its metrics carry the band every such exposure shares, since
+    a count's own band is its rounded value, which withholding it is there to keep.
+    """
+    start, end = lifetime
+    metric = next(each for each in stage.backend.metrics() if each.name == "count")
+    entry: Dict[str, Any] = {"start": start, **({"end": end} if end is not None else {})}
+    for key in ("children", "activeDays"):
+        entry[key] = {
+            "definition": metric.identifier,
+            "status": disclosure.SECONDARY,
+            "sampleSize": {"min": 0},
+            "disclosure": stage.rule.name,
+        }
+        stage.tallies[0][disclosure.SECONDARY] += 1
+    entry["window"] = {"start": str(window[0]), "end": str(window[1])}
+    return entry
 
 
 def _children_metric(
@@ -1263,49 +1338,19 @@ def _children_metric(
     return _count_metric(backend, rule, tally, value, verdict, shown, value)
 
 
-def _differences_pass(
-    days: Mapping[int, int], published: Sequence[Mapping[int, int]], rule: disclosure.DisclosureRule
-) -> disclosure.Verdict:
-    """Whether *days* may be published beside the ``activeDays`` already published for a parent table.
-
-    Two exposures of one parent table, on the same window, publish sums whose difference is the
-    sum over the parents they treat differently of the days between them: with one such parent
-    that is one record's date. So against each one already published, the parents whose active
-    days differ must pass the count rules and their absolute differences the sum rule, the
-    profile's own. An identical exposure (every difference 0) says nothing new and passes.
-    Returns the verdict of the first check that fails.
-    """
-    for earlier in published:
-        differences = [
-            abs(days.get(row, 0) - earlier.get(row, 0)) for row in days.keys() | earlier.keys()
-        ]
-        differing = [each for each in differences if each]
-        if not differing:
-            continue
-        verdict = disclosure.check_count(len(differing), rule)
-        if verdict.published:
-            verdict = disclosure.check_rounding(len(differing), rule)
-        if verdict.published:
-            verdict = disclosure.check_sum([Fraction(each) for each in differing], rule)
-        if not verdict.published:
-            return verdict
-    return disclosure.PUBLISHED
-
-
 def _days_metric(
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
     tally: "Counter[str]",
     days: Mapping[int, int],
-    published: List[Dict[int, int]],
 ) -> Dict[str, Any]:
     """``activeDays``: a sum over the parents with a start, so the count of them and the sum rule.
 
     *days* is each such parent's (by row) days active. Published only when those parents pass
-    the count rules, the days they are each active do not let one or two of them make up most
-    of the sum, and it differs from each ``activeDays`` of the same parent table already
-    published (*published*, which a published one joins) only as :func:`_differences_pass` allows.
-    The sum is exact, as a ``sum`` metric is.
+    the count rules and the days they are each active do not let one or two of them make up most
+    of the sum. No other lifetime of the parent table publishes its days beside it
+    (:func:`choose_lifetimes`), so no difference of two of them is left to check. The sum is
+    exact, as a ``sum`` metric is.
     """
     parents = len(days)
     verdict = disclosure.check_count(parents, rule)
@@ -1313,9 +1358,5 @@ def _days_metric(
         verdict = disclosure.check_rounding(parents, rule)
     if verdict.published:
         verdict = disclosure.check_sum([Fraction(each) for each in days.values()], rule)
-    if verdict.published:
-        verdict = _differences_pass(days, published, rule)
-    if verdict.published:
-        published.append(dict(days))
     total = sum(days.values())
     return _count_metric(backend, rule, tally, total, verdict, total, parents)
