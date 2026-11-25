@@ -18,8 +18,8 @@ bytes and the commit of the repository it was built from::
           ref: refs/tags/v1.4.0    # optional
 
 The run refuses a lock it cannot seal before any stage runs: an entry the format does not allow,
-a path that leads out of its directory, a link, or a file whose bytes are not the sha256 the lock
-names. The release then copies each file to ``external/<name>/<file>``, hashes the copy again,
+a path that is absolute, hidden or leads out of the lock's directory (by ``..`` or a link), a link,
+or a file whose bytes are not the sha256 the lock names. The release then copies each file to ``external/<name>/<file>``, hashes the copy again,
 and records the entries in its ``identity``, sorted by name and without the paths on this
 machine, so two clean runs with the same lock and the same bytes give the same identity and a
 changed file gives a new one. Each entry is shaped as a SLSA ``resolvedDependencies`` item
@@ -58,6 +58,7 @@ _SOURCE_KEYS = {"repo", "commit", "ref"}
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 _FILE = re.compile(r"[A-Za-z0-9._=+-]{1,255}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_DRIVE = re.compile(r"[A-Za-z]:")
 _MAX_PATH = 4096
 
 
@@ -149,7 +150,7 @@ def _entry(item: Any, where: str) -> LockEntry:
     if missing:
         raise LockError(f"{where}: {', '.join(missing)} required")
     kind = item["kind"]
-    if kind not in KINDS:
+    if not isinstance(kind, str) or kind not in KINDS:
         raise LockError(f"{where}.kind: expected one of {', '.join(KINDS)}")
     path = _path(item["path"], kind, where)
     sha = item["sha256"]
@@ -163,20 +164,34 @@ def _entry(item: Any, where: str) -> LockEntry:
 
 
 def _path(value: Any, kind: str, where: str) -> str:
-    """The entry's ``path``: a file name the release can hold, inside the lock's directory
-    when relative, with the suffix its kind takes."""
-    if not isinstance(value, str) or not value or len(value) > _MAX_PATH or "\x00" in value:
+    """The entry's ``path``: relative, inside the lock's directory, through no hidden file or
+    directory, every segment a name the release can hold, with the suffix its kind takes.
+
+    Inside the lock's directory only: the lock is a file of the checkout that anyone who can
+    change the checkout can change, so it must not name a file only the runner may read (a
+    credential under the home directory, another checkout). Hidden names are refused for the same
+    reason: a CI system keeps its token in the checkout's ``.git/config``."""
+    if not isinstance(value, str) or not value or len(value) > _MAX_PATH:
         raise LockError(f"{where}.path: expected the path of a file")
     if "\\" in value:
         raise LockError(f"{where}.path: expected / between directories, not \\")
-    if ".." in PurePosixPath(value).parts:
-        raise LockError(f"{where}.path: {value!r} leads out of its directory (a .. segment)")
-    file = PurePosixPath(value).name
-    if not _FILE.fullmatch(file) or file in (".", ".."):
+    if value.startswith("/") or _DRIVE.match(value):
         raise LockError(
-            f"{where}.path: the file name {file!r} has characters a release does not keep "
-            "(letters, digits and ._=+- only)"
+            f"{where}.path: {value!r} is absolute; a lock names files inside its own directory, "
+            "by a path relative to it"
         )
+    parts = PurePosixPath(value).parts
+    if ".." in parts:
+        raise LockError(f"{where}.path: {value!r} leads out of its directory (a .. segment)")
+    for part in parts:
+        if part.startswith("."):
+            raise LockError(f"{where}.path: {value!r} names a hidden file or directory ({part})")
+        if not _FILE.fullmatch(part):
+            raise LockError(
+                f"{where}.path: {part!r} has characters a release does not keep (letters, "
+                "digits and ._=+- only in each segment)"
+            )
+    file = parts[-1]
     suffixes = KINDS[kind]
     if suffixes and not file.lower().endswith(suffixes):
         raise LockError(f"{where}.path: a {kind} is a {' or '.join(suffixes)} file")
@@ -197,6 +212,8 @@ def _source(value: Any, where: str) -> Tuple[str, str, Optional[str]]:
             f"{where}.repo: expected the repository's https, http, ssh or git URL, or "
             "user@host:org/repo"
         )
+    if "@" in repository:  # the source is recorded as git+<repo>@<ref>
+        raise LockError(f"{where}.repo: a repository URL with @ in its path cannot be recorded")
     commit = commit.strip().lower() if isinstance(commit, str) else ""
     if not release._REVISION.fullmatch(commit):
         raise LockError(f"{where}.commit: expected the commit's hash, 7 to 64 hex characters")
@@ -218,24 +235,32 @@ def check_files(entries: Sequence[LockEntry], base: Path, where: str) -> List[Ex
     from fluid_build.cli.security import validate_cli_path
 
     found: List[ExternalArtifact] = []
+    root = base.resolve()
     for entry in entries:
         named = f"{where}: {entry.name}"
         local = base / entry.path
         try:
             validate_cli_path(local, mode="read", file_type="artifact", any_extension=True)
+            if not local.resolve().is_relative_to(root):
+                raise LockError(f"{named}: {entry.path} leads out of the lock's directory (a link)")
             release._regular_file(local)
             actual = _sha256_file(local)
         except CLIError as exc:
             raise LockError(f"{named}: {exc.message}") from None
+        except LockError:
+            raise
         except release.ReleaseError:
             raise LockError(
                 f"{named}: {entry.path} is not a regular file (a link is not)"
             ) from None
-        except OSError as exc:
-            raise LockError(f"{named}: cannot read {entry.path}: {exc.strerror or exc}") from None
+        except (OSError, ValueError, RuntimeError) as exc:  # RuntimeError: a link loop
+            why = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
+            raise LockError(f"{named}: cannot read {entry.path}: {why}") from None
         if actual != entry.sha256:
+            # Never the digest it has: a lock is no way to learn the hash of a file it may name.
             raise LockError(
-                f"{named}: {entry.path} has sha256 {actual}, and the lock names {entry.sha256}"
+                f"{named}: {entry.path} does not have the sha256 the lock names ({entry.sha256}); "
+                f"the lock needs the one `sha256sum {entry.path}` prints"
             )
         found.append(ExternalArtifact(entry, local))
     return found

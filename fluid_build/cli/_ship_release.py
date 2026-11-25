@@ -418,10 +418,12 @@ def copy_reports(staging: Path, report_dir: Path, root: Path, passed: Collection
 
 
 def _files(staging: Path) -> Dict[str, str]:
+    """Every file of the release but its index, by path: an external file may be named
+    ``release.json`` too (``external/<name>/release.json``), and is listed."""
     return {
         path.relative_to(staging).as_posix(): _sha256(path)
         for path in sorted(staging.rglob("*"))
-        if path.is_file() and path.name != RELEASE_INDEX
+        if path.is_file() and path != staging / RELEASE_INDEX
     }
 
 

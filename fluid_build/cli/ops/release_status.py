@@ -39,6 +39,8 @@ MAX_ENTRIES = 2_000
 MAX_INDEX_BYTES = 1_048_576
 #: Characters of any text taken from a record.
 _TEXT = 200
+#: External files read from one record: as many as a lock may list.
+MAX_EXTERNAL = 256
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 #: What a reader of a record is told about it, once, under an answer.
 NOT_AUTHENTICATED = (
@@ -173,10 +175,11 @@ def _read_index(directory: Path) -> Optional[Dict[str, Any]]:
 
 
 def _external(identity: Mapping[str, Any]) -> List[Dict[str, str]]:
-    """The external files ``identity`` names, cleaned, at most 50."""
+    """The external files ``identity`` names, cleaned: at most :data:`MAX_EXTERNAL`, as many as
+    a lock may list (``_release_lock.MAX_ENTRIES``)."""
     items = identity.get("external")
     out: List[Dict[str, str]] = []
-    for item in items[:50] if isinstance(items, list) else []:
+    for item in items[:MAX_EXTERNAL] if isinstance(items, list) else []:
         item = _mapping(item)
         source = _mapping(item.get("source"))
         found = {

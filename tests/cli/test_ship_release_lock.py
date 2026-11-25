@@ -25,6 +25,7 @@ import yaml
 
 from fluid_build.cli import _release_lock as lock
 from fluid_build.cli import _ship_release as release
+from fluid_build.cli import _ship_stages as st
 from fluid_build.cli import ship
 from fluid_build.cli.ops import release_status as rs
 from tests.cli.test_ship_release import (  # noqa: F401 - fixtures
@@ -82,7 +83,7 @@ def _package(directory: Path, data: bytes = b"package") -> Path:
 
 
 def test_entries_are_sorted_by_name_and_recorded_without_a_local_path() -> None:
-    dag = _entry(name="a-dag", kind="airflow-dag", path="/srv/ci/dags/orders.py")
+    dag = _entry(name="a-dag", kind="airflow-dag", path="build/dags/orders.py")
     entries = lock.parse_lock({"artifacts": [_entry(), dag]}, "lock")
     assert [e.name for e in entries] == ["a-dag", "orders-jobs"]
     assert entries[0].identity() == {
@@ -95,7 +96,7 @@ def test_entries_are_sorted_by_name_and_recorded_without_a_local_path() -> None:
             "digest": {"gitCommit": COMMIT},
         },
     }
-    assert "/srv/ci" not in json.dumps([e.identity() for e in entries])
+    assert "build/" not in json.dumps([e.identity() for e in entries])
 
 
 def test_a_source_is_normalized_as_the_ci_source_is() -> None:
@@ -117,6 +118,14 @@ def test_a_source_is_normalized_as_the_ci_source_is() -> None:
         ({"artifacts": [{"name": "x", "kind": "file"}]}, "path, sha256, source required"),
         ({"artifacts": [_entry(name="../x")]}, ".name: expected letters"),
         ({"artifacts": [_entry(kind="jar")]}, ".kind: expected one of"),
+        ({"artifacts": [_entry(kind=["file"])]}, ".kind: expected one of"),
+        ({"artifacts": [_entry(kind={"a": 1})]}, ".kind: expected one of"),
+        ({"artifacts": [_entry(path="/home/ci/dist/x.zip")]}, "is absolute"),
+        ({"artifacts": [_entry(path="C:/dist/x.zip")]}, "is absolute"),
+        ({"artifacts": [_entry(kind="file", path=".git/config")]}, "hidden file or directory"),
+        ({"artifacts": [_entry(kind="file", path="dist/.env")]}, "hidden file or directory"),
+        ({"artifacts": [_entry(path="\ud800/x.zip")]}, "has characters a release"),
+        ({"artifacts": [_entry(path="my dist/x.zip")]}, "has characters a release"),
         ({"artifacts": [_entry(path="../dist/x.zip")]}, "leads out of its directory"),
         ({"artifacts": [_entry(path="dist\\x.zip")]}, "expected / between directories"),
         ({"artifacts": [_entry(path="dist/my package.zip")]}, "has characters a release"),
@@ -124,6 +133,10 @@ def test_a_source_is_normalized_as_the_ci_source_is() -> None:
         ({"artifacts": [_entry(kind="airflow-dag")]}, None),  # a packaged DAG is a .zip
         ({"artifacts": [_entry(sha256="ABC")]}, ".sha256: expected the file's sha256"),
         ({"artifacts": [_entry(source={"repo": "/srv/repo", "commit": COMMIT})]}, ".repo:"),
+        (
+            {"artifacts": [_entry(source={"repo": "https://h.example/a@b", "commit": COMMIT})]},
+            "with @ in its path",
+        ),
         ({"artifacts": [_entry(source={"repo": REPO, "commit": "main"})]}, ".commit:"),
         ({"artifacts": [_entry(source={"repo": REPO, "commit": COMMIT, "ref": "a b"})]}, ".ref:"),
         ({"artifacts": [_entry(source={"repo": REPO})]}, ".commit:"),
@@ -150,9 +163,9 @@ def test_bytes_that_are_not_the_sha256_named_are_refused(tmp_path: Path) -> None
     _package(tmp_path, b"other bytes")
     with pytest.raises(lock.LockError) as raised:
         lock.load(str(_write_lock(tmp_path, _entry())))
-    assert f"has sha256 {_sha(b'other bytes')}, and the lock names {_sha(b'package')}" in str(
-        raised.value
-    )
+    message = str(raised.value)
+    assert f"does not have the sha256 the lock names ({_sha(b'package')})" in message
+    assert _sha(b"other bytes") not in message  # never the digest the file has
 
 
 def test_a_link_is_refused(tmp_path: Path) -> None:
@@ -180,10 +193,13 @@ def test_a_path_out_of_the_locks_directory_is_refused(tmp_path: Path) -> None:
         lock.load(str(_write_lock(project, _entry(path="../dist/orders_jobs-1.4.0.zip"))))
 
 
-def test_a_system_path_is_refused(tmp_path: Path) -> None:
-    entry = _entry(kind="file", path="/etc/hosts", sha256=_sha(b"x"))
-    with pytest.raises(lock.LockError, match="hosts"):
-        lock.load(str(_write_lock(tmp_path, entry)))
+def test_a_linked_directory_that_leads_out_is_refused(tmp_path: Path) -> None:
+    _package(tmp_path / "outside")
+    project = tmp_path / "project"
+    project.mkdir()
+    os.symlink(tmp_path / "outside" / "dist", project / "dist")
+    with pytest.raises(lock.LockError, match="leads out of the lock's directory"):
+        lock.load(str(_write_lock(project, _entry())))
 
 
 def test_a_directory_is_not_a_file(tmp_path: Path) -> None:
@@ -220,6 +236,14 @@ def test_the_flag_without_a_release_is_refused(
     assert "names files to seal into a release, and this run publishes none" in caplog.text
 
 
+def test_a_blank_flag_is_refused(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--artifacts "$LOCK"` with LOCK unset seals no external file without saying so."""
+    monkeypatch.setenv(lock.LOCK_ENV, "lock.yaml")
+    for value in ("", "  "):
+        with pytest.raises(st.ShipUsageError, match="needs the path of a lock file"):
+            ship._artifacts_lock(argparse.Namespace(artifacts=value), work / "rel")
+
+
 def test_the_variable_is_read_only_by_a_run_that_seals_a_release(
     work: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -241,7 +265,7 @@ def test_a_lock_the_release_cannot_seal_refuses_the_run_before_any_stage(
     _write_lock(work, _entry())
     assert _ship([*_UNTIL_4, "--release-dir", "../rel", "--artifacts", "artifacts.lock.yaml"]) == 2
     assert fake.calls == []
-    assert "and the lock names" in caplog.text
+    assert "does not have the sha256 the lock names" in caplog.text
     assert not (work.parent / "rel").exists()
 
 
@@ -321,7 +345,7 @@ def test_a_file_changed_while_the_run_ran_publishes_nothing(
     assert not (work.parent / "rel").exists()
     shipped = json.loads((work / "runtime" / "ship-report.json").read_text(encoding="utf-8"))
     assert shipped["release"]["status"] == "not-published"
-    assert f"has sha256 {_sha(b'swapped')}" in shipped["release"]["reason"]
+    assert "does not have the sha256 the lock names" in shipped["release"]["reason"]
 
 
 def test_the_copy_is_hashed_again_before_the_release_is_published(tmp_path: Path) -> None:
@@ -335,3 +359,16 @@ def test_the_copy_is_hashed_again_before_the_release_is_published(tmp_path: Path
         release._copy_external(staging, {"external": [entry.identity()]}, [artifact])
     with pytest.raises(release.ReleaseError, match="names other external files"):
         release._copy_external(staging, {}, [artifact])
+
+
+def test_an_external_file_named_like_the_index_is_listed(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    (staging / "external" / "x").mkdir(parents=True)
+    (staging / "release.json").write_text("{}", encoding="utf-8")
+    (staging / "external" / "x" / "release.json").write_text("[]", encoding="utf-8")
+    assert list(release._files(staging)) == ["external/x/release.json"]
+
+
+def test_status_reads_as_many_external_files_as_a_lock_may_list() -> None:
+    items = [{"name": f"n{i:03d}", "kind": "file"} for i in range(lock.MAX_ENTRIES + 5)]
+    assert len(rs._external({"external": items})) == lock.MAX_ENTRIES == rs.MAX_EXTERNAL

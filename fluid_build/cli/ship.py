@@ -384,6 +384,8 @@ def _artifacts_lock(args: argparse.Namespace, release_dir: Optional[Path]) -> st
     from . import _release_lock
 
     flag = getattr(args, "artifacts", None)
+    if flag is not None and not flag.strip():  # `--artifacts "$LOCK"` with LOCK unset
+        raise st.ShipUsageError("--artifacts needs the path of a lock file")
     value = flag if flag is not None else os.environ.get(_release_lock.LOCK_ENV, "")
     value = value.strip() if flag is not None or release_dir is not None else ""
     return os.path.abspath(value) if value else ""
