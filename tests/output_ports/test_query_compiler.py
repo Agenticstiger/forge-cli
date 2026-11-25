@@ -1333,7 +1333,7 @@ def _xml_dump_statements():
 @pytest.mark.parametrize("dialect", ["postgres", None])
 @pytest.mark.parametrize("sql", _xml_dump_statements())
 def test_query_sql_refuses_a_function_that_dumps_a_table_as_xml(sql, dialect):
-    with pytest.raises(QueryValidationError, match="as XML"):
+    with pytest.raises(QueryValidationError, match="reads a relation or runs a query"):
         compile_free_form_sql(
             sql=sql, table_reference="public.customers", limit=10, dialect=dialect
         )
@@ -1346,7 +1346,7 @@ def test_query_sql_refuses_the_xml_dump_inside_a_larger_statement(name):
         f"SELECT length({name}('public.customers', true, false, '')::text) AS n",
         f"SELECT id FROM public.customers WHERE {name}('x', true, false, '') IS NOT NULL",
     ):
-        with pytest.raises(QueryValidationError, match="as XML"):
+        with pytest.raises(QueryValidationError, match="reads a relation or runs a query"):
             compile_free_form_sql(sql=sql, table_reference="public.customers", limit=10)
 
 

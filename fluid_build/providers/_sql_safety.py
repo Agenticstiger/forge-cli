@@ -62,14 +62,18 @@ def names_refused_duckdb_function(sql: str) -> bool:
     return _DUCKDB_REFUSED_RE.search(sql) is not None
 
 
-#: Postgres functions that return a whole table, schema, database or query result as
-#: XML. They take the relation or the statement as a string argument, so no table node
-#: and no column name shows in the text a check here reads, and the engine reads past
-#: any column projection the caller's statement was limited to. Refused as a call, in
-#: any case, quoted or schema-qualified, on every dialect; a column that only shares a
-#: name is not a call.
+#: Postgres functions that read a relation or run a statement given as a string: the
+#: XML family returns a whole table, schema, database or query result, ``ts_stat`` and
+#: ``ts_rewrite`` run a query given as text (``ts_stat('SEL' || 'ECT ... FROM t')``
+#: spells it without the word), ``connectby`` reads a table named in text, and the
+#: ``crosstab``, ``dblink`` and ``pgstat`` families run a query or read a relation by
+#: name. No table node and no column name shows in the text a check here reads, so the
+#: engine reads past any column projection or row filter the caller's statement was
+#: limited to. Refused as a call, in any case, quoted or schema-qualified, on every
+#: dialect; a column that only shares a name is not a call.
 POSTGRES_REFUSED_FUNCTIONS = frozenset(
     {
+        "connectby",
         "cursor_to_xml",
         "cursor_to_xmlschema",
         "query_to_xml",
@@ -78,10 +82,19 @@ POSTGRES_REFUSED_FUNCTIONS = frozenset(
         "table_to_xml",
         "table_to_xml_and_xmlschema",
         "table_to_xmlschema",
+        "ts_rewrite",
+        "ts_stat",
     }
 )
-#: ``schema_to_xml*`` and ``database_to_xml*`` are a family: every member is refused.
-POSTGRES_REFUSED_FUNCTION_PREFIXES = ("schema_to_xml", "database_to_xml")
+#: Families whose every member is refused: ``schema_to_xml*``, ``database_to_xml*``,
+#: ``crosstab*`` (tablefunc), ``dblink*`` and ``pgstat*`` (pgstattuple).
+POSTGRES_REFUSED_FUNCTION_PREFIXES = (
+    "schema_to_xml",
+    "database_to_xml",
+    "crosstab",
+    "dblink",
+    "pgstat",
+)
 
 _POSTGRES_REFUSED_RE = re.compile(
     r"(?i)\b(?:"
@@ -93,8 +106,8 @@ _POSTGRES_REFUSED_RE = re.compile(
 
 
 def names_refused_postgres_function(sql: str) -> bool:
-    """Whether ``sql`` calls one of :data:`POSTGRES_REFUSED_FUNCTIONS` or a
-    ``schema_to_xml*`` / ``database_to_xml*`` function."""
+    """Whether ``sql`` calls one of :data:`POSTGRES_REFUSED_FUNCTIONS` or a member of a
+    :data:`POSTGRES_REFUSED_FUNCTION_PREFIXES` family."""
     return _POSTGRES_REFUSED_RE.search(sql) is not None
 
 

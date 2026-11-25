@@ -820,3 +820,67 @@ def test_serve_refuses_a_policy_that_is_not_a_mapping_before_anything_reads_it(t
     output = proc.stdout + proc.stderr
     assert proc.returncode == 2, output
     assert "is not a mapping" in output and "Traceback" not in output
+
+
+# ---------------------------------------------------------------------
+# query_sql reads nothing but the exposed table through its projection
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Postgres functions that run a query given as text, or read a relation named in
+        # text: no table node shows for the projection to cover.
+        pytest.param(
+            "SELECT ts_stat('SEL' || 'ECT to_tsvector(''simple'', region) FROM customers')",
+            id="ts-stat",
+        ),
+        pytest.param(
+            "SELECT ts_rewrite('a'::tsquery, 'SEL' || 'ECT a, b FROM customers')",
+            id="ts-rewrite",
+        ),
+        pytest.param(
+            "SELECT dblink('dbname=x', 'SEL' || 'ECT region FROM customers')",
+            id="dblink",
+        ),
+        pytest.param(
+            "SELECT crosstab('SEL' || 'ECT id, region, amount FROM customers')", id="crosstab"
+        ),
+        pytest.param("SELECT connectby('customers', 'id', 'id', '1', 0)", id="connectby"),
+        pytest.param("SELECT pgstattuple('customers')", id="pgstattuple"),
+        # Any relation besides the exposed table: a catalog view holds every row's values.
+        pytest.param(
+            "SELECT attname, most_common_vals::text FROM pg_stats WHERE tablename = 'customers'",
+            id="pg-stats",
+        ),
+        pytest.param("SELECT table_name FROM information_schema.tables", id="information-schema"),
+        pytest.param(
+            "SELECT c.id FROM customers AS c JOIN other_table AS o ON c.id = o.id", id="other-table"
+        ),
+    ],
+)
+@pytest.mark.parametrize("restricted", [(), ("secret",)], ids=["filtered", "filtered-restricted"])
+def test_query_sql_reads_no_relation_but_the_exposed_table(sql, restricted):
+    with pytest.raises(query_compiler.QueryValidationError):
+        query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=10,
+            restricted_columns=restricted,
+            expose=_expose(),
+            caller_attributes=_as(EU),
+            dialect="postgres",
+        )
+
+
+def test_a_restricted_expose_without_a_filter_reads_no_other_relation_either():
+    with pytest.raises(query_compiler.QueryValidationError, match="pg_stats"):
+        query_compiler.compile_free_form_sql(
+            sql="SELECT most_common_vals::text FROM pg_stats",
+            table_reference="customers",
+            limit=10,
+            restricted_columns=("secret",),
+            expose=_expose(row_filters=[], readers=[]),
+            dialect="postgres",
+        )

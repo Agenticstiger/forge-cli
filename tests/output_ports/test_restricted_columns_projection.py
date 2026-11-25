@@ -659,13 +659,14 @@ def test_a_cte_body_and_a_shadowing_cte_name_see_the_projection(con):
     from fluid_build.output_ports.mcp.query_compiler import _project_exposed_table
 
     allowed = ["id", "segment", "amount", "tenant_id"]
-    rewritten = _project_exposed_table(
-        "SELECT * FROM x",
-        table_reference="customers",
-        allowed=allowed,
-        dialect="duckdb",
-    )
-    assert "customers" not in rewritten
+    # Any relation besides the exposed table and the statement's own CTEs is refused.
+    with pytest.raises(QueryValidationError, match="sql reads 'x'"):
+        _project_exposed_table(
+            "SELECT * FROM x",
+            table_reference="customers",
+            allowed=allowed,
+            dialect="duckdb",
+        )
     with_cte = _project_exposed_table(
         "WITH x AS (SELECT * FROM customers) SELECT to_json(x) FROM x",
         table_reference="customers",

@@ -366,6 +366,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and an unterminated quote escaped as a parser error. Each is now refused with the filter's
   position, wherever the IaC emitters read row filters (`fluid generate iac`, `fluid apply`), and
   so is a `rowFilters` value that is not a list (`{}`, `""`), which used to be read as no filter.
+- **On an expose that restricts columns or filters rows, `query_sql` reads only the exposed
+  table.** A statement may still read its own CTEs, `VALUES` and `UNNEST`; any other relation is
+  refused, since a catalog view such as Postgres's `pg_stats` holds values from every row and
+  column of a table and the projection covers only the table itself. On every expose, `query_sql`,
+  contract expressions and the drivers' statement guard also refuse the Postgres functions that read
+  a relation or run a query given as text: `ts_stat`, `ts_rewrite`, `connectby` and every
+  `crosstab*`, `dblink*` and `pgstat*` function, beside the XML functions already refused. Their
+  query text can be spelt without the word SELECT (`'SEL' || 'ECT ...'`), so neither the statement
+  guard nor the projection saw it.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -559,7 +568,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the claim that carries a caller's principal: `FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal`.
   On an expose with row filters the query tools read only the columns `contract.schema` declares,
   as they already did on an expose with column restrictions.
-
+- **`query_sql` on an expose that restricts columns or filters rows reads only the exposed
+  table.** A statement that joins another table or reads a catalog view there is now refused; read
+  the other table through its own expose. On every expose, `query_sql` refuses `ts_stat`,
+  `ts_rewrite`, `connectby` and the `crosstab*`, `dblink*` and `pgstat*` functions.
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so

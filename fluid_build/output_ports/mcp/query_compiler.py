@@ -1828,7 +1828,8 @@ def _crosscheck_duckdb_projection(
 
 def _refuse_unprojectable_reads(tree: Any, exposed_name: str) -> List[Any]:
     """The statement's tables, after refusing what the projection cannot cover: a CTE
-    named like the exposed table, and a table function or a file path as a table."""
+    named like the exposed table, a table function or a file path as a table, and any
+    relation besides the exposed table and the statement's own CTEs."""
     from sqlglot import exp
 
     for cte in tree.find_all(exp.CTE):
@@ -1838,11 +1839,19 @@ def _refuse_unprojectable_reads(tree: Any, exposed_name: str) -> List[Any]:
                 "table; use another name."
             )
     tables = list(tree.find_all(exp.Table))
+    ctes = {cte.alias_or_name.casefold() for cte in tree.find_all(exp.CTE)}
     for table in tables:
         if not isinstance(table.this, exp.Identifier) or _FILE_LIKE_TABLE_RE.search(table.name):
             raise QueryValidationError(
                 "sql may not read from a table function or a file path on an expose that "
                 "restricts columns or rows; query the exposed table directly."
+            )
+        # Any other relation is outside the projection: a catalog view such as
+        # Postgres's ``pg_stats`` holds values of every row and column of the table.
+        if table.name.casefold() not in ctes | {exposed_name}:
+            raise QueryValidationError(
+                f"sql reads {table.name!r}; on an expose that restricts columns or rows a "
+                "statement reads only the exposed table, its own CTEs, VALUES and UNNEST."
             )
     return tables
 
@@ -2089,10 +2098,10 @@ def compile_free_form_sql(
         )
     if names_refused_postgres_function(candidate):
         raise QueryValidationError(
-            "sql may not call a function that returns a whole table, schema, database or "
-            "query result as XML (table_to_xml, query_to_xml, cursor_to_xml, "
-            "schema_to_xml, database_to_xml and their variants). Select the columns of the "
-            "exposed table directly."
+            "sql may not call a function that reads a relation or runs a query given as "
+            "text (table_to_xml, query_to_xml, cursor_to_xml, schema_to_xml, "
+            "database_to_xml, ts_stat, ts_rewrite, connectby, crosstab, dblink, pgstattuple "
+            "and their variants). Select the columns of the exposed table directly."
         )
     body = parts[1]
     validate_sql_expression_allowlist(body)
