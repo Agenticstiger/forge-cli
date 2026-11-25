@@ -461,26 +461,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS DISTINCT FROM`), `IN`, `BETWEEN`, `LIKE`, `ILIKE`,
     `IS NULL`, `EXISTS`, a column declared as a boolean, or TRUE or FALSE; `IS UNKNOWN` is
     refused;
-  - both sides of a comparison have one known kind (string, number, boolean, date and time,
-    interval, binary or uuid). A column has the kind of the type `contract.schema` declares for
-    it, read through CTEs and derived tables that select it unchanged (a derived table's column
-    list by position; an alias column list on a table reference is refused), and that type must
-    be the table's own, which the gateway reads from the engine's catalog once per expose, in
-    the current schema when the binding names none (a name the catalog reports with two kinds
-    is not typed). A
-    constant is a literal, a cast or an interval of one, or the current date or time. A column
-    declared without a type, a `VALUES` or `UNNEST` column, a computed value and a JSON, array,
-    map or struct value are not compared, a `USING` column must have one kind on both sides,
-    an `IN` subquery must return one value of the left side's kind, and NATURAL joins are
-    refused;
+  - the values a comparison relates have one type. A column has the type the table holds,
+    which the gateway reads from the engine's catalog (Postgres's `pg_catalog`, so a view, a
+    materialized view, an enum, `citext` and a domain are typed; `information_schema.columns`
+    elsewhere), in the current schema when the binding names none, and reads again after five
+    minutes. A type `contract.schema` declares must agree with it, and without a driver the
+    declared type stands. The type follows the column through CTEs and derived tables that
+    select it unchanged (a derived table's column list by position; an alias column list on a
+    table reference is refused). A name the catalog reports with two types, or with a type the
+    gateway does not type, is not compared. A constant is a literal, a cast or an interval of
+    one, or the current date or time, typed as the engine reads it: `DATE '2024-01-01'` and
+    `CURRENT_DATE` are dates, a date plus or minus an integer is a date, `TIMESTAMP '...'` is a
+    timestamp, and `now()` and `CURRENT_TIMESTAMP` are timestamps with a time zone. A date plus
+    or minus an interval is not typed, since engines differ on whether it is a date or a
+    timestamp; cast it, as in `CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)`;
+  - exact numbers are compared as DECIMAL. An integer type is DECIMAL(d, 0), with d = 3, 5, 10,
+    19 and 39 for tinyint, smallint, int, bigint and hugeint, and a decimal literal is
+    DECIMAL(its digits, its decimals). Two exact numbers meet only when the larger integer part
+    plus the larger scale is at most 38 digits, and a number of unknown precision (Postgres's
+    unconstrained `numeric`) meets no other exact number. A float meets any number;
+  - a date meets only a date, a timestamp only a timestamp, and a timestamp with a time zone
+    only a timestamp with a time zone;
+  - each `coalesce`, `IN` and `BETWEEN` operand is held to the same rules. A `VALUES` or
+    `UNNEST` column, a computed value and a JSON, array, map or struct value are not compared,
+    a `USING` column must have one type on both sides, an `IN` subquery must return one value
+    of the left side's type, and NATURAL joins are refused;
   - `LIKE` and `ILIKE` take a string and a string literal pattern with no `ESCAPE` clause and no
     backslash, so a literal `%` or `_` cannot be matched;
-  - `lower` and `upper` take a string column or literal, and `coalesce` columns and literals of
-    one kind.
+  - `lower` and `upper` take a string column or literal, and `coalesce` columns and constants
+    of one type.
   HAVING and QUALIFY may also compare aggregates and window functions, which see only the rows
-  the filter keeps, and a value a subquery computes is refused. A reader no filter narrows is
-  not limited, and the `query_sql` tool's description states these limits. A refusal names the
-  function or the condition as the caller wrote it where the parser kept its position.
+  the filter keeps; the other values of such a comparison are still typed, and a HAVING name a
+  select-list alias could take is typed only when the column and the alias have one type. A
+  value a subquery computes is refused. A reader no filter narrows is not limited, and the
+  `query_sql` tool's description states these limits. A refusal names the function or the
+  condition as the caller wrote it where the parser kept its position.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -683,13 +698,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_prepared_statements` and `pg_cursors` views.
 - **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
   read the name as a string. Write the column name bare.
-- **A caller a row filter narrows writes `query_sql` conditions as typed comparisons.** Declare
-  each column's type in `contract.schema`, as the table holds it: a column declared without a
-  type cannot be compared, and a declared type the table does not hold refuses the filtered
-  caller. Compare a column with a literal of its own type (`DATE '2024-01-01'`, not
-  `'2024-01-01'`), write LIKE patterns as string literals without `ESCAPE` or a backslash, and
-  compute values (casts, arithmetic, other functions) in the outer select list. Only listed
-  functions may be called, and the row and string generators are no longer listed.
+- **A caller a row filter narrows writes `query_sql` conditions as typed comparisons.** The
+  gateway types each column by the table's own type, and a type `contract.schema` declares must
+  agree with it (a column declared as a string but held as a number refuses the filtered
+  caller). Compare a column with a constant of its own type: `DATE '2024-01-01'` or
+  `CURRENT_DATE` for a date (not `'2024-01-01'`), `now()` for a timestamp with a time zone,
+  and `CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)` for a date relative to today. Keep
+  comparisons of exact numbers within 38 digits; a column of unknown precision, such as
+  Postgres's unconstrained `numeric`, meets another exact number only once the table gives it
+  a precision and scale. Write LIKE patterns as string
+  literals without `ESCAPE` or a backslash, and compute values (casts, arithmetic, other
+  functions) in the outer select list. Only listed functions may be called, and the row and
+  string generators are no longer listed.
 - **sqlglot 30.1 or newer is required.** 26.16 and older record no identifier positions, so the MCP
   output port refused every row filter on them, and releases before 30.1 refuse some valid
   `query_sql` reads on an expose with row filters (a DuckDB `EXISTS (FROM ...)` subquery, for one).

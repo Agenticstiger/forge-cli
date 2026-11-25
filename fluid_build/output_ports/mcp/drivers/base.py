@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
@@ -46,8 +47,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # module so ``from ...drivers.base import RowFilterIdentityMissing`` keeps working.
 from ..query_compiler import (
     ROW_FILTER_ALIAS,
+    ColumnType,
     catalog_columns_sql,
-    kind_of_type,
+    column_type,
     row_filter_predicate,
     select_body,
     strip_projection_open,
@@ -62,6 +64,11 @@ from ..query_compiler import (
 
 class UnsupportedBindingError(RuntimeError):
     """Raised when no driver supports the (platform, format) pair."""
+
+
+#: How long a driver keeps the exposed table's column types before reading the catalog
+#: again (:meth:`EngineDriver.physical_column_types`).
+PHYSICAL_TYPES_TTL_SECONDS = 300.0
 
 
 # ---------------------------------------------------------------------
@@ -227,8 +234,10 @@ class EngineDriver(ABC):
         # marked columns still leaked when the consumer was allowed
         # to see them.
         self._pii_columns: Set[str] = self._compute_pii_columns(expose)
-        # The exposed table's column kinds as the engine holds them, read on first use.
-        self._physical_kinds: Optional[Dict[str, Optional[str]]] = None
+        # The exposed table's column types as the engine holds them, read on first use
+        # and again once PHYSICAL_TYPES_TTL_SECONDS have passed.
+        self._physical_types: Optional[Dict[str, Optional[ColumnType]]] = None
+        self._physical_types_read_at = 0.0
 
     # ------------------------------------------------------------------
     # Abstract surface — concrete drivers must override these.
@@ -437,15 +446,19 @@ class EngineDriver(ABC):
         truncated = len(rows) >= limit
         return SampleResult(columns=visible_columns, rows=rows, truncated=truncated)
 
-    def physical_column_kinds(self) -> Dict[str, Optional[str]]:
-        """``{column name (case-folded): kind}`` of the exposed table as the engine holds
-        it, read once from its catalog (``information_schema.columns``, see
-        :func:`...query_compiler.catalog_columns_sql`) and kept for the driver's life.
-        ``query_sql`` checks a filtered caller's declared types against it. Raises
-        :class:`RowFilterUnavailable` when the catalog cannot be read: a filtered caller's
-        comparisons cannot be typed then. Drivers override this when the engine has a
-        cheaper or more exact source."""
-        if self._physical_kinds is None:
+    def physical_column_types(self) -> Dict[str, Optional[ColumnType]]:
+        """``{column name (case-folded): type}`` of the exposed table as the engine holds
+        it, read from its catalog (see :func:`...query_compiler.catalog_columns_sql`) and
+        read again once :data:`PHYSICAL_TYPES_TTL_SECONDS` have passed, so a table that
+        is altered is typed by its new columns within minutes. ``query_sql`` types a
+        filtered caller's comparisons by it. Raises :class:`RowFilterUnavailable` when
+        the catalog cannot be read: a filtered caller's comparisons cannot be typed
+        then, and an earlier read is not used. Drivers override this when the engine has
+        a cheaper or more exact source."""
+        now = time.monotonic()
+        fresh = now - self._physical_types_read_at < PHYSICAL_TYPES_TTL_SECONDS
+        if self._physical_types is None or not fresh:
+            self._physical_types = None
             descriptor = self.descriptor()
             try:
                 sql = catalog_columns_sql(descriptor.table_reference, descriptor.dialect)
@@ -455,17 +468,22 @@ class EngineDriver(ABC):
                     "the gateway could not read the exposed table's column types from the "
                     "engine's catalog, so it cannot type a filtered caller's comparisons."
                 ) from exc
-            kinds: Dict[str, Optional[str]] = {}
+            types: Dict[str, Optional[ColumnType]] = {}
             for row in rows:
                 fields = {str(key).lower(): value for key, value in row.items()}
                 name = fields.get("column_name")
                 if isinstance(name, str):
-                    kind = kind_of_type(fields.get("data_type"))
+                    found = column_type(
+                        fields.get("data_type"),
+                        descriptor.dialect,
+                        fields.get("numeric_precision"),
+                        fields.get("numeric_scale"),
+                    )
                     folded = name.casefold()
-                    # Two catalog rows for one name with different kinds: not known.
-                    kinds[folded] = kind if kinds.get(folded, kind) == kind else None
-            self._physical_kinds = kinds
-        return dict(self._physical_kinds)
+                    # Two catalog rows for one name with different types: not known.
+                    types[folded] = found if types.get(folded, found) == found else None
+            self._physical_types, self._physical_types_read_at = types, now
+        return dict(self._physical_types)
 
     def query(
         self,
