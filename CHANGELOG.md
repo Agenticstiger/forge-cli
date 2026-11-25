@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] — 2026-11-25
+
 ### Added
 
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
@@ -166,6 +168,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names no endpoint and no such field (a local file source), has nothing to judge. The refusal
   (`EnvTemplateHostError`, reason `unpaired`) names the variable, the field that writes it and the
   host as written, never a rendered value.
+- **The examples move past their known advisories.** The Flink and Iceberg example's runtime
+  takes Flink 1.20.5, Iceberg 1.12.0, the Hadoop client 3.5.0 and newer Maven and its jar plugin,
+  with its base images pinned by digest; the bitcoin price example raises its Python dependency
+  floors. Dependabot now watches the example manifests.
+- **The release image's Python base is pinned by digest**, and the release tools install from a
+  hash-locked file. The GHCR image is attested, and the GitHub Release carries a provenance
+  bundle for each file it attaches.
+- **CI:** tool installs are hash-locked, the Helm download is verified, the write token is scoped
+  to the one job that needs it, and the docs reminder checks out the base branch. Routine tool
+  bumps: black 26.10.1 (the source is reformatted, with no change in behaviour), semgrep 1.186.0
+  and uv 0.13.9. Two test fixtures changed: the Debezium launch fixtures name the expose their
+  outputs land in, and the Gemini key fixture is built at runtime.
+- **The versioned-relationships RFC** (`RFC-versioned-relationships.md`) describes the design
+  behind versioned tables and as-of relationships.
 
 ### Deprecated
 
