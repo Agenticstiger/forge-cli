@@ -33,7 +33,7 @@ records as --source <exposeId>=<location> (and a database's table as --table
 
 The document follows FLUX PROFILE-SPEC and names the least format that holds it:
 1-0-0, or 1-1-0 when it holds a quantile with bins, 1-2-0 with facts, 1-3-0 with a
-statistic grouped through a link, 1-4-0 with a rank correlation or a statistic grouped
+statistic grouped through a link or a query's rate grouped by a column, 1-4-0 with a rank correlation or a statistic grouped
 by bins. It holds only aggregates that passed the output checks: no
 record, no sample, no per-record value. The checks are ACRO 1.1.0's defaults, named
 "acro-default" in the document:
@@ -164,9 +164,9 @@ A request of format 1-2-0 may also ask for more, each exact and under the same c
     that reaches no parent is in no group. Each listed item the profile does not answer is named in the report
 with its reason (for example a histogram over a number with no declared range,
 quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
-column of a counted relationship). A workload and the consumers' queries are not
-formed: each is named under Not measured, and with --strict such a request is refused
-before any record is read. A table's calendar is formed, but not by a private release,
+column of a counted relationship). A workload is not formed: it is named under Not
+measured, and with --strict such a request is refused before any record is read. A
+table's calendar is formed, but not by a private release,
 which names it. A table's date pairs (DATE columns) and
 a relationship's dates and exposure are formed (format 1-3-0); a pair's days are
 counted on a fixed ladder of whole days, trimmed to the bins from the first holding a
@@ -184,7 +184,18 @@ back fewer than minimumCell rows, or where zeros are disclosive an empty
 combination the rules' texts do not rule out, is withheld too (D in the report).
 Rules that share too many parts to be read are taken to rule nothing out, which
 withholds more. A rule over an aggregate, a dependency or a related row is
-not measured, and the report says why. A boolean
+not measured, and the report says why. A listed consumer query is answered with its
+rate: one level histogram over false and true (the queries section), where k is the
+records of its unit (a table, or a view's rows) and the true count the rows the query
+returns, per level of its groupBy column when it has one (format 1-3-0). The query
+text is checked and run only in a locked DuckDB process of its own, as a checked tree
+rebuilt and checked again, never as written. A query is answered when it keeps some of
+its unit's records and changes none (a SELECT of columns from its unit with at most
+one WHERE: no join, DISTINCT, GROUP BY, aggregate, window, ORDER BY or LIMIT); the rest
+is named under Not measured, and --strict refuses it before any record is read. The
+queries of one unit are checked as a set, with the facts of a table, so that two
+queries differing by a few records give none back; a group the set withholds is
+written as a fact withheld by it (D). A private release publishes no query rate. A boolean
 column is asked only its counts by `fluxsim init`, so it gets no level
 histogram this way.
 
@@ -332,7 +343,8 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         action="store_true",
         help=(
             "refuse a --request before any record is read when the request or the contract "
-            "alone shows an ask cannot be formed: a workload, a consumer query, a metric, "
+            "alone shows an ask cannot be formed: a workload, a consumer query the check or "
+            "the shape rules out (a query that does not keep some of its unit's records), a metric, "
             "statistic, rank correlation, grouping, date pair, calendar, relationship date or "
             "exposure over a column the profile does not read, a key or a column whose type "
             "rules it out, a fact whose rule it cannot measure, more entries than a profile "
@@ -1029,6 +1041,7 @@ def _report(
             ),
             soft_wrap=True,
         )
+    _report_queries(say, result)
     for what, reason in result.not_measured:
         say(f"Not measured: {what}: {reason}.", soft_wrap=True)
     if not result.published:
@@ -1037,6 +1050,21 @@ def _report(
     say("Pin it in the FLUX Simulation:")
     # One line, never wrapped: it is copied as it stands.
     say(f"  profile: {{digest: {result.digest}}}", soft_wrap=True)
+
+
+def _report_queries(say: Any, result: Any) -> None:
+    """The consumer queries a request lists: how many are published, and each one withheld."""
+    from fluid_build.profiler import query_rates
+
+    for line in query_rates.report_lines(result.queries, len(result.queries)):
+        say(line, soft_wrap=True)
+    for each in result.queries:
+        if not each.published and each.code:
+            say(
+                f"Query {each.name}: withheld by the check "
+                f"({each.code}, {_CODE_MEANING.get(str(each.code), 'withheld')}).",
+                soft_wrap=True,
+            )
 
 
 def _refuse_timings_with_release(args: argparse.Namespace) -> None:

@@ -233,7 +233,7 @@ def test_a_listed_relationship_the_contract_does_not_declare_is_reported_not_ref
     assert "children per parent" in what and "declares no such relationship" in reason
 
 
-def _with_asks(text):
+def _with_asks(text, sql="SELECT order_id FROM orders WHERE paid"):
     """The fixture request in format 1-1-0, also asking a calendar of orders and one query."""
     text = text.replace("/profile-request/1-0-0/", "/profile-request/1-1-0/")
     marker = '    "rowCount": true\n"relationships":'
@@ -244,7 +244,7 @@ def _with_asks(text):
     return text + (
         '"queries":\n'
         '  - "name": "paid_orders"\n'
-        '    "sql": "SELECT order_id FROM orders WHERE paid"\n'
+        f'    "sql": "{sql}"\n'
         '    "unit":\n'
         '      "table": "orders"\n'
     )
@@ -254,8 +254,15 @@ def test_the_reader_keeps_every_ask_of_the_request_format(workspace):
     asked = FakeBackend().read_request(_with_asks(REQUEST), name="asks.yml")
     assert asked.table("orders").calendar == ("placed_at",)
     assert asked.table("customers").calendar == ()
-    # A query is kept by its name alone: its text is the consumers', and never kept.
-    assert asked.queries == ("paid_orders",)
+    # A query is kept whole; its text is the consumers', so no representation shows it.
+    (query,) = asked.queries
+    assert (query.name, query.table, query.unit_sql, query.group_by) == (
+        "paid_orders",
+        "orders",
+        None,
+        None,
+    )
+    assert query.sql == "SELECT order_id FROM orders WHERE paid"
     assert "SELECT" not in repr(asked)
 
 
@@ -285,15 +292,12 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
                 ),
             ),
         ),
-        queries=("paid_orders",),
+        queries=(_stats.RequestQuery("paid_orders", "SELECT 1", table="orders"),),
     )
     link = "orders(customer_id) to customers(customer_id)"
     # A public profile forms date pairs, dates and exposure; what it cannot it names once it has
     # read the records, with the reason it has.
-    assert asked_for.unformed(asked) == [
-        ("workload status of orders", asked_for.NO_WORKLOAD),
-        ("query paid_orders", asked_for.NO_QUERIES),
-    ]
+    assert asked_for.unformed(asked) == [("workload status of orders", asked_for.NO_WORKLOAD)]
     assert asked_for.unformed(asked, private=True) == [
         ("date pair placed_at to shipped_at of orders", asked_for.NO_DATE_PAIRS),
         ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
@@ -301,7 +305,7 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
         (f"dates customers.joined_at to orders.placed_at of {link}", asked_for.NO_DATES),
         (f"exposure customers.joined_at to left_at of {link}", asked_for.NO_EXPOSURE),
         (f"exposure customers.joined_at of {link}", asked_for.NO_EXPOSURE),
-        ("query paid_orders", asked_for.NO_QUERIES),
+        ("query paid_orders", asked_for.NO_QUERIES_PRIVATE),
     ]
     assert asked_for.unformed(replace(asked, tables=(), relationships=(), queries=())) == []
     assert (
@@ -310,15 +314,14 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
     )
 
 
-def test_a_profile_forms_the_calendar_a_request_asks_and_names_the_query_it_does_not_run(
-    workspace,
-):
+def test_a_profile_forms_the_calendar_a_request_asks_and_answers_its_query(workspace):
     asked = FakeBackend().read_request(_with_asks(REQUEST), name="asks.yml")
     result = _profile(workspace, asked)
     said = dict(result.not_measured)
     assert "calendar of orders.placed_at" not in said
-    assert said["query paid_orders"] == asked_for.NO_QUERIES
-    assert "queries" not in result.document
+    assert "query paid_orders" not in said
+    (query,) = result.document["queries"]
+    assert query["name"] == "paid_orders"
     orders = dict(result.document["tables"]["orders"])
     (entry,) = orders.pop("calendar")
     assert entry["column"] == "placed_at" and set(entry) == {
@@ -330,36 +333,35 @@ def test_a_profile_forms_the_calendar_a_request_asks_and_names_the_query_it_does
     # The rest of the request is answered as it was without the asks.
     without = _profile(workspace, _asked(workspace))
     assert {**result.document["tables"], "orders": orders} == without.document["tables"]
-    assert [each for each in result.not_measured if each not in without.not_measured] == [
-        ("query paid_orders", asked_for.NO_QUERIES),
-    ]
+    assert [each for each in result.not_measured if each not in without.not_measured] == []
 
 
-def test_the_cli_names_the_query_it_does_not_run_and_reports_the_calendar(
-    workspace, registry, capsys
-):
+def test_the_cli_reports_the_query_it_answers_and_the_calendar(workspace, registry, capsys):
     (workspace / "asks.yml").write_text(_with_asks(REQUEST), encoding="utf-8")
     rc = main(_argv("--out", "p.json", request="asks.yml"))
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "Not measured: calendar of orders.placed_at" not in out
     assert "exposes[orders]: Calendar: " in out
-    assert "Not measured: query paid_orders: fluid profile runs no consumer query." in out
-    assert "SELECT" not in out
+    assert "Queries: 1 of 1 published whole." in out
+    assert "Not measured: query" not in out and "SELECT" not in out
 
 
 def test_strict_refuses_a_request_with_an_ask_it_does_not_form_before_a_read(
     workspace, registry, capsys
 ):
-    (workspace / "asks.yml").write_text(_with_asks(REQUEST), encoding="utf-8")
+    asks = _with_asks(REQUEST, sql="SELECT count(*) AS n FROM orders")
+    (workspace / "asks.yml").write_text(asks, encoding="utf-8")
     (workspace / "orders.ndjson").unlink()  # a read would be a different refusal
     out = _refused(
         capsys,
         _argv("--strict", "--out", "p.json", request="asks.yml"),
         "profile_request_not_formed",
     )
-    assert "asks for 1 item fluid profile does not form" in out
+    # the contract's own refusals of the fixture request come with it: the query is one of them
+    assert "items fluid profile does not form" in out
     assert "query paid_orders" in out and "calendar of" not in out
+    assert "keeps some of its unit's records" in out
     assert "no record was read" in out and "SELECT" not in out
     assert not (workspace / "p.json").exists()
 

@@ -24,8 +24,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 import pytest
 
 from fluid_build.cli import main
+from fluid_build.profiler import query_rates, sources
 from fluid_build.profiler import request as asked_for
-from fluid_build.profiler import sources
 from fluid_build.profiler._stats import (
     Request,
     RequestColumn,
@@ -35,6 +35,7 @@ from fluid_build.profiler._stats import (
     RequestExposure,
     RequestFact,
     RequestLinked,
+    RequestQuery,
     RequestRankCorrelation,
     RequestRelationship,
     RequestTable,
@@ -481,7 +482,10 @@ def _every_kind_of_ask() -> Request:
             RequestFact("members.order", "members", "order"),
             RequestFact("loans.after", "loans", "after"),
         ),
-        queries=("recent",),
+        queries=(
+            RequestQuery("recent", "SELECT count(*) AS n FROM loans", table="loans"),
+            RequestQuery("files", "SELECT * FROM read_csv('/etc/hosts')", table="loans"),
+        ),
     )
 
 
@@ -588,6 +592,8 @@ def test_the_matrix_holds_each_reason_the_contract_decides(tmp_path, monkeypatch
         "the relationship is not one whose two tables and keys the profile reads",
         "its target is not profiled in this call",
         "an exposure is formed over DATE columns",
+        "fluid profile answers a query that keeps some of its unit's records: ",
+        "the check refuses the query: ",
     ):
         assert any(needle in reason for reason in reasons), needle
 
@@ -601,12 +607,14 @@ def test_the_records_reasons_are_the_ones_decided_by_records():
         "a key of members names more than one parent, so a child has no one parent",
         "an exposure states its window, and the parent's start has no published span or "
         "declared range",
+        *query_rates.RECORD_REASONS,
     ):
         assert asked_for.decided_by_records(reason), reason
     for reason in (
         "a key of a counted relationship, which its children per parent describe",
         "the contract declares no such relationship",
         "a mean is formed for a number column only",
+        "fluid profile answers a query that keeps some of its unit's records: it joins",
     ):
         assert not asked_for.decided_by_records(reason), reason
 

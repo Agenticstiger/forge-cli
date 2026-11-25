@@ -297,11 +297,29 @@ class RequestFact:
 
 
 @dataclass(frozen=True)
+class RequestQuery:
+    """A consumer query a request of format 1-1-0 asks the rate of, kept whole.
+
+    ``sql`` is the consumers' text and ``unit_sql`` the view text of a unit given as SQL: both are
+    untrusted, never shown in a message or a representation, and run only after
+    :mod:`fluid_build.profiler.query_rates` has checked them. The unit is the table named by
+    ``table`` or the view ``unit_sql`` (exactly one of the two); ``group_by`` names a column of
+    the query's rows (format 1-3-0).
+    """
+
+    name: str
+    sql: str = field(repr=False)
+    table: Optional[str] = None
+    unit_sql: Optional[str] = field(default=None, repr=False)
+    group_by: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class Request:
     """A profile request as the registry reads it: what a profile may measure and publish.
 
-    ``contract_digest`` is ``None`` when the request names none. ``queries`` are the names of
-    the consumers' queries a request of format 1-1-0 asks a rate of; their text is not kept.
+    ``contract_digest`` is ``None`` when the request names none. ``queries`` are the consumers'
+    queries a request of format 1-1-0 asks a rate of, each kept whole.
     """
 
     contract_digest: Optional[str]
@@ -309,7 +327,7 @@ class Request:
     tables: Tuple[RequestTable, ...]
     relationships: Tuple[RequestRelationship, ...] = ()
     facts: Tuple[RequestFact, ...] = ()
-    queries: Tuple[str, ...] = ()
+    queries: Tuple[RequestQuery, ...] = ()
 
     def table(self, expose_id: str) -> Optional[RequestTable]:
         return next((each for each in self.tables if each.expose_id == expose_id), None)
@@ -978,9 +996,16 @@ class _FluxStatsBackend:
                 for link in asked.relationships
             ),
             facts=tuple(RequestFact(fact.name, fact.table, fact.rule) for fact in asked.facts),
-            # The name of each consumer query alone: its text is the consumers', and this
-            # profile neither checks nor runs it.
-            queries=tuple(query.name for query in _asked(asked, "queries")),
+            queries=tuple(
+                RequestQuery(
+                    query.name,
+                    query.sql,
+                    table=query.unit.table,
+                    unit_sql=query.unit.sql,
+                    group_by=query.group_by,
+                )
+                for query in _asked(asked, "queries")
+            ),
         )
 
     def contract_digest(self, text: str, *, name: str) -> str:

@@ -46,6 +46,7 @@ from typing import (
     Callable,
     Dict,
     FrozenSet,
+    Iterable,
     Iterator,
     List,
     Mapping,
@@ -65,6 +66,7 @@ from fluid_build.profiler import (
     document,
     facts,
     grouped,
+    query_rates,
     ranks,
     sources,
 )
@@ -89,6 +91,7 @@ from fluid_build.profiler._stats import (
 )
 from fluid_build.profiler.bundle import BundleBlock
 from fluid_build.profiler.document import DEFAULT_FRACTIONAL_BITS
+from fluid_build.profiler.query_rates import QueryResult
 
 __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
@@ -99,6 +102,7 @@ __all__ = [
     "ExposeSource",
     "ProfileError",
     "ProfileResult",
+    "QueryResult",
     "Relationship",
     "RelationshipResult",
     "TableResult",
@@ -381,6 +385,8 @@ class ProfileResult:
     not_measured: Tuple[Tuple[str, str], ...] = ()
     #: Answering a request: each fact measured, published or withheld.
     facts: Tuple[FactResult, ...] = ()
+    #: Answering a request: each consumer query measured, and what became of it.
+    queries: Tuple[QueryResult, ...] = ()
 
 
 def _base_type(type_name: Any) -> str:
@@ -772,6 +778,7 @@ class _Planned:
     """What a profile settles before it reads a record: its plans, blocks and relationships."""
 
     fact_plans: List["facts.FactPlan"]
+    query_plans: "query_rates.QueryPlans"
     plans: List[ExposePlan]
     asked: Dict[str, RequestTable]
     blocks: Mapping[str, BundleBlock]
@@ -816,6 +823,7 @@ def _plan_profile(
     from fluid_build.profiler import request as asked_for
 
     fact_plans: List[facts.FactPlan] = []
+    query_plans = query_rates.QueryPlans()
     if request is not None:
         if bundles:
             raise ProfileError(
@@ -837,6 +845,7 @@ def _plan_profile(
         asked_for.check_tables(request, contract)
         asked_for.check_sources(request, [each.expose_id for each in exposes])
         fact_plans = _plan_facts(contract, request)
+        query_plans = query_rates.plan_queries(contract, request, backend.enum_levels)
     if fractional_bits is not None:
         document.check_fractional_bits(fractional_bits)
     if not exposes:
@@ -902,11 +911,13 @@ def _plan_profile(
             keys,
             matched,
             fact_plans,
+            query_plans,
             backend,
             fractional_bits,
         )
     return _Planned(
         fact_plans=fact_plans,
+        query_plans=query_plans,
         plans=plans,
         asked=asked,
         blocks=blocks,
@@ -978,6 +989,7 @@ def profile_exposes(
         planned.asked,
         planned.blocks,
     )
+    query_plans = planned.query_plans
     declared, uncovered, matched = planned.declared, planned.uncovered, planned.matched
     relationships, held, unfiltered = planned.relationships, planned.held, planned.unfiltered
     keys, fractional_bits = planned.keys, planned.fractional_bits
@@ -990,7 +1002,7 @@ def profile_exposes(
                     plan,
                     sources.read_columns(
                         exposed.source,
-                        _read_names(plan, fact_plans),
+                        _read_names(plan, fact_plans, query_plans),
                         table=exposed.table,
                         cwd=cwd,
                     ),
@@ -1117,10 +1129,13 @@ def profile_exposes(
         )
     fact_results: Tuple[FactResult, ...] = ()
     invariants: List[Dict[str, Any]] = []
+    queries: List[Dict[str, Any]] = []
+    query_results: Tuple[QueryResult, ...] = ()
     if request is not None:
-        invariants, fact_results, more = _measured_for_request(
+        invariants, fact_results, more, queries, query_results = _measured_for_request(
             contract,
             fact_plans,
+            query_plans,
             plans,
             reads,
             asked,
@@ -1150,6 +1165,7 @@ def profile_exposes(
             fractional_bits=fractional_bits,
             relationships=relationship_docs,
             invariants=invariants,
+            queries=queries,
         )
         canonical = document.canonical_bytes(built)
         backend.check_document(canonical.decode("utf-8"))
@@ -1168,12 +1184,14 @@ def profile_exposes(
         relationships_left_out=tuple(relationships_left_out),
         not_measured=unanswered,
         facts=fact_results,
+        queries=query_results,
     )
 
 
 def _measured_for_request(
     contract: Mapping[str, Any],
     fact_plans: Sequence["facts.FactPlan"],
+    query_plans: "query_rates.QueryPlans",
     plans: Sequence[ExposePlan],
     reads: Sequence[sources.SourceColumns],
     asked: Mapping[str, RequestTable],
@@ -1187,22 +1205,41 @@ def _measured_for_request(
     row_floor: Optional[int],
     held: Mapping[str, FrozenSet[str]],
     timings: Optional[StageTimings],
-) -> Tuple[List[Dict[str, Any]], Tuple[FactResult, ...], Tuple[Tuple[str, str], ...]]:
-    """What only a request measures once the tables are: its facts and its column pairs.
+) -> Tuple[
+    List[Dict[str, Any]],
+    Tuple[FactResult, ...],
+    Tuple[Tuple[str, str], ...],
+    List[Dict[str, Any]],
+    Tuple[QueryResult, ...],
+]:
+    """What only a request measures once the tables are: its facts, queries and column pairs.
 
     The keyword arguments are what the tables were measured with. Writes each table's ``columnPairs`` into *tables_doc*;
-    returns the invariants, the fact results and the lines this adds under Not measured.
+    returns the invariants, the fact results, the lines this adds under Not measured, the
+    ``queries`` entries and what became of each query.
+
+    The consumer queries run once, over the one read of each table; a table's queries and facts
+    are then checked as one set (:func:`_fact_entries`).
     """
     by_table = {plan.expose_id: read for plan, read in zip(plans, reads, strict=True)}
     with _shared(
         timings,
         "measure",
-        lambda: list(dict.fromkeys(each.table for each in fact_plans if each.reason is None)),
+        lambda: list(
+            dict.fromkeys(
+                [
+                    *(each.table for each in fact_plans if each.reason is None),
+                    *(table for table in by_table if query_plans.columns_of(table)),
+                ]
+            )
+        ),
     ):
+        rates = query_rates.measure(query_plans, by_table, backend, rule)
         invariants, fact_results, unmeasured = _fact_entries(
-            contract, fact_plans, by_table, rule, tallies[0]
+            contract, fact_plans, by_table, rule, tallies[0], rates
         )
-    left: Tuple[Tuple[str, str], ...] = (*unmeasured, *answered.not_measured)
+        query_docs, query_results, query_left = rates.entries(rule, tallies[0])
+    left: Tuple[Tuple[str, str], ...] = (*unmeasured, *query_left, *answered.not_measured)
     for plan, read in zip(plans, reads, strict=True):
         table = asked[plan.expose_id]
         with _timed(timings, "measure", plan.expose_id):
@@ -1220,7 +1257,7 @@ def _measured_for_request(
         if pairs:
             tables_doc[plan.expose_id]["columnPairs"] = pairs
         left = (*left, *missing_pairs)
-    return invariants, fact_results, left
+    return invariants, fact_results, left, query_docs, query_results
 
 
 def _metric_domains(backend: StatisticsBackend) -> Dict[str, FrozenSet[str]]:
@@ -1298,6 +1335,7 @@ def _refuse_unformable(
     keys: Mapping[str, FrozenSet[str]],
     matched: Set[int],
     fact_plans: Sequence["facts.FactPlan"],
+    query_plans: "query_rates.QueryPlans",
     backend: StatisticsBackend,
     fractional_bits: int,
 ) -> None:
@@ -1345,6 +1383,7 @@ def _refuse_unformable(
                 contract, request, relationships, relationships_left_out, matched
             ),
             metric_domains=_metric_domains(backend),
+            queries=query_plans,
         )
     )
     found.extend(answered.not_measured)
@@ -1671,15 +1710,25 @@ def _fact_refusal(exc: "facts.FactRefused") -> ProfileError:
     )
 
 
-def _read_names(plan: ExposePlan, fact_plans: Sequence["facts.FactPlan"]) -> List[str]:
-    """The columns of a table to read: those profiled, then those only a fact's rule reads.
+def _read_names(
+    plan: ExposePlan,
+    fact_plans: Sequence["facts.FactPlan"],
+    query_plans: "query_rates.QueryPlans",
+) -> List[str]:
+    """The columns of a table to read: those profiled, then those only a fact or a query reads.
 
-    A column read for a fact alone is read and never profiled: reading is not publishing.
+    A column read for a fact or a query alone is read and never profiled: reading is not
+    publishing.
     """
     names = [column.name for column in plan.columns]
     for each in fact_plans:
         if each.table == plan.expose_id:
             names.extend(name for name in each.columns if name not in names)
+    names.extend(name for name in query_plans.columns_of(plan.expose_id) if name not in names)
+    if not names and plan.expose_id in query_plans.schema:
+        # a table listed with no column and no answerable query is still read for its records'
+        # number: one column, never profiled
+        names = [name for name, _ in query_plans.schema[plan.expose_id].columns[:1]]
     return names
 
 
@@ -1693,6 +1742,7 @@ def _fact_entries(
     reads: Mapping[str, sources.SourceColumns],
     rule: disclosure.DisclosureRule,
     tally: "Counter[str]",
+    rates: Optional["query_rates.Measured"] = None,
 ) -> Tuple[List[Dict[str, Any]], Tuple[FactResult, ...], List[Tuple[str, str]]]:
     """The ``invariants`` entries of the facts measured, how each fared, and those not measured.
 
@@ -1734,12 +1784,25 @@ def _fact_entries(
         verdicts = [_checked_cell(count, rule) for count in cells[each.name]]
         refused[each.name] = next((verdict for verdict in verdicts if not verdict.published), None)
     covers_all: Dict[str, bool] = {}
-    for table in dict.fromkeys(each.table for each in measured):
+    queried = list(rates.tables) if rates is not None else []
+    for table in dict.fromkeys([*(each.table for each in measured), *queried]):
         on_table = [each for each in measured if each.table == table]
-        together = facts.states_together(contract, on_table)
+        together = facts.states_together(contract, on_table) if on_table else None
         for each in on_table:
+            assert together is not None
             covers_all[each.name] = not together({each.name: facts.NOT_COVERED})
-        for name in _differenced(on_table, states, refused, rule, together):
+        withheld: Iterable[str]
+        if rates is not None and rates.has_table(table):
+            # the table's queries are members of the same set as its facts
+            names = [each.name for each in on_table]
+            passed = {name for name in names if refused[name] is None}
+            withheld = rates.check_table(table, names, states, passed, together, rule)
+        elif on_table:
+            assert together is not None
+            withheld = _differenced(on_table, states, refused, rule, together)
+        else:
+            withheld = []
+        for name in withheld:
             refused[name] = disclosure.Verdict(
                 disclosure.SECONDARY,
                 "with the other facts of its table it would give back a small cell",

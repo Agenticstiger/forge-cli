@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each rounded end and its unit per table under Rounded extremes; a column whose ends pass
   exactly is unchanged.
 
+- **`fluid profile` answers a profile request's consumer queries with their rates.** A query that
+  keeps some of its unit's records and changes none (a `SELECT` of columns from its unit, a table
+  or a view's rows, with at most one `WHERE`) gets a `queries` entry: one level histogram over
+  `false` and `true`, where `k` is the records of the unit and the `true` count the rows the query
+  returns, per level of its `groupBy` column when it has one (format 1-3-0). The text is checked
+  and then run only as a tree built again and checked again, in the locked process; the count of
+  its own rows must match the one derived from the unit's records. What is answered is decided
+  before any record is read, so `--strict` refuses the rest, and each query not answered is named
+  under Not measured with its reason. The queries of one unit are checked as a set, together with
+  the facts of the same table, so two queries that differ by a few records give none back; a
+  private release publishes no query rate. The report adds `Queries: N of M published whole`.
+
+
 - **`fluid profile` can check a consumer query and run it in a locked process.** A query a profile
   request lists is untrusted text. It is parsed with sqlglot and refused, naming the construct,
   unless it is one `SELECT` (or a non-recursive `WITH` before one) built only from listed

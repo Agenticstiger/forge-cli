@@ -35,7 +35,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
-from fluid_build.profiler import dates, runner
+from fluid_build.profiler import dates, query_rates, runner
 from fluid_build.profiler._stats import (
     DeclaredBlock,
     Request,
@@ -53,6 +53,7 @@ __all__ = [
     "check_flags",
     "check_sources",
     "check_tables",
+    "NO_QUERIES_PRIVATE",
     "contract_unformed",
     "decided_by_records",
     "filter_block",
@@ -99,7 +100,9 @@ NO_WORKLOAD = (
 )
 NO_DATES = "a private release forms no relationship dates"
 NO_EXPOSURE = "a private release forms no exposure"
-NO_QUERIES = "fluid profile runs no consumer query"
+NO_QUERIES_PRIVATE = (
+    "a private release publishes no query rate: PROFILE-SPEC refuses noise on a query statistic"
+)
 
 
 #: The reasons only the records can give, which ``--strict`` therefore never refuses on.
@@ -108,6 +111,7 @@ _BY_RECORDS = frozenset(
         _NO_RECORD,  # a column or a calendar with no non-null record
         _NO_RECORD_FORMS,  # the statistic is declared and no record forms a group of it
         _WITHHELD_ROW_COUNT,  # the row count's own output check
+        *query_rates.RECORD_REASONS,  # a query's values, statements and rows are the records'
         _TIMESTAMP_LADDER,  # whether a timestamp's date span is published is read from its records
         _TIMESTAMP_NEVER_BOTH,  # the same: the histogram sits on a span the records gave
         # a day bin of a date pair holds too few records to publish an outer edge
@@ -477,10 +481,11 @@ def unformed(
 ) -> List[Tuple[str, str]]:
     """Each ask of *request* of a kind ``fluid profile`` does not form, with why: ``(what, reason)``.
 
-    Decided from the request alone, before any record is read: a workload entry and a consumer
-    query, and, for a *private* release only, a table's date pairs and calendar and a
+    Decided from the request alone, before any record is read: a workload entry, and, for a
+    *private* release only, a consumer query, a table's date pairs and calendar and a
     relationship's dates and exposure (a public profile forms those, and names one it cannot
-    with the reason it has, once it has read the records). *workload* is the reason a workload
+    with the reason it has, once it has read the records; which queries it answers needs the
+    contract, :func:`fluid_build.profiler.query_rates.plan_queries`). *workload* is the reason a workload
     entry is not used, which a private release words its own way. Never a value: only tables,
     columns, names and reasons.
     """
@@ -505,8 +510,8 @@ def unformed(
             )
         for exposure in link.exposure:
             found.append((_exposure_name(link, exposure), NO_EXPOSURE))
-    for name in request.queries:
-        found.append((f"query {name}", NO_QUERIES))
+    for query in request.queries if private else ():
+        found.append((f"query {query.name}", NO_QUERIES_PRIVATE))
     return found
 
 
@@ -730,8 +735,9 @@ def contract_unformed(
     matched: Set[int],
     unread: Mapping[int, str],
     metric_domains: Mapping[str, FrozenSet[str]],
+    queries: Optional["query_rates.QueryPlans"] = None,
 ) -> List[Tuple[str, str]]:
-    """Each ask of a table or relationship the contract rules out, before any record is read.
+    """Each ask of a table, relationship or query the contract rules out, before any record is read.
 
     The asks :func:`not_measured` names once the records are read, less those whose reason the
     records decide (:func:`decided_by_records`): *plans* are the tables as the request restricts
@@ -741,9 +747,13 @@ def contract_unformed(
     (:func:`fluid_build.profiler.runner._no_fixed_mean`). *matched* are the listed relationships
     that name a declared one and *unread* those of them the profile does not read, with why. A
     listed column the profile does not read at all has every ask named, with the reason it is
-    not profiled.
+    not profiled. A consumer query is named with the reason :func:`query_rates.plan_queries`
+    gives it (*queries*): the check, the shape rules and the public bounds decide it from the
+    request and the contract alone.
     """
     found: List[Tuple[str, str]] = []
+    if queries is not None:
+        found.extend(queries.unanswered())
     for table in request.tables:
         found.extend(
             _table_unformed(

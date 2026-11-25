@@ -183,7 +183,10 @@ def test_a_follows_release_names_an_ask_fluid_profile_does_not_form(workspace, r
     (workspace / "billing.profile-request.yml").write_text(yaml.safe_dump(asked), encoding="utf-8")
     assert main(_argv()) == 0
     out = _out(capsys)
-    assert "Not released (fluid profile runs no consumer query): query large_quantities." in out
+    assert (
+        "Not released (a private release publishes no query rate: PROFILE-SPEC refuses noise on a query statistic): query large_quantities."
+        in out
+    )
     assert "SELECT" not in out
 
 
