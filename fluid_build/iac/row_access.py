@@ -47,7 +47,8 @@ def row_filters_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[RowFil
     if raw is None:
         return ()
     schema = (exposure.get("contract") or {}).get("schema") or []
-    declared = {col.get("name") for col in schema if isinstance(col, Mapping)}
+    names = (col.get("name") for col in schema if isinstance(col, Mapping))
+    declared = {name for name in names if isinstance(name, str)}
     try:
         return parse_row_filters(raw, declared=declared, where_at=_where(exposure, index))
     except RowFilterError as exc:

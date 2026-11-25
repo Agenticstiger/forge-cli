@@ -775,16 +775,12 @@ class OutputPortMcpServer:
         pre-existing no-auth behaviour — with one exception below.
 
         **Certificate attributes and the principal are verified-only in every
-        mode.** ``client_cn`` / ``client_fingerprint``
-        name a client certificate, and only the trusted mTLS proxy can vouch
-        for one, so the audit trail never attributes a call to a certificate
-        the client merely named. ``principal`` decides which rows
-        ``policy.authz.rowFilters`` lets a caller read: a client naming its
-        own would pick its filter, or a reader's every row. All three are
-        dropped from the self-attested tier whatever the auth mode, so with
-        auth off a row-filtered expose refuses every call rather than serve
-        the rows of whichever principal the client typed. ``jurisdiction``
-        has the same rule for its gate (:meth:`_resolve_verified_jurisdiction`).
+        mode** (:meth:`_drop_verified_only_attributes`): only the trusted proxy
+        can vouch for a certificate, and the principal decides which rows
+        ``policy.authz.rowFilters`` lets a caller read. With auth off a
+        row-filtered expose therefore refuses every call rather than serve the
+        rows of whichever principal the client typed. ``jurisdiction`` has the
+        same rule for its gate (:meth:`_resolve_verified_jurisdiction`).
         """
         model_id: Optional[str] = None
         use_case: Optional[str] = None
@@ -853,22 +849,7 @@ class OutputPortMcpServer:
                     attrs[key] = value
         except Exception as exc:  # noqa: BLE001
             self.state.logger.debug("output_port_identity_capability_failed: %s", exc)
-        self_attested_certs = sorted(MTLS_IDENTITY_ATTRS.intersection(attrs))
-        for name in self_attested_certs:
-            del attrs[name]
-        if self_attested_certs:
-            self.state.logger.debug(
-                "output_port_identity_self_attested_certificate_ignored: dropped=%s "
-                "(certificate attributes bind only from a trusted proxy)",
-                self_attested_certs,
-            )
-        if PRINCIPAL_ATTR in attrs:
-            del attrs[PRINCIPAL_ATTR]
-            self.state.logger.debug(
-                "output_port_identity_self_attested_principal_ignored: the principal "
-                "binds only from a verified credential (FLUID_MCP_JWT_CLAIM_MAPPING="
-                "<claim>=principal)"
-            )
+        self._drop_verified_only_attributes(attrs)
         try:
             request = getattr(ctx, "request", None)
             scope = getattr(request, "scope", None) or {}
@@ -909,6 +890,21 @@ class OutputPortMcpServer:
             attrs.setdefault("use_case", use_case)
             attrs.setdefault("useCase", use_case)
         return model_id, use_case, attrs
+
+    def _drop_verified_only_attributes(self, attrs: Dict[str, Any]) -> None:
+        """Remove from the self-attested tier what binds only from a verified channel:
+        the certificate attributes (only the trusted proxy can vouch for a certificate)
+        and the row-filter principal (a client naming its own would pick its rows)."""
+        dropped = sorted((MTLS_IDENTITY_ATTRS | {PRINCIPAL_ATTR}).intersection(attrs))
+        for name in dropped:
+            del attrs[name]
+        if dropped:
+            self.state.logger.debug(
+                "output_port_identity_self_attested_verified_only_ignored: dropped=%s "
+                "(certificate attributes and the principal bind only from a verified "
+                "channel)",
+                dropped,
+            )
 
     def _resolve_verified_jurisdiction(self, request_context: Any) -> Optional[str]:
         """The caller's jurisdiction, and ONLY if a credential carried it.

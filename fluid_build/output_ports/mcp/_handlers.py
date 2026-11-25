@@ -33,6 +33,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .server import SessionState
 
 
+def _shown_sql(compiled: Any) -> Any:
+    """The compiled statement as the caller may see it: a row-filter predicate (policy
+    the ``describe`` tool does not return either) reads ``(<row filter>)``."""
+    shown = getattr(compiled, "shown_sql", None)
+    return shown() if callable(shown) else getattr(compiled, "sql", None)
+
+
 def _serialize_query_result(
     expose: Mapping[str, Any], compiled: Any, result: Any
 ) -> Dict[str, Any]:
@@ -44,7 +51,7 @@ def _serialize_query_result(
         "rowCount": len(getattr(result, "rows", ()) or ()),
         "truncated": getattr(result, "truncated", False),
         "compiled": {
-            "sql": getattr(compiled, "sql", None),
+            "sql": _shown_sql(compiled),
             "parameters": getattr(compiled, "parameters", None),
         },
     }

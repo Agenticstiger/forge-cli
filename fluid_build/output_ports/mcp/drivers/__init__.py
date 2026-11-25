@@ -99,6 +99,19 @@ def _accepts_kwarg(driver_class: Type[EngineDriver], name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def registered_driver_name(expose: Mapping[str, Any]) -> Optional[str]:
+    """The ``name`` of the driver :func:`build_driver` would build for ``expose``, or
+    ``None`` when its binding names no registered driver. Every built-in driver's name
+    is its dialect token, so the CLI can check a contract against the engine before a
+    driver (and its connection) exists."""
+    try:
+        platform, fmt, _ = get_binding(expose)
+    except UnsupportedBindingError:
+        return None
+    driver_class = _DRIVER_REGISTRY.get((platform, fmt))
+    return None if driver_class is None else driver_class.name
+
+
 def build_driver(
     *,
     expose: Mapping[str, Any],
@@ -161,6 +174,7 @@ __all__ = [
     "AthenaDriver",
     "build_driver",
     "register_driver",
+    "registered_driver_name",
     "supported_keys",
     "UnsupportedBindingError",
 ]

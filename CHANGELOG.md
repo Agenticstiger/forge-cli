@@ -348,18 +348,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row access policies, and a principal in `policy.authz.readers` that no filter names reads every
   row. Every filter is parsed by the same code the IaC emitters write platform policies from, then
   checked as the engine reads it: a predicate BigQuery or Spark would read differently (a
-  double-quoted name is a string there) is refused on those engines. It fails closed. A request
+  double-quoted name is a string there, even beside the same name unquoted) is refused on those
+  engines, and so is a predicate holding the text `:p_` (the gateway's bind markers are rewritten
+  wherever they appear) or the word UNION, INTERSECT or EXCEPT (its statement guard reads string
+  literals too). The statement returned to the caller shows `(<row filter>)` in place of the
+  predicate, which is policy the `describe` tool does not return either. It fails closed. A request
   with no principal a filter or reader names is refused (`RowFilterIdentityMissing`), every call on
   an expose whose filter cannot be applied is refused (`RowFilterUnavailable`), and
-  `fluid mcp output-port serve` refuses to start an expose with row filters when no request could
-  carry a principal: over stdio, over HTTP without auth or with a shared token, and with JWT auth
-  when no claim is mapped to `principal`. The principal binds only from a verified credential; a
+  `fluid mcp output-port serve` refuses to start an expose whose row filters every call would
+  refuse, checked as the binding's engine reads them, or when no request could carry a principal:
+  over stdio, over HTTP without auth or with a shared token, and with JWT auth when no claim is
+  mapped to `principal`. The principal binds only from a verified credential; a
   client that states its own is ignored in every auth mode.
 - **The IaC row-filter check refuses a predicate with a subquery, a clause besides its WHERE, or a
   bind placeholder.** `EXISTS (SELECT ...)`, `HAVING`, `QUALIFY`, `WINDOW` and `?` / `:name` /
   `$1` placeholders passed the check into the platform's row access policy or data cells filter,
   and an unterminated quote escaped as a parser error. Each is now refused with the filter's
-  position, wherever the IaC emitters read row filters (`fluid generate iac`, `fluid apply`).
+  position, wherever the IaC emitters read row filters (`fluid generate iac`, `fluid apply`), and
+  so is a `rowFilters` value that is not a list (`{}`, `""`), which used to be read as no filter.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is

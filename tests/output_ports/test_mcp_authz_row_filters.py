@@ -43,6 +43,8 @@ from fluid_build.output_ports.mcp._handlers import (  # noqa: E402
     tool_sample,
 )
 
+from .test_identity_isolation import _client_info, _request_context  # noqa: E402
+
 EU = "group:eu-analysts@northwind.example"
 T1 = "group:tenant-t1@northwind.example"
 EVERYONE = "group:all-staff@northwind.example"
@@ -292,25 +294,18 @@ def _server(expose: Dict[str, Any]):
     )
 
 
-def _request(*, client_info: Optional[Dict[str, Any]] = None, scope=None) -> SimpleNamespace:
-    info = SimpleNamespace(model_extra=dict(client_info)) if client_info is not None else None
-    session = SimpleNamespace(client_params=SimpleNamespace(clientInfo=info))
-    request = SimpleNamespace(scope=scope) if scope is not None else None
-    return SimpleNamespace(session=session, request=request)
-
-
 def test_a_self_attested_principal_never_binds():
     """The principal decides which rows a caller reads, so a client naming its own
     must not pick its filter (or a reader's every row): it binds only from a verified
     credential, whatever the auth mode."""
     server = _server(_expose())
     _model, _use_case, attrs = server._resolve_request_identity(
-        _request(client_info={"principal": EVERYONE, "tenant_id": "t1"})
+        _request_context(client_info=_client_info(principal=EVERYONE, tenant_id="t1"))
     )
-    assert "principal" not in attrs
+    assert "principal" not in attrs and attrs["tenant_id"] == "t1"
     _model, _use_case, attrs = server._resolve_request_identity(
-        _request(
-            client_info={"principal": EVERYONE},
+        _request_context(
+            client_info=_client_info(principal=EVERYONE),
             scope={"fluid_auth_kind": "jwt", "fluid_auth_attrs": {"principal": EU}},
         )
     )
@@ -322,7 +317,9 @@ def test_a_verified_principal_reaches_the_compiled_statement_per_request(state_f
     state = state_for(_expose())
     for principal, ids in ((EU, [1, 3]), (T1, [1, 2]), (EU, [1, 3])):
         _model, _use_case, attrs = server._resolve_request_identity(
-            _request(scope={"fluid_auth_kind": "jwt", "fluid_auth_attrs": {"principal": principal}})
+            _request_context(
+                scope={"fluid_auth_kind": "jwt", "fluid_auth_attrs": {"principal": principal}}
+            )
         )
         assert _query_sql_ids(state, attrs) == ids
 
@@ -542,6 +539,14 @@ def test_the_engine_parser_refuses_a_projection_whose_filter_was_changed():
         pytest.param([{"principal": EU, "where": "region = 'EU' HAVING 1 = 1"}], id="having"),
         pytest.param([{"principal": EU, "where": "region = :p_0"}], id="placeholder"),
         pytest.param([{"principal": EU, "where": "region = ?"}], id="positional-placeholder"),
+        # The statement's own bind-marker text is rewritten wherever it appears, inside
+        # a literal too, which would change the predicate on its way to the engine.
+        pytest.param([{"principal": EU, "where": "region <> 'x:p_1'"}], id="bind-marker-text"),
+        pytest.param([{"principal": EU, "where": "region <> 'a:P_b'"}], id="bind-marker-upper"),
+        # Words the driver's statement guard refuses inside a literal too.
+        pytest.param([{"principal": EU, "where": "region <> 'union'"}], id="guarded-word"),
+        pytest.param([{"principal": EU, "where": "segment <> 'Except Retail'"}], id="guarded-in"),
+        pytest.param([{"principal": EU, "where": "segment <> 'delete'"}], id="keyword-literal"),
         pytest.param(
             [{"principal": EU, "where": "customers.region = 'EU'"}], id="qualified-column"
         ),
@@ -583,6 +588,14 @@ def test_malformed_readers_are_refused(state_for):
         pytest.param("bigquery", "\"region\" <> 'x'", id="bigquery-double-quotes"),
         pytest.param("databricks", "\"region\" <> 'x'", id="spark-double-quotes"),
         pytest.param("snowflake", "`region` = 'EU'", id="snowflake-backticks"),
+        # The same name bare and double-quoted: BigQuery reads the second as a string,
+        # so the predicate there would be ``region IS NOT NULL`` alone.
+        pytest.param(
+            "bigquery", "region IS NOT NULL AND \"region\" <> 'US'", id="bigquery-bare-and-quoted"
+        ),
+        pytest.param(
+            "databricks", "region = 'EU' AND \"region\" <> 'EU'", id="spark-bare-and-quoted"
+        ),
     ],
 )
 def test_a_predicate_the_engine_would_read_differently_is_refused(dialect, where):
@@ -676,13 +689,134 @@ def test_startup_refuses_row_filters_no_request_can_satisfy():
     )
 
 
-def test_startup_refuses_the_old_key_and_a_malformed_filter():
+def _deeply_nested() -> str:
+    return "(" * 3000 + "region = 'EU'" + ")" * 3000
+
+
+def _bigquery(expose: Dict[str, Any]) -> Dict[str, Any]:
+    location = {"project": "proj-1", "dataset": "ds", "table": "customers"}
+    return {
+        **expose,
+        "binding": {"platform": "gcp", "format": "bigquery_table", "location": location},
+    }
+
+
+def _expose_where(**changes: Any) -> Dict[str, Any]:
+    expose = _expose()
+    for key, value in changes.items():
+        if key == "policy":
+            expose["policy"] = value
+        elif key == "schema_name":
+            expose["contract"]["schema"].append({"name": value})
+        elif key == "row_filters":
+            expose["policy"]["authz"]["rowFilters"] = value
+    return expose
+
+
+def test_startup_reads_an_odd_schema_without_failing():
     from fluid_build.cli.mcp_output_port import _row_filter_gate_unsatisfiable
 
     mapped = _jwt_auth({"https://fluid/principal": "principal"})
-    legacy = _expose(row_filters=[])
-    legacy["policy"] = {"rowFilters": [{"column": "tenant_id", "equals": "t1"}]}
-    message = _row_filter_gate_unsatisfiable(legacy, transport="http", http_auth=mapped)
-    assert message and "policy.authz.rowFilters" in message
-    broken = _expose(row_filters=[{"principal": EU, "where": "nope = 1"}])
-    assert _row_filter_gate_unsatisfiable(broken, transport="http", http_auth=mapped)
+    expose = _expose_where(schema_name=["region"])
+    assert _row_filter_gate_unsatisfiable(expose, transport="http", http_auth=mapped) is None
+
+
+@pytest.mark.parametrize(
+    "expose, reason",
+    [
+        pytest.param(
+            _expose_where(policy={"rowFilters": [{"column": "tenant_id", "equals": "t1"}]}),
+            "policy.authz.rowFilters",
+            id="the-old-key",
+        ),
+        pytest.param(
+            _expose_where(row_filters=[{"principal": EU, "where": "nope = 1"}]),
+            "does not declare",
+            id="undeclared-column",
+        ),
+        pytest.param(_expose_where(row_filters={}), "must be a list", id="row-filters-not-a-list"),
+        pytest.param(_expose_where(policy="oops"), "is not a mapping", id="policy-not-a-mapping"),
+        pytest.param(
+            _expose_where(
+                schema_name=["plan"], row_filters=[{"principal": EU, "where": "plan = 'gold'"}]
+            ),
+            "does not declare",
+            id="a-column-declared-with-a-name-that-is-not-a-string",
+        ),
+        pytest.param(
+            _expose_where(row_filters=[{"principal": EU, "where": _deeply_nested()}]),
+            "nests too deeply",
+            id="deeply-nested",
+        ),
+        pytest.param(
+            _bigquery(_expose_where(row_filters=[{"principal": EU, "where": "\"region\" <> 'x'"}])),
+            "other columns on this engine",
+            id="the-bindings-engine-reads-it-differently",
+        ),
+    ],
+)
+def test_startup_refuses_a_policy_every_call_would_refuse(expose, reason):
+    from fluid_build.cli.mcp_output_port import _row_filter_gate_unsatisfiable
+
+    mapped = _jwt_auth({"https://fluid/principal": "principal"})
+    message = _row_filter_gate_unsatisfiable(expose, transport="http", http_auth=mapped)
+    assert message is not None and reason in message, message
+
+
+def test_serve_refuses_a_policy_that_is_not_a_mapping_before_anything_reads_it(tmp_path):
+    """The row-filter check runs before the rest of ``serve`` reads the expose's policy,
+    so a policy that is not a mapping stops the gateway with the reason instead of an
+    AttributeError further on."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    (tmp_path / "rows.csv").write_text("id,region\n1,EU\n", encoding="utf-8")
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text(
+        'fluidVersion: "0.7.7"\n'
+        "kind: DataProduct\n"
+        "id: silver.demo.rows_v1\n"
+        "name: Rows\n"
+        "metadata:\n"
+        "  layer: Silver\n"
+        "  owner: { team: demo, email: demo@example.com }\n"
+        "exposes:\n"
+        "  - exposeId: rows\n"
+        "    kind: table\n"
+        "    contract:\n"
+        "      schema:\n"
+        "        - { name: id, type: INTEGER }\n"
+        "        - { name: region, type: STRING }\n"
+        "    binding:\n"
+        "      platform: local\n"
+        "      format: csv\n"
+        "      location: { path: ./rows.csv, table: rows }\n"
+        "    policy: oops\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "home").mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("FLUID_MCP_")}
+    env.update(
+        {
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            "HOME": str(tmp_path / "home"),
+            "FLUID_QUIET": "1",
+            "FLUID_NONINTERACTIVE": "1",
+            "FLUID_AUDIT_ROOT": str(tmp_path / "audit"),
+        }
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "fluid_build", "mcp", "output-port", "serve", str(contract)]
+        + ["--transport", "stdio", "--readable-paths", str(tmp_path)],
+        cwd=str(tmp_path),
+        env=env,
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 2, output
+    assert "is not a mapping" in output and "Traceback" not in output

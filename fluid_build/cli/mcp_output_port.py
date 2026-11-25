@@ -401,6 +401,15 @@ def _run_serve(args, logger: logging.Logger) -> int:
             f"(only expose in contract).\n"
         )
         sys.stderr.flush()
+    # Before anything else reads the expose's policy: a policy every call would
+    # refuse (or one that is not a mapping) stops here with the reason.
+    rows_unsatisfiable = _row_filter_gate_unsatisfiable(
+        expose, transport=transport, http_auth=http_auth
+    )
+    if rows_unsatisfiable is not None:
+        sys.stderr.write(rows_unsatisfiable)
+        sys.stderr.flush()
+        return 2
     policy = _build_policy(args, contract_path=contract_path, expose=expose, contract=contract)
     tool_refusal = _tool_name_refusal(policy)
     if tool_refusal is not None:
@@ -500,13 +509,6 @@ def _run_serve(args, logger: logging.Logger) -> int:
     cert_unsatisfiable = _cert_identity_gate_unsatisfiable(transport=transport, http_auth=http_auth)
     if cert_unsatisfiable is not None:
         sys.stderr.write(cert_unsatisfiable)
-        sys.stderr.flush()
-        return 2
-    rows_unsatisfiable = _row_filter_gate_unsatisfiable(
-        expose, transport=transport, http_auth=http_auth
-    )
-    if rows_unsatisfiable is not None:
-        sys.stderr.write(rows_unsatisfiable)
         sys.stderr.flush()
         return 2
     logger.info(
@@ -910,32 +912,30 @@ def _row_filter_gate_unsatisfiable(
     carries none. A principal binds only from a JWT claim mapped to it
     (``FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal``), so stdio, HTTP with auth off,
     ``shared-token`` (a token carries no identity) and ``jwt`` without that mapping
-    would deny every call. The old ``policy.rowFilters`` key, which every call
-    refuses, and a filter that cannot be applied are refused here too, with the
-    reason. Returns the message, or ``None`` when serving is fine.
+    would deny every call. A policy every call refuses is refused here too, with the
+    reason: the old ``policy.rowFilters`` key, a filter that cannot be applied, or a
+    predicate the binding's engine reads differently (checked as the driver the binding
+    resolves to reads it). Returns the message, or ``None`` when serving is fine.
     """
     from fluid_build.output_ports.mcp.auth import PRINCIPAL_ATTR
+    from fluid_build.output_ports.mcp.drivers import registered_driver_name
     from fluid_build.output_ports.mcp.query_compiler import (
         RowFilterIdentityMissing,
-        RowFilterUnavailable,
-        declares_row_filters,
         row_filter_predicate,
     )
 
     try:
-        if not declares_row_filters(expose):
+        # Parsed as the first call would be, with no principal: a policy with row
+        # filters then ends in RowFilterIdentityMissing, one without them in None.
+        if row_filter_predicate(expose, {}, dialect=registered_driver_name(expose)) is None:
             return None
-        # Every filter is parsed here, as the first call would: a malformed one stops
-        # the gateway now rather than refusing each call. No principal is passed, so
-        # a well-formed policy ends in RowFilterIdentityMissing.
-        row_filter_predicate(expose, {})
-    except RowFilterUnavailable as exc:
+    except RowFilterIdentityMissing:
+        pass
+    except Exception as exc:  # noqa: BLE001 - every other failure refuses every call
         return (
             "fluid mcp output-port: refusing to serve: this expose's row filters cannot "
             f"be applied.\n  {exc}\n"
         )
-    except RowFilterIdentityMissing:
-        pass
     mapped = (
         transport == "http"
         and http_auth is not None

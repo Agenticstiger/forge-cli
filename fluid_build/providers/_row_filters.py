@@ -104,6 +104,11 @@ def parse_predicate(where: str, at: str, *, dialect: Optional[str] = None) -> An
         ) from None
     try:
         tree = sqlglot.parse_one(f"SELECT 1 FROM t WHERE {where}", read=dialect)
+    except RecursionError:
+        raise RowFilterError(
+            f"{at}.where nests too deeply to be checked.",
+            ("Write the predicate with fewer nested parentheses.",),
+        ) from None
     except SqlglotError as exc:
         # A tokenizer error (an unterminated quote) is not a ParseError, so the base
         # class is caught: every unreadable predicate is refused the same way.
