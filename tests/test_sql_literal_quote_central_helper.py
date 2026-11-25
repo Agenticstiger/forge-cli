@@ -20,7 +20,7 @@ This module pins the sites the lane consolidated that still exist:
 1. ``providers/local/local.py::_register_one`` (the ``repr()`` bug — a
    value with a single quote must produce a *single-quote-doubled literal*,
    never a repr double-quoted identifier).
-2. ``build_runners/meltano/runner.py::_sql_literal`` — untrusted Singer
+2. ``build_runners/meltano/runner.py::_sql_literal``: untrusted Singer
    record values feeding a ``CREATE TABLE AS SELECT ... VALUES``.
 3. ``output_ports/mcp/drivers/duckdb.py::_configure_connection``.
 """
