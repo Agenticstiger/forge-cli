@@ -15,16 +15,14 @@ Two documented regressions diverge from it:
   doubling, but a maintenance divergence from the one helper (and it
   breaks under non-default Snowflake escape settings).
 
-This module pins all four sites the lane consolidated:
+This module pins the sites the lane consolidated that still exist:
 
 1. ``providers/local/local.py::_register_one`` (the ``repr()`` bug — a
    value with a single quote must produce a *single-quote-doubled literal*,
    never a repr double-quoted identifier).
-2. ``output_ports/iam_compiler.py`` — Snowflake RAP / Postgres RLS / AWS
-   Lake Formation constant-equality predicates.
-3. ``build_runners/meltano/runner.py::_sql_literal`` — untrusted Singer
+2. ``build_runners/meltano/runner.py::_sql_literal`` — untrusted Singer
    record values feeding a ``CREATE TABLE AS SELECT ... VALUES``.
-4. ``output_ports/mcp/drivers/duckdb.py::_configure_connection``.
+3. ``output_ports/mcp/drivers/duckdb.py::_configure_connection``.
 """
 
 from __future__ import annotations
@@ -163,72 +161,7 @@ class TestLocalRegisterOneLiteral:
             con.close()
 
 
-# ── Site 2: iam_compiler constant-equality predicates ────────────────────
-
-
-class TestIamCompilerLiteral:
-    @staticmethod
-    def _contract(binding, value):
-        expose = {
-            "exposeId": "demo",
-            "binding": binding,
-            "policy": {
-                "agentPolicy": {},
-                "rowFilters": [{"column": "region", "equals": value}],
-            },
-        }
-        return {
-            "fluidVersion": "0.7.4",
-            "kind": "DataProduct",
-            "id": "test.iam",
-            "exposes": [expose],
-        }
-
-    def _sql(self, target, binding, value):
-        from fluid_build.output_ports.iam_compiler import compile_agent_policy_to_iam
-
-        compiled = compile_agent_policy_to_iam(
-            contract=self._contract(binding, value), target=target
-        )
-        return compiled[0].sql
-
-    _SNOWFLAKE = {
-        "platform": "snowflake",
-        "format": "snowflake_table",
-        "location": {"database": "PROD", "schema": "T", "table": "C"},
-    }
-    _POSTGRES = {
-        "platform": "postgres",
-        "format": "postgres_table",
-        "location": {"database": "appdb", "schema": "t", "table": "c"},
-    }
-    _AWS = {
-        "platform": "aws",
-        "format": "athena_table",
-        "location": {"database": "analytics", "table": "events"},
-    }
-
-    def test_snowflake_rap_quotes_literal(self):
-        sql = self._sql("snowflake", self._SNOWFLAKE, APOS)
-        assert f"= {quote_string_literal(APOS)}" in sql
-        assert "= 'o''brien'" in sql
-
-    def test_postgres_rls_quotes_literal(self):
-        sql = self._sql("postgres", self._POSTGRES, APOS)
-        assert f"= {quote_string_literal(APOS)}" in sql
-        assert "= 'o''brien'" in sql
-
-    def test_aws_lake_formation_quotes_literal(self):
-        sql = self._sql("aws", self._AWS, APOS)
-        assert "o''brien" in sql
-
-    def test_benign_value_not_over_escaped(self):
-        sql = self._sql("snowflake", self._SNOWFLAKE, "us")
-        assert "= 'us'" in sql
-        assert "''" not in sql
-
-
-# ── Site 3: meltano _sql_literal ─────────────────────────────────────────
+# ── Site 2: meltano _sql_literal ─────────────────────────────────────────
 
 
 class TestMeltanoSqlLiteral:
@@ -270,7 +203,7 @@ class TestMeltanoSqlLiteral:
             con.close()
 
 
-# ── Site 4: duckdb MCP driver _configure_connection ──────────────────────
+# ── Site 3: duckdb MCP driver _configure_connection ──────────────────────
 
 
 class TestDuckdbDriverLiteral:

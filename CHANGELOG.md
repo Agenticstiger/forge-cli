@@ -175,6 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starting with `/`. The same-document `#key` stays refused. As with `ref_target_suffix_unknown`, a
   contract read only for another product's sake logs it at DEBUG.
 
+### Removed
+
+- **`fluid_build.output_ports.iam_compiler`.** Nothing called it, and it compiled row filters
+  from the old `policy.rowFilters` key, which no contract schema allows and the MCP output port
+  refuses. `fluid apply` writes `policy.authz.rowFilters` into BigQuery row access policies, Lake
+  Formation data cells filters and Unity Catalog row filters.
+
 ### Fixed
 
 - **The Postgres driver's query timeout applies.** It was set with `SET LOCAL statement_timeout`
