@@ -33,9 +33,9 @@ import os
 import stat
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
-from fluid_build.profiler import runner
+from fluid_build.profiler import dates, runner
 from fluid_build.profiler._stats import (
     DeclaredBlock,
     Request,
@@ -53,12 +53,18 @@ __all__ = [
     "check_flags",
     "check_sources",
     "check_tables",
+    "contract_unformed",
+    "decided_by_records",
     "filter_block",
     "not_measured",
     "read_request_file",
+    "refuse_asks",
+    "refuse_unformed",
     "relationship_asks",
+    "relationship_dates_asks",
     "relationship_filter",
     "restrict_plan",
+    "unformed",
 ]
 
 #: The most a request may hold: the reader's own bound of 8 MiB of characters, and a margin
@@ -72,6 +78,60 @@ _NOT_MEASURED_RELATIONSHIP = (
 )
 _KEY_COLUMN = "a key column of a counted relationship, which its children per parent describe"
 _NO_RECORD = "no non-null record to form it over"
+_NO_RECORD_FORMS = "no record forms it"
+_WITHHELD_ROW_COUNT = "the output check withholds it"
+_TIMESTAMP_LADDER = "its date span is not published, so it gets quantile/2 on its type's ladder"
+_TIMESTAMP_NEVER_BOTH = (
+    "its histogram is on its published span or declared range, and a column gets a histogram "
+    "or quantiles, never both on one set of bins"
+)
+
+#: Why each kind of ask that ``fluid profile`` does not form is left out. The request's
+#: reader holds every ask of its format, so none is dropped without a word: each is named
+#: with one of these reasons (:func:`unformed`), and ``--strict`` refuses a request that
+#: holds one. A public profile forms a table's date pairs and calendar and a relationship's dates and
+#: exposure (:mod:`fluid_build.profiler.dates`) and names the ones it cannot with a reason of
+#: their own; a private release forms none of them, and names each with the reasons below.
+NO_DATE_PAIRS = "a private release forms no date pair"
+NO_CALENDAR = "a private release forms no calendar"
+NO_WORKLOAD = (
+    "a workload weighs the column sets a private release may join, and this profile joins none"
+)
+NO_DATES = "a private release forms no relationship dates"
+NO_EXPOSURE = "a private release forms no exposure"
+NO_QUERIES = "fluid profile runs no consumer query"
+
+
+#: The reasons only the records can give, which ``--strict`` therefore never refuses on.
+_BY_RECORDS = frozenset(
+    {
+        _NO_RECORD,  # a column or a calendar with no non-null record
+        _NO_RECORD_FORMS,  # the statistic is declared and no record forms a group of it
+        _WITHHELD_ROW_COUNT,  # the row count's own output check
+        _TIMESTAMP_LADDER,  # whether a timestamp's date span is published is read from its records
+        _TIMESTAMP_NEVER_BOTH,  # the same: the histogram sits on a span the records gave
+        # a day bin of a date pair holds too few records to publish an outer edge
+        dates._NO_DAY_HISTOGRAM,
+        # an exposure's window is the parent start's published span
+        dates._NO_WINDOW,
+    }
+)
+
+
+def decided_by_records(reason: str) -> bool:
+    """Whether *reason* for an ask left out is one only the records can give.
+
+    ``--strict`` refuses an ask before any record is read when the contract and the request
+    show it cannot be formed; an ask whose reason this says the records decide is never
+    refused, and is named under Not measured once they are read. A reason is one of the
+    exact texts above, a value that is not a whole day or that the reader refuses, or a key
+    that names more than one parent.
+    """
+    return (
+        reason in _BY_RECORDS
+        or (reason.startswith("a value of ") and reason.endswith(("is not a whole day", "reader")))
+        or "names more than one parent" in reason
+    )
 
 
 def _refuse(event: str, message: str, next_step: str) -> ProfileError:
@@ -328,10 +388,39 @@ def relationship_filter(
                 and each.parent.columns == parent_columns
             ):
                 matched.add(position)
-                found = found or "marginalHistogram/1" in each.statistics or bool(each.linked)
+                found = (
+                    found
+                    or "marginalHistogram/1" in each.statistics
+                    or bool(each.linked)
+                    or bool(each.dates)
+                    or bool(each.exposure)
+                )
         return found
 
     return wanted, matched
+
+
+def _links_of(request: Request, relationship: "runner.Relationship") -> List[RequestRelationship]:
+    """The links the request lists for one declared relationship: the same tables and keys."""
+    return [
+        each
+        for each in request.relationships
+        if each.child.table == relationship.child
+        and each.parent.table == relationship.parent
+        and each.child.columns == relationship.child_columns
+        and each.parent.columns == relationship.parent_columns
+    ]
+
+
+def _distinct_asks(
+    links: Sequence[RequestRelationship], *picks: Callable[[RequestRelationship], Sequence[Any]]
+) -> List[List[Any]]:
+    """What each of *picks* takes from the links, each value once, in the order listed."""
+    found: List[List[Any]] = [[] for _ in picks]
+    for link in links:
+        for held, pick in zip(found, picks, strict=True):
+            held.extend(value for value in pick(link) if value not in held)
+    return found
 
 
 def relationship_asks(
@@ -344,30 +433,116 @@ def relationship_asks(
     statistics are asked grouped by and *linked* the ``(child column, parent column)`` pairs
     asked, each once, in the order listed.
     """
-    counted = False
-    group_by: List[str] = []
-    linked: List[Tuple[str, str]] = []
-    for each in request.relationships:
-        if (
-            each.child.table == relationship.child
-            and each.parent.table == relationship.parent
-            and each.child.columns == relationship.child_columns
-            and each.parent.columns == relationship.parent_columns
-        ):
-            counted = counted or "marginalHistogram/1" in each.statistics
-            group_by.extend(name for name in each.group_by if name not in group_by)
-            linked.extend(
-                pair
-                for pair in ((item.column, item.parent_column) for item in each.linked)
-                if pair not in linked
-            )
+    links = _links_of(request, relationship)
+    counted = any("marginalHistogram/1" in each.statistics for each in links)
+    group_by, linked = _distinct_asks(
+        links,
+        lambda each: each.group_by,
+        lambda each: [(item.column, item.parent_column) for item in each.linked],
+    )
     return counted, tuple(group_by), tuple(linked)
+
+
+def relationship_dates_asks(
+    request: Request, relationship: "runner.Relationship"
+) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[str, Optional[str]], ...]]:
+    """The dates and exposure the request asks of one declared relationship.
+
+    ``(dates, exposure)``: the ``(parent column, child column)`` pairs asked days apart and the
+    ``(start, end)`` parent lifetimes asked as children per active day (``end`` is ``None`` for a
+    lifetime with no end column), each once, in the order listed.
+    """
+    dates, exposure = _distinct_asks(
+        _links_of(request, relationship),
+        lambda each: [(item.parent, item.child) for item in each.dates],
+        lambda each: [(item.start, item.end) for item in each.exposure],
+    )
+    return tuple(dates), tuple(exposure)
 
 
 def _spelled(link: RequestRelationship) -> str:
     return (
         f"{link.child.table}({', '.join(link.child.columns)}) to "
         f"{link.parent.table}({', '.join(link.parent.columns)})"
+    )
+
+
+def _exposure_name(link: RequestRelationship, exposure: Any) -> str:
+    span = exposure.start if exposure.end is None else f"{exposure.start} to {exposure.end}"
+    return f"exposure {link.parent.table}.{span} of {_spelled(link)}"
+
+
+def unformed(
+    request: Request, *, workload: str = NO_WORKLOAD, private: bool = False
+) -> List[Tuple[str, str]]:
+    """Each ask of *request* of a kind ``fluid profile`` does not form, with why: ``(what, reason)``.
+
+    Decided from the request alone, before any record is read: a workload entry and a consumer
+    query, and, for a *private* release only, a table's date pairs and calendar and a
+    relationship's dates and exposure (a public profile forms those, and names one it cannot
+    with the reason it has, once it has read the records). *workload* is the reason a workload
+    entry is not used, which a private release words its own way. Never a value: only tables,
+    columns, names and reasons.
+    """
+    found: List[Tuple[str, str]] = []
+    for table in request.tables:
+        for pair in table.date_pairs if private else ():
+            found.append(
+                (f"date pair {pair.start} to {pair.end} of {table.expose_id}", NO_DATE_PAIRS)
+            )
+        for column in table.calendar if private else ():
+            found.append((f"calendar of {table.expose_id}.{column}", NO_CALENDAR))
+        for entry in table.workload:
+            found.append((f"workload {', '.join(entry.columns)} of {table.expose_id}", workload))
+    for link in request.relationships if private else ():
+        for dates in link.dates:
+            found.append(
+                (
+                    f"dates {link.parent.table}.{dates.parent} to {link.child.table}.{dates.child} "
+                    f"of {_spelled(link)}",
+                    NO_DATES,
+                )
+            )
+        for exposure in link.exposure:
+            found.append((_exposure_name(link, exposure), NO_EXPOSURE))
+    for name in request.queries:
+        found.append((f"query {name}", NO_QUERIES))
+    return found
+
+
+def refuse_unformed(request: Request, *, private: bool = False) -> None:
+    """``--strict``: refuse *request* when it asks for anything :func:`unformed` names.
+
+    A public profile forms date pairs, dates and exposure, so this leaves them: the contract's
+    reasons for one it cannot form are told, with every other, by the profile before any record
+    is read (:func:`refuse_asks`, from :func:`fluid_build.profiler.runner.profile_exposes`),
+    and the records' reasons are named under Not measured.
+
+    Raised before any record is read, so the refusal says nothing about the records. The
+    message counts the asks and its context names each, grouped by its reason.
+    """
+    found = unformed(request, private=private)
+    if found:
+        raise refuse_asks(found)
+
+
+def refuse_asks(found: Sequence[Tuple[str, str]]) -> ProfileError:
+    """The ``--strict`` refusal naming each ask of *found*, ``(what, reason)``, by reason."""
+    by_reason: Dict[str, List[str]] = {}
+    for what, reason in found:
+        by_reason.setdefault(reason, []).append(what)
+    return ProfileError(
+        "profile_request_not_formed",
+        f"--strict: the request asks for {len(found)} item{'' if len(found) == 1 else 's'} "
+        "fluid profile does not form",
+        {
+            **{reason: "; ".join(items) for reason, items in by_reason.items()},
+            "read": "nothing: no record was read",
+            "next": (
+                "leave --strict out to profile what fluid profile forms, with each of these "
+                "named under Not measured, or write the request without them"
+            ),
+        },
     )
 
 
@@ -379,7 +554,7 @@ def not_measured(
     uncovered: Mapping[str, Mapping[str, str]],
     keys: Mapping[str, FrozenSet[str]],
     matched: Set[int],
-    metric_names: FrozenSet[str],
+    metric_domains: Mapping[str, FrozenSet[str]],
 ) -> List[Tuple[str, str]]:
     """Each listed item the profile does not hold, with the reason: ``(what, reason)``.
 
@@ -391,66 +566,120 @@ def not_measured(
     """
     found: List[Tuple[str, str]] = []
     for table in request.tables:
-        document = tables.get(table.expose_id, {})
-        if table.row_count and "rowCount" not in document:
-            found.append((f"rowCount of {table.expose_id}", "the output check withholds it"))
-        for column in table.columns:
-            if column.name not in document.get("columns", {}):
-                continue  # not read at all: the report names it, with why, as not profiled
-            entry = document["columns"][column.name]
-            for name in column.metrics:
-                if name in entry.get("metrics", {}):
-                    continue
-                reason = (
-                    _NO_RECORD
-                    if name in metric_names
-                    else "fluid profile has no output check for it"
-                )
-                found.append((f"{name} of {table.expose_id}.{column.name}", reason))
-            published = {each["definition"] for each in entry.get("statistics", ())}
-            default_block = defaults.get(table.expose_id)
-            default_ids = {
-                each.identifier
-                for each in (default_block.statistics if default_block else ())
-                if each.column == column.name and each.group_by is None
-            }
-            for identifier in column.statistics:
-                if identifier in published:
-                    continue
-                reason = _why(
-                    identifier,
-                    column.domain,
-                    column.name,
-                    default_ids,
-                    uncovered.get(table.expose_id, {}),
-                    keys.get(table.expose_id, frozenset()),
-                )
-                found.append((f"{identifier} of {table.expose_id}.{column.name}", reason))
+        found.extend(_table_not_measured(table, tables, defaults, uncovered, keys, metric_domains))
     for position, link in enumerate(request.relationships):
-        if position not in matched:
-            found.append(
-                (
-                    f"children per parent of {_spelled(link)}",
-                    "the contract declares no such relationship",
-                )
-            )
-            continue
-        if link.group_by and "marginalHistogram/1" not in link.statistics:
-            found.append(
-                (
-                    f"groupBy of children per parent of {_spelled(link)}",
-                    "children per parent is counted only where marginalHistogram/1 is listed",
-                )
-            )
-        for identifier in link.statistics:
-            if identifier != "marginalHistogram/1":
-                found.append(
-                    (
-                        f"{identifier} of children per parent of {_spelled(link)}",
-                        _NOT_MEASURED_RELATIONSHIP,
-                    )
-                )
+        found.extend(_link_not_measured(link, declared=position in matched))
+    found.extend(unformed(request))
     return found
+
+
+def _table_not_measured(
+    table: RequestTable,
+    tables: Mapping[str, Mapping[str, Any]],
+    defaults: Mapping[str, Optional[DeclaredBlock]],
+    uncovered: Mapping[str, Mapping[str, str]],
+    keys: Mapping[str, FrozenSet[str]],
+    metric_domains: Mapping[str, FrozenSet[str]],
+) -> List[Tuple[str, str]]:
+    """Each item a request lists of one table that the profile does not hold, with why."""
+    found: List[Tuple[str, str]] = []
+    document = tables.get(table.expose_id, {})
+    if table.row_count and "rowCount" not in document:
+        found.append((f"rowCount of {table.expose_id}", _WITHHELD_ROW_COUNT))
+    for column in table.columns:
+        if column.name not in document.get("columns", {}):
+            continue  # not read at all: the report names it, with why, as not profiled
+        entry = document["columns"][column.name]
+        for name in column.metrics:
+            if name in entry.get("metrics", {}):
+                continue
+            reason = _metric_reason(name, column.domain, metric_domains)
+            found.append((f"{name} of {table.expose_id}.{column.name}", reason))
+        published = {each["definition"] for each in entry.get("statistics", ())}
+        default_block = defaults.get(table.expose_id)
+        default_ids = {
+            each.identifier
+            for each in (default_block.statistics if default_block else ())
+            if each.column == column.name and each.group_by is None
+        }
+        for identifier in column.statistics:
+            if identifier in published:
+                continue
+            reason = _why(
+                identifier,
+                column.domain,
+                column.name,
+                default_ids,
+                uncovered.get(table.expose_id, {}),
+                keys.get(table.expose_id, frozenset()),
+            )
+            found.append((f"{identifier} of {table.expose_id}.{column.name}", reason))
+    return found
+
+
+def _metric_reason(name: str, domain: str, metric_domains: Mapping[str, FrozenSet[str]]) -> str:
+    """Why a listed metric of a column is not in the profile."""
+    if name not in metric_domains:
+        return "fluid profile has no output check for it"
+    if domain not in metric_domains[name]:
+        return f"{name} is not formed for a {domain} column"
+    return _NO_RECORD
+
+
+def _undeclared_not_measured(link: RequestRelationship) -> List[Tuple[str, str]]:
+    """Each ask of a listed relationship the contract does not declare, with why."""
+    undeclared = "the contract declares no such relationship"
+    found: List[Tuple[str, str]] = []
+    if link.statistics or link.group_by or link.linked or not (link.dates or link.exposure):
+        found.append((f"children per parent of {_spelled(link)}", undeclared))
+    for dates in link.dates:
+        found.append(
+            (
+                f"dates {link.parent.table}.{dates.parent} to "
+                f"{link.child.table}.{dates.child} of {_spelled(link)}",
+                undeclared,
+            )
+        )
+    for exposure in link.exposure:
+        found.append((_exposure_name(link, exposure), undeclared))
+    return found
+
+
+def _link_not_measured(link: RequestRelationship, *, declared: bool) -> List[Tuple[str, str]]:
+    """Each ask of one listed relationship that the profile does not hold, with why."""
+    if not declared:
+        return _undeclared_not_measured(link)
+    found: List[Tuple[str, str]] = []
+    if link.group_by and "marginalHistogram/1" not in link.statistics:
+        found.append(
+            (
+                f"groupBy of children per parent of {_spelled(link)}",
+                "children per parent is counted only where marginalHistogram/1 is listed",
+            )
+        )
+    for identifier in link.statistics:
+        if identifier != "marginalHistogram/1":
+            found.append(
+                (
+                    f"{identifier} of children per parent of {_spelled(link)}",
+                    _NOT_MEASURED_RELATIONSHIP,
+                )
+            )
+    return found
+
+
+def _binned_why(identifier: str, domain: str, default_ids: Set[str]) -> str:
+    """Why a histogram or quantiles of a column are not in the profile: it gets the other."""
+    other = "quantile/2" if identifier == "marginalHistogram/1" else "marginalHistogram/1"
+    if other not in default_ids:
+        return "it has neither a declared range nor a type that bounds it"
+    if identifier == "marginalHistogram/1":
+        if domain == "timestamp":
+            return _TIMESTAMP_LADDER
+        return "it has no declared range, so it gets quantile/2 on its type's ladder"
+    if domain == "timestamp":
+        return _TIMESTAMP_NEVER_BOTH
+    return "a column gets a histogram or quantiles, never both on one set of bins"
 
 
 def _why(
@@ -474,17 +703,11 @@ def _why(
             )
         return _NO_RECORD
     if identifier in default_ids:
-        return "no record forms it"
+        return _NO_RECORD_FORMS
     if column in uncovered:
         return uncovered[column]
-    if identifier == "marginalHistogram/1":
-        if "quantile/2" in default_ids:
-            return "it has no declared range, so it gets quantile/2 on its type's ladder"
-        return "it has neither a declared range nor a type that bounds it"
-    if identifier == "quantile/2":
-        if "marginalHistogram/1" in default_ids:
-            return "a column gets a histogram or quantiles, never both on one set of bins"
-        return "it has neither a declared range nor a type that bounds it"
+    if identifier in ("marginalHistogram/1", "quantile/2"):
+        return _binned_why(identifier, domain, default_ids)
     if identifier == "support/1":
         if "levelHistogram/1" in default_ids:
             return "beside a level histogram it would show which withheld cells hold no record"
@@ -494,3 +717,93 @@ def _why(
     if identifier == "quantile/1":
         return "a quantile without bins is not formed, quantile/2 is"
     return "fluid profile forms no such statistic"
+
+
+def contract_unformed(
+    request: Request,
+    *,
+    plans: Mapping[str, "runner.ExposePlan"],
+    defaults: Mapping[str, Optional[DeclaredBlock]],
+    uncovered: Mapping[str, Mapping[str, str]],
+    keys: Mapping[str, FrozenSet[str]],
+    no_mean: Mapping[str, FrozenSet[str]],
+    matched: Set[int],
+    unread: Mapping[int, str],
+    metric_domains: Mapping[str, FrozenSet[str]],
+) -> List[Tuple[str, str]]:
+    """Each ask of a table or relationship the contract rules out, before any record is read.
+
+    The asks :func:`not_measured` names once the records are read, less those whose reason the
+    records decide (:func:`decided_by_records`): *plans* are the tables as the request restricts
+    them, *defaults* each table's default block before the request's filter, *uncovered* the
+    columns it leaves out with why, *keys* the key columns of the relationships the request
+    asks of, and *no_mean* each table's number columns that take no ``mean/1`` of their own
+    (:func:`fluid_build.profiler.runner._no_fixed_mean`). *matched* are the listed relationships
+    that name a declared one and *unread* those of them the profile does not read, with why. A
+    listed column the profile does not read at all has every ask named, with the reason it is
+    not profiled.
+    """
+    found: List[Tuple[str, str]] = []
+    for table in request.tables:
+        found.extend(
+            _table_unformed(
+                table,
+                plans[table.expose_id],
+                defaults.get(table.expose_id),
+                uncovered.get(table.expose_id, {}),
+                keys.get(table.expose_id, frozenset()),
+                no_mean.get(table.expose_id, frozenset()),
+                metric_domains,
+            )
+        )
+    for position, link in enumerate(request.relationships):
+        if position not in matched:
+            found.extend(_undeclared_not_measured(link))
+            continue
+        found.extend(_link_not_measured(link, declared=True))
+        if position in unread and ("marginalHistogram/1" in link.statistics or link.linked):
+            found.append((f"children per parent of {_spelled(link)}", unread[position]))
+    return found
+
+
+def _table_unformed(
+    table: RequestTable,
+    plan: "runner.ExposePlan",
+    default_block: Optional[DeclaredBlock],
+    uncovered: Mapping[str, str],
+    keys: FrozenSet[str],
+    no_mean: FrozenSet[str],
+    metric_domains: Mapping[str, FrozenSet[str]],
+) -> List[Tuple[str, str]]:
+    """Each ask of one table's columns the contract rules out, with why."""
+    found: List[Tuple[str, str]] = []
+    domains = {column.name: column.domain for column in plan.columns}
+    skipped = dict(plan.skipped)
+    default_ids_of: Dict[str, Set[str]] = {}
+    for each in default_block.statistics if default_block else ():
+        if each.group_by is None:
+            default_ids_of.setdefault(each.column, set()).add(each.identifier)
+    for column in table.columns:
+        if column.name not in domains:
+            # The profile does not read the column at all: nothing asked of it is formed.
+            why = skipped.get(column.name, "it is a column fluid profile does not read")
+            found.extend(
+                (f"{name} of {table.expose_id}.{column.name}", why)
+                for name in (*column.metrics, *column.statistics)
+            )
+            continue
+        domain = domains[column.name]
+        for name in column.metrics:
+            reason = _metric_reason(name, domain, metric_domains)
+            if not decided_by_records(reason):
+                found.append((f"{name} of {table.expose_id}.{column.name}", reason))
+        default_ids = default_ids_of.get(column.name, set())
+        for identifier in column.statistics:
+            if identifier in default_ids:
+                continue  # the profile forms it: the records say whether a group is left
+            if identifier == "mean/1" and domain == "number" and column.name not in no_mean:
+                continue  # the fixed mean is formed, unless the column has no record
+            reason = _why(identifier, domain, column.name, default_ids, uncovered, keys)
+            if not decided_by_records(reason):
+                found.append((f"{identifier} of {table.expose_id}.{column.name}", reason))
+    return found

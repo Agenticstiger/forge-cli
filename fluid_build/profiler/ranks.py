@@ -36,7 +36,7 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tupl
 from fluid_build.profiler import disclosure, sources
 from fluid_build.profiler._stats import RequestTable, StatisticsBackend
 
-__all__ = ["MOST_ROW_FLOOR", "column_pairs"]
+__all__ = ["MOST_ROW_FLOOR", "column_pairs", "contract_unformed"]
 
 #: The largest ``rowFloor`` a profile holds: a count, so at most 2^53 - 1.
 MOST_ROW_FLOOR = disclosure.MAX_COUNT
@@ -84,9 +84,7 @@ def column_pairs(
             for second in ask.columns[position + 1 :]:
                 reason = _unavailable(first, second, domains, held)
                 if reason is not None:
-                    left_out.append(
-                        (f"{ask.definition} of {table.expose_id}.{first} and {second}", reason)
-                    )
+                    left_out.append((_what(ask.definition, table.expose_id, first, second), reason))
                     continue
                 pairs = [
                     (x, y)
@@ -104,6 +102,24 @@ def column_pairs(
         for (first, second), statistics in entries.items()
     ]
     return found, left_out
+
+
+def _what(definition: str, expose_id: str, first: str, second: str) -> str:
+    return f"{definition} of {expose_id}.{first} and {second}"
+
+
+def contract_unformed(
+    table: RequestTable, domains: Mapping[str, str], held: FrozenSet[str]
+) -> List[Tuple[str, str]]:
+    """Each rank correlation of *table* the contract rules out, as :func:`column_pairs` names it."""
+    found: List[Tuple[str, str]] = []
+    for ask in table.rank_correlations:
+        for position, first in enumerate(ask.columns):
+            for second in ask.columns[position + 1 :]:
+                reason = _unavailable(first, second, domains, held)
+                if reason is not None:
+                    found.append((_what(ask.definition, table.expose_id, first, second), reason))
+    return found
 
 
 def _unavailable(

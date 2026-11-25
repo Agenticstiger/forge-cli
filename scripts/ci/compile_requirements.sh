@@ -9,16 +9,25 @@
 # --python-version, so one file serves the whole CI matrix (3.10 to 3.14) and
 # the Jenkins nodes. --generate-hashes records every wheel and sdist hash, so
 # `pip install --require-hashes -r <file>` rejects anything else.
+#
+# A requirements/<name>.overrides file, when present, is passed as --override:
+# its pins replace whatever version a dependency asks for. A lock built with
+# one must be installed with --no-deps, or pip re-checks the original pin.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 compile_one() {
   local name="$1" python_version="$2"
+  local extra=()
+  if [ -f "requirements/${name}.overrides" ]; then
+    extra+=(--override "requirements/${name}.overrides")
+  fi
   uv pip compile "requirements/${name}.in" \
     --universal \
     --generate-hashes \
     --python-version "${python_version}" \
+    ${extra[@]+"${extra[@]}"} \
     --output-file "requirements/${name}.txt"
 }
 

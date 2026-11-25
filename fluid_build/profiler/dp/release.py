@@ -132,6 +132,12 @@ RHO_WARN = Fraction(1)
 DELTA_TEXT = "1e-6"
 
 _NOT_NOISY = "format 1-2-0 holds no noisy form of it"
+#: Why a request's workload entry is not used: a release chooses the column pairs it joins by
+#: weighing them with the contract's dimensions (:func:`_pair_weights`).
+WORKLOAD_UNUSED = (
+    "the release weighs the column pairs it may join by the contract's dimensions, not by a "
+    "workload"
+)
 _NOTHING_READ = "nothing: no record was read"
 
 
@@ -827,6 +833,9 @@ def _not_released(
         )
     for fact in request.facts:
         found.append((f"fact {fact.name}", _NOT_NOISY))
+    from fluid_build.profiler import request as asked_for
+
+    found.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED, private=True))
     return tuple(found)
 
 

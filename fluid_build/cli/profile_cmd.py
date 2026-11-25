@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -158,7 +159,17 @@ A request of format 1-2-0 may also ask for more, each exact and under the same c
     that reaches no parent is in no group. Each listed item the profile does not answer is named in the report
 with its reason (for example a histogram over a number with no declared range,
 quantiles beside a histogram on one set of bins, a mean of a timestamp, a key
-column of a counted relationship). A listed fact, a rule of the contract's
+column of a counted relationship). A workload and the consumers' queries are not
+formed: each is named under Not measured, and with --strict such a request is refused
+before any record is read. A table's calendar is formed, but not by a private release,
+which names it. A table's date pairs (DATE columns) and
+a relationship's dates and exposure are formed (format 1-3-0); a pair's days are
+counted on a fixed ladder of whole days, trimmed to the bins from the first holding a
+record to the last, and are published only when each of those two bins holds at
+least minimumCell records. One that cannot be formed (a pair with a timestamp
+column, an exposure with no window, days with a small end bin) is named under
+Not measured with its reason, and --strict refuses, before any record is read, one
+the contract rules out (a pair with a timestamp column). A listed fact, a rule of the contract's
 invariants, is measured on the table's records as the share of the rows it covers
 that satisfy it: two counts (the rows that do not, the rows that do) that pass the
 checks as cells do, and either withheld withholds both (format 1-2-0, the
@@ -311,6 +322,33 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
             "records alone and states no rowFloor"
         ),
     )
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "refuse a --request before any record is read when the request or the contract "
+            "alone shows an ask cannot be formed: a workload, a consumer query, a metric, "
+            "statistic, rank correlation, grouping, date pair, calendar, relationship date or "
+            "exposure over a column the profile does not read, a key or a column whose type "
+            "rules it out, a fact whose rule it cannot measure, more entries than a profile "
+            "holds, any ask of a relationship the contract does not declare or the profile does "
+            "not read; with --privacy-unit, instead the kinds a private release does not form "
+            "(a workload, a consumer query, date pairs, a calendar, relationship dates, "
+            "exposure). An ask only the records leave unanswered is named under Not measured, "
+            "as without --strict"
+        ),
+    )
+    p.add_argument(
+        "--timings",
+        action="store_true",
+        help=(
+            "after the report, print how long each table took to read, measure and check, and "
+            "how long the document took to write, in seconds; the document is the same bytes "
+            "without it. check: the output checks across a column's statistics "
+            "(counts at edges); a check made metric by metric is counted as measure. Refused "
+            "with a private release, whose output must not follow the row count"
+        ),
+    )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
     from fluid_build.cli import _profile_release
 
@@ -356,10 +394,50 @@ def _refusal(event: str, detail: str, context: Dict[str, str]) -> Any:
     )
 
 
+def _refuse_before_reading(args: argparse.Namespace) -> None:
+    """Refuse the flag combinations the profile turns away before anything else is looked at."""
+    if getattr(args, "strict", False) and getattr(args, "request", None) is None:
+        raise _refusal(
+            "profile_strict_needs_request",
+            "--strict refuses a request that asks for what fluid profile does not form, and "
+            "--request names none",
+            {
+                "read": "nothing: no record was read",
+                "next": "give --request, or leave --strict out",
+            },
+        )
+    _refuse_timings_with_release(args)
+
+
+def _read_request(
+    args: argparse.Namespace, request_file: Any, contract_path: Any, backend: Any
+) -> Tuple[Any, Optional[bool]]:
+    """Read ``--request`` and check it against the contract: the request and whether the
+    contract file's digest is the one it names (``None`` with no request)."""
+    if request_file is None:
+        return None, None
+    from fluid_build.cli.security import validate_cli_path
+    from fluid_build.profiler import _stats, runner
+    from fluid_build.profiler import request as asked_for
+
+    try:
+        asked_for.check_flags(bundle=args.bundle, env=args.env, exposes=args.expose_id)
+        asked = asked_for.read_request_file(
+            validate_cli_path(request_file, mode="read", file_type="request"), backend
+        )
+        digest_matched = asked_for.check_contract_file(contract_path, asked, backend)
+        if getattr(args, "strict", False):
+            asked_for.refuse_unformed(asked)
+    except (runner.ProfileError, _stats.StatisticsUnavailable) as exc:
+        raise _as_refusal(exc, args.source) from None
+    return asked, digest_matched
+
+
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Profile the expose and write the document; return the exit code."""
     from fluid_build.cli import _profile_release
 
+    _refuse_before_reading(args)
     if _profile_release.wanted(args):
         return _profile_release.run(args, logger)
     from fluid_build._console import cprint_literal
@@ -398,17 +476,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
     bundle_dir = _bundle_dir(args.bundle)
     request_file = getattr(args, "request", None)
-    asked = None
-    digest_matched: Optional[bool] = None
-    if request_file is not None:
-        try:
-            asked_for.check_flags(bundle=args.bundle, env=args.env, exposes=args.expose_id)
-            asked = asked_for.read_request_file(
-                validate_cli_path(request_file, mode="read", file_type="request"), backend
-            )
-            digest_matched = asked_for.check_contract_file(contract_path, asked, backend)
-        except (runner.ProfileError, _stats.StatisticsUnavailable) as exc:
-            raise _as_refusal(exc, args.source) from None
+    asked, digest_matched = _read_request(args, request_file, contract_path, backend)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     try:
         if asked is not None:
@@ -426,6 +494,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             if bundle_dir
             else None
         )
+        timings = runner.StageTimings() if getattr(args, "timings", False) else None
+        started = time.perf_counter()
         result = runner.profile_exposes(
             contract,
             exposes,
@@ -435,8 +505,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             bundles=blocks,
             request=asked,
             row_floor=getattr(args, "row_floor", None),
+            timings=timings,
+            strict=getattr(args, "strict", False),
         )
+        write_started = time.perf_counter()
         _write(out, result.canonical)
+        _stamp_timings(timings, started, write_started)
     except (
         runner.ProfileError,
         bundle.BundleError,
@@ -455,6 +529,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         answered_block=blocks is not None,
         request=None if asked is None else (Path(str(request_file)).name, digest_matched),
     )
+    _report_timings(cprint_literal, result, timings)
     return 0
 
 
@@ -937,6 +1012,8 @@ def _report(
     for child, name, reason in result.relationships_left_out:
         say(f"No children per parent for exposes[{child}] {name!r}: {reason}.", soft_wrap=True)
     _report_rank_correlations(say, result, several)
+    _report_dates(say, result)
+    _report_structure(say, result)
     for fact in result.facts:
         say(
             (
@@ -955,6 +1032,152 @@ def _report(
     say("Pin it in the FLUX Simulation:")
     # One line, never wrapped: it is copied as it stands.
     say(f"  profile: {{digest: {result.digest}}}", soft_wrap=True)
+
+
+def _refuse_timings_with_release(args: argparse.Namespace) -> None:
+    """Refuse ``--timings`` with a private release, whose output must not follow the row count."""
+    from fluid_build.cli import _profile_release
+
+    if getattr(args, "timings", False) and _profile_release.wanted(args):
+        raise _refusal(
+            "profile_timings_with_release",
+            "a private release prints nothing that depends on the records outside the noise, "
+            "and timings follow the row count",
+            {
+                "read": "nothing: no record was read",
+                "next": "leave --timings out of a private release",
+            },
+        )
+
+
+def _stamp_timings(timings: Any, started: float, write_started: float) -> None:
+    """Close the document's timings: the write, and the whole run. Nothing without ``--timings``."""
+    if timings is not None:
+        now = time.perf_counter()
+        timings.write += now - write_started
+        timings.total = now - started
+
+
+def _report_timings(say: Any, result: Any, timings: Any) -> None:
+    """One line per table, in profile order, then the document's: seconds, two decimals.
+
+    Nothing without ``--timings`` (*timings* is ``None``).
+    """
+    if timings is None:
+        return
+    for table in result.tables:
+        name = table.plan.expose_id
+        say(
+            f"Timings for {name}: read {timings.read.get(name, 0.0):.2f} s, "
+            f"measure {timings.measure.get(name, 0.0):.2f} s, "
+            f"check {timings.check.get(name, 0.0):.2f} s.",
+            soft_wrap=True,
+        )
+    say(
+        f"Timings for the document: write {timings.write:.2f} s; total {timings.total:.2f} s.",
+        soft_wrap=True,
+    )
+
+
+def _published_pairs(entries: Any) -> Tuple[int, int]:
+    """How many pairs are published whole and how many only in part.
+
+    A pair is whole when it holds a day histogram and every group of that histogram and of
+    its order is published with none of its cells withheld; in part when some group is and
+    some is not. A pair none of whose groups is published is neither.
+    """
+    whole = part = 0
+    for each in entries:
+        held = [*each["statistics"], *([each["order"]] if each.get("order") else [])]
+        shown, total = _published_groups(held)
+        if each["statistics"] and total and shown == total:
+            whole += 1
+        elif shown:
+            part += 1
+    return whole, part
+
+
+def _pairs_line(entries: Any) -> str:
+    """``N of M published``, naming the pairs published in part when there are any."""
+    whole, part = _published_pairs(entries)
+    if part:
+        return f"{whole} of {len(entries)} published whole, {part} in part."
+    return f"{whole} of {len(entries)} published."
+
+
+def _published_groups(statistics: Any) -> Tuple[int, int]:
+    """How many of the groups of these statistics are published, and how many there are.
+
+    A group counts as published only when it is and none of its cells is withheld.
+    """
+    groups = [group for each in statistics for group in each["groups"]]
+    whole = [
+        each
+        for each in groups
+        if each["status"] == "F" and all(status == "F" for status in each.get("cellStatus", ()))
+    ]
+    return len(whole), len(groups)
+
+
+def _report_structure(say: Any, result: Any) -> None:
+    """One line for each table's calendar, periods and per-entity statistics: how many published.
+
+    Names tables and how many of the written groups were published, never a count of records.
+    """
+    for expose_id, table in result.document["tables"].items():
+        where = f"exposes[{expose_id}]: "
+        calendar = [
+            each[key] for each in table.get("calendar", ()) for key in each if key != "column"
+        ]
+        if calendar:
+            shown, total = _published_groups(calendar)
+            say(f"{where}Calendar: {shown} of {total} histograms published.", soft_wrap=True)
+        periods = [each for entry in table.get("periods", ()) for each in entry["statistics"]]
+        if periods:
+            shown, total = _published_groups(periods)
+            say(f"{where}Periods: {shown} of {total} monthly groups published.", soft_wrap=True)
+        per = [
+            each
+            for column in table["columns"].values()
+            for each in column.get("statistics", ())
+            if "per" in each
+        ]
+        if per:
+            shown, total = _published_groups(per)
+            say(f"{where}Per-entity statistics: {shown} of {total} published.", soft_wrap=True)
+
+
+def _report_dates(say: Any, result: Any) -> None:
+    """The lines about a profile's date pairs, relationship dates, structural classes and exposure.
+
+    Each names tables, columns and how many entries were published, never a count of records.
+    """
+    for expose_id, table in result.document["tables"].items():
+        pairs = table.get("datePairs", ())
+        if pairs:
+            say(f"exposes[{expose_id}]: Date pairs: {_pairs_line(pairs)}")
+    for entry in result.document.get("relationships", ()):
+        where = f"exposes[{entry['parent']['table']}] in exposes[{entry['child']['table']}]"
+        dates = entry.get("dates", ())
+        if dates:
+            say(
+                f"Dates of {where}: {_pairs_line(dates)}",
+                soft_wrap=True,
+            )
+        if "structural" in entry:
+            say(
+                f"Structural classes of {where}: {', '.join(entry['structural'])}, "
+                "stated by the contract.",
+                soft_wrap=True,
+            )
+        exposure = entry.get("exposure", ())
+        if exposure:
+            published = sum(
+                1
+                for each in exposure
+                if each["children"]["status"] == "F" and each["activeDays"]["status"] == "F"
+            )
+            say(f"Exposure of {where}: {published} of {len(exposure)} published.", soft_wrap=True)
 
 
 def _report_rank_correlations(say: Any, result: Any, several: bool) -> None:
@@ -1008,5 +1231,10 @@ def _report_table(say: Any, table: Any, prefix: str, grid: str) -> None:
     for name, reason in table.uncovered:
         say(
             f"{prefix}Left out of the default statistics: column {name!r}: {reason}.",
+            soft_wrap=True,
+        )
+    for name, reason in table.no_span:
+        say(
+            f"{prefix}{table.plan.expose_id}.{name}: no date span: {reason}.",
             soft_wrap=True,
         )

@@ -589,6 +589,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             validate_cli_path(args.request, mode="read", file_type="request"), backend
         )
         digest_matched = asked_for.check_contract_file(contract_path, asked, backend)
+        if getattr(args, "strict", False):
+            asked_for.refuse_unformed(asked, private=True)
         if args.fractional_bits is not None and args.fractional_bits != asked.fractional_bits:
             raise runner.ProfileError(
                 "profile_request_fractional_bits_conflict",
