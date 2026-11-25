@@ -118,3 +118,26 @@ def write_customer_csv(path: Path) -> Path:
         for row in rows:
             writer.writerow(row)
     return path
+
+
+def duckdb_csv_session(csv_path: Path, expose: Dict[str, Any], *, table: str) -> Any:
+    """A ``SessionState`` stand-in over a DuckDB driver that reads ``csv_path`` as
+    ``table``: what the tool handlers need, with ``expose`` bound to the file."""
+    from types import SimpleNamespace
+
+    from fluid_build.output_ports.mcp.drivers import build_driver
+
+    expose = dict(expose)
+    expose["binding"] = {
+        "platform": "local",
+        "format": "csv",
+        "location": {"path": str(csv_path), "table": table},
+    }
+    driver = build_driver(expose=expose, contract={"exposes": [expose]})
+    return SimpleNamespace(
+        expose=expose,
+        caller_attributes={},
+        policy=SimpleNamespace(max_sample_rows=100),
+        query_timeout_seconds=None,
+        get_driver=lambda: driver,
+    )

@@ -20,7 +20,6 @@ Each refused statement below is one the engine could fail on for a withheld row'
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -368,7 +367,7 @@ def test_the_qualifier_refusal_names_the_spellings_it_accepts():
 @pytest.fixture()
 def state_for(tmp_path):
     """A ``SessionState`` stand-in over a DuckDB driver reading a typed CSV."""
-    from fluid_build.output_ports.mcp.drivers import build_driver
+    from ._fixtures import duckdb_csv_session
 
     csv = tmp_path / "customers.csv"
     csv.write_text(
@@ -379,23 +378,7 @@ def state_for(tmp_path):
         encoding="utf-8",
     )
 
-    def _make(schema: List[Tuple[str, Optional[str]]]) -> SimpleNamespace:
-        expose = _expose(schema)
-        expose["binding"] = {
-            "platform": "local",
-            "format": "csv",
-            "location": {"path": str(csv), "table": "customers"},
-        }
-        driver = build_driver(expose=expose, contract={"exposes": [expose]})
-        return SimpleNamespace(
-            expose=expose,
-            caller_attributes={},
-            policy=SimpleNamespace(max_sample_rows=100),
-            query_timeout_seconds=None,
-            get_driver=lambda: driver,
-        )
-
-    return _make
+    return lambda schema: duckdb_csv_session(csv, _expose(schema), table="customers")
 
 
 _CSV_SCHEMA: List[Tuple[str, Optional[str]]] = [

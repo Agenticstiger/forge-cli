@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import copy
 import logging
-from types import SimpleNamespace
 from typing import Any, Callable, Dict
 
 import pytest
@@ -139,24 +138,12 @@ def test_every_row_filter_reader_refuses_an_unresolved_pointer(expose):
 def test_the_sample_and_query_sql_tools_refuse_an_unresolved_pointer(tmp_path):
     pytest.importorskip("duckdb")
     from fluid_build.output_ports.mcp._handlers import tool_query_sql, tool_sample
-    from fluid_build.output_ports.mcp.drivers import build_driver
+
+    from ._fixtures import duckdb_csv_session
 
     csv = tmp_path / "orders.csv"
     csv.write_text("id,region\n1,EU\n2,US\n", encoding="utf-8")
-    expose = _expose(policy={"$ref": _POINTER})
-    expose["binding"] = {
-        "platform": "local",
-        "format": "csv",
-        "location": {"path": str(csv), "table": "orders"},
-    }
-    driver = build_driver(expose=expose, contract={"exposes": [expose]})
-    state = SimpleNamespace(
-        expose=expose,
-        caller_attributes={},
-        policy=SimpleNamespace(max_sample_rows=100),
-        query_timeout_seconds=None,
-        get_driver=lambda: driver,
-    )
+    state = duckdb_csv_session(csv, _expose(policy={"$ref": _POINTER}), table="orders")
     with pytest.raises(RowFilterUnavailable, match=r"unresolved \$ref"):
         tool_sample(state, {"limit": 10}, caller_attributes={"principal": EU})
     with pytest.raises(RowFilterUnavailable, match=r"unresolved \$ref"):

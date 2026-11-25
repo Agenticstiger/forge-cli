@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import logging
 import re
-from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
 import pytest
@@ -119,30 +118,13 @@ def con():
 @pytest.fixture()
 def state_for(tmp_path):
     """A ``SessionState`` stand-in over a DuckDB driver reading a CSV of ``_ROWS``."""
-    from fluid_build.output_ports.mcp.drivers import build_driver
+    from ._fixtures import duckdb_csv_session
 
     csv = tmp_path / "customers.csv"
     csv.write_text(
         ",".join(_COLUMNS) + "\n" + "".join(",".join(map(str, row)) + "\n" for row in _ROWS)
     )
-
-    def _make(expose: Dict[str, Any]) -> SimpleNamespace:
-        expose = dict(expose)
-        expose["binding"] = {
-            "platform": "local",
-            "format": "csv",
-            "location": {"path": str(csv), "table": "customers"},
-        }
-        driver = build_driver(expose=expose, contract={"exposes": [expose]})
-        return SimpleNamespace(
-            expose=expose,
-            caller_attributes={},
-            policy=SimpleNamespace(max_sample_rows=100),
-            query_timeout_seconds=None,
-            get_driver=lambda: driver,
-        )
-
-    return _make
+    return lambda expose: duckdb_csv_session(csv, expose, table="customers")
 
 
 def _refusal(call: Callable[[], Any]) -> str:
