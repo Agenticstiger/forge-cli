@@ -89,6 +89,7 @@ POSTGRES_REFUSED_FUNCTIONS = frozenset(
         "currval",
         "cursor_to_xml",
         "cursor_to_xmlschema",
+        "lastval",
         "lo_close",
         "lo_creat",
         "lo_create",

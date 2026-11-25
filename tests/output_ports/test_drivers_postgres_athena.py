@@ -318,8 +318,13 @@ def _connecting(monkeypatch, role_row, *, filtered):
 
 @pytest.mark.parametrize(
     ("role_row", "named"),
-    [((True, []), "superuser"), ((False, ["pg_read_server_files"]), "pg_read_server_files")],
-    ids=["superuser", "reads-server-files"],
+    [
+        ((True, []), "superuser"),
+        ((False, ["pg_read_server_files"]), "pg_read_server_files"),
+        ((False, ["pg_read_all_data"]), "pg_read_all_data"),
+        ((False, ["pg_read_all_settings", "pg_read_all_stats"]), "pg_read_all_settings"),
+    ],
+    ids=["superuser", "reads-server-files", "reads-all-data", "reads-all-settings-and-stats"],
 )
 def test_postgres_refuses_to_serve_row_filters_as_a_privileged_role(monkeypatch, role_row, named):
     """Such a role can read a table's files and the write-ahead log, past any filter."""
@@ -330,6 +335,31 @@ def test_postgres_refuses_to_serve_row_filters_as_a_privileged_role(monkeypatch,
         driver._get_connection()
     connection.close.assert_called_once()
     assert driver._connection is None
+
+
+def test_the_privileged_roles_are_pinned():
+    """A role dropped from this tuple would serve row filters it can read past."""
+    from fluid_build.output_ports.mcp.drivers.postgres import PRIVILEGED_ROLES
+
+    assert PRIVILEGED_ROLES == (
+        "pg_execute_server_program",
+        "pg_monitor",
+        "pg_read_all_data",
+        "pg_read_all_settings",
+        "pg_read_all_stats",
+        "pg_read_server_files",
+        "pg_write_server_files",
+    )
+
+
+def test_the_role_query_names_its_catalog_objects_by_schema():
+    """No schema on the search path can put its own pg_roles or pg_has_role first."""
+    import re
+
+    from fluid_build.output_ports.mcp.drivers.postgres import _PRIVILEGE_QUERY
+
+    assert re.findall(r"[\w.]*pg_roles\b", _PRIVILEGE_QUERY) == ["pg_catalog.pg_roles"] * 2
+    assert re.findall(r"[\w.]*pg_has_role\b", _PRIVILEGE_QUERY) == ["pg_catalog.pg_has_role"]
 
 
 def test_postgres_serves_row_filters_as_a_role_that_reads_only_tables(monkeypatch):

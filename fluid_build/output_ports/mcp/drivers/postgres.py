@@ -62,20 +62,27 @@ _LOG = logging.getLogger(__name__)
 _PARAM_REWRITE = re.compile(r":p_(\d+)\b")
 
 #: The predefined Postgres roles that reach past the tables an expose names: they read or
-#: write server files, run programs on the server, or read every session's activity. A
-#: superuser can do all of it. Their functions read a table's own files and the
-#: write-ahead log, so the rows a row filter withholds.
+#: write server files, run programs on the server, read every table, or read every
+#: session's activity, statistics and settings. A superuser can do all of it. Their
+#: functions and views read a table's own files, the write-ahead log and other tables,
+#: so the rows a row filter withholds. Membership counts directly or through another role.
 PRIVILEGED_ROLES = (
     "pg_execute_server_program",
     "pg_monitor",
+    "pg_read_all_data",
+    "pg_read_all_settings",
+    "pg_read_all_stats",
     "pg_read_server_files",
     "pg_write_server_files",
 )
+# Every catalog name is qualified with pg_catalog, so no schema on the search path can put
+# its own pg_roles or pg_has_role in front of them.
 _PRIVILEGE_QUERY = (
-    "SELECT r.rolsuper, ARRAY(SELECT p.rolname::text FROM pg_roles AS p WHERE p.rolname IN ("
+    "SELECT r.rolsuper, ARRAY(SELECT p.rolname::text FROM pg_catalog.pg_roles AS p "
+    "WHERE p.rolname IN ("
     + ", ".join(f"'{role}'" for role in PRIVILEGED_ROLES)
-    + ") AND pg_has_role(current_user, p.oid, 'MEMBER') ORDER BY p.rolname) "
-    "FROM pg_roles AS r WHERE r.rolname = current_user"
+    + ") AND pg_catalog.pg_has_role(current_user, p.oid, 'MEMBER') ORDER BY p.rolname) "
+    "FROM pg_catalog.pg_roles AS r WHERE r.rolname = current_user"
 )
 
 

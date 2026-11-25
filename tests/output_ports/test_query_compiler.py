@@ -1490,6 +1490,7 @@ def test_a_name_or_star_against_the_keyword_still_compiles(sql):
         pytest.param("SELECT pg_terminate_backend(1)", id="other-session"),
         pytest.param("SELECT pg_try_advisory_lock(1)", id="try-advisory-lock"),
         pytest.param("SELECT currval('customers_id_seq')", id="current-sequence"),
+        pytest.param("SELECT lastval()", id="last-sequence"),
         pytest.param("SELECT pg_notify('c', 'm')", id="notify"),
         pytest.param("SELECT pg_switch_wal()", id="switch-wal"),
         pytest.param("SELECT pg_drop_replication_slot('s')", id="replication-slot"),
