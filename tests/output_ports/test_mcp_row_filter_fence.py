@@ -172,6 +172,20 @@ def test_predicates_and_boolean_columns_are_conditions(where, dialect):
         pytest.param("SELECT id FROM customers WHERE created > '2024-01-01'", id="date-string"),
         pytest.param("SELECT id FROM customers WHERE amount = id + 0", id="arithmetic"),
         pytest.param("SELECT id FROM customers WHERE -amount > 0", id="negated-column"),
+        pytest.param("SELECT id FROM customers WHERE loose = loose", id="two-untyped-columns"),
+        pytest.param(
+            "SELECT a.id FROM customers AS a JOIN (VALUES (5, 6)) AS v(x, y) ON v.x = v.y",
+            id="two-values-columns",
+        ),
+        pytest.param(
+            "SELECT a.id FROM customers AS a JOIN (VALUES (5, 6)) AS v(x, y) ON v.x IN (v.y)",
+            id="values-columns-in",
+        ),
+        pytest.param(
+            "SELECT a.id FROM customers AS a JOIN (VALUES (5, 6)) AS v(x, y) "
+            "ON v.x BETWEEN v.y AND v.y",
+            id="values-columns-between",
+        ),
     ],
 )
 @pytest.mark.parametrize("dialect", _ENGINES)
@@ -420,6 +434,9 @@ _HELD = {
     "created": "DATE",
     "seen": "TIMESTAMP",
     "stamped": "TIMESTAMP WITH TIME ZONE",
+    # Types the gateway does not type: their columns have no type, declared or not.
+    "flags": "BIT",
+    "nanos": "TIMESTAMP_NS",
 }
 # The same, as Postgres's pg_catalog.format_type writes them.
 _PG_HELD = {
@@ -529,6 +546,14 @@ def test_comparisons_the_type_rules_allow(where, held, dialect):
         pytest.param("big BETWEEN 0.5 AND 1", *_DUCK, "38 digits", id="between"),
         pytest.param("(big, id) IN ((0.5, 1))", *_DUCK, "38 digits", id="tuple"),
         pytest.param("big = ANY(ARRAY[1, 0.5])", *_DUCK, "38 digits", id="any-array"),
+        # Two values neither of which has a type the gateway knows.
+        pytest.param("flags = nanos", *_DUCK, "cannot type", id="two-untyped-columns"),
+        pytest.param("flags = flags", *_DUCK, "cannot type", id="an-untyped-column-twice"),
+        pytest.param("flags IN (nanos)", *_DUCK, "cannot type", id="untyped-in"),
+        pytest.param("flags BETWEEN nanos AND nanos", *_DUCK, "cannot type", id="untyped-between"),
+        pytest.param(
+            "coalesce(flags, nanos) IS NULL", *_DUCK, "cannot type", id="untyped-coalesce"
+        ),
         pytest.param(f"id = {'1' * 38}.5", *_DUCK, "38 digits", id="a-39-digit-literal"),
         # An exact number of unknown precision: Postgres's unconstrained numeric.
         pytest.param("total > 5", *_PG, "does not know", id="unconstrained-numeric"),

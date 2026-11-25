@@ -7,24 +7,23 @@ The unit tests stub the rows the check reads. Here ``_PRIVILEGE_QUERY`` runs on 
 for one role per privileged membership, held directly and through another role, and for
 a plain role, and the driver connects as such roles to an expose with row filters. It
 skips unless ``FLUID_TEST_POSTGRES_DSN`` names a server whose user may create roles and
-grant the predefined ones (the CI job that starts one sets it). Docker is CI-only for
-forge.
+grant the predefined ones. The CI job that starts one sets it, and sets
+``FLUID_TEST_POSTGRES_REQUIRED=1`` so that a missing server fails the job instead
+(``_live_postgres.py``). Docker is CI-only for forge.
 """
 
 from __future__ import annotations
 
-import os
 import secrets
 from typing import Any, Callable, Iterator, List, Tuple
 
 import pytest
 
+from ._live_postgres import live_postgres
+
 pytestmark = pytest.mark.integration
 
-_DSN = os.environ.get("FLUID_TEST_POSTGRES_DSN", "")
-if not _DSN:
-    pytest.skip("FLUID_TEST_POSTGRES_DSN is unset", allow_module_level=True)
-psycopg = pytest.importorskip("psycopg")
+_DSN, psycopg = live_postgres()
 
 from psycopg import sql as pgsql  # noqa: E402
 from psycopg.conninfo import conninfo_to_dict  # noqa: E402

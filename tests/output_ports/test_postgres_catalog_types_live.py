@@ -8,23 +8,23 @@ resolves to: a table, a view or a materialized view (``information_schema.column
 lists no materialized view), with an enum and ``citext`` read as text and a domain as
 its base type. The unit tests check the statement; here it runs on Postgres. It skips
 unless ``FLUID_TEST_POSTGRES_DSN`` names a server whose user may create a schema, types
-and tables (the CI job that starts one sets it). Docker is CI-only for forge.
+and tables. The CI job that starts one sets it, and sets ``FLUID_TEST_POSTGRES_REQUIRED=1``
+so that a missing server fails the job instead (``_live_postgres.py``). Docker is CI-only
+for forge.
 """
 
 from __future__ import annotations
 
-import os
 import secrets
 from typing import Any, Dict, Iterator, Optional, Tuple
 
 import pytest
 
+from ._live_postgres import live_postgres
+
 pytestmark = pytest.mark.integration
 
-_DSN = os.environ.get("FLUID_TEST_POSTGRES_DSN", "")
-if not _DSN:
-    pytest.skip("FLUID_TEST_POSTGRES_DSN is unset", allow_module_level=True)
-psycopg = pytest.importorskip("psycopg")
+_DSN, psycopg = live_postgres()
 
 from psycopg import sql as pgsql  # noqa: E402
 from psycopg.conninfo import conninfo_to_dict  # noqa: E402

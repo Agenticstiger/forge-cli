@@ -777,7 +777,9 @@ jobs:
   # that types a filtered caller's comparisons over a table, a view and a
   # materialized view with enum, domain and citext columns. Free and
   # secret-less like the jobs above. Docker is CI-only for forge: the tests
-  # skip wherever FLUID_TEST_POSTGRES_DSN is unset.
+  # skip wherever FLUID_TEST_POSTGRES_DSN is unset, except in this job, which
+  # sets FLUID_TEST_POSTGRES_REQUIRED so a missing server fails it.
+  # tests/test_ci_postgres_live.py pins the job.
   # ──────────────────────────────────────────────────────────────
   postgres-role-check:
     name: Postgres role check
@@ -808,6 +810,8 @@ jobs:
       - name: Run the role check and the catalog read against Postgres 17
         env:
           FLUID_TEST_POSTGRES_DSN: postgresql://postgres:fluid-ci-only@127.0.0.1:55433/postgres  # pragma: allowlist secret
+          # A live module fails instead of skipping here (tests/output_ports/_live_postgres.py).
+          FLUID_TEST_POSTGRES_REQUIRED: "1"
         run: >-
           python -m pytest -v -p no:randomly -m integration
           tests/output_ports/test_postgres_role_check_live.py
