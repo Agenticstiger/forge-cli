@@ -913,3 +913,18 @@ def test_the_postgres_projection_is_a_separate_step(tool):
 
     assert "WHERE ((_fluid_rows.region = 'EU')) OFFSET 0) AS " in compiled("postgres")
     assert "OFFSET 0" not in compiled("duckdb")
+
+
+def test_the_resources_do_not_serve_the_access_policy():
+    from fluid_build.output_ports.mcp.server import _read_resource_payload
+
+    expose = _expose(restricted=["secret"])
+    contract = {"id": "c", "exposes": [expose]}
+    for uri in (
+        "forge://output-port/customers/expose.json",
+        "forge://output-port/customers/contract.yaml",
+    ):
+        body = _read_resource_payload(uri=uri, contract=contract, expose=expose)
+        assert "segment" in body  # the rest of the expose is still served
+        for policy_text in ("rowFilters", "region = 'EU'", EU, EVERYONE, "columnRestrictions"):
+            assert policy_text not in body, (uri, policy_text)

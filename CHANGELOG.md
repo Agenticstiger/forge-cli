@@ -380,6 +380,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter removes, so a condition that fails on such a row (a cast, a division by zero) could tell
   the caller the row exists. `query` and `query_sql` now end the filtered projection with
   `OFFSET 0` on Postgres, which keeps it separate.
+- **The MCP output port's resources no longer serve an expose's access policy.** The `expose.json`
+  and `contract.yaml` resources returned `policy.authz` (readers, writers, column restrictions and
+  row-filter predicates), which the `describe` tool and the statement shown to the caller leave
+  out. Both now omit `policy.authz` and the old `policy.rowFilters`.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is

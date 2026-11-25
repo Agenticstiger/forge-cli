@@ -1356,15 +1356,29 @@ def _render_resources(
     return resources
 
 
+def _without_access_policy(expose: Any) -> Any:
+    """``expose`` without ``policy.authz`` (readers, writers, column restrictions, row
+    filters) or the old ``policy.rowFilters``: who may read which rows is policy the
+    gateway enforces on its callers, and the ``describe`` tool does not return it either."""
+    if not isinstance(expose, Mapping) or not isinstance(expose.get("policy"), Mapping):
+        return expose
+    policy = {k: v for k, v in expose["policy"].items() if k not in ("authz", "rowFilters")}
+    return {**expose, "policy": policy}
+
+
 def _read_resource_payload(
     *, uri: str, contract: Mapping[str, Any], expose: Mapping[str, Any]
 ) -> str:
     """Resolve a resource URI to its body. Unknown URIs raise so the
-    SDK turns them into a JSON-RPC error."""
+    SDK turns them into a JSON-RPC error. Neither body carries an expose's
+    access policy (:func:`_without_access_policy`)."""
     if uri.endswith("/contract.yaml"):
-        return yaml.safe_dump(_jsonable(dict(contract)), sort_keys=False)
+        shown = dict(contract)
+        if isinstance(shown.get("exposes"), list):
+            shown["exposes"] = [_without_access_policy(item) for item in shown["exposes"]]
+        return yaml.safe_dump(_jsonable(shown), sort_keys=False)
     if uri.endswith("/expose.json"):
-        return json.dumps(_jsonable(dict(expose)), indent=2, default=str)
+        return json.dumps(_jsonable(_without_access_policy(expose)), indent=2, default=str)
     if uri.endswith("/contract-path"):
         # Best-effort — the server may not have a contract_path bound.
         return uri
