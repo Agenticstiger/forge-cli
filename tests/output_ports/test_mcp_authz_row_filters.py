@@ -118,13 +118,9 @@ def con():
 @pytest.fixture()
 def state_for(tmp_path):
     """A ``SessionState`` stand-in over a DuckDB driver reading a CSV of ``_ROWS``."""
-    from ._fixtures import duckdb_csv_session
+    from ._fixtures import csv_session_factory
 
-    csv = tmp_path / "customers.csv"
-    csv.write_text(
-        ",".join(_COLUMNS) + "\n" + "".join(",".join(map(str, row)) + "\n" for row in _ROWS)
-    )
-    return lambda expose: duckdb_csv_session(csv, expose, table="customers")
+    return csv_session_factory(tmp_path, _COLUMNS, _ROWS)
 
 
 def _refusal(call: Callable[[], Any]) -> str:

@@ -58,14 +58,20 @@ def _expose(
 @pytest.fixture()
 def state_for(tmp_path):
     """A ``SessionState`` stand-in over a DuckDB driver reading a CSV of ``_ROWS``."""
-    from ._fixtures import duckdb_csv_session
+    from ._fixtures import csv_session_factory
 
-    csv = tmp_path / "customers.csv"
-    csv.write_text(
-        ",".join(_HEADER) + "\n" + "".join(",".join(map(str, row)) + "\n" for row in _ROWS),
-        encoding="utf-8",
+    return csv_session_factory(tmp_path, _HEADER, _ROWS)
+
+
+def _compile_on(sql: str, dialect: str, *, reference: str = "customers", expose: Any = None) -> Any:
+    """``sql`` compiled for a caller no row filter narrows."""
+    return query_compiler.compile_free_form_sql(
+        sql=sql,
+        table_reference=reference,
+        limit=10,
+        expose=_expose() if expose is None else expose,
+        dialect=dialect,
     )
-    return lambda expose: duckdb_csv_session(csv, expose, table="customers")
 
 
 def _users(payload: Dict[str, Any]) -> List[str]:
@@ -328,12 +334,8 @@ def test_the_projection_takes_the_callers_name_for_the_table_quoted(dialect, ref
     """A read without an alias gets the caller's own name for the table, folded the way
     the engine folds an unquoted name and quoted, so a table named like a reserved
     word still reads and the statement's references to it still resolve."""
-    compiled = query_compiler.compile_free_form_sql(
-        sql=sql,
-        table_reference=reference,
-        limit=10,
-        expose=_expose(schema=[{"name": "id"}]),
-        dialect=dialect,
+    compiled = _compile_on(
+        sql, dialect, reference=reference, expose=_expose(schema=[{"name": "id"}])
     )
     assert f") AS {alias}\nLIMIT 10" in compiled.sql, compiled.sql
 
@@ -356,20 +358,12 @@ def test_a_quoted_name_the_engine_reads_as_another_table_is_refused(
     another table there than ``customers``: serving the exposed table's rows under it
     would label them as that table's."""
 
-    def compile_it() -> Any:
-        return query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference=reference,
-            limit=10,
-            expose=_expose(schema=[{"name": "id"}]),
-            dialect=dialect,
-        )
-
+    expose = _expose(schema=[{"name": "id"}])
     if refused:
         with pytest.raises(query_compiler.QueryValidationError, match="another table"):
-            compile_it()
+            _compile_on(sql, dialect, reference=reference, expose=expose)
     else:
-        compile_it()
+        _compile_on(sql, dialect, reference=reference, expose=expose)
 
 
 @pytest.mark.parametrize(
@@ -382,13 +376,7 @@ def test_a_quoted_name_the_engine_reads_as_another_table_is_refused(
 )
 def test_a_postgres_cast_that_looks_a_name_up_is_refused(sql):
     with pytest.raises(query_compiler.QueryValidationError, match="looks a name up"):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_expose(),
-            dialect="postgres",
-        )
+        _compile_on(sql, "postgres")
 
 
 @pytest.mark.parametrize(
@@ -396,13 +384,7 @@ def test_a_postgres_cast_that_looks_a_name_up_is_refused(sql):
     [("duckdb", "string_split(region, ',')"), ("postgres", "string_to_array(region, ',')")],
 )
 def test_splitting_a_string_is_a_listed_function(dialect, call):
-    query_compiler.compile_free_form_sql(
-        sql=f"SELECT {call} AS parts FROM customers",
-        table_reference="customers",
-        limit=10,
-        expose=_expose(),
-        dialect=dialect,
-    )
+    _compile_on(f"SELECT {call} AS parts FROM customers", dialect)
 
 
 def test_a_table_named_like_a_reserved_word_reads_end_to_end():

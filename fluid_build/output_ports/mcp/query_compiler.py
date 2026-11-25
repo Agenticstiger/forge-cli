@@ -2297,11 +2297,18 @@ def _refuse_unlisted_functions(tree: Any, sql: str = "", read: Optional[str] = N
     for operator in tree.find_all(exp.Operator):
         # ``OPERATOR(schema.op)`` calls the function behind an operator a schema defines.
         raise QueryValidationError(_unlisted_function(operator.sql(dialect=read)[:80]))
+
+
+def _refuse_catalog_lookup_casts(tree: Any, read: Optional[str]) -> None:
+    """Refuse a Postgres cast to an object identifier type (``regclass``, ``regproc``,
+    ``regrole`` and the like): it looks a name up in the catalog, so it tells whether
+    another relation, function or role exists."""
+    from sqlglot import exp
+
+    if read != "postgres":
+        return
     for cast in tree.find_all(exp.Cast, exp.TryCast):
-        # Postgres's object identifier types (``regclass``, ``regproc``, ``regrole``...)
-        # look a name up in the catalog: a cast to one tells whether another relation,
-        # function or role exists.
-        if read == "postgres" and cast.to.sql(dialect=read).casefold().startswith("reg"):
+        if cast.to.sql(dialect=read).casefold().startswith("reg"):
             raise QueryValidationError(
                 f"sql casts to {cast.to.sql(dialect=read)}, which looks a name up in the "
                 "catalog; query_sql reads only the exposed table."
@@ -3758,6 +3765,7 @@ def _project_exposed_table(
     # projection, naming another relation or the server's state by an argument (a
     # view's definition, the server's settings, an object's DDL).
     _refuse_unlisted_functions(tree, sql, read)
+    _refuse_catalog_lookup_casts(tree, read)
     if predicate is not None:
         # A filtered caller: nothing a planner could run on a row the filter removes
         # that would raise an error there.
