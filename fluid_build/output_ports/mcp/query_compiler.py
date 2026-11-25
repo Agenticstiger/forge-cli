@@ -618,14 +618,16 @@ def _first_ref(node: Any, path: str) -> Optional[Tuple[str, Any]]:
 
 
 def _refuse_unresolved_refs(expose: Mapping[str, Any]) -> None:
-    """Refuse an expose whose ``policy``, or whose ``contract`` or the column entries of
-    its ``contract.schema``, still holds a ``$ref``. The row filters, readers, column
+    """Refuse an expose that is itself a ``$ref``, or whose ``policy``, ``contract`` or
+    ``contract.schema`` column entries still hold one. The row filters, readers, column
     restrictions and declared columns behind the pointer would read as absent, and the
     expose would be served as though it declared none. forge's loader and ``fluid
     bundle`` resolve every reference before the gateway reads a contract; a caller that
     passes an expose of its own must resolve them first."""
     at = f"exposes[{expose.get('exposeId') or '?'}]"
-    found = _first_ref(expose.get("policy"), f"{at}.policy")
+    # The expose itself, its policy, then its contract and columns.
+    found = (at, expose["$ref"]) if "$ref" in expose else None
+    found = found or _first_ref(expose.get("policy"), f"{at}.policy")
     contract = expose.get("contract")
     if found is None and isinstance(contract, Mapping):
         schema = contract.get("schema")

@@ -435,8 +435,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same document included, before `serve` reads a policy. A caller that passes an expose of its
   own to `compile_semantic_query`, `compile_free_form_sql`, `row_filter_predicate` or
   `declares_row_filters` could pass `policy: {$ref: ...}` unresolved, which read as no row
-  filter. Every read path, and the startup check, now refuses an expose whose `policy`,
-  `contract` or `contract.schema` entries hold a `$ref`.
+  filter. Every read path, and the startup check, now refuses an expose that is itself a `$ref`,
+  or whose `policy`, `contract` or `contract.schema` entries hold one.
 - **The Postgres driver refuses to serve an expose with row filters as a privileged role.** At
   connect it checks whether the role is a superuser or a member, directly or through another
   role, of `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program`,

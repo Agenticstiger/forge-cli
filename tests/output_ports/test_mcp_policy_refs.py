@@ -91,6 +91,7 @@ _UNRESOLVED = [
     pytest.param(_expose(**{"contract.schema.1": {"$ref": _POINTER}}), id="schema-column"),
     pytest.param(_expose(**{"contract.schema": {"$ref": _POINTER}}), id="schema"),
     pytest.param(_expose(contract={"$ref": _POINTER}), id="contract"),
+    pytest.param({"exposeId": "orders", "$ref": "#/x-shared/orders_expose"}, id="the-expose"),
 ]
 
 
