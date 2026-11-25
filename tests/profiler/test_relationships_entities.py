@@ -349,6 +349,46 @@ def test_children_per_entity_are_left_out_when_the_entity_is_a_counted_foreign_k
     assert "foreign key of a relationship this profile counts" in said[("reading", "station")]
 
 
+def test_a_counted_key_holding_the_entity_among_more_columns_leaves_them_out(tmp_path):
+    # A composite key that holds the entity counts at least as many tuples as there are entities,
+    # so beside its parents the entities still give the parents with no version back.
+    contract = _contract()
+    version = contract["exposes"][0]
+    version["semantics"]["relationships"] = [
+        {
+            "name": "site",
+            "to": "site",
+            "fromColumns": ["station_id", "kind"],
+            "toColumns": ["station_id", "kind"],
+            "cardinality": "many_to_one",
+        }
+    ]
+    contract["exposes"].append(
+        {
+            "exposeId": "site",
+            "kind": "table",
+            "contract": {
+                "schema": [
+                    {"name": "station_id", "type": "int"},
+                    {"name": "kind", "type": "enum('fixed','mobile')"},
+                ]
+            },
+        }
+    )
+    sites = [
+        {"station_id": n, "kind": row_kind}
+        for n in range(STATIONS + 3)
+        for row_kind in ("fixed", "mobile")
+    ]
+    result = profile_exposes(
+        contract,
+        [*_sources(tmp_path), ExposeSource("site", _write(tmp_path / "site.ndjson", sites))],
+        backend=load_backend(),
+    )
+    said = {(child, name): reason for child, name, reason in result.relationships_left_out}
+    assert "foreign key of a relationship this profile counts" in said[("reading", "station")]
+
+
 def test_a_window_without_a_natural_entity_leaves_the_relationship_out(tmp_path):
     contract = _contract()
     contract["exposes"][0]["semantics"]["entities"] = []

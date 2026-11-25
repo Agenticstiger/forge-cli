@@ -728,7 +728,9 @@ def _history(
     notes: List[Tuple[str, str]],
 ) -> Dict[str, Any]:
     window = _window(context, expose)
-    if (context.expose_id, (window.key,)) in context.stage.counted_keys:
+    from fluid_build.profiler import runner
+
+    if runner.counts_the_entity(context.stage.counted_keys, context.expose_id, (window.key,)):
         raise _Unformed(_COUNTED_KEY)
     stations, used = _ordered(context, window)
     versions = sum(len(held) for held in stations.values())

@@ -46,6 +46,7 @@ from typing import (
     Callable,
     Dict,
     FrozenSet,
+    Iterable,
     Iterator,
     List,
     Mapping,
@@ -2074,6 +2075,19 @@ _ENTITY_IS_A_COUNTED_KEY = (
 )
 
 
+def counts_the_entity(
+    counted_keys: Iterable[Tuple[str, Sequence[str]]], table: str, entity: Sequence[str]
+) -> bool:
+    """Whether a counted relationship's key on *table* holds every column of *entity*.
+
+    Its distinct tuples are then at least the entities, each version of an entity holding one
+    tuple when the other columns are stable, so its children per parent and the entity count
+    together give its childless bin back, whatever other columns the key also holds.
+    """
+    wanted = set(entity)
+    return any(child == table and wanted <= set(columns) for child, columns in counted_keys)
+
+
 def _entities_beside_counted_keys(
     relationships: Sequence[Relationship],
     left_out: Sequence[Tuple[str, str, str]],
@@ -2084,13 +2098,15 @@ def _entities_beside_counted_keys(
     entities. Where the target's entity is itself the foreign key of a counted relationship, that
     number is the distinct count of the key :func:`_key_columns` withholds: beside that
     relationship's parents it gives back the parents with no version, a cell of its histogram.
-    Such a relationship is named and left out; the choice reads the contract alone.
+    Such a relationship is named and left out; the choice reads the contract alone. A counted
+    key that holds the entity among more columns counts no fewer distinct tuples than there are
+    entities, so it is a counted key of the entity too (:func:`counts_the_entity`).
     """
     counted_keys = {(each.child, tuple(each.child_columns)) for each in relationships}
     kept: List[Relationship] = []
     out = list(left_out)
     for each in relationships:
-        if each.entity and (each.parent, tuple(each.parent_columns)) in counted_keys:
+        if each.entity and counts_the_entity(counted_keys, each.parent, each.parent_columns):
             out.append((each.child, each.name, _ENTITY_IS_A_COUNTED_KEY))
         else:
             kept.append(each)

@@ -630,6 +630,48 @@ def test_a_table_whose_entity_is_a_counted_foreign_key_forms_no_history(tmp_path
     assert "foreign key of a relationship" in said[f"history of {TABLE}"]
 
 
+def test_a_counted_key_holding_the_entity_among_more_columns_forms_no_history(tmp_path):
+    rows = _stations()
+    contract = _contract()
+    (expose,) = contract["exposes"]
+    expose["semantics"]["relationships"] = [
+        {
+            "name": "site",
+            "to": "site",
+            "fromColumns": ["station_id", "sensor_model"],
+            "toColumns": ["station_id", "sensor_model"],
+            "cardinality": "many_to_one",
+        }
+    ]
+    contract["exposes"].append(
+        {
+            "exposeId": "site",
+            "kind": "table",
+            "contract": {
+                "schema": [
+                    {"name": "station_id", "type": "integer"},
+                    {"name": "sensor_model", "type": "enum('m1','m2')"},
+                ]
+            },
+        }
+    )
+    sites = [
+        {"station_id": i, "sensor_model": model}
+        for i in sorted({row["station_id"] for row in rows})
+        for model in ("m1", "m2")
+    ]
+    result = profile_exposes(
+        contract,
+        [
+            ExposeSource(TABLE, _write(tmp_path / "stations.ndjson", rows)),
+            ExposeSource("site", _write(tmp_path / "s.ndjson", sites)),
+        ],
+        backend=load_backend(),
+    )
+    assert "history" not in result.document["tables"][TABLE]
+    assert "foreign key of a relationship" in dict(result.not_measured)[f"history of {TABLE}"]
+
+
 def test_a_request_profile_writes_no_history(tmp_path):
     asked = Request(
         contract_digest=None,
