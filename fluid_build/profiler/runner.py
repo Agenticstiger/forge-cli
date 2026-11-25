@@ -1013,6 +1013,7 @@ def profile_exposes(
                 history.HistoryStage(
                     raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
                     tallies, fractional_bits, timings,
+                    frozenset((each.child, tuple(each.child_columns)) for each in relationships),
                 )  # fmt: skip
             )
         )

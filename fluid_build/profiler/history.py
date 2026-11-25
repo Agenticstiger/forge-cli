@@ -17,6 +17,12 @@ entity are ordered by start, then end (an open end last), then row position. An 
 it is NULL, or when it equals the ``openEnd`` literal the contract declares, read as the column's
 own values are read.
 
+A table whose entity is the foreign key of a relationship the profile counts forms no history:
+that relationship's children per parent are the entities by their versions with one more bin, the
+parents with none, and its parents beside the history's entities (every member gives their number,
+as a ``k`` or as the versions less the chain's pairs) would give that bin back, as a distinct count
+of the key would (:func:`fluid_build.profiler.runner._key_columns`).
+
 **Members.** Each is a statistic of the document, checked by the disclosure rule cell by cell:
 
 * ``versionsPerEntity``: the entities by their number of versions, on the bins ``1, 2, 3, 5, 10,
@@ -24,9 +30,11 @@ own values are read.
   (:func:`fluid_build.profiler.disclosure.pinned_children_cells`): a reader knows the entities and
   the versions exactly (the chain's size is their difference), and a first bin that starts at one
   because every entity has a version.
-* ``firstStart``: the entities' first starts in epoch milliseconds, on the months (or the years)
-  :func:`fluid_build.profiler.defaults.date_span` gives a date column. With no span it is written
-  on the public year ladder, withheld whole.
+* ``firstStart``: the entities' first starts, written on the public year ladder and withheld
+  whole. Where each end is the next version's start, the ends a column holds are the starts less
+  the first starts (and the closed last ends), so the first starts beside the start and end
+  columns' own histograms and calendars would give a withheld cell of any of them back, or the
+  closed last ends, cell by cell.
 * ``versionLength``: the whole days from a version's start to the next version's start, on the
   ladder of days trimmed as a date pair's are (:func:`fluid_build.profiler.dates.trimmed_span`).
   With no such span it is written on the ladder from day 0, withheld whole.
@@ -62,7 +70,6 @@ Nothing here names a value: a note names a table, columns and a reason.
 
 from __future__ import annotations
 
-from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from typing import (
@@ -116,6 +123,11 @@ _PINNED = "the entities' and the versions' counts would give a withheld cell bac
 _NO_WINDOW = "its semantics declare no validity window that is well formed"
 _NOT_READ = "is not a column fluid profile reads"
 _NOT_DATES = "its start and end are not DATE columns, or timestamp columns, of one type"
+#: Why a table whose entity is a counted relationship's foreign key forms no history.
+_COUNTED_KEY = (
+    "its entity is the foreign key of a relationship this profile counts, and the history's "
+    "entities beside that relationship's parents would give the parents with no version back"
+)
 _NO_ROWS = "no row holds both an entity and a start"
 _NOT_DAYS = "a value of its start or end is not a whole day"
 _NO_LEVELS = "the contract declares no levels for it"
@@ -140,6 +152,8 @@ class HistoryStage:
     tallies: Tuple["Counter[str]", "Counter[str]"]
     bits: int
     timings: Optional["StageTimings"]
+    #: The ``(child table, child columns)`` of every relationship the profile counts.
+    counted_keys: FrozenSet[Tuple[str, Tuple[str, ...]]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -475,30 +489,10 @@ def _versions_per_entity(
     )
 
 
-def _first_start(context: _Context, firsts: Sequence[int]) -> Dict[str, Any]:
-    backend, bits = context.stage.backend, context.stage.bits
-    name = f"{context.expose_id} first start"
-    spelled, _ = defaults.date_span(firsts, context.stage.rule.minimum_cell)
-    if spelled is None:
-        ladder = _year_ladder()
-        return context.withheld(
-            "marginalHistogram/1", {"bins": [str(each) for each in ladder]}, [""]
-        )
-    edges = [_milliseconds(each) for each in spelled]
-    inner = edges[1:-1]
-    cells = [0] * (len(edges) - 1)
-    for value in firsts:
-        cells[bisect_right(inner, value)] += 1
-    return _histogram_entry(
-        context, name, edges, backend.count_cells(cells, edges, bits), total=len(firsts)
-    )
-
-
-def _milliseconds(instant: str) -> int:
-    """The epoch milliseconds of an instant :func:`defaults.date_span` spells."""
-    seconds = defaults._read_instant(instant)
-    assert seconds is not None
-    return seconds * 1000
+def _first_start(context: _Context) -> Dict[str, Any]:
+    """The first starts, on the public year ladder and withheld whole (see the module docstring)."""
+    ladder = _year_ladder()
+    return context.withheld("marginalHistogram/1", {"bins": [str(each) for each in ladder]}, [""])
 
 
 def _year_ladder() -> List[int]:
@@ -734,9 +728,10 @@ def _history(
     notes: List[Tuple[str, str]],
 ) -> Dict[str, Any]:
     window = _window(context, expose)
+    if (context.expose_id, (window.key,)) in context.stage.counted_keys:
+        raise _Unformed(_COUNTED_KEY)
     stations, used = _ordered(context, window)
     versions = sum(len(held) for held in stations.values())
-    firsts = [held[0].start for held in stations.values()]
     lengths: Counter[int] = Counter(
         (following.start - current.start) // _MS_PER_DAY
         for held in stations.values()
@@ -747,7 +742,7 @@ def _history(
         "start": window.start_column,
         "end": window.end_column,
         "versionsPerEntity": _versions_per_entity(context, stations, versions),
-        "firstStart": _first_start(context, firsts),
+        "firstStart": _first_start(context),
         "versionLength": _version_length(context, lengths, versions - len(stations)),
         "chain": _chain(context, window, stations),
         "lastVersion": _last_version(context, stations),

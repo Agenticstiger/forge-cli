@@ -342,18 +342,15 @@ def test_versions_per_entity_counts_the_entities_by_their_versions(stations):
     assert entry["sampleSize"] == disclosure.sample_size(want["entities"], RULE)
 
 
-def test_first_start_counts_the_first_starts_by_month_in_epoch_milliseconds(stations):
-    result, rows = stations
-    want = _expected(rows)
+def test_first_starts_are_withheld_whole_on_the_year_ladder(stations):
+    # Where each end is the next start, the end column's counts are the start column's less the
+    # first starts, so published first starts would give a withheld cell of either column back.
+    result, _ = stations
     entry = _history_of(result)["firstStart"]
+    assert [g["status"] for g in entry["groups"]] == ["C"]
+    assert entry["sampleSize"] == {"min": 0}
     edges = [int(each) for each in entry["bins"]]
-    assert edges[0] == _ms("2022-01-01") and edges[-1] == _ms("2022-12-01")
-    assert all(datetime.fromtimestamp(e / 1000, timezone.utc).day == 1 for e in edges)
-    cells = Counter()
-    for value in want["first"]:
-        cells[max(i for i, e in enumerate(edges[:-1]) if e <= value)] += 1
-    assert _bins(entry) == [_rounded(cells[i]) for i in range(len(edges) - 1)]
-    assert _group(entry)["k"] == _rounded(want["entities"])
+    assert edges[0] < _ms("1901-01-01") and edges[-1] > _ms("2100-12-31")
 
 
 def test_version_length_counts_the_days_to_the_next_start_on_the_ladder_of_days(stations):
@@ -491,8 +488,7 @@ def test_a_timestamp_window_is_a_history_too(tmp_path):
     published = _history_of(result)
     assert _levels(published["chain"])["nextStart"] == _rounded(want["chain"]["nextStart"])
     assert _levels(published["lastVersion"])["closed"] == _rounded(want["last"]["closed"])
-    edges = [int(each) for each in published["firstStart"]["bins"]]
-    assert edges[0] == _ms("2022-01-01")
+    assert [g["status"] for g in published["firstStart"]["groups"]] == ["C"]
     load_profile_text(result.canonical.decode("utf-8"))
 
 
@@ -594,6 +590,44 @@ def test_a_column_without_declared_levels_is_named_and_not_tracked(tmp_path):
 
 
 # -- what is not written -------------------------------------------------------------------------
+
+
+def test_a_table_whose_entity_is_a_counted_foreign_key_forms_no_history(tmp_path):
+    # Its relationship's children per parent are the entities by their versions with one more bin
+    # (the parents with none): the history's entities beside those parents would give it back.
+    rows = _stations()
+    contract = _contract()
+    (expose,) = contract["exposes"]
+    expose["semantics"]["relationships"] = [
+        {
+            "name": "station",
+            "to": "station",
+            "fromColumns": ["station_id"],
+            "toColumns": ["station_id"],
+            "cardinality": "many_to_one",
+        }
+    ]
+    contract["exposes"].append(
+        {
+            "exposeId": "station",
+            "kind": "table",
+            "contract": {"schema": [{"name": "station_id", "type": "integer"}]},
+        }
+    )
+    ids = sorted({row["station_id"] for row in rows}) + [9001, 9002, 9003]
+    result = profile_exposes(
+        contract,
+        [
+            ExposeSource(TABLE, _write(tmp_path / "stations.ndjson", rows)),
+            ExposeSource(
+                "station", _write(tmp_path / "s.ndjson", [{"station_id": i} for i in ids])
+            ),
+        ],
+        backend=load_backend(),
+    )
+    assert "history" not in result.document["tables"][TABLE]
+    said = dict(result.not_measured)
+    assert "foreign key of a relationship" in said[f"history of {TABLE}"]
 
 
 def test_a_request_profile_writes_no_history(tmp_path):
@@ -781,7 +815,7 @@ def test_the_report_counts_the_members_published_and_names_no_count_of_records(s
     lines: List[str] = []
     profile_cmd._report_structure(lambda text, **_: lines.append(text), result)
     history_lines = [line for line in lines if "History:" in line]
-    assert history_lines == [f"exposes[{TABLE}]: History: 10 of 10 members published."]
+    assert history_lines == [f"exposes[{TABLE}]: History: 9 of 10 members published."]
     assert not any(str(len(rows)) in line for line in lines)
 
 
