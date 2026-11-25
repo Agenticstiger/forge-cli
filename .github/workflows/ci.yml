@@ -847,6 +847,58 @@ jobs:
         run: python scripts/cleanup_local_test_artifacts.py
 
   # ──────────────────────────────────────────────────────────────
+  # sqlglot floor. pyproject.toml takes sqlglot>=<floor> with no ceiling, and
+  # every other job installs the newest release. This installs exactly the
+  # floor (read from pyproject.toml, so the two cannot drift) and runs the
+  # suites whose result depends on how sqlglot reads SQL: the shared
+  # row-filter parser, the MCP gateway's row filters and its column
+  # projection. Below the floor some of them fail.
+  # ──────────────────────────────────────────────────────────────
+  sqlglot-floor:
+    name: sqlglot floor (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with local extras, then the sqlglot floor
+        env:
+          # Same pip timeout and retried install as the test matrix.
+          PIP_TIMEOUT: "30"
+        run: |
+          python -m pip install --upgrade pip
+          for attempt in 1 2 3; do
+            python -m pip install -e ".[dev,local]" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -e .[dev,local] failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
+          floor=$(python -c "import re, tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']; v = next(m.group(1) for d in deps if (m := re.fullmatch(r'sqlglot>=([0-9.]+)', d))); print(v + '.0' * (2 - v.count('.')))")
+          for attempt in 1 2 3; do
+            python -m pip install "sqlglot==${floor}" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install sqlglot==${floor} failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install sqlglot==${floor} failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
+          python -c "import sqlglot, sys; print('sqlglot', sqlglot.__version__); sys.exit(sqlglot.__version__ != '${floor}')"
+      - name: Run the sqlglot-version-sensitive tests on the floor
+        run: |
+          python -m pytest -q \
+            tests/iac/test_iac_row_filter_predicates.py \
+            tests/output_ports/test_mcp_authz_row_filters.py \
+            tests/output_ports/test_query_rls.py \
+            tests/output_ports/test_restricted_columns_projection.py
+
+  # ──────────────────────────────────────────────────────────────
   # dbt v2 canary. The `test` and `coverage-and-audit` jobs install
   # `dbt-core<2` + dbt-duckdb, so they exercise the 1.x line only. Every
   # claim this repo makes about dbt v2 / Fusion was otherwise asserted

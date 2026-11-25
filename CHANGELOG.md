@@ -615,8 +615,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_prepared_statements` and `pg_cursors` views.
 - **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
   read the name as a string. Write the column name bare.
-- **sqlglot 26.20 or newer is required.** Older releases record no identifier positions, so the MCP
-  output port refused every row filter on them.
+- **sqlglot 30.1 or newer is required.** 26.16 and older record no identifier positions, so the MCP
+  output port refused every row filter on them, and releases before 30.1 refuse some valid
+  `query_sql` reads on an expose with row filters (an `EXISTS` subquery, for one).
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so
