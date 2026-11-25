@@ -68,6 +68,21 @@ is written as a fact withheld by it (``D``); a group that is the only way to a w
 size withholds the others the same way, so some groups of a query may be published and others
 withheld. Nothing is published that depends on a query's text.
 
+**Errors that depend on a record.** A condition that could raise an error depending on a row's
+value (a cast, arithmetic, a ``CASE``, an unlisted function) is refused before any read with
+:data:`CAN_FAIL`, by the fence and function allowlist the MCP gateway applies to a filtered
+caller (:func:`fluid_build.output_ports.mcp.query_compiler.refuse_conditions_that_can_fail`).
+As a backstop, any failure that still depends on the records withholds every query of the run
+with :data:`RUN_FAILED`, so a run says at most one bit (that some statement failed), never which
+query or which record.
+
+**What is left.** A query is checked as a set with the table's facts and the other queries and
+units over that table, not with a column's level histogram, ``nullCount`` or row count beside
+it (facts have the same limit); a query and a published histogram cell differ only at the
+rounding precision. The cost is bounded and public: at most :data:`MOST_QUERIES` queries, each
+statement limited in time and memory, run in a locked process. A request from a source that is
+not trusted belongs in a container.
+
 Nothing printed, logged or written names a count of records: a reason names a query, a table, a
 column or a bound.
 """
@@ -100,6 +115,7 @@ from fluid_build.profiler._stats import Request, RequestQuery, StatisticsBackend
 from fluid_build.profiler.consumer_queries import Checked, Refused, Table
 
 __all__ = [
+    "CAN_FAIL",
     "MEMORY_BYTES",
     "MOST_GROUPED_PER_COLUMN",
     "MOST_GROUP_LEVELS",
@@ -108,15 +124,9 @@ __all__ = [
     "MOST_SET_PARTS",
     "MOST_TEXT_TOKENS",
     "NOT_A_FILTER_VIEW",
-    "NOT_A_LEVEL",
-    "NOT_LOADED",
-    "OUT_OF_MEMORY",
-    "PROCESS_STOPPED",
     "RECORD_REASONS",
-    "REFUSED_BY_PROCESS",
-    "ROWS_NOT_RECORDS",
+    "RUN_FAILED",
     "STATEMENT_SECONDS",
-    "TIMED_OUT",
     "Measured",
     "QueryPlan",
     "QueryPlans",
@@ -143,28 +153,19 @@ MEMORY_BYTES = 2 << 30
 
 #: Why a query is not answered once the records are read: only they decide these, so ``--strict``
 #: never refuses on them.
-NOT_LOADED = "a value of a column the query reads cannot be loaded as the column's type"
-TIMED_OUT = "the query process passed its time limit"
-OUT_OF_MEMORY = "the query process passed its memory limit"
-REFUSED_BY_PROCESS = "the query process refused the statement built from it"
-PROCESS_STOPPED = "the query process stopped before it answered"
-ROWS_NOT_RECORDS = "its rows are not its unit's records"
-NOT_A_LEVEL = "a value of its groupBy column is not a level the contract declares"
-RECORD_REASONS = frozenset(
-    {
-        NOT_LOADED,
-        TIMED_OUT,
-        OUT_OF_MEMORY,
-        REFUSED_BY_PROCESS,
-        PROCESS_STOPPED,
-        ROWS_NOT_RECORDS,
-        NOT_A_LEVEL,
-    }
+RUN_FAILED = (
+    "a statement of this request's queries failed on the records, so no query of it is answered"
 )
-
+RECORD_REASONS = frozenset({RUN_FAILED})
 NOT_A_FILTER_VIEW = (
     "a unit that aggregates, joins or reshapes rows is not one fluid profile can check with "
     "its table: name the table, or a view that keeps some of one table's rows"
+)
+
+CAN_FAIL = (
+    "a condition of its query or its unit's view could raise an error that depends on a row's "
+    "value, so fluid profile does not run it: compare columns with constants of their own type, "
+    "joined by AND, OR and NOT"
 )
 _KEPT = "fluid profile answers a query that keeps some of its unit's records: "
 _LEVELS = ["false", "true"]
@@ -415,6 +416,8 @@ class _Planner:
             alias = table or ""
         else:
             reads = tuple(sorted(set(checked.columns)))
+        if not self._cannot_fail(where, alias, table or ""):
+            return blank.refused(CAN_FAIL)
         levels: Tuple[str, ...] = ()
         if query.group_by is not None:
             grouped = self._group(query, checked, query.table or "")
@@ -444,6 +447,32 @@ class _Planner:
         if isinstance(built, str):
             return blank.refused(built)
         return replace(plan, **built)
+
+    def _cannot_fail(self, where: Any, alias: str, table: str) -> bool:
+        """Whether the condition passes the gateway's fence for conditions that can fail on a row.
+
+        The fence and its function allowlist are the ones a filtered caller's statement passes
+        (:func:`fluid_build.output_ports.mcp.query_compiler.refuse_conditions_that_can_fail`),
+        applied to the one condition the query and its unit's view keep rows by, typed by the
+        contract. A column the contract types as an ``enum(...)`` is loaded as text.
+        """
+        if where is None:
+            return True
+        from fluid_build.output_ports.mcp import query_compiler
+
+        types: Dict[str, Optional[Any]] = {}
+        for name, kind in self._schema[table].columns:
+            if _duck(kind) == "VARCHAR" and re.match(r"\s*enum\s*\(", kind, re.IGNORECASE):
+                types[name.casefold()] = query_compiler.ColumnType("string")
+        sql = f"SELECT 1 FROM {_ident(table)} AS {_ident(table)} WHERE {_condition(where, alias, table)}"
+        expose = {
+            "contract": {"schema": [{"name": n, "type": k} for n, k in self._schema[table].columns]}
+        }
+        try:
+            query_compiler.refuse_conditions_that_can_fail(sql, expose, table, "duckdb", types)
+        except query_compiler.QueryValidationError:
+            return False
+        return True
 
     # -- the public budget -------------------------------------------------------------------
 
@@ -1345,6 +1374,28 @@ def measure(
 ) -> Measured:
     """Run every answerable query over the records in one query process and keep what it counted.
 
+    Any failure that depends on the records (a statement that errors, a time-out, out of memory,
+    a crash, a value that does not load, a grouping value that is not a level, rows that are not
+    the unit's records) withholds every query of the run, each named with :data:`RUN_FAILED`: an
+    answer for the others would say, one bit per query, that a chosen record made that statement
+    fail. The run says at most one bit, that some statement failed, never which.
+    """
+    done = _measure(plans, reads, backend, rule)
+    if not done.failed:
+        return done
+    stopped = Measured(plans)
+    stopped.failed = {each.index: RUN_FAILED for each in plans.answerable()}
+    return stopped
+
+
+def _measure(
+    plans: QueryPlans,
+    reads: Mapping[str, Any],
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+) -> Measured:
+    """Run every answerable query over the records in one query process and keep what it counted.
+
     *reads* are the tables' records (``fluid_build.profiler.sources.SourceColumns``), which hold
     every column the queries read. Each group's cells are checked and each view's queries are
     checked as a set; a table's queries wait for :meth:`Measured.check_table`, which also takes
@@ -1369,7 +1420,7 @@ def measure(
         )
     except ValueError:  # an argument the process refuses: nothing is run, nothing is guessed
         for each in live:
-            done.failed[each.index] = NOT_LOADED
+            done.failed[each.index] = RUN_FAILED
         return done
     by_id = {each.id: each for each in run.results}
     for plan in live:
@@ -1389,7 +1440,7 @@ def _load(
                 loaded[(table, column)] = _loaded(duck, reads[table].values[column])
     for plan in live:
         if any(loaded[pair] is None for pair in plan.reads):
-            done.failed[plan.index] = NOT_LOADED
+            done.failed[plan.index] = RUN_FAILED
     return {pair: values for pair, values in loaded.items() if values is not None}
 
 
@@ -1414,7 +1465,7 @@ def _assign(
         read = cache[key]
         index = {level: at for at, level in enumerate(plan.levels)}
         if read is None or any(value is not None and value not in index for value in read):
-            done.failed[plan.index] = NOT_A_LEVEL
+            done.failed[plan.index] = RUN_FAILED
             continue
         found[plan.index] = [None if value is None else index[value] for value in read]
     return found
@@ -1456,18 +1507,6 @@ def _send(
     return tables, statements
 
 
-_STATUS_REASON = {
-    "timedOut": TIMED_OUT,
-    "outOfMemory": OUT_OF_MEMORY,
-    "error": REFUSED_BY_PROCESS,
-    "crashed": PROCESS_STOPPED,
-}
-
-
-def _reason_of(result: Any) -> str:
-    return _STATUS_REASON.get(str(result.status), REFUSED_BY_PROCESS)
-
-
 def _table_answer(
     plan: QueryPlan,
     by_id: Mapping[str, Any],
@@ -1478,41 +1517,41 @@ def _table_answer(
     bits = by_id.get(f"b{plan.index}")
     count = by_id.get(f"c{plan.index}")
     if bits is None or bits.status != "ok" or bits.bits is None:
-        done.failed[plan.index] = _reason_of(bits) if bits is not None else PROCESS_STOPPED
+        done.failed[plan.index] = RUN_FAILED
         return
     if count is None or count.status != "ok":
-        done.failed[plan.index] = _reason_of(count) if count is not None else PROCESS_STOPPED
+        done.failed[plan.index] = RUN_FAILED
         return
     n = reads[str(plan.table)].row_count
     flags = bits.bits.to_list()
     outcomes = bytes(_IN if each else _OUT for each in flags)
     true = outcomes.count(_IN)
     if len(flags) != n or count.count != true:
-        done.failed[plan.index] = ROWS_NOT_RECORDS
+        done.failed[plan.index] = RUN_FAILED
         return
     size = n
     unit: Optional[bytes] = None
     if plan.view is not None:
         kept = by_id.get(f"k{plan.index}")
         if kept is None or kept.status != "ok":
-            done.failed[plan.index] = _reason_of(kept) if kept is not None else PROCESS_STOPPED
+            done.failed[plan.index] = RUN_FAILED
             return
         size = kept.count or 0
         if plan.unit_where is not None:
             held = by_id.get(f"u{plan.index}")
             if held is None or held.status != "ok" or held.bits is None:
-                done.failed[plan.index] = _reason_of(held) if held is not None else PROCESS_STOPPED
+                done.failed[plan.index] = RUN_FAILED
                 return
             unit_flags = held.bits.to_list()
             unit = bytes(_IN if each else _OUT for each in unit_flags)
             if len(unit_flags) != n or unit.count(_IN) != size:
-                done.failed[plan.index] = ROWS_NOT_RECORDS
+                done.failed[plan.index] = RUN_FAILED
                 return
         elif size != n:
-            done.failed[plan.index] = ROWS_NOT_RECORDS
+            done.failed[plan.index] = RUN_FAILED
             return
         if any(each == _IN and not held_in for each, held_in in _pairs(outcomes, unit)):
-            done.failed[plan.index] = ROWS_NOT_RECORDS
+            done.failed[plan.index] = RUN_FAILED
             return
     sizes: Optional[List[Tuple[int, int]]] = None
     if assigned is not None:

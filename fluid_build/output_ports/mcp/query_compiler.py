@@ -2191,6 +2191,32 @@ def _refuse_unlisted_functions(tree: Any, sql: str = "", read: Optional[str] = N
         raise QueryValidationError(_unlisted_function(operator.sql(dialect=read)[:80]))
 
 
+def refuse_conditions_that_can_fail(
+    sql: str,
+    expose: Mapping[str, Any],
+    exposed_name: str,
+    dialect: Optional[str] = "duckdb",
+    types: Optional[Mapping[str, Optional[ColumnType]]] = None,
+) -> None:
+    """Refuse ``sql`` (one ``SELECT`` on the expose) unless it calls only the functions
+    :func:`_refuse_unlisted_functions` lists and every condition passes
+    :func:`_refuse_conditions_that_can_fail`: the fence a filtered caller's statement passes,
+    for a caller outside the gateway (``fluid profile``). Column types come from the expose's
+    ``contract.schema`` (:func:`_declared_column_types`), *types* overriding them for the
+    columns it names. Raises :class:`QueryValidationError`."""
+    import sqlglot
+    from sqlglot.errors import SqlglotError
+
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    try:
+        tree = sqlglot.parse_one(sql, read=read)
+    except SqlglotError:
+        raise _unreadable_sql() from None
+    column_types = {**_declared_column_types(expose, read), **(types or {})}
+    _refuse_unlisted_functions(tree, sql, read)
+    _refuse_conditions_that_can_fail(tree, sql, column_types, exposed_name.casefold(), read)
+
+
 def _written_name(node: Any, sql: str) -> Optional[str]:
     """The text of ``node``'s name in ``sql`` (a function's name as the caller wrote it,
     quotes included), when the parser kept its position."""

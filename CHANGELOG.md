@@ -31,7 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the facts of the same table, so two queries that differ by a few records give none back; a
   private release publishes no query rate. A view unit counts its table's records and its
   condition is one more factor of that table's set check; a view that joins, aggregates or
-  reshapes rows is named before any read. The report adds `Queries: N of M published whole`.
+  reshapes rows is named before any read. A condition that could raise an error depending on a
+  row's value is refused before any read with the gateway's own condition fence, and any failure
+  that still depends on the records withholds every query of the run with one fixed message, so
+  a run says at most that some statement failed, never which. A query is checked as a set with the
+  table's facts and the other queries over it, not with a column's level histogram, `nullCount`
+  or row count beside it. The report adds `Queries: N of M published whole`.
 
 
 - **`fluid profile` can check a consumer query and run it in a locked process.** A query a profile

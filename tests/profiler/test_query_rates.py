@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
-from fluid_build.profiler import _stats, disclosure, query_rates
+from fluid_build.profiler import _stats, consumer_queries, disclosure, query_rates
 from fluid_build.profiler import request as asked_for
 from fluid_build.profiler.runner import ExposeSource, ProfileError, profile_exposes
 from tests.profiler._fake_backend import FakeBackend
@@ -585,17 +585,17 @@ def test_a_query_whose_rows_are_not_its_units_records_is_not_published(tmp_path,
     _run_with(monkeypatch, change)
     result = _profile(tmp_path, _on_table("north", NORTH))
     assert "queries" not in result.document
-    assert _said(result)["query north"] == "its rows are not its unit's records"
+    assert _said(result)["query north"] == query_rates.RUN_FAILED
     assert asked_for.decided_by_records(_said(result)["query north"])
 
 
 @pytest.mark.parametrize(
     ("status", "reason"),
     [
-        ("timedOut", query_rates.TIMED_OUT),
-        ("outOfMemory", query_rates.OUT_OF_MEMORY),
-        ("error", query_rates.REFUSED_BY_PROCESS),
-        ("crashed", query_rates.PROCESS_STOPPED),
+        ("timedOut", query_rates.RUN_FAILED),
+        ("outOfMemory", query_rates.RUN_FAILED),
+        ("error", query_rates.RUN_FAILED),
+        ("crashed", query_rates.RUN_FAILED),
     ],
 )
 def test_a_statement_that_does_not_finish_names_its_query_and_is_never_a_strict_refusal(
@@ -626,7 +626,7 @@ def test_a_value_the_process_cannot_load_names_the_query_and_not_the_value(tmp_p
     stations[7]["altitude"] = "not a number"
     result = _profile(tmp_path, _on_table("north", NORTH + " AND altitude > 3"), stations=stations)
     reason = _said(result)["query north"]
-    assert reason == query_rates.NOT_LOADED
+    assert reason == query_rates.RUN_FAILED
     assert "not a number" not in reason
     assert asked_for.decided_by_records(reason)
 
@@ -672,16 +672,8 @@ def test_a_private_release_publishes_no_query_rate():
 
 
 def test_the_reasons_a_profile_gives_before_reading_are_not_the_ones_the_records_give():
-    for reason in (
-        query_rates.NOT_LOADED,
-        query_rates.TIMED_OUT,
-        query_rates.OUT_OF_MEMORY,
-        query_rates.REFUSED_BY_PROCESS,
-        query_rates.PROCESS_STOPPED,
-        query_rates.ROWS_NOT_RECORDS,
-        query_rates.NOT_A_LEVEL,
-    ):
-        assert asked_for.decided_by_records(reason)
+    assert asked_for.decided_by_records(query_rates.RUN_FAILED)
+    assert not asked_for.decided_by_records(query_rates.CAN_FAIL)
     planned = query_rates.plan_queries(
         CONTRACT, _request(_on_table("joined", SHAPES[0][1])), FakeBackend().enum_levels
     )
@@ -728,7 +720,7 @@ def test_a_value_that_is_no_level_of_the_grouping_column_names_the_query_and_not
         ),
         stations=stations,
     )
-    assert _said(result)["query active"] == query_rates.NOT_A_LEVEL
+    assert _said(result)["query active"] == query_rates.RUN_FAILED
     assert "EAST" not in repr(result.not_measured)
 
 
@@ -790,3 +782,99 @@ def test_a_query_grouped_by_a_boolean_column_has_the_two_levels(tmp_path):
     statistic = _entry(result, "low")
     assert [each["group"] for each in statistic["groups"]] == ["false", "true"]
     assert [each["levelCounts"] for each in statistic["groups"]] == [[75, 75], [75, 75]]
+
+
+# ---- a condition that can fail on a row's value is refused before anything runs --------------
+
+ORACLE = (
+    "SELECT station_id FROM station WHERE CASE WHEN station_id = 's007' AND active "
+    "THEN CAST(region AS BIGINT) = 1 ELSE altitude < 150 END"
+)
+CAN_FAIL_CONDITIONS = [
+    ("case", ORACLE),
+    ("cast", "SELECT station_id FROM station WHERE CAST(region AS BIGINT) = 1"),
+    ("arithmetic", "SELECT station_id FROM station WHERE altitude + 1 > 3"),
+    ("division", "SELECT station_id FROM station WHERE 100 / altitude > 3"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "sql"), CAN_FAIL_CONDITIONS, ids=[each[0] for each in CAN_FAIL_CONDITIONS]
+)
+def test_a_condition_that_can_fail_on_a_value_is_refused_before_any_read(tmp_path, label, sql):
+    each = _on_table("oracle", sql)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, each, strict=True, sources=_gone(tmp_path, each))
+    assert refused.value.event == "profile_request_not_formed"
+    assert "query oracle" in str(refused.value.context)
+    assert query_rates.CAN_FAIL in str(refused.value.context)
+    assert sql not in str(refused.value.context)
+    assert not asked_for.decided_by_records(query_rates.CAN_FAIL)
+
+
+def test_a_condition_in_a_units_view_that_can_fail_is_refused_before_any_read(tmp_path):
+    view = "SELECT * FROM station WHERE altitude + 1 > 3"
+    each = _on_view("oracle", _over(view), view)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, each, strict=True, sources=_gone(tmp_path, each))
+    assert query_rates.CAN_FAIL in str(refused.value.context)
+
+
+def test_the_answers_do_not_depend_on_what_one_chosen_record_holds(tmp_path):
+    said = []
+    for active in (True, False):
+        stations = _stations()
+        stations[7]["active"] = active
+        result = _profile(tmp_path, _on_table("oracle", ORACLE), stations=stations)
+        said.append(([each["name"] for each in result.document.get("queries", [])], _said(result)))
+    assert said[0] == said[1]
+
+
+def _failing_one(monkeypatch, status):
+    from dataclasses import replace
+
+    real = consumer_queries.run_in_child
+
+    def wrapped(tables, statements, **kwargs):
+        run = real(tables, statements, **kwargs)
+        results = tuple(
+            (
+                replace(each, status=status, reason="x", bits=None, count=None, groups=None)
+                if each.id == "b0"
+                else each
+            )
+            for each in run.results
+        )
+        return replace(run, results=results)
+
+    monkeypatch.setattr(consumer_queries, "run_in_child", wrapped)
+
+
+@pytest.mark.parametrize("status", ["error", "timedOut", "outOfMemory", "crashed"])
+def test_a_statement_that_fails_on_the_records_withholds_every_query_of_the_run(
+    tmp_path, monkeypatch, status
+):
+    _failing_one(monkeypatch, status)
+    result = _profile(
+        tmp_path,
+        _on_table("north", NORTH),
+        _on_table("active", "SELECT station_id FROM station WHERE active"),
+    )
+    assert _said(result) == {
+        "query north": query_rates.RUN_FAILED,
+        "query active": query_rates.RUN_FAILED,
+    }
+    assert "queries" not in result.document
+
+
+def test_a_value_that_does_not_load_withholds_the_queries_that_read_other_columns_too(tmp_path):
+    stations = _stations()
+    stations[7]["altitude"] = "not a number"
+    result = _profile(
+        tmp_path,
+        _on_table("north", NORTH),
+        _on_table("high", "SELECT station_id FROM station WHERE altitude > 3"),
+        stations=stations,
+    )
+    assert set(_said(result).values()) == {query_rates.RUN_FAILED}
+    assert len(_said(result)) == 2

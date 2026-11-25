@@ -191,8 +191,12 @@ returns, per level of its groupBy column when it has one (format 1-3-0). The que
 text is checked and run only in a locked DuckDB process of its own, as a checked tree
 rebuilt and checked again, never as written. A query is answered when it keeps some of
 its unit's records and changes none (a SELECT of columns from its unit with at most
-one WHERE: no join, DISTINCT, GROUP BY, aggregate, window, ORDER BY or LIMIT); the rest
-is named under Not measured, and --strict refuses it before any record is read. The
+one WHERE: no join, DISTINCT, GROUP BY, aggregate, window, ORDER BY or LIMIT), a unit
+that is a view keeps some rows of one table the same way, and no condition can raise an
+error that depends on a row's value; the rest is named under Not measured, and --strict
+refuses it before any record is read. A statement that still fails on the records
+withholds every query of the run. At most 1024 queries run, each limited in time and
+memory; a request from a source you do not trust belongs in a container. The
 queries of one unit are checked as a set, with the facts of a table, so that two
 queries differing by a few records give none back; a group the set withholds is
 written as a fact withheld by it (D). A private release publishes no query rate. A boolean
