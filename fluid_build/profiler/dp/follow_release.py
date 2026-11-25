@@ -422,6 +422,41 @@ def _entity_link_reason(
     return why_units
 
 
+def _link_structure(
+    contract: Mapping[str, Any],
+    backend: StatisticsBackend,
+    each: runner.Relationship,
+    column: str,
+    parent_column: str,
+    bits: int,
+    keyed: Mapping[str, FrozenSet[str]],
+) -> Tuple[Optional[ReleasedColumn], Optional[ReleasedColumn], str]:
+    """The cells of the child column a link counts and of the parent column it is grouped by.
+
+    Either is ``None`` when it has none, and the last value says why. The counted child column may
+    hold no value where the contract does not require one.
+    """
+    child_made, why = _group_structure(
+        contract, backend, each.child, column, bits, keys=keyed.get(each.child, frozenset())
+    )
+    if child_made is not None:
+        child_made = _nullable_where_allowed(contract, each.child, column, child_made)
+    by_made, by_why = _group_structure(
+        contract,
+        backend,
+        each.parent,
+        parent_column,
+        bits,
+        keys=keyed.get(each.parent, frozenset()),
+    )
+    if by_made is not None and not by_made.categorical:
+        by_made, by_why = None, (
+            f"{parent_column}: a group is keyed by the parent column's value, and only the "
+            "levels an enum(...) or a boolean column declares are public"
+        )
+    return child_made, by_made, why or by_why
+
+
 def _children_sensitivity(
     each: runner.Relationship,
     followed: Optional[FollowEdge],
@@ -786,26 +821,11 @@ def plan_follow_release(
                     )
                 )
                 continue
-            child_made, why = _group_structure(
-                contract, backend, each.child, column, bits, keys=keyed.get(each.child, frozenset())
+            child_made, by_made, why = _link_structure(
+                contract, backend, each, column, parent_column, bits, keyed
             )
-            if child_made is not None:
-                child_made = _nullable_where_allowed(contract, each.child, column, child_made)
-            by_made, by_why = _group_structure(
-                contract,
-                backend,
-                each.parent,
-                parent_column,
-                bits,
-                keys=keyed.get(each.parent, frozenset()),
-            )
-            if by_made is not None and not by_made.categorical:
-                by_made, by_why = None, (
-                    f"{parent_column}: a group is keyed by the parent column's value, and only the "
-                    "levels an enum(...) or a boolean column declares are public"
-                )
             if child_made is None or by_made is None:
-                not_released.append((what, why or by_why))
+                not_released.append((what, why))
                 continue
             links.append(
                 LinkStat(
