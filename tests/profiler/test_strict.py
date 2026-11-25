@@ -562,6 +562,16 @@ def test_the_same_holds_for_the_shop_request(tmp_path, monkeypatch, with_asks):
     assert before  # the request asks a statistic of a key column, which the contract rules out
 
 
+def test_the_same_holds_through_a_relationship_that_reaches_an_entity(tmp_path, monkeypatch):
+    from tests.profiler import test_relationships_entities as entities
+
+    request = entities.asking_everything()
+    before = _sides_hold(entities._contract(), entities._sources(tmp_path), request, monkeypatch)
+    reasons = {reason for _, reason in before}
+    assert any("an entity's versions may disagree" in reason for reason in reasons)
+    assert any("a date of a parent is not one date" in reason for reason in reasons)
+
+
 def test_the_matrix_holds_each_reason_the_contract_decides(tmp_path, monkeypatch):
     request = _every_kind_of_ask()
     asked = _captured(monkeypatch)

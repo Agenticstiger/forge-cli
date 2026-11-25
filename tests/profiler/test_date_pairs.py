@@ -909,7 +909,7 @@ def test_a_request_forms_only_the_exposures_it_lists(tmp_path):
     assert "dates" not in entry
 
 
-def test_a_private_release_names_the_asks_it_does_not_form():
+def test_a_private_release_forms_a_date_pair_and_leaves_its_reasons_to_the_plan():
     from fluid_build.profiler import request as asked_for
 
     asked = _request(
@@ -921,9 +921,7 @@ def test_a_private_release_names_the_asks_it_does_not_form():
         )
     )
     assert asked_for.unformed(asked) == []
-    assert asked_for.unformed(asked, private=True) == [
-        ("date pair opened to closed of loans", asked_for.NO_DATE_PAIRS)
-    ]
+    assert asked_for.unformed(asked, private=True) == []
 
 
 def test_the_report_counts_published_entries_and_names_no_record_count(tmp_path):
