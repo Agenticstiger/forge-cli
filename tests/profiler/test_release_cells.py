@@ -398,7 +398,10 @@ def test_the_report_names_what_was_left_out_and_no_count_appears(
     seen = capsys.readouterr()
     text = seen.out + seen.err + caplog.text
     flat = " ".join(text.split())
-    assert f"Not released ({_reason(cap)}): {last}." in flat
+    from fluid_build.cli import _profile_follow
+
+    words = _profile_follow.part_words(last, None if follow else "loan")
+    assert f"Not released ({_reason(cap)}): {words}." in flat
     shown = _numbers(text, workspace)
     for secret in _secrets():
         assert str(secret) not in shown, secret
@@ -409,3 +412,45 @@ def test_the_report_names_what_was_left_out_and_no_count_appears(
     (workspace / f"{name}.profile.json").unlink()
     assert main(_again(follow=follow)) == 0
     assert (workspace / f"{name}.profile.json").read_bytes() == first
+
+
+def test_a_left_out_part_is_named_in_the_words_of_the_other_items():
+    from fluid_build.cli._profile_follow import left_out_words, part_words
+
+    assert part_words("noise/returned_on", "loan") == "returned_on of loan"
+    assert part_words("loan/noise/returned_on") == "returned_on of loan"
+    assert (
+        part_words("loan/pair/days/borrowed_on/due_on") == "date pair borrowed_on to due_on of loan"
+    )
+    assert part_words("link/loan.shelf/by/member.branch/via/member_id") == (
+        "shelf of loan grouped by member.branch"
+    )
+    pair = [("pair/days/a/b", "r"), ("pair/order/a/b", "r")]
+    assert left_out_words(pair, "loan") == [("date pair a to b of loan", "r")]
+
+
+@pytest.mark.parametrize("follow", [False, True], ids=["own rows", "follow"])
+def test_strict_refuses_before_any_read_a_part_the_cap_leaves_out_when_no_clique_is_chosen(
+    workspace, capsys, monkeypatch, follow
+):
+    plan = _follow_plan() if follow else _plan()
+    total = sum((_follow_cells(plan) if follow else _own_cells(plan)).values())
+    _set_cap(monkeypatch, total - 1)
+    read: List[str] = []
+    from fluid_build.profiler import sources
+
+    real = sources.read_columns
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        read.append("read")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sources, "read_columns", counting)
+    code = main([*_argv(follow=follow), "--strict"])
+    text = capsys.readouterr()
+    if plan.selects:
+        assert code == 0
+    else:
+        assert code == 1
+        assert "profile_request_not_formed" in text.out + text.err
+        assert not read

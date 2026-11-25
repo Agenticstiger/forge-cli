@@ -687,6 +687,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             named = plan.table
         if getattr(args, "strict", False):
             _refuse_unformed_pairs(plan)
+            _refuse_left_out_before_reading(plan, follows)
         _only_the_read_tables(args.source, contract, read_tables)
         exposes = profile_cmd._expose_sources(contract, read_tables, args.source, args.table)
         out = profile_cmd._out_path(args.out, named, [each.source for each in exposes])
@@ -809,6 +810,30 @@ def _refuse_unformed_pairs(plan: Any) -> None:
     unformed = [item for item in plan.not_released if item[0].startswith("date pair ")]
     if unformed:
         raise asked_for.refuse_asks(unformed)
+
+
+def _refuse_left_out_before_reading(plan: Any, follows: Any) -> None:
+    """Under ``--strict``, refuse a part the cap leaves out when the release chooses no clique.
+
+    With no selection, every part and its cells are known before any record is read, and so is
+    what the cap admits: a part it leaves out is then decided by the contract and the request, and
+    ``--strict`` refuses it like any other ask they rule out. With a selection the choice waits for
+    the cliques, which are released, and the part is only named.
+    """
+    from fluid_build.cli import _profile_follow
+    from fluid_build.profiler import request as asked_for
+    from fluid_build.profiler.dp import follow_release, release
+
+    if plan.selects:
+        return
+    if follows:
+        _, left = follow_release.admit(plan, {})
+    else:
+        _, left = release.admit(plan, ())
+    if left:
+        raise asked_for.refuse_asks(
+            _profile_follow.left_out_words(left, getattr(plan, "table", None))
+        )
 
 
 def _only_the_read_tables(given: Sequence[str], contract: Any, tables: Sequence[str]) -> None:

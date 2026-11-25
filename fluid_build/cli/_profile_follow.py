@@ -14,9 +14,16 @@ never the seed. Only the standard library is imported at module scope.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__all__ = ["columns_text", "report", "say_not_released", "unknown_values_notes"]
+__all__ = [
+    "columns_text",
+    "left_out_words",
+    "part_words",
+    "report",
+    "say_not_released",
+    "unknown_values_notes",
+]
 
 _KIND = {
     "clique": "clique of",
@@ -61,10 +68,42 @@ def columns_text(table: Any) -> str:
     return joiner.join(table.columns)
 
 
+def part_words(label: str, table: Optional[str] = None) -> str:
+    """A release part's label in the words the other items it leaves out are named with.
+
+    ``[<table>/]pair/<days|order>/<start>/<end>`` is a date pair, ``[<table>/]noise/<column>`` a
+    column's histogram, and ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped
+    through a link; any other label is said as it is.
+    """
+    steps = label.split("/")
+    if steps[0] == "link" and len(steps) >= 4 and "." in steps[1]:
+        child, column = steps[1].split(".", 1)
+        return f"{column} of {child} grouped by {steps[3]}"
+    if steps[0] not in ("noise", "pair") and len(steps) > 1:
+        table, steps = steps[0], steps[1:]
+    where = f" of {table}" if table else ""
+    if steps[0] == "pair" and len(steps) == 4:
+        return f"date pair {steps[2]} to {steps[3]}{where}"
+    if steps[0] == "noise" and len(steps) == 2:
+        return f"{steps[1]}{where}"
+    return label
+
+
+def left_out_words(
+    left_out: Sequence[Tuple[str, str]], table: Optional[str] = None
+) -> List[Tuple[str, str]]:
+    """The parts the cap leaves out, each named once in words (a pair's two parts are one)."""
+    found: Dict[Tuple[str, str], None] = {}
+    for label, reason in left_out:
+        found.setdefault((part_words(label, table), reason), None)
+    return list(found)
+
+
 def say_not_released(say: Any, plan: Any, drawn: Any) -> None:
     """Say what the release does not hold, one line for each reason: the plan's and the cap's."""
     by_reason: Dict[str, List[str]] = {}
-    for what, reason in (*plan.not_released, *drawn.left_out):
+    left = left_out_words(drawn.left_out, getattr(plan, "table", None))
+    for what, reason in (*plan.not_released, *left):
         by_reason.setdefault(reason, []).append(what)
     for reason, items in by_reason.items():
         say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
