@@ -5,10 +5,11 @@
 
 Started by :mod:`.runner` as ``python -I <this file>`` with an environment of its own (``PATH``
 and ``LC_ALL`` only) and its two pipes as the only descriptors it holds. This file imports the
-standard library and, after the limits are set, ``duckdb``: nothing of forge, so ``-I`` (no
-working directory and no user site on ``sys.path``) leaves nothing to import but the two. The
-parent imports this file too, for the framing and the settings both ends must agree on; that
-needs the standard library only.
+standard library and, after the limits are set, ``duckdb`` and forge's DuckDB sandbox, which
+opens the connection (:func:`fluid_build.providers._duckdb_sandbox.secure_duckdb_connect`, with
+no file or network access granted): ``-I`` (no working directory and no user site on
+``sys.path``) leaves only the installed packages to import. The parent imports this file too,
+for the framing and the settings both ends must agree on; that needs the standard library only.
 
 The framing is a 4-byte big-endian length and then that many bytes: a JSON header frame and, for
 a table, one JSON frame of values per column. Nothing is pickled, a frame past its bound ends the
@@ -48,6 +49,7 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import threading
 from typing import IO, Any, Dict, List, Optional, Tuple
 
@@ -91,7 +93,7 @@ ERROR = "error"
 _LENGTH = struct.Struct(">I")
 _RETURNS = ("count", "counts", "bits")
 _NAME = re.compile(r"[^\x00]{1,256}")
-_DECIMAL = re.compile(r"^DECIMAL\((\d{1,2}),(\d{1,2})\)$")
+_DECIMAL = re.compile(r"\ADECIMAL\((\d{1,2}),(\d{1,2})\)\Z")
 _PLAIN_TYPES = frozenset(
     {"BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "VARCHAR"}
 )
@@ -272,6 +274,18 @@ def connect_settings(memory: int) -> Dict[str, Any]:
     }
 
 
+#: Where the sandbox may make its spill directory (an empty directory: nothing spills into it).
+_TEMP_DIRS = ("/tmp", "/var/tmp")
+
+#: The settings passed when the connection opens; the sandbox sets the others, then locks them.
+_START_UP = (
+    "allow_unsigned_extensions",
+    "python_enable_replacements",
+    "threads",
+    "memory_limit",
+    "max_temp_directory_size",
+)
+
 #: What DuckDB reports for the settings that must hold, read back from ``duckdb_settings()``.
 _EXPECTED_READ_BACK: Dict[str, str] = {
     "enable_external_access": "false",
@@ -279,7 +293,7 @@ _EXPECTED_READ_BACK: Dict[str, str] = {
     "autoinstall_known_extensions": "false",
     "allow_community_extensions": "false",
     "allow_unsigned_extensions": "false",
-    "allow_persistent_secrets": "false",
+    "allow_persistent_secrets": "false",  # pragma: allowlist secret
     "python_enable_replacements": "false",
     "threads": "1",
     "max_temp_directory_size": "0 bytes",
@@ -393,14 +407,16 @@ def _group_key(value: Any) -> Any:
 
 
 def _fetch_count(cursor: Any) -> Dict[str, Any]:
-    rows = cursor.fetchmany(2)
+    rows = cursor.fetchall()
     if len(rows) != 1 or len(rows[0]) != 1:
         raise _Refused("a count is one row of one column")
     return {"count": _whole(rows[0][0])}
 
 
 def _fetch_counts(cursor: Any) -> Dict[str, Any]:
-    rows = cursor.fetchmany(MAX_GROUPS + 1)
+    # Read whole (on DuckDB 2.0 a result read partway keeps the connection busy); the plan bounds
+    # the combinations a statement can return well below the cap, which stays as a check.
+    rows = cursor.fetchall()
     if len(rows) > MAX_GROUPS:
         raise _Refused(f"the result has more than {MAX_GROUPS} groups")
     groups: List[List[Any]] = []
@@ -412,22 +428,21 @@ def _fetch_counts(cursor: Any) -> Dict[str, Any]:
 
 
 def _fetch_bits(cursor: Any) -> Dict[str, Any]:
+    # Read whole, as every result here is: a bit column has one row per row of a table the
+    # parent already holds, so it is no larger than what the parent sent.
+    rows = cursor.fetchall()
+    if len(rows) > MAX_BITS:
+        raise _Refused("the result has more rows than a bit column carries")
     packed = bytearray()
     total = 0
-    while True:
-        rows = cursor.fetchmany(65_536)
-        if not rows:
-            break
-        for row in rows:
-            if len(row) != 1 or type(row[0]) is not bool:
-                raise _Refused("a bit column holds a boolean in every row")
-            if total >= MAX_BITS:
-                raise _Refused("the result has more rows than a bit column carries")
-            if total % 8 == 0:
-                packed.append(0)
-            if row[0]:
-                packed[-1] |= 1 << (total % 8)
-            total += 1
+    for row in rows:
+        if len(row) != 1 or type(row[0]) is not bool:
+            raise _Refused("a bit column holds a boolean in every row")
+        if total % 8 == 0:
+            packed.append(0)
+        if row[0]:
+            packed[-1] |= 1 << (total % 8)
+        total += 1
     return {"bits": {"n": total, "data": base64.b64encode(bytes(packed)).decode("ascii")}}
 
 
@@ -659,13 +674,24 @@ def main(*, select_only: bool = True) -> int:
         return 2
     seconds, memory, cpu = asked
     limits = _lower_before_imports(memory, cpu)
+    sys.dont_write_bytecode = True  # a file this process writes may not grow past zero bytes
     try:
         duckdb = importlib.import_module("duckdb")
+        sandbox = importlib.import_module("fluid_build.providers._duckdb_sandbox")
     except ModuleNotFoundError as error:
         _reply(stdout, {"op": "missing", "module": error.name or ""})
         return 3
     settings = connect_settings(memory)
-    connection = duckdb.connect(":memory:", config=settings)
+    # The sandbox makes its spill directory with tempfile, which would probe each candidate by
+    # writing a file there; no file this process writes may grow past zero bytes, so name it.
+    tempfile.tempdir = next((each for each in _TEMP_DIRS if os.path.isdir(each)), None)
+    # The repo's one way to open DuckDB (no file or network access: an empty allowlist), with
+    # the start-up options the sandbox does not set itself passed when the connection opens.
+    connection = sandbox.secure_duckdb_connect(
+        ":memory:",
+        allow=sandbox.DuckDBAllowlist.none(),
+        config={key: settings[key] for key in _START_UP},
+    )
     read_back = _read_back(connection)
     _lower_nofile(limits)
     _reply(

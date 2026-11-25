@@ -89,8 +89,9 @@ package's own; DuckDB's message never crosses (it can quote a value).
 described; :class:`ChildUnavailable` (a ``FluidUserError``) when DuckDB is missing, older than
 1.5.0 (the sandbox's floor) or does not read back the locks it connected with.
 
-The child is ``sys.executable -I <_child.py>``: the standard library and DuckDB only, no working
-directory and no user site on ``sys.path``; an environment of ``PATH`` and ``LC_ALL=C`` only;
+The child is ``sys.executable -I <_child.py>``: the standard library, DuckDB and the repo's DuckDB
+sandbox (``providers._duckdb_sandbox.secure_duckdb_connect``, the one way forge opens DuckDB),
+no working directory and no user site on ``sys.path``; an environment of ``PATH`` and ``LC_ALL=C`` only;
 every descriptor closed but its two pipes; ``RLIMIT_FSIZE`` 0, ``RLIMIT_CPU`` and (where the
 platform enforces it) ``RLIMIT_AS`` before DuckDB is imported, ``RLIMIT_NOFILE`` after it
 connects; an in-memory database connected with ``enable_external_access=false``, no

@@ -111,7 +111,7 @@ class Refused:
     reason: str
 
 
-_DECIMAL = re.compile(r"^(?:decimal|numeric|dec)\s*\(\s*(\d{1,2})\s*(?:,\s*(\d{1,2})\s*)?\)$")
+_DECIMAL = re.compile(r"\A(?:decimal|numeric|dec)\s*\(\s*(\d{1,2})\s*(?:,\s*(\d{1,2})\s*)?\)\Z")
 _SIMPLE = {
     "string": "VARCHAR",
     "varchar": "VARCHAR",

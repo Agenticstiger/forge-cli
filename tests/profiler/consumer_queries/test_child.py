@@ -418,12 +418,30 @@ def test_the_child_cannot_import_the_working_directory(
     assert not marker.exists()
 
 
-def test_the_child_file_imports_nothing_of_forge() -> None:
-    source = Path(_child.__file__).read_text(encoding="utf-8")
-    assert "fluid_build" not in source.replace("fluid_build/", "")
+def test_the_child_file_imports_only_the_standard_library_duckdb_and_the_sandbox() -> None:
+    # The child opens DuckDB through the repo's one sandboxed connect, and imports nothing else of
+    # forge: outside docstrings, the module name appears only in that one import.
     import ast
 
+    source = Path(_child.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    named = [
+        n.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant)
+        and isinstance(n.value, str)
+        and id(n) not in docstrings
+        and "fluid_build" in n.value
+    ]
+    assert named == ["fluid_build.providers._duckdb_sandbox"]
     roots = {
         alias.name.split(".")[0]
         for n in ast.walk(tree)
