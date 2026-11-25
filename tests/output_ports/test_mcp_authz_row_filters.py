@@ -186,6 +186,28 @@ def _free_form(con, sql: str, attrs: Dict[str, Any], **expose_kwargs: Any) -> Li
     return sorted(con.execute(compiled.sql).fetchall())
 
 
+def _compile_for(
+    sql: str,
+    caller: str = EU,
+    dialect: str = "duckdb",
+    *,
+    expose: Optional[Dict[str, Any]] = None,
+    table_reference: str = "customers",
+    **kwargs: Any,
+):
+    """Compile ``sql`` as ``query_sql`` does for ``caller``, on the fixture expose unless
+    another is given."""
+    return query_compiler.compile_free_form_sql(
+        sql=sql,
+        table_reference=table_reference,
+        limit=10,
+        expose=_expose() if expose is None else expose,
+        caller_attributes=_as(caller),
+        dialect=dialect,
+        **kwargs,
+    )
+
+
 # ---------------------------------------------------------------------
 # Every read path serves only the caller's rows
 # ---------------------------------------------------------------------
@@ -449,14 +471,7 @@ def test_a_predicate_column_the_table_lacks_never_reads_an_outer_one(con):
 )
 def test_query_sql_refuses_a_source_the_filter_cannot_cover(sql):
     with pytest.raises(query_compiler.QueryValidationError):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect="duckdb",
-        )
+        _compile_for(sql)
 
 
 def test_every_read_of_the_exposed_table_carries_the_filter():
@@ -485,15 +500,7 @@ def test_every_read_of_the_exposed_table_carries_the_filter():
 
 def test_an_unfiltered_reader_keeps_the_callers_statement():
     sql = "SELECT id FROM customers"
-    compiled = query_compiler.compile_free_form_sql(
-        sql=sql,
-        table_reference="customers",
-        limit=10,
-        expose=_expose(),
-        caller_attributes=_as(EVERYONE),
-        dialect="duckdb",
-    )
-    assert compiled.sql.startswith(sql)
+    assert _compile_for(sql, EVERYONE).sql.startswith(sql)
 
 
 def test_the_engine_parser_refuses_a_projection_whose_filter_was_changed():
@@ -875,15 +882,7 @@ def test_serve_refuses_a_policy_that_is_not_a_mapping_before_anything_reads_it(t
 @pytest.mark.parametrize("restricted", [(), ("secret",)], ids=["filtered", "filtered-restricted"])
 def test_query_sql_reads_no_relation_but_the_exposed_table(sql, restricted):
     with pytest.raises(query_compiler.QueryValidationError):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            restricted_columns=restricted,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect="postgres",
-        )
+        _compile_for(sql, dialect="postgres", restricted_columns=restricted)
 
 
 @pytest.mark.parametrize(
@@ -913,14 +912,7 @@ def test_a_cte_covers_only_the_reads_in_its_scope(sql):
     """A name that matches a CTE somewhere else in the statement is still the catalog's
     relation where that CTE is not in scope."""
     with pytest.raises(query_compiler.QueryValidationError, match="duckdb_views"):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect="duckdb",
-        )
+        _compile_for(sql)
 
 
 def test_a_cte_in_scope_reads_the_filtered_projection(con):
@@ -1089,14 +1081,7 @@ _BINDINGS = {"duckdb": "customers", "postgres": "logistics.public.customers"}
 def test_a_table_of_the_exposed_name_in_another_schema_is_refused(dialect, sql):
     """It would be served the exposed table's filtered rows under another table's name."""
     with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference=_BINDINGS[dialect],
-            limit=10,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect=dialect,
-        )
+        _compile_for(sql, dialect=dialect, table_reference=_BINDINGS[dialect])
 
 
 @pytest.mark.parametrize(
@@ -1109,14 +1094,7 @@ def test_a_table_of_the_exposed_name_in_another_schema_is_refused(dialect, sql):
     ],
 )
 def test_the_exposed_table_may_be_named_as_its_binding_names_it(dialect, sql):
-    compiled = query_compiler.compile_free_form_sql(
-        sql=sql,
-        table_reference=_BINDINGS[dialect],
-        limit=10,
-        expose=_expose(),
-        caller_attributes=_as(EU),
-        dialect=dialect,
-    )
+    compiled = _compile_for(sql, dialect=dialect, table_reference=_BINDINGS[dialect])
     assert "_fluid_rows.region = 'EU'" in compiled.sql
 
 
@@ -1143,38 +1121,16 @@ def _bound_to(db_file: Optional[str]) -> Dict[str, Any]:
 )
 def test_duckdb_reads_the_exposed_table_under_the_catalog_its_binding_opens(db_file, sql, refused):
     """DuckDB names the database a binding opens ``memory``, or after the file's stem."""
-
-    def compile_it():
-        return query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_bound_to(db_file),
-            caller_attributes=_as(EU),
-            dialect="duckdb",
-        )
-
     if refused:
         with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
-            compile_it()
+            _compile_for(sql, expose=_bound_to(db_file))
     else:
-        assert "_fluid_rows.region = 'EU'" in compile_it().sql
+        assert "_fluid_rows.region = 'EU'" in _compile_for(sql, expose=_bound_to(db_file)).sql
 
 
 # ---------------------------------------------------------------------
 # A filtered caller calls only listed functions
 # ---------------------------------------------------------------------
-
-
-def _compile_for(sql: str, caller: str = EU, dialect: str = "duckdb"):
-    return query_compiler.compile_free_form_sql(
-        sql=sql,
-        table_reference="customers",
-        limit=10,
-        expose=_expose(),
-        caller_attributes=_as(caller),
-        dialect=dialect,
-    )
 
 
 @pytest.mark.parametrize(
@@ -1369,22 +1325,11 @@ def _typed() -> Dict[str, Any]:
 def test_a_declared_string_column_is_compared_only_with_strings(sql, refused):
     """The engine would cast every row's value of the string column, and fail on a
     withheld one. ``region`` declares no type, so nothing is known about it."""
-
-    def compile_it():
-        return query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_typed(),
-            caller_attributes=_as(EU),
-            dialect="snowflake",
-        )
-
     if refused:
         with pytest.raises(query_compiler.QueryValidationError, match="a string column"):
-            compile_it()
+            _compile_for(sql, dialect="snowflake", expose=_typed())
     else:
-        compile_it()
+        _compile_for(sql, dialect="snowflake", expose=_typed())
 
 
 @pytest.mark.parametrize(
@@ -1432,18 +1377,9 @@ def test_a_refusal_names_what_the_caller_wrote(dialect, sql, named):
     ],
 )
 def test_duckdb_names_a_database_file_up_to_its_first_dot(sql, refused):
-    def compile_it():
-        return query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_bound_to("/data/data.v1.duckdb"),
-            caller_attributes=_as(EU),
-            dialect="duckdb",
-        )
-
+    expose = _bound_to("/data/data.v1.duckdb")
     if refused:
         with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
-            compile_it()
+            _compile_for(sql, expose=expose)
     else:
-        compile_it()
+        _compile_for(sql, expose=expose)
