@@ -44,7 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version and the changes between versions, with the changes counted by the column that moves.
   Each member goes through the same disclosure checks as every other statistic, and a table that
   cannot form one is named under Not measured. The document names format 1-3-0. A request or a
-  private release writes no history.
+  private release writes no history. A default profile of such a table no longer lists the
+  window's own start and end under `datePairs`: the pair is named under Not measured, since its
+  days and the history's version lengths would give each other's withheld cells back. A table
+  without a validity window keeps the same bytes.
 
 - **A private release counts children per entity of a versioned table.** With `--privacy-unit`
   and `--follow`, a relationship into a table with a validity window, whose `toColumns` are its
