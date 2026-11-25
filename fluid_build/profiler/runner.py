@@ -33,6 +33,7 @@ domain, as the levels ``false`` and ``true``, which is how flux-stats reads one.
 
 from __future__ import annotations
 
+import bisect
 import re
 import time
 from collections import Counter
@@ -347,6 +348,8 @@ class RelationshipResult:
     #: The cells published, of the histogram's cells; 0 when it is withheld whole.
     published: int
     cells: int
+    #: Which bins of the histogram publish their cell (all ``False`` when it is withheld whole).
+    shown: Tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1132,6 +1135,11 @@ def profile_exposes(
     queries: List[Dict[str, Any]] = []
     query_results: Tuple[QueryResult, ...] = ()
     if request is not None:
+        links = (
+            _counted_links(relationships, counted_entries, by_expose, backend)
+            if query_plans.needs_links()
+            else []
+        )
         invariants, fact_results, more, queries, query_results = _measured_for_request(
             contract,
             fact_plans,
@@ -1141,6 +1149,7 @@ def profile_exposes(
             asked,
             answered,
             tables_doc,
+            links,
             backend=backend,
             rule=rule,
             tallies=tallies,
@@ -1197,6 +1206,7 @@ def _measured_for_request(
     asked: Mapping[str, RequestTable],
     answered: "_Groupings",
     tables_doc: Dict[str, Dict[str, Any]],
+    links: Sequence["query_rates.CountedLink"],
     *,
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
@@ -1234,7 +1244,7 @@ def _measured_for_request(
             )
         ),
     ):
-        rates = query_rates.measure(query_plans, by_table, backend, rule)
+        rates = query_rates.measure(query_plans, by_table, backend, rule, links)
         invariants, fact_results, unmeasured = _fact_entries(
             contract, fact_plans, by_table, rule, tallies[0], rates
         )
@@ -2102,13 +2112,7 @@ def _children_counted(
     through the one call, so the output check sees the partition the groups share, and the
     audit of withheld cells runs group by group, on the parents and children of each.
     """
-    parents = _keys(tables[relationship.parent], relationship.parent_columns, backend)
-    children = Counter(
-        key
-        for key in _keys(tables[relationship.child], relationship.child_columns, backend)
-        if None not in key
-    )
-    counts = [0 if None in key else children.get(key, 0) for key in parents]
+    parents, counts = _parent_counts(relationship, tables, backend)
     encode = backend.encoder(fractional_bits)
     statistic = DeclaredStatistic(
         identifier="marginalHistogram/1",
@@ -2173,19 +2177,69 @@ def _children_counted(
             )
         )
     (group,) = entries[0]["groups"]
-    published = (
-        sum(1 for count in group["binCounts"] if count is not None)
-        if group["status"] == disclosure.FREE
-        else 0
-    )
+    if group["status"] == disclosure.FREE:
+        shown = tuple(count is not None for count in group["binCounts"])
+    else:
+        shown = (False,) * (len(CHILDREN_EDGES) - 1)
+    published = sum(shown)
     document_entry = {
         "parent": {"table": relationship.parent, "columns": list(relationship.parent_columns)},
         "child": {"table": relationship.child, "columns": list(relationship.child_columns)},
         "statistics": entries,
     }
     return document_entry, RelationshipResult(
-        relationship, published=published, cells=len(CHILDREN_EDGES) - 1
+        relationship, published=published, cells=len(CHILDREN_EDGES) - 1, shown=shown
     )
+
+
+def _parent_counts(
+    relationship: Relationship,
+    tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
+    backend: StatisticsBackend,
+) -> Tuple[List[Tuple[Any, ...]], List[int]]:
+    """Each parent row's key and its number of children, in the order the parent's rows were read."""
+    parents = _keys(tables[relationship.parent], relationship.parent_columns, backend)
+    children = Counter(
+        key
+        for key in _keys(tables[relationship.child], relationship.child_columns, backend)
+        if None not in key
+    )
+    return parents, [0 if None in key else children.get(key, 0) for key in parents]
+
+
+def _counted_links(
+    relationships: Sequence[Relationship],
+    counted: Mapping[int, Tuple[Dict[str, Any], RelationshipResult]],
+    tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
+    backend: StatisticsBackend,
+) -> List["query_rates.CountedLink"]:
+    """The counted relationships of one key column each, with each parent's bin of its histogram.
+
+    A consumer query whose unit groups the child's rows by that column counts the parents, so it
+    is checked with the bin each parent is in and with which bins the histogram publishes. Held
+    for the run's checks, never written.
+    """
+    found: List["query_rates.CountedLink"] = []
+    for position, (_, result) in counted.items():
+        each = relationships[position]
+        if len(each.child_columns) != 1 or len(each.parent_columns) != 1:
+            continue
+        _, counts = _parent_counts(each, tables, backend)
+        bins = tuple(
+            min(bisect.bisect_right(CHILDREN_EDGES, count) - 1, len(CHILDREN_EDGES) - 2)
+            for count in counts
+        )
+        found.append(
+            query_rates.CountedLink(
+                each.child,
+                each.parent,
+                each.child_columns[0],
+                each.parent_columns[0],
+                bins,
+                result.shown,
+            )
+        )
+    return found
 
 
 def _members(grouping: Grouping) -> Dict[str, List[int]]:

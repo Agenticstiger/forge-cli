@@ -31,8 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under Not measured with its reason. The queries of one unit are checked as a set, together with
   the facts of the same table, so two queries that differ by a few records give none back; a
   private release publishes no query rate. A view unit counts its table's records and its
-  condition is one more factor of that table's set check; a view that joins, aggregates or
-  reshapes rows is named before any read. A condition that could raise an error depending on a
+  condition is one more factor of that table's set check; a view that joins or reshapes rows is
+  named before any read. A unit may aggregate when it counts entities: one table's rows grouped
+  by one column of a declared `many_to_one` relationship (`SELECT K, count(*) AS n FROM t GROUP
+  BY K`, with `count`, `sum`, `avg`, `min` or `max` of the table's columns, a `WHERE` and a
+  `HAVING`). Its records are the entities, the parents of a counted relationship or the distinct
+  values of the column, and a query over it is checked as a set with whether the entity is in the
+  unit and, where the relationship's children-per-parent histogram withholds a bin, that bin;
+  any other aggregate, and a table's natural entity, is named before any read. A condition that could raise an error depending on a
   row's value is refused before any read with the gateway's own condition fence, and any failure
   that still depends on the records withholds every query of the run with one fixed message, so
   a run says at most that some statement failed, never which. A query is checked as a set with the

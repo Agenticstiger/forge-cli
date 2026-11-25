@@ -10,7 +10,28 @@ number of rows the query returns, per level of the ``groupBy`` column when it ha
 unit is a table of the request (its rows) or a view that keeps some of one table's rows
 (``SELECT <columns> FROM <table> [WHERE <condition>]``): the records counted are then the table's,
 and the view's condition is one more factor of that table's set check. Any other view (a join,
-an aggregate, a reshaping) is named before any read.
+a reshaping) is named before any read, and so is an aggregate unless it counts entities.
+
+**Entity units.** A unit may aggregate when it groups one table's rows by an entity they belong
+to: ``SELECT K [AS ..], <aggregates of t's columns> [AS ..] FROM t [AS a] [WHERE c] GROUP BY K
+[HAVING h]``, with ``K`` the child column of one declared ``many_to_one`` relationship of ``t``
+(one column a side). The aggregates are ``count``, ``sum``, ``avg``, ``min`` and ``max`` of one
+column; no nested aggregate, window, ``DISTINCT``, join, subquery, set operation, ``ORDER BY`` or
+``LIMIT``. ``c`` passes the fence the other conditions pass, and ``h`` passes it too, reading each
+aggregate as a column of the type it returns (:func:`_aggregate_type`); a query over the unit
+passes it over the unit's output columns, typed the same way. A table's natural entity, and a
+column that also keys the table's per-entity statistics, are refused: those publish counts of
+the same entities. The unit's records are the entities with at least one row passing ``c`` and
+``h``, and the population is every entity:
+
+* ``K`` is the child column of a relationship the profile counts: the parents, each a record, with
+  the bin of the children-per-parent histogram each is in. The bins whose cell the histogram
+  withholds are a part of the set check (a published cell is one state, as a column's published
+  histogram is not crossed with a fact), so a query cannot give a withheld cell back;
+* otherwise: the distinct values of ``K`` among the table's rows.
+
+One ``counts`` statement per population gives every combination of "in the unit" and each query's
+outcome; the entities' set is checked apart from the table's own rows.
 
 **What is answered is decided before any record is read** (:func:`plan_queries`), so that
 ``--strict`` refuses the rest. A query is answered when
@@ -116,6 +137,11 @@ from fluid_build.profiler.consumer_queries import Checked, Refused, Table
 
 __all__ = [
     "CAN_FAIL",
+    "ENTITY_ONLY",
+    "HISTORY_ENTITY",
+    "PER_ENTITY_KEY",
+    "CountedLink",
+    "EntityUnit",
     "MEMORY_BYTES",
     "MOST_GROUPED_PER_COLUMN",
     "MOST_GROUP_LEVELS",
@@ -160,6 +186,26 @@ RECORD_REASONS = frozenset({RUN_FAILED})
 NOT_A_FILTER_VIEW = (
     "a unit that aggregates, joins or reshapes rows is not one fluid profile can check with "
     "its table: name the table, or a view that keeps some of one table's rows"
+)
+
+ENTITY_ONLY = (
+    "a unit that aggregates is answered only when it groups one table's rows by an entity "
+    "they belong to"
+)
+HISTORY_ENTITY = (
+    "a unit that groups a versioned table by its natural entity counts the entities whose "
+    "versions per entity the table's history publishes, so fluid profile does not answer it"
+)
+PER_ENTITY_KEY = (
+    "its entity column also keys the per-entity statistics of its table, which count the same "
+    "entities, so fluid profile does not answer a unit that groups by it"
+)
+ENTITY_KEY_TYPE = (
+    "its entity column has a type whose values fluid profile does not match as entities: "
+    "use a text, boolean, whole-number or decimal key"
+)
+ENTITY_PARENT_TYPE = (
+    "its entity column and the key of its relationship's parent are not read as one type"
 )
 
 CAN_FAIL = (
@@ -215,6 +261,40 @@ def report_lines(results: Sequence[QueryResult], asked: int) -> List[str]:
 
 
 @dataclass(frozen=True)
+class EntityUnit:
+    """A unit that groups one table's rows by an entity they belong to.
+
+    ``key`` is the table's column the rows are grouped by and ``out_key`` the name the unit
+    returns it under; ``outputs`` are the unit's columns with the contract type each has for the
+    fence. ``parent`` is the ``(table, key column)`` of the declared ``many_to_one`` relationship
+    ``key`` is the child column of.
+    """
+
+    table: str
+    key: str
+    out_key: str
+    outputs: Tuple[Tuple[str, str], ...]
+    parent: Optional[Tuple[str, str]] = None
+
+
+@dataclass(frozen=True)
+class CountedLink:
+    """A relationship whose children per parent the profile counts, as a population needs it.
+
+    ``bins`` is the bin of each parent row (the bins of the children-per-parent histogram), in the
+    order the parent's rows were read; ``shown`` says which bins' cells the histogram publishes.
+    Held in memory for the one run, never written.
+    """
+
+    child: str
+    parent: str
+    child_column: str
+    parent_column: str
+    bins: Tuple[int, ...] = field(repr=False)
+    shown: Tuple[bool, ...] = ()
+
+
+@dataclass(frozen=True)
 class QueryPlan:
     """What one request query needs, decided from the request and the contract alone.
 
@@ -249,6 +329,8 @@ class QueryPlan:
     #: counts the rows of its checked text.
     unit_bits_sql: str = field(default="", repr=False)
     unit_verify_sql: str = field(default="", repr=False)
+    #: A unit that groups its table's rows by an entity: its records are entities, not rows.
+    entity: Optional[EntityUnit] = None
 
     @property
     def unit(self) -> Tuple[str, str]:
@@ -274,6 +356,10 @@ class QueryPlans:
     def unanswered(self) -> List[Tuple[str, str]]:
         """Each query decided not answered before any record is read, with why."""
         return [(f"query {each.name}", each.reason) for each in self.plans if each.reason]
+
+    def needs_links(self) -> bool:
+        """Whether an answerable query counts entities that may be a counted relationship's parents."""
+        return any(each.entity is not None and each.entity.parent for each in self.answerable())
 
     def columns_of(self, table: str) -> List[str]:
         """The columns of *table* the answerable queries and their units read, in order."""
@@ -306,7 +392,7 @@ def plan_queries(
         return QueryPlans()
     schema = _schema_of(contract, request)
     rows = {table: _row_column(columns) for table, columns in schema.items()}
-    planner = _Planner(schema, rows, enum_levels)
+    planner = _Planner(schema, rows, enum_levels, contract)
     plans = tuple(planner.plan(index, each) for index, each in enumerate(request.queries))
     return QueryPlans(plans, schema, rows)
 
@@ -362,10 +448,17 @@ class _Planner:
         schema: Mapping[str, Table],
         rows: Mapping[str, str],
         enum_levels: Callable[[str], Sequence[str]],
+        contract: Mapping[str, Any],
     ) -> None:
         self._schema = schema
         self._rows = rows
         self._enum_levels = enum_levels
+        self._exposes: Dict[str, Mapping[str, Any]] = {
+            str(item.get("exposeId")): item
+            for item in iter_exposes(dict(contract))
+            if item.get("exposeId")
+        }
+        self._entity_parts: Dict[Tuple[str, str], int] = {}
         self._spent = 0
         self._exhausted = False
         self._counted: Set[str] = set()
@@ -397,7 +490,12 @@ class _Planner:
             view = found
             kept = _filter_view(view, self._schema)
             if kept is None:
-                return blank.refused(NOT_A_FILTER_VIEW)
+                counts_entities = self._entity_unit(view)
+                if counts_entities is None:
+                    return blank.refused(NOT_A_FILTER_VIEW)
+                if isinstance(counts_entities, str):
+                    return blank.refused(counts_entities)
+                return self._plan_entity(index, query, checked, view, counts_entities)
             table, unit_where, names = kept
         elif query.table not in self._schema:
             return blank.refused("its unit's table is not one the request lists")
@@ -456,23 +554,249 @@ class _Planner:
         applied to the one condition the query and its unit's view keep rows by, typed by the
         contract. A column the contract types as an ``enum(...)`` is loaded as text.
         """
+        return self._fenced(where, table, self._schema[table].columns)
+
+    @staticmethod
+    def _fenced(where: Any, relation: str, columns: Sequence[Tuple[str, str]]) -> bool:
+        """Whether *where*, read over *relation* whose *columns* are ``(name, contract type)``, passes."""
         if where is None:
             return True
         from fluid_build.output_ports.mcp import query_compiler
 
         types: Dict[str, Optional[Any]] = {}
-        for name, kind in self._schema[table].columns:
-            if _duck(kind) == "VARCHAR" and re.match(r"\s*enum\s*\(", kind, re.IGNORECASE):
+        for name, kind in columns:
+            if re.match(r"\s*enum\s*\(", kind, re.IGNORECASE):
                 types[name.casefold()] = query_compiler.ColumnType("string")
-        sql = f"SELECT 1 FROM {_ident(table)} AS {_ident(table)} WHERE {_condition(where, alias, table)}"
-        expose = {
-            "contract": {"schema": [{"name": n, "type": k} for n, k in self._schema[table].columns]}
-        }
+        sql = (
+            f"SELECT 1 FROM {_ident(relation)} AS {_ident(relation)} "
+            f"WHERE {_condition(where, relation, relation)}"
+        )
+        expose = {"contract": {"schema": [{"name": n, "type": k} for n, k in columns]}}
         try:
-            query_compiler.refuse_conditions_that_can_fail(sql, expose, table, "duckdb", types)
+            query_compiler.refuse_conditions_that_can_fail(sql, expose, relation, "duckdb", types)
         except query_compiler.QueryValidationError:
             return False
         return True
+
+    # -- a unit that groups one table's rows by an entity -----------------------------------
+
+    def _entity_unit(self, view: Checked) -> Union[None, str, EntityUnit]:
+        """A view that groups one table's rows by an entity they belong to, else why not.
+
+        ``None`` for a view that does not aggregate at all (it is a view that is not a filter).
+        The shape is ``SELECT K [AS ..], <aggregates of the table's columns> [AS ..] FROM t
+        [WHERE c] GROUP BY K [HAVING h]`` and nothing else: no join, subquery, window,
+        ``DISTINCT``, set operation, ``ORDER BY`` or ``LIMIT``. ``c`` and ``h`` pass the fence
+        the other conditions pass, ``h`` over the typed outputs of the aggregates it reads.
+        """
+        from sqlglot import exp
+
+        from fluid_build.output_ports.mcp import query_compiler
+
+        tree = view.tree
+        if not isinstance(tree, exp.Select):
+            return None
+        if tree.args.get("group") is None and not any(
+            isinstance(node, exp.AggFunc) for node in tree.walk()
+        ):
+            return None
+        for key, value in tree.args.items():
+            if key not in _ENTITY_ARGS and not _blank(value):
+                return ENTITY_ONLY
+        allowed = (*_entity_nodes(), *query_compiler._condition_nodes())
+        for node in tree.walk():
+            if not isinstance(node, allowed):
+                return ENTITY_ONLY
+            if isinstance(node, exp.Star) and not isinstance(node.parent, exp.Count):
+                return ENTITY_ONLY
+        from_ = tree.args.get("from_")
+        source = from_.this if isinstance(from_, exp.From) else None
+        if not isinstance(source, exp.Table) or str(source.name) not in self._schema:
+            return ENTITY_ONLY
+        if any(k not in ("this", "alias") and not _blank(v) for k, v in source.args.items()):
+            return ENTITY_ONLY
+        table, alias = str(source.name), str(source.alias or source.name)
+        group = tree.args.get("group")
+        if not isinstance(group, exp.Group):
+            return ENTITY_ONLY
+        if any(k != "expressions" and not _blank(v) for k, v in group.args.items()):
+            return ENTITY_ONLY
+        grouped = group.expressions
+        if len(grouped) != 1 or not isinstance(grouped[0], exp.Column):
+            return ENTITY_ONLY
+        if str(grouped[0].table) != alias:
+            return ENTITY_ONLY
+        key = str(grouped[0].name)
+        columns = self.types(table)
+        if key not in columns:
+            return ENTITY_ONLY
+        parent = self._entity_of(table, key)
+        if isinstance(parent, str):
+            return parent
+        why = self._entity_key(table, key, parent)
+        if why is not None:
+            return why
+        outputs, out_key = self._outputs(tree, view, alias, key, columns)
+        if out_key is None:
+            return ENTITY_ONLY
+        where = tree.args.get("where")
+        if where is not None:
+            if any(isinstance(node, exp.AggFunc) for node in where.walk()):
+                return ENTITY_ONLY
+            if not self._cannot_fail(where.this, alias, table):
+                return CAN_FAIL
+        having = tree.args.get("having")
+        if having is not None:
+            found = self._having_fenced(having.this, alias, key, columns)
+            if found is not None:
+                return found
+        return EntityUnit(table, key, out_key, tuple(outputs), parent)
+
+    def _entity_of(self, table: str, key: str) -> Union[str, Optional[Tuple[str, str]]]:
+        """The ``(parent, key column)`` of the one many_to_one relationship *key* is the child of.
+
+        A reason when *key* is no entity of *table*: its natural entity (the table's history
+        publishes that population's versions per entity), the key of per-entity statistics, or
+        a column no single declared many_to_one relationship hangs on. ``None`` when the
+        relationship's parent is not a table of the request.
+        """
+        from fluid_build.forge_datamodel import semantics_builder
+        from fluid_build.profiler import per_entity
+
+        expose = self._exposes.get(table, {})
+        semantics = expose.get("semantics")
+        semantics = semantics if isinstance(semantics, Mapping) else {}
+        try:
+            window = semantics_builder.version_window(semantics)
+        except (KeyError, StopIteration, TypeError, ValueError):
+            return HISTORY_ENTITY  # a window that cannot be read is not shown not to be the key's
+        if window is not None and window.key == key:
+            return HISTORY_ENTITY
+        links = [
+            raw
+            for raw in (semantics.get("relationships") or [])
+            if isinstance(raw, Mapping) and _names(raw.get("fromColumns")) == (key,)
+        ]
+        if len(links) != 1 or links[0].get("cardinality") != "many_to_one":
+            return ENTITY_ONLY
+        if any(source == (key,) for source, _ in per_entity.dependencies(expose)):
+            return PER_ENTITY_KEY
+        target, to_columns = links[0].get("to"), _names(links[0].get("toColumns"))
+        if len(to_columns) != 1 or not isinstance(target, str):
+            return ENTITY_ONLY
+        return (target, to_columns[0]) if target in self._schema else None
+
+    def _entity_key(self, table: str, key: str, parent: Optional[Tuple[str, str]]) -> Optional[str]:
+        """Why the entity column cannot be matched as entities, or ``None``."""
+        duck = _duck(self.types(table)[key])
+        if duck is None or duck.split("(")[0] not in _ENTITY_KEYS:
+            return ENTITY_KEY_TYPE
+        if parent is not None:
+            theirs = self.types(parent[0]).get(parent[1])
+            if theirs is None or _duck(theirs) != duck:
+                return ENTITY_PARENT_TYPE
+        return None
+
+    def _outputs(
+        self, tree: Any, view: Checked, alias: str, key: str, columns: Mapping[str, str]
+    ) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+        """The unit's output columns with their contract types, and the name the key is returned as."""
+        from sqlglot import exp
+
+        items = tree.args.get("expressions") or []
+        outputs: List[Tuple[str, str]] = []
+        out_key: Optional[str] = None
+        if len(items) != len(view.output_columns):
+            return [], None
+        for item, name in zip(items, view.output_columns, strict=True):
+            inner = item.this if isinstance(item, exp.Alias) else item
+            if isinstance(inner, exp.Column):
+                if str(inner.table) != alias or str(inner.name) != key:
+                    return [], None
+                out_key = out_key or name
+                outputs.append((name, columns[key]))
+                continue
+            kind = _aggregate_type(inner, alias, columns)
+            if kind is None:
+                return [], None
+            outputs.append((name, kind))
+        if len({name for name, _ in outputs}) != len(outputs):
+            return [], None
+        return outputs, out_key
+
+    def _having_fenced(
+        self, condition: Any, alias: str, key: str, columns: Mapping[str, str]
+    ) -> Optional[str]:
+        """Why a ``HAVING`` condition is refused, or ``None``: it reads only typed aggregates.
+
+        Each aggregate of the condition is read as a column of the type it returns, and the
+        entity column as itself, so the one fence the other conditions pass decides it.
+        """
+        from sqlglot import exp
+
+        rebuilt = condition.copy()
+        typed: List[Tuple[str, str]] = [(key, columns[key])]
+        for found in list(rebuilt.find_all(exp.AggFunc)):
+            kind = _aggregate_type(found, alias, columns)
+            if kind is None:
+                return ENTITY_ONLY
+            name = f"__a{len(typed)}"
+            typed.append((name, kind))
+            found.replace(exp.column(name))
+        for column in rebuilt.find_all(exp.Column):
+            if not str(column.name).startswith("__a") and (
+                str(column.name) != key or str(column.table) not in ("", alias)
+            ):
+                return ENTITY_ONLY
+        return None if self._fenced(rebuilt, "having", typed) else CAN_FAIL
+
+    def _plan_entity(
+        self, index: int, query: RequestQuery, checked: Checked, view: Checked, unit: EntityUnit
+    ) -> QueryPlan:
+        """Plan a query over an entity unit: a filter of the unit's output rows."""
+        blank = QueryPlan(index, query.name)
+        if query.group_by is not None:
+            return blank.refused("fluid profile groups a query only over a table unit's records")
+        try:
+            where, alias = _kept(checked, table=None, view=view.text)
+        except _NotKept as found_not_kept:
+            return blank.refused(_KEPT + str(found_not_kept))
+        if not self._fenced(where, alias, unit.outputs):
+            return blank.refused(CAN_FAIL)
+        pairs = {*view.columns, (unit.table, unit.key)}
+        if unit.parent is not None:
+            pairs.add(unit.parent)
+        reads = tuple(sorted(pairs))
+        why = self._loadable(reads)
+        if why is not None:
+            return blank.refused(why)
+        plan = QueryPlan(
+            index,
+            query.name,
+            table=unit.table,
+            view=view.text,
+            text=checked.text,
+            reads=reads,
+            where=where,
+            alias=alias,
+            entity=unit,
+        )
+        why = self._room(plan)
+        if why is not None:
+            return blank.refused(why)
+        verify = _checked_statement(
+            f"SELECT count(*) FROM ({plan.text}) AS {_ident('q')}", self._schema
+        )
+        counted = _checked_statement(
+            f"SELECT count(*) FROM ({view.text}) AS {_ident('q')}", self._schema
+        )
+        if isinstance(verify, Refused) or isinstance(counted, Refused):
+            again = verify if isinstance(verify, Refused) else counted
+            assert isinstance(again, Refused)
+            return blank.refused(
+                f"a statement that counts its rows is refused when checked again: {again.reason}"
+            )
+        return replace(plan, verify_sql=verify.text, unit_verify_sql=counted.text)
 
     # -- the public budget -------------------------------------------------------------------
 
@@ -551,6 +875,15 @@ class _Planner:
         unit_part = (table or "", plan.view or "")
         if plan.view is not None and unit_part not in self._unit_parts:
             parts += 1  # the view's own condition is one more factor of the table's set
+        if plan.entity is not None:
+            # the entities of a table are another population than its rows: a set of their own
+            population = (plan.entity.table, plan.entity.key)
+            if self._entity_parts.get(population, 0) + parts > MOST_SET_PARTS:
+                return f"past the {MOST_SET_PARTS} parts one table's set check holds"
+            self._per_unit[unit] = self._per_unit.get(unit, 0) + 1
+            self._unit_parts.add(unit_part)
+            self._entity_parts[population] = self._entity_parts.get(population, 0) + parts
+            return None
         if plan.group_by is not None and table is not None:
             column = (table, plan.group_by)
             if self._grouped.get(column, 0) >= MOST_GROUPED_PER_COLUMN:
@@ -679,6 +1012,76 @@ def _filter_view(
             return None
         names[written] = str(column.name)
     return table, condition, names
+
+
+_ENTITY_ARGS = frozenset({"expressions", "from_", "where", "group", "having"})
+#: The duckdb types an entity column may have: ones whose equality is the entity's own.
+_ENTITY_KEYS = frozenset(
+    {"VARCHAR", "BOOLEAN", "DECIMAL", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT"}
+)
+
+
+def _entity_nodes() -> Tuple[type, ...]:
+    """What an entity unit's own structure is made of, beside the nodes of a condition."""
+    from sqlglot import exp
+
+    return (
+        exp.Select,
+        exp.From,
+        exp.Table,
+        exp.TableAlias,
+        exp.Where,
+        exp.Group,
+        exp.Having,
+        exp.Alias,
+        exp.Count,
+        exp.Sum,
+        exp.Avg,
+        exp.Min,
+        exp.Max,
+        exp.Star,
+    )
+
+
+def _names(value: Any) -> Tuple[str, ...]:
+    return tuple(each for each in value if isinstance(each, str)) if isinstance(value, list) else ()
+
+
+def _aggregate_type(node: Any, alias: str, columns: Mapping[str, str]) -> Optional[str]:
+    """The contract type an aggregate of one column returns, as the fence compares it.
+
+    ``count`` is a whole number, ``sum`` an exact number (or a double for a double), ``avg`` a
+    double, ``min`` and ``max`` the column's own type; ``None`` for an aggregate or an argument
+    that cannot be typed this way (an expression, a column of a type that does not add up).
+    """
+    from sqlglot import exp
+
+    if not isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+        return None
+    argument = node.this
+    if isinstance(node, exp.Count) and isinstance(argument, exp.Star):
+        return "long"
+    # a column inside HAVING is left unqualified by the check: the one table it reads is the unit's
+    if not isinstance(argument, exp.Column) or str(argument.table) not in ("", alias):
+        return None
+    kind = columns.get(str(argument.name))
+    duck = _duck(kind) if kind is not None else None
+    if kind is None or duck is None:
+        return None
+    base = duck.split("(")[0]
+    if isinstance(node, exp.Count):
+        return "long"
+    if isinstance(node, (exp.Min, exp.Max)):
+        return kind
+    if base == "DOUBLE":
+        return "double"
+    if isinstance(node, exp.Avg):
+        return "double" if base in _BOUNDS or base == "DECIMAL" else None
+    if base in _BOUNDS:
+        return "decimal(38,0)"
+    if base == "DECIMAL":
+        return f"decimal(38,{duck.split(',')[1].rstrip(')')})"
+    return None
 
 
 def _folded(unit_where: Any, where: Any, names: Mapping[str, str]) -> Any:
@@ -1017,6 +1420,10 @@ class Measured:
         self._members: Dict[int, _Member] = {}
         self._population: Dict[int, int] = {}
         self._checked: Set[str] = set()
+        #: The entities of the tables the entity units group, one population each.
+        self.populations: List[_Population] = []
+        self._entity_true: Dict[int, int] = {}
+        self._populations_checked = False
 
     def has_table(self, table: str) -> bool:
         return bool(self.tables.get(table))
@@ -1034,6 +1441,13 @@ class Measured:
                     cells = [[k - true, true] for k, true in each.sizes]
                 self._own[each.plan.index] = _Own([_cell_verdict(pair, rule) for pair in cells])
                 self._population[each.plan.index] = each.size
+        for population in self.populations:
+            for entity in population.members:
+                index = entity.plan.index
+                pair = [entity.k - entity.true, entity.true]
+                self._own[index] = _Own([_cell_verdict(pair, rule)])
+                self._population[index] = entity.k
+                self._entity_true[index] = entity.true
 
     # -- a table: its queries and its facts in one set --------------------------------------
 
@@ -1083,6 +1497,7 @@ class Measured:
         self, rule: disclosure.DisclosureRule, tally: "Counter[str]"
     ) -> Tuple[List[Dict[str, Any]], Tuple[QueryResult, ...], List[Tuple[str, str]]]:
         """The ``queries`` entries, what became of every query listed, and those not answered."""
+        self._check_populations(rule)
         for table in self.tables:
             if table not in self._checked:
                 self.check_table(table, (), {}, set(), None, rule)
@@ -1152,7 +1567,48 @@ class Measured:
         return {"name": plan.name, "statistics": [statistic]}, result
 
     def _true_of(self, plan: QueryPlan) -> int:
+        if plan.index in self._entity_true:
+            return self._entity_true[plan.index]
         return self._members[plan.index].true
+
+    # -- a population of entities: its units' and its queries' outcomes, in one set -------------
+
+    def _check_populations(self, rule: disclosure.DisclosureRule) -> None:
+        """Check each population of entities as a set, withholding the queries that give a cell back.
+
+        The population is the parents of a counted relationship, or the distinct values of the
+        entity column. The parts are whether an entity is in each unit, each query's outcome and,
+        when the relationship's histogram withholds some bins, the bin of the entity's children
+        count; the table's own rows are another population and are never in this set.
+        """
+        if self._populations_checked:
+            return
+        self._populations_checked = True
+        for population in self.populations:
+            layout = _EntityLayout(population, self._own)
+            if not layout.width:
+                continue
+            cells = layout.project(population.cells)
+            dead: Set[int] = set()
+            while True:
+                candidates = [at for at in range(layout.width) if at not in dead]
+                found = set(
+                    disclosure.suppress_differencing(
+                        cells, candidates, rule, layout.factors, _ENTITY_STATES
+                    )
+                )
+                if layout.bin_at in found:
+                    # a published bin cannot be merged: the entities' parts are all withheld
+                    dead = set(range(layout.width))
+                    break
+                new = (found | layout.dependants(dead | found)) - dead
+                if not new:
+                    break
+                dead |= new
+            for at in dead:
+                index = layout.query_of.get(at)
+                if index is not None and self._own[index].verdicts[0] is None:
+                    self._own[index].verdicts[0] = _SET_VERDICT
 
 
 #: What a set check withholds a group with: the code facts the set withholds are written with.
@@ -1173,6 +1629,112 @@ def _cell_verdict(
         if not verdict.published:
             return verdict
     return None
+
+
+@dataclass
+class _EntityMember:
+    """One answered query over an entity unit: the entities its unit holds and the query keeps."""
+
+    plan: QueryPlan
+    k: int
+    true: int
+
+
+@dataclass
+class _Population:
+    """The entities of one table's rows (or of a counted relationship's parents) and what is known.
+
+    A combination holds, in order, whether the entity is in each unit, each query's outcome and,
+    when the relationship's histogram withholds some bin, the entity's bin state; ``cells`` maps
+    each combination some entity holds to the exact number that do.
+    """
+
+    members: List[_EntityMember]
+    unit_at: List[int]
+    query_at: List[int]
+    bin_at: Optional[int]
+    bin_states: FrozenSet[int]
+    cells: Dict[Combination, int]
+
+
+#: The bins of the children-per-parent histogram (runner.CHILDREN_EDGES has one edge more).
+_BINS = 7
+#: A bin of the children-per-parent histogram is one state when its cell is published and its own
+#: state when the cell is withheld: the withheld cells are what a query must not give back.
+_BIN_PUBLISHED = 3
+_ENTITY_STATES = tuple(range(_BIN_PUBLISHED + 8))
+
+
+def _bin_state(bin_index: int, shown: Sequence[bool]) -> int:
+    published = bin_index < len(shown) and shown[bin_index]
+    return _BIN_PUBLISHED if published else _BIN_PUBLISHED + 1 + bin_index
+
+
+class _EntityLayout:
+    """The positions of one population's set check: each unit, its queries, and the bin.
+
+    Only queries that passed their own cell checks are laid out; a part left out is merged, as the
+    set check merges a part it withholds. A unit's position is the entity being in it, and a
+    record kept by none of its queries when it is not.
+    """
+
+    def __init__(self, population: _Population, own: Mapping[int, _Own]) -> None:
+        self.query_of: Dict[int, int] = {}
+        self.units: List[Tuple[int, List[int]]] = []
+        self.bin_at: Optional[int] = None
+        kept: List[int] = []
+        by_unit: Dict[int, List[Tuple[int, int]]] = {}
+        for entity, unit_at, query_at in zip(
+            population.members, population.unit_at, population.query_at, strict=True
+        ):
+            if own[entity.plan.index].verdicts[0] is None:
+                by_unit.setdefault(unit_at, []).append((query_at, entity.plan.index))
+        for unit_at, queries in by_unit.items():
+            here = len(kept)
+            kept.append(unit_at)
+            positions: List[int] = []
+            for query_at, index in queries:
+                self.query_of[len(kept)] = index
+                positions.append(len(kept))
+                kept.append(query_at)
+            self.units.append((here, positions))
+        if population.bin_at is not None and kept:
+            self.bin_at = len(kept)
+            kept.append(population.bin_at)
+        self._kept = kept
+        self.width = len(kept)
+        self._bin_allowed: FrozenSet[Combination] = frozenset(
+            (state,) for state in population.bin_states
+        )
+
+    def project(self, cells: Mapping[Combination, int]) -> "Counter[Combination]":
+        projected: Counter[Combination] = Counter()
+        for combination, count in cells.items():
+            projected[tuple(combination[at] for at in self._kept)] += count
+        return projected
+
+    def factors(self, order: Sequence[int]) -> disclosure.Factors:
+        shown = set(order)
+        found: List[Tuple[Tuple[int, ...], FrozenSet[Combination]]] = []
+        for unit_at, queries in self.units:
+            if unit_at in shown:
+                kept = [unit_at, *(at for at in queries if at in shown)]
+                found.append((tuple(kept), _inside(len(kept) - 1)))
+            else:
+                found.extend(((at,), frozenset({(_OUT,), (_IN,)})) for at in queries if at in shown)
+        if self.bin_at is not None and self.bin_at in shown:
+            found.append(((self.bin_at,), self._bin_allowed))
+        return found
+
+    def dependants(self, dead: Set[int]) -> Set[int]:
+        """The parts that go with *dead*: a unit's queries, and a unit none of its queries show."""
+        more: Set[int] = set()
+        for unit_at, queries in self.units:
+            if unit_at in dead:
+                more |= set(queries)
+            elif all(at in dead for at in queries):
+                more.add(unit_at)
+        return more - dead
 
 
 class _Layout:
@@ -1371,6 +1933,7 @@ def measure(
     reads: Mapping[str, Any],
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
+    links: Sequence[CountedLink] = (),
 ) -> Measured:
     """Run every answerable query over the records in one query process and keep what it counted.
 
@@ -1379,8 +1942,11 @@ def measure(
     the unit's records) withholds every query of the run, each named with :data:`RUN_FAILED`: an
     answer for the others would say, one bit per query, that a chosen record made that statement
     fail. The run says at most one bit, that some statement failed, never which.
+
+    *links* are the relationships the profile counts, for the queries over a unit that groups
+    by the child column of one: their parents are that unit's records.
     """
-    done = _measure(plans, reads, backend, rule)
+    done = _measure(plans, reads, backend, rule, links)
     if not done.failed:
         return done
     stopped = Measured(plans)
@@ -1393,6 +1959,7 @@ def _measure(
     reads: Mapping[str, Any],
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
+    links: Sequence[CountedLink] = (),
 ) -> Measured:
     """Run every answerable query over the records in one query process and keep what it counted.
 
@@ -1414,6 +1981,9 @@ def _measure(
     if not live:
         return done
     tables, statements = _send(live, plans, loaded, reads)
+    populations = _populations([each for each in live if each.entity is not None], plans, links)
+    for population in populations:
+        _add_population(population, plans, reads, tables, statements, done)
     try:
         run = consumer_queries.run_in_child(
             tables, statements, seconds=STATEMENT_SECONDS, memory=MEMORY_BYTES
@@ -1424,7 +1994,10 @@ def _measure(
         return done
     by_id = {each.id: each for each in run.results}
     for plan in live:
-        _table_answer(plan, by_id, reads, assigned.get(plan.index), done)
+        if plan.entity is None:
+            _table_answer(plan, by_id, reads, assigned.get(plan.index), done)
+    for population in populations:
+        _population_answer(population, by_id, reads, done)
     done.check_cells(rule)
     return done
 
@@ -1499,6 +2072,9 @@ def _send(
     statements: List[Any] = []
     for plan in live:
         statements.append(Statement(f"c{plan.index}", plan.verify_sql, "count"))
+        if plan.entity is not None:
+            statements.append(Statement(f"k{plan.index}", plan.unit_verify_sql, "count"))
+            continue
         statements.append(Statement(f"b{plan.index}", plan.bits_sql, "bits"))
         if plan.view is not None:
             statements.append(Statement(f"k{plan.index}", plan.unit_verify_sql, "count"))
@@ -1571,3 +2147,299 @@ def _pairs(outcomes: bytes, unit: Optional[bytes]) -> List[Tuple[int, bool]]:
     if unit is None:
         return [(each, True) for each in outcomes]
     return [(each, held == _IN) for each, held in zip(outcomes, unit, strict=True)]
+
+
+# -- the entities a unit counts -----------------------------------------------------------------
+
+
+@dataclass
+class _PopPlan:
+    """The queries over the units that group one table by one entity column, run together."""
+
+    n: int
+    table: str
+    key: str
+    plans: List[QueryPlan]
+    link: Optional[CountedLink]
+    parent: Optional[Tuple[str, str]]
+    units: List[str] = field(default_factory=list)
+    bin_column: str = ""
+    sql: str = field(default="", repr=False)
+    size_sql: str = field(default="", repr=False)
+    #: Whether the bin of the entity's children count is one more part of the set.
+    binned: bool = False
+
+
+def _populations(
+    live: Sequence[QueryPlan], plans: QueryPlans, links: Sequence[CountedLink]
+) -> List[_PopPlan]:
+    """The populations of *live* entity queries: one for each table and entity column."""
+    grouped: Dict[Tuple[str, str], List[QueryPlan]] = {}
+    for plan in live:
+        assert plan.entity is not None
+        grouped.setdefault((plan.entity.table, plan.entity.key), []).append(plan)
+    found: List[_PopPlan] = []
+    for n, ((table, key), members) in enumerate(grouped.items()):
+        unit = members[0].entity
+        assert unit is not None
+        link = None
+        if unit.parent is not None:
+            wanted = (table, unit.parent[0], key, unit.parent[1])
+            link = next(
+                (
+                    each
+                    for each in links
+                    if (each.child, each.parent, each.child_column, each.parent_column) == wanted
+                ),
+                None,
+            )
+        found.append(
+            _PopPlan(n, table, key, members, link, unit.parent if link is not None else None)
+        )
+    return found
+
+
+def _unused(name: str, taken: Set[str]) -> str:
+    while name in taken:
+        name += "_"
+    return name
+
+
+def _sentinel(duck: str) -> str:
+    """A constant of the entity column's type: a null is told from it by its own flag."""
+    base = duck.split("(")[0]
+    return "''" if base == "VARCHAR" else "FALSE" if base == "BOOLEAN" else "0"
+
+
+def _population_sql(population: _PopPlan, plans: QueryPlans) -> Union[str, Tuple[str, str]]:
+    """The checked statement that counts every combination of the population, and the size one.
+
+    The statement is built from the checked text of each unit and the checked tree of each
+    query's condition, then checked once more; a refusal is the reason it is not run.
+    """
+    members = population.plans
+    units: List[str] = []
+    first: Dict[str, QueryPlan] = {}
+    for plan in members:
+        text = str(plan.view)
+        if text not in first:
+            units.append(text)
+            first[text] = plan
+    population.units = units
+    taken = {name for plan in members for name, _ in (plan.entity.outputs if plan.entity else ())}
+    mark = _unused("__in", taken)
+    kv, kn = _unused("__kv", taken), _unused("__kn", taken)
+    tables = dict(plans.schema)
+    table, key = population.table, population.key
+    counted = population.link is not None and population.parent is not None
+    duck = _duck(plans.types_of(table)[key]) or "VARCHAR"
+    if counted:
+        assert population.parent is not None
+        parent, parent_key = population.parent
+        schema = plans.schema[parent]
+        population.bin_column = _unused("__bin", {*schema.column_names, plans.row_columns[parent]})
+        tables[parent] = Table(columns=(*schema.columns, (population.bin_column, "long")))
+
+    def wrapper(at: int) -> str:
+        unit = first[units[at]].entity
+        assert unit is not None
+        columns = ", ".join(f'"w".{_ident(name)} AS {_ident(name)}' for name, _ in unit.outputs)
+        extra = f", TRUE AS {_ident(mark)}"
+        if not counted:
+            held = f'"w".{_ident(unit.out_key)}'
+            extra += (
+                f", COALESCE({held}, {_sentinel(duck)}) AS {_ident(kv)}, ({held} IS NULL) AS "
+                f"{_ident(kn)}"
+            )
+        return f'(SELECT {columns}{extra} FROM ({units[at]}) AS "w") AS "v{at}"'
+
+    if counted:
+        base = f'{_ident(parent)} AS "p"'
+        head = [f'"p".{_ident(population.bin_column)} AS "b"']
+    else:
+        column = f"{_ident(table)}.{_ident(key)}"
+        base = (
+            f'(SELECT {column} AS "k", COALESCE({column}, {_sentinel(duck)}) AS "kv", '
+            f'({column} IS NULL) AS "kn" FROM {_ident(table)} AS {_ident(table)} '
+            f'GROUP BY {column}) AS "e"'
+        )
+        head = []
+    joins: List[str] = []
+    selects = list(head)
+    for at, text in enumerate(units):
+        unit = first[text].entity
+        assert unit is not None
+        if counted:
+            on = f'"p".{_ident(parent_key)} = "v{at}".{_ident(unit.out_key)}'
+        else:
+            on = f'"e"."kv" = "v{at}".{_ident(kv)} AND "e"."kn" = "v{at}".{_ident(kn)}'
+        joins.append(f"LEFT JOIN {wrapper(at)} ON {on}")
+        selects.append(f'COALESCE("v{at}".{_ident(mark)}, FALSE) AS "u{at}"')
+    for at, plan in enumerate(members):
+        unit_at = units.index(str(plan.view))
+        condition = _condition(plan.where, plan.alias, f"v{unit_at}")
+        selects.append(f'COALESCE("v{unit_at}".{_ident(mark)} AND ({condition}), FALSE) AS "o{at}"')
+    names = [*(["b"] if counted else []), *(f"u{at}" for at in range(len(units)))]
+    names += [f"o{at}" for at in range(len(members))]
+    listed = ", ".join(f'"x".{_ident(name)}' for name in names)
+    text = (
+        f"SELECT {listed}, COUNT(*) FROM (SELECT {', '.join(selects)} FROM {base} "
+        f'{" ".join(joins)}) AS "x" GROUP BY {listed}'
+    )
+    checked = _checked_statement(text, tables)
+    if isinstance(checked, Refused):
+        return f"the statement that counts its entities is refused when checked again: {checked.reason}"
+    size = ""
+    if not counted:
+        column = f"{_ident(table)}.{_ident(key)}"
+        sized = _checked_statement(
+            f'SELECT COUNT(*) FROM (SELECT {column} AS "k" FROM {_ident(table)} AS '
+            f'{_ident(table)} GROUP BY {column}) AS "q"',
+            tables,
+        )
+        if isinstance(sized, Refused):
+            return f"the statement that counts its entities is refused when checked again: {sized.reason}"
+        size = sized.text
+    return checked.text, size
+
+
+def _add_population(
+    population: _PopPlan,
+    plans: QueryPlans,
+    reads: Mapping[str, Any],
+    tables: Dict[str, List[Tuple[str, str, Sequence[Any]]]],
+    statements: List[Any],
+    done: "Measured",
+) -> None:
+    """Add what *population* runs to the tables and statements of the process, or fail its queries."""
+    from fluid_build.profiler.consumer_queries import Statement
+
+    built = _population_sql(population, plans)
+    link = population.link
+    stale = (
+        link is not None
+        and population.parent is not None
+        and len(link.bins) != reads[population.parent[0]].row_count
+    )
+    if isinstance(built, str) or stale:
+        for plan in population.plans:
+            done.failed[plan.index] = RUN_FAILED
+        population.plans = []
+        return
+    population.sql, population.size_sql = built
+    if link is not None and population.parent is not None:
+        tables[population.parent[0]].append((population.bin_column, "BIGINT", list(link.bins)))
+        population.binned = not all(_shown_of(link))
+    statements.append(Statement(f"e{population.n}", population.sql, "counts"))
+    if population.size_sql:
+        statements.append(Statement(f"s{population.n}", population.size_sql, "count"))
+
+
+def _shown_of(link: CountedLink) -> Tuple[bool, ...]:
+    """Which of the histogram's bins publish their cell; a bin it has no word on is withheld."""
+    return tuple(link.shown[at] if at < len(link.shown) else False for at in range(_BINS))
+
+
+def _population_answer(
+    population: _PopPlan, by_id: Mapping[str, Any], reads: Mapping[str, Any], done: "Measured"
+) -> None:
+    """Read a population's counts and check them against the rows each statement counted.
+
+    Anything that does not add up fails every query of the population (and so of the run): the
+    units' rows must be the entities, the queries' rows those the combinations keep. A counted
+    relationship's parents leave out the groups with no parent (a null or unknown key), which the
+    rows may hold, so there the rows may only be as many as the entities or more.
+    """
+    members = population.plans
+    if not members:
+        return
+
+    def fail() -> None:
+        for plan in members:
+            done.failed[plan.index] = RUN_FAILED
+
+    result = by_id.get(f"e{population.n}")
+    if result is None or result.status != "ok" or result.groups is None:
+        fail()
+        return
+    counted = population.link is not None and population.parent is not None
+    if counted:
+        assert population.parent is not None
+        size = reads[population.parent[0]].row_count
+    else:
+        sized = by_id.get(f"s{population.n}")
+        if sized is None or sized.status != "ok" or sized.count is None:
+            fail()
+            return
+        size = sized.count
+    link = population.link
+    units, queries = len(population.units), len(members)
+    offset = 1 if counted else 0
+    binned = population.binned
+    cells: Dict[Combination, int] = {}
+    in_unit = [0] * units
+    kept = [0] * queries
+    seen: Set[int] = set()
+    total = 0
+    for row in result.groups:
+        *keys, count = row
+        if len(keys) != offset + units + queries or not isinstance(count, int) or count < 0:
+            fail()
+            return
+        flags = keys[offset:]
+        if any(not isinstance(each, bool) for each in flags):
+            fail()
+            return
+        state: Tuple[int, ...] = ()
+        if counted:
+            assert link is not None
+            at = keys[0]
+            if isinstance(at, bool) or not isinstance(at, int) or not 0 <= at < _BINS:
+                fail()
+                return
+            seen.add(at)
+            state = (_bin_state(at, link.shown),) if binned else ()
+        combination = (*(_IN if each else _OUT for each in flags), *state)
+        cells[combination] = cells.get(combination, 0) + count
+        total += count
+        for at, each in enumerate(flags[:units]):
+            in_unit[at] += count if each else 0
+        for at, each in enumerate(flags[units:]):
+            kept[at] += count if each else 0
+    if total != size:
+        fail()
+        return
+    members_found: List[_EntityMember] = []
+    unit_at: List[int] = []
+    for at, plan in enumerate(members):
+        unit = population.units.index(str(plan.view))
+        rows_unit, rows_query = by_id.get(f"k{plan.index}"), by_id.get(f"c{plan.index}")
+        if rows_unit is None or rows_unit.status != "ok" or rows_unit.count is None:
+            fail()
+            return
+        if rows_query is None or rows_query.status != "ok" or rows_query.count is None:
+            fail()
+            return
+        if counted:
+            exact = rows_unit.count >= in_unit[unit] and rows_query.count >= kept[at]
+        else:
+            exact = rows_unit.count == in_unit[unit] and rows_query.count == kept[at]
+        if not exact:
+            fail()
+            return
+        members_found.append(_EntityMember(plan, in_unit[unit], kept[at]))
+        unit_at.append(unit)
+    states: Set[int] = set()
+    if binned:
+        assert link is not None
+        states = {_bin_state(at, link.shown) for at in range(_BINS)}
+    done.populations.append(
+        _Population(
+            members_found,
+            unit_at,
+            [units + at for at in range(queries)],
+            units + queries if binned else None,
+            frozenset(states),
+            cells,
+        )
+    )

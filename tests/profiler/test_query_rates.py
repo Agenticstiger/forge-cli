@@ -222,7 +222,6 @@ NOT_A_FILTER = (
 )
 JOIN_VIEW = "SELECT a.station_id FROM station AS a JOIN station AS b ON b.altitude = 7777"
 UNFILTERED_VIEWS = [
-    ("aggregate", HEAVY_VIEW, "n"),
     ("join", JOIN_VIEW, "station_id"),
     ("distinct", "SELECT DISTINCT region FROM station", "region"),
     ("computed", "SELECT altitude + 1 AS up FROM station", "up"),
@@ -258,6 +257,14 @@ def test_a_view_unit_that_is_not_a_filter_of_one_table_is_refused_before_any_rea
     assert refused.value.event == "profile_request_not_formed"
     assert NOT_A_FILTER in str(refused.value.context)
     assert view not in str(refused.value.context)
+
+
+def test_a_view_unit_that_aggregates_names_what_an_aggregating_unit_is_answered_by(tmp_path):
+    query = _on_view("odd", _over(HEAVY_VIEW, '"v"."n" IS NOT NULL', "n"), HEAVY_VIEW)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, query, strict=True, sources=_gone(tmp_path, query))
+    assert query_rates.ENTITY_ONLY in str(refused.value.context)
+    assert HEAVY_VIEW not in str(refused.value.context)
 
 
 def _padded_views(count: int):
