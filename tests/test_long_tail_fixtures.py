@@ -3,15 +3,15 @@
 
 """Long-tail fixture coverage from the Phase 6 plan.
 
-  * **contract-edge.yaml** — string-form ``team`` (ODCS v2 wire format),
-    exotic logicalTypes (uuid format, BIGNUMERIC, jsonb, deeply-nested
-    structs), and mixed-unit slaProperties (time + percentage + count).
-    Known mapper limitations are pinned via xfail markers.
-  * **product-bitol-nested/** — ODCS contracts in a ``contracts/`` subdir.
-    Exercises the resolver's candidate-path probing across
-    ``{<base>, contracts/, odcs/, odcs/contracts/}``.
-  * **product-bitol-remote.yaml** — port's ``contractId`` is an https URL.
-    Exercises the resolver's http(s) path + ``--no-remote`` rejection.
+* **contract-edge.yaml** — string-form ``team`` (ODCS v2 wire format),
+  exotic logicalTypes (uuid format, BIGNUMERIC, jsonb, deeply-nested
+  structs), and mixed-unit slaProperties (time + percentage + count).
+  Known mapper limitations are pinned via xfail markers.
+* **product-bitol-nested/** — ODCS contracts in a ``contracts/`` subdir.
+  Exercises the resolver's candidate-path probing across
+  ``{<base>, contracts/, odcs/, odcs/contracts/}``.
+* **product-bitol-remote.yaml** — port's ``contractId`` is an https URL.
+  Exercises the resolver's http(s) path + ``--no-remote`` rejection.
 """
 
 from __future__ import annotations

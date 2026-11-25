@@ -277,13 +277,11 @@ def test_a_read_written_inside_a_chain_belongs_to_it_and_a_name_stays_shared(tmp
 
 
 def test_the_facts_say_which_reads_a_write_is_made_of(tmp_path):
-    facts = facts_of(
-        """
+    facts = facts_of("""
         spark.sql("INSERT INTO mart.t1 SELECT * FROM raw.a")
         spark.table("raw.b").write.saveAsTable("mart.t2")
         combine(spark).write.saveAsTable("mart.t3")
-        """
-    )
+        """)
     assert [r.name for r in facts.reads] == ["raw.a", "raw.b"]
     assert [w.feeds for w in facts.writes] == [
         (io.read_key(facts.reads[0]),),
@@ -621,13 +619,11 @@ def test_the_note_about_a_job_is_for_outputs_the_code_does_not_account_for(tmp_p
         _contracts, report = PySparkImporter().import_to_contracts("jobs", options={})
         return [n for n in report.notes if "which input feeds which output" in n]
 
-    exact = textwrap.dedent(
-        """
+    exact = textwrap.dedent("""
         x = spark.table("raw.x")
         spark.sql("INSERT INTO mart.t1 SELECT * FROM raw.a")
         spark.sql("INSERT INTO mart.t2 SELECT * FROM raw.b")
-        """
-    )
+        """)
     assert notes(exact) == []  # each says what feeds it
     assert len(notes(exact + 'combine(x).write.saveAsTable("mart.t3")\n')) == 1
 
@@ -756,8 +752,7 @@ def test_a_scalar_made_of_a_read_in_a_way_that_is_not_followed_lists_the_read_on
     got = consumed(
         tmp_path,
         monkeypatch,
-        setup
-        + """
+        setup + """
 a = spark.table("raw.a")
 a.where(F.col("k").isin(keys)).write.saveAsTable("mart.t1")
 spark.table("raw.c").write.saveAsTable("mart.t2")

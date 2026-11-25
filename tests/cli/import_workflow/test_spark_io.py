@@ -38,15 +38,13 @@ def writes(facts: JobFacts) -> List[Tuple[str, str]]:
 
 
 def test_a_table_read_through_the_session_and_the_reader():
-    facts = job(
-        """
+    facts = job("""
         from pyspark.sql import SparkSession
         spark = SparkSession.builder.getOrCreate()
         a = spark.table("Retail.Orders")
         b = spark.read.table("retail.customers")
         c = spark.readStream.table("retail.events")
-        """
-    )
+        """)
     assert reads(facts) == [
         ("table", "retail.orders"),
         ("table", "retail.customers"),
@@ -57,26 +55,22 @@ def test_a_table_read_through_the_session_and_the_reader():
 
 
 def test_table_reads_need_a_session_like_receiver():
-    facts = job(
-        """
+    facts = job("""
         spark = None
         x = tabulate.table("not-spark")
         y = self.spark.table("is.spark")
         z = other.table("neither")
-        """
-    )
+        """)
     assert reads(facts) == [("table", "is.spark")]
 
 
 def test_a_session_built_under_another_name_is_found_by_how_it_is_made():
-    facts = job(
-        """
+    facts = job("""
         from pyspark.sql import SparkSession
         engine = SparkSession.builder.appName("a").getOrCreate()
         engine.table("retail.a")
         engine.sql("INSERT INTO retail.b SELECT * FROM retail.a")
-        """
-    )
+        """)
     assert reads(facts) == [("table", "retail.a"), ("table", "retail.a")]
     assert writes(facts) == [("table", "retail.b")]
 
@@ -116,26 +110,22 @@ def test_the_format_of_a_read_is_kept():
 
 
 def test_a_read_that_goes_through_variables_is_followed():
-    facts = job(
-        """
+    facts = job("""
         reader = spark.read.format("iceberg")
         configured = reader.option("x", "y")
         df = configured.load("glue.retail.dim")
         also = spark.read
         other = also.parquet("s3://l/p")
-        """
-    )
+        """)
     assert reads(facts) == [("table", "glue.retail.dim"), ("path", "s3://l/p")]
 
 
 def test_jdbc_is_a_note_not_a_table():
-    facts = job(
-        """
+    facts = job("""
         a = spark.read.jdbc("jdbc:x", "public.orders")
         b = spark.read.format("jdbc").option("dbtable", "public.t").load()
         c = df.write.jdbc("jdbc:x", "public.out")
-        """
-    )
+        """)
     assert not facts.reads and not facts.writes
     assert len(facts.notes) == 3 and all("JDBC" in n for n in facts.notes)
 
@@ -144,15 +134,13 @@ def test_jdbc_is_a_note_not_a_table():
 
 
 def test_a_name_that_is_not_a_constant_is_reported_with_its_reason():
-    facts = job(
-        """
+    facts = job("""
         import sys
         args = parse()
         a = spark.table(sys.argv[1])
         b = spark.table(args.source)
         c = spark.table(f"{args.env}_orders")
-        """
-    )
+        """)
     assert [r.resolved for r in facts.reads] == [False, False, False]
     assert "command-line argument" in facts.reads[0].why
     assert facts.reads[1].shown == "args.source"
@@ -263,13 +251,11 @@ def test_the_writer_v2_chain(terminal, mode):
 
 
 def test_a_write_chain_through_a_variable_and_a_read_that_feeds_it():
-    facts = job(
-        """
+    facts = job("""
         writer = df.write.format("iceberg").mode("append")
         writer.saveAsTable("retail.a")
         spark.read.parquet("s3://l/in").write.parquet("s3://l/out")
-        """
-    )
+        """)
     assert reads(facts) == [("path", "s3://l/in")]
     assert writes(facts) == [("table", "retail.a"), ("path", "s3://l/out")]
     assert facts.writes[0].fmt == "iceberg" and facts.writes[0].mode == "append"
@@ -281,13 +267,11 @@ def test_the_same_chain_is_not_counted_twice():
 
 
 def test_a_sink_that_keeps_nothing_is_ignored():
-    facts = job(
-        """
+    facts = job("""
         df.writeStream.format("console").start()
         df.writeStream.format("memory").queryName("m").start()
         df.write.format("noop").save()
-        """
-    )
+        """)
     assert not facts.writes and not facts.streams
 
 
@@ -295,8 +279,7 @@ def test_a_sink_that_keeps_nothing_is_ignored():
 
 
 def test_kafka_to_kafka_with_checkpoint_trigger_and_query_name():
-    facts = job(
-        """
+    facts = job("""
         reader = (spark.readStream.format("kafka")
                   .option("kafka.bootstrap.servers", "b1:9092,b2:9092")
                   .option("subscribe", "clicks, views"))
@@ -309,8 +292,7 @@ def test_kafka_to_kafka_with_checkpoint_trigger_and_query_name():
                  .trigger(processingTime="1 minute")
                  .queryName("clean")
                  .start())
-        """
-    )
+        """)
     assert [(r.kind, r.name, r.host, r.streaming) for r in facts.reads] == [
         ("topic", "clicks", "b1:9092,b2:9092", True),
         ("topic", "views", "b1:9092,b2:9092", True),
@@ -329,8 +311,7 @@ def test_kafka_to_kafka_with_checkpoint_trigger_and_query_name():
 
 
 def test_kafka_source_options_by_every_spelling():
-    facts = job(
-        """
+    facts = job("""
         opts = {"subscribe": "from_dict", "kafka.bootstrap.servers": "h:1"}
         a = spark.readStream.format("kafka").options(**opts).load()
         b = spark.readStream.format("kafka").options(subscribe="from_kwargs").load()
@@ -338,8 +319,7 @@ def test_kafka_source_options_by_every_spelling():
         d = spark.readStream.format("kafka").option("assign", '{"t1": [0, 1], "t2": [0]}').load()
         e = spark.readStream.format("kafka").option("subscribe", f"{PREFIX}-events").load()
         f = spark.read.format("kafka").load()
-        """
-    )
+        """)
     assert [(r.kind, r.name or r.shown, r.resolved) for r in facts.reads] == [
         ("topic", "from_dict", True),
         ("topic", "from_kwargs", True),
@@ -356,8 +336,7 @@ def test_kafka_credentials_and_odd_hosts_are_never_kept():
     jaas = (
         "org.apache.kafka.common.security.plain.PlainLoginModule required pass" + "word='s3cr3t';"
     )
-    facts = job(
-        f"""
+    facts = job(f"""
         x = (spark.readStream.format("kafka")
              .option("kafka.bootstrap.servers", "user:pw@host:9092")
              .option("kafka.sasl.jaas.config", "{jaas}")
@@ -365,8 +344,7 @@ def test_kafka_credentials_and_odd_hosts_are_never_kept():
         y = (spark.readStream.format("kafka")
              .option("kafka.bootstrap.servers", f"{{host}}:9092")
              .option("subscribe", "t2").load())
-        """
-    )
+        """)
     assert [r.host for r in facts.reads] == [None, None]
     assert "s3cr3t" not in repr(facts) and "sasl" not in repr(facts)
 
@@ -394,12 +372,10 @@ def test_triggers(trigger, expected):
 
 
 def test_start_and_totable_take_their_options_from_keywords():
-    facts = job(
-        """
+    facts = job("""
         df.writeStream.format("parquet").start("s3://l/out", checkpointLocation="s3://l/ck", queryName="qq")
         df.writeStream.toTable("retail.stream_out", "iceberg", "append", checkpointLocation="s3://l/ck2")
-        """
-    )
+        """)
     first, second = facts.writes
     assert (first.name, first.checkpoint, first.query_name) == ("s3://l/out", "s3://l/ck", "qq")
     assert (second.kind, second.name, second.fmt, second.output_mode, second.checkpoint) == (
@@ -412,15 +388,13 @@ def test_start_and_totable_take_their_options_from_keywords():
 
 
 def test_the_session_conf_gives_the_default_checkpoint():
-    facts = job(
-        """
+    facts = job("""
         spark = (SparkSession.builder
                  .config("spark.sql.streaming.checkpointLocation", "s3://l/default")
                  .getOrCreate())
         df.writeStream.format("parquet").start("s3://l/out")
         df.writeStream.format("parquet").option("checkpointLocation", "s3://l/own").start("s3://l/out2")
-        """
-    )
+        """)
     assert [w.checkpoint for w in facts.writes] == ["s3://l/default", "s3://l/own"]
 
 
@@ -432,8 +406,7 @@ def test_a_checkpoint_that_is_not_a_constant_is_shown_as_such():
 
 
 def test_foreach_batch_writes_carry_the_stream_facts():
-    facts = job(
-        """
+    facts = job("""
         def process(batch_df, epoch_id):
             batch_df.write.format("iceberg").mode("append").save("retail.events")
             spark.sql("INSERT INTO retail.audit SELECT * FROM retail.events")
@@ -444,8 +417,7 @@ def test_foreach_batch_writes_carry_the_stream_facts():
                .trigger(availableNow=True)
                .queryName("fb")
                .start())
-        """
-    )
+        """)
     by_name = {w.name: w for w in facts.writes}
     assert by_name["retail.events"].streaming and by_name["retail.audit"].streaming
     assert by_name["retail.events"].checkpoint == "s3://l/c"
@@ -457,11 +429,9 @@ def test_foreach_batch_writes_carry_the_stream_facts():
 
 
 def test_foreach_batch_with_a_lambda():
-    facts = job(
-        """
+    facts = job("""
         stream.writeStream.foreachBatch(lambda b, i: b.write.saveAsTable("retail.t")).start()
-        """
-    )
+        """)
     assert facts.writes[0].streaming and facts.streams[0].batch_function == (2, 2)
 
 
@@ -469,8 +439,7 @@ def test_foreach_batch_with_a_lambda():
 
 
 def test_sql_reads_and_writes_with_temp_views_and_ctes_left_out():
-    facts = job(
-        """
+    facts = job("""
         df.createOrReplaceTempView("staging")
         spark.sql('''
             WITH recent AS (SELECT * FROM retail.orders WHERE d > 1)
@@ -480,8 +449,7 @@ def test_sql_reads_and_writes_with_temp_views_and_ctes_left_out():
         ''')
         spark.sql("CREATE OR REPLACE TEMPORARY VIEW later AS SELECT * FROM retail.events")
         spark.sql("SELECT * FROM later JOIN global_temp.g ON 1 = 1")
-        """
-    )
+        """)
     # one statement's names come out in name order; later statements follow
     assert reads(facts) == [
         ("table", "glue.retail.customers"),
@@ -551,15 +519,13 @@ def test_sql_paths_with_their_format():
 
 
 def test_sql_built_from_an_unknown_name_keeps_everything_else():
-    facts = job(
-        """
+    facts = job("""
         TGT = "retail.orders_daily"
         spark.sql(f"INSERT INTO {TGT} SELECT * FROM {args.source} s JOIN retail.dim d ON 1 = 1")
         spark.sql("INSERT INTO {}.facts SELECT * FROM retail.dim".format(args.db))
         spark.sql("INSERT INTO %s.facts2 SELECT * FROM retail.dim" % args.db)
         spark.sql("INSERT INTO " + target + " SELECT * FROM retail.dim")
-        """
-    )
+        """)
     assert [(w.shown, w.resolved) for w in facts.writes] == [
         ("retail.orders_daily", True),
         ("{args.db}.facts", False),
@@ -572,14 +538,12 @@ def test_sql_built_from_an_unknown_name_keeps_everything_else():
 
 
 def test_sql_that_is_not_a_constant_or_does_not_parse_is_a_note():
-    facts = job(
-        """
+    facts = job("""
         import sys
         spark.sql(sys.argv[1])
         spark.sql("INSERT OVERWRITE DIRECTORY 's3://b/out' USING parquet SELECT * FROM t")
         spark.sql("this is not sql at all (((")
-        """
-    )
+        """)
     assert not facts.reads and not facts.writes
     assert any("takes SQL that is not a constant" in n for n in facts.notes)
     assert sum("did not parse" in n for n in facts.notes) == 2
@@ -650,13 +614,11 @@ def test_a_helper_called_with_a_parameter_is_counted_as_a_helper_itself():
 
 
 def test_results_are_ordered_by_line_and_unique():
-    facts = job(
-        """
+    facts = job("""
         b = spark.table("z.last")
         a = spark.table("a.first")
         c = spark.table("a.first")
-        """
-    )
+        """)
     assert [(r.line, r.name) for r in facts.reads] == [
         (2, "z.last"),
         (3, "a.first"),
@@ -672,13 +634,11 @@ def test_a_file_with_no_spark_in_it_has_no_facts():
 
 def test_the_reader_does_not_run_the_job(tmp_path):
     marker = tmp_path / "ran"
-    job(
-        f"""
+    job(f"""
         from pyspark.sql import SparkSession
         open({str(marker)!r}, "w").write("x")
         raise SystemExit(1)
-        """
-    )
+        """)
     assert not marker.exists()
 
 
@@ -686,15 +646,13 @@ def test_the_reader_does_not_run_the_job(tmp_path):
 
 
 def test_a_placeholder_in_sql_that_is_not_an_f_string_is_a_hole_not_a_table():
-    facts = job(
-        """
+    facts = job("""
         from pyspark.sql import SparkSession
         spark = SparkSession.builder.getOrCreate()
         spark.sql("INSERT INTO ${env}.orders SELECT * FROM {src}.events JOIN retail.users")
         spark.sql("SELECT * FROM %(db)s.clicks")
         spark.sql("SELECT * FROM {{ db }}.sessions")
-        """
-    )
+        """)
     resolved = [r for r in facts.reads if r.name]
     unresolved = [r for r in facts.reads if not r.name]
     assert [r.name for r in resolved] == ["retail.users"]
@@ -709,68 +667,58 @@ def test_a_placeholder_in_sql_that_is_not_an_f_string_is_a_hole_not_a_table():
 
 
 def test_a_placeholder_inside_a_string_literal_is_harmless():
-    facts = job(
-        """
+    facts = job("""
         spark = SparkSession.builder.getOrCreate()
         spark.sql("SELECT * FROM retail.orders WHERE dt = '{{ ds }}' AND k = '${key}'")
-        """
-    )
+        """)
     assert reads(facts) == [("table", "retail.orders")]
 
 
 def test_a_temp_view_registered_under_a_name_that_is_not_a_constant_is_noted():
-    facts = job(
-        """
+    facts = job("""
         from pyspark.sql import SparkSession
         spark = SparkSession.builder.getOrCreate()
         df = spark.table("retail.orders")
         df.createOrReplaceTempView(view_name)
         spark.table("whatever")
-        """
-    )
+        """)
     assert any("temporary view" in note and "not a constant" in note for note in facts.notes)
     assert [n for n in facts.notes if "temporary view" in n][0].startswith("job.py:5 ")
 
 
 def test_a_reader_variable_assigned_twice_is_not_followed_and_the_note_says_so():
-    facts = job(
-        """
+    facts = job("""
         from pyspark.sql import SparkSession
         spark = SparkSession.builder.getOrCreate()
         reader = spark.read.format("parquet")
         if flag:
             reader = spark.read.format("csv")
         df = reader.load("s3://bucket/in/")
-        """
-    )
+        """)
     assert facts.reads == []
     [note] = [n for n in facts.notes if "assigned more than once" in n]
     assert note.startswith("job.py:7 ") and ".load(...)" in note and "`reader`" in note
 
 
 def test_a_writer_variable_assigned_twice_is_not_followed_and_the_note_says_so():
-    facts = job(
-        """
+    facts = job("""
         from pyspark.sql import SparkSession
         spark = SparkSession.builder.getOrCreate()
         out = df.write.mode("append")
         out = df.write.mode("overwrite")
         out.saveAsTable("retail.totals")
-        """
-    )
+        """)
     assert facts.writes == []
     assert any("assigned more than once" in n and "`out`" in n for n in facts.notes)
 
 
 def test_a_variable_assigned_once_is_still_followed_without_a_note():
-    facts = job(
-        """
+    facts = job("""
         from pyspark.sql import SparkSession
         spark = SparkSession.builder.getOrCreate()
         reader = spark.read.format("parquet")
         df = reader.load("s3://bucket/in/")
-        """
-    )
+        """)
     assert reads(facts) == [("path", "s3://bucket/in/")]
     assert not [n for n in facts.notes if "assigned more than once" in n]
 
@@ -832,13 +780,11 @@ def test_placeholders_in_the_longest_sql_the_folder_gives_are_found_in_bounded_t
 
 
 def test_a_table_named_by_identifier_is_a_name_that_is_not_a_constant():
-    facts = job(
-        """
+    facts = job("""
         spark = SparkSession.builder.getOrCreate()
         spark.sql("INSERT INTO IDENTIFIER(:tbl) SELECT * FROM raw.src")
         spark.sql("INSERT INTO out.t SELECT * FROM IDENTIFIER('a.b')")
-        """
-    )
+        """)
     assert [r.name for r in facts.reads if r.name] == ["raw.src"]
     unresolved = [x for x in (*facts.reads, *facts.writes) if not x.name]
     assert sorted(x.shown for x in unresolved) == ["{IDENTIFIER('a.b')}", "{IDENTIFIER(:tbl)}"]
@@ -867,14 +813,12 @@ def test_the_same_statement_is_parsed_once_however_often_it_is_passed(monkeypatc
 
 def test_a_path_with_a_credential_in_it_is_kept_without_it():
     userinfo = "KEY" + ":" + "VALUE" + "@"  # built here: no credential-shaped text in the source
-    facts = job(
-        f"""
+    facts = job(f"""
         spark = SparkSession.builder.getOrCreate()
         spark.read.parquet("s3a://{userinfo}inbucket/raw/orders")
         df.write.parquet("gs://b/x/token=hunterE/y")
         df.write.saveAsTable("db.\\u202ename")
-        """
-    )
+        """)
     assert reads(facts) == [("path", "s3a://inbucket/raw/orders")]
     assert writes(facts) == [("path", "gs://b/x/token=REDACTED/y"), ("table", "db.name")]
 

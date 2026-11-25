@@ -75,12 +75,10 @@ def test_cli_imports_without_cycle_error() -> None:
     pin the *mechanism* (leaf-import bypass vs. structural cycle
     removal) — both fix shapes are acceptable.
     """
-    result = _run_python(
-        """
+    result = _run_python("""
         import fluid_build.cli  # noqa: F401
         print("ok")
-        """
-    )
+        """)
     assert result.returncode == 0, (
         "import fluid_build.cli failed: " f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
@@ -99,8 +97,7 @@ def test_observability_does_not_pull_build_runners() -> None:
     grows a new edge back into ``build_runners``, this test catches
     it before the cycle re-forms.
     """
-    result = _run_python(
-        """
+    result = _run_python("""
         import sys
 
         # Import the observability package + its concrete reporter
@@ -117,8 +114,7 @@ def test_observability_does_not_pull_build_runners() -> None:
             print("LEAKED:", ",".join(loaded))
             raise SystemExit(1)
         print("clean")
-        """
-    )
+        """)
     assert result.returncode == 0, (
         "observability imports leaked build_runners modules into sys.modules. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -135,8 +131,7 @@ def test_hostname_is_private_lives_in_tier_zero() -> None:
     other ``fluid_build.*`` package init — that's the whole point of
     the tier-0 invariant. Pin it.
     """
-    result = _run_python(
-        """
+    result = _run_python("""
         import sys
 
         from fluid_build._net import _hostname_is_private  # noqa: F401
@@ -159,8 +154,7 @@ def test_hostname_is_private_lives_in_tier_zero() -> None:
             print("LEAKED:", ",".join(leaked))
             raise SystemExit(1)
         print("clean")
-        """
-    )
+        """)
     assert result.returncode == 0, (
         "fluid_build._net acquired an upstream package dep at import time. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -213,8 +207,7 @@ def test_build_runners_does_not_pull_cli() -> None:
     future edit re-introduces a module-scope ``cli`` import in any runner,
     this catches it before the import-linter contract does.
     """
-    result = _run_python(
-        """
+    result = _run_python("""
         import sys
 
         import fluid_build.build_runners  # noqa: F401
@@ -225,8 +218,7 @@ def test_build_runners_does_not_pull_cli() -> None:
             print("LEAKED:", ",".join(leaked))
             raise SystemExit(1)
         print("clean")
-        """
-    )
+        """)
     assert result.returncode == 0, (
         "importing build_runners leaked fluid_build.cli modules into sys.modules. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -279,8 +271,7 @@ def test_shared_leaves_do_not_pull_cli_or_build_runners() -> None:
     from re-forming through a leaf. Importing them must not land either
     package (nor their re-export shims) in ``sys.modules``.
     """
-    result = _run_python(
-        """
+    result = _run_python("""
         import sys
 
         import fluid_build._errors  # noqa: F401
@@ -296,8 +287,7 @@ def test_shared_leaves_do_not_pull_cli_or_build_runners() -> None:
             print("LEAKED:", ",".join(leaked))
             raise SystemExit(1)
         print("clean")
-        """
-    )
+        """)
     assert result.returncode == 0, (
         "a shared tier-0 leaf pulled cli/build_runners at import time. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"

@@ -38,8 +38,7 @@ def pii_sqlite_db(tmp_path: Path) -> Path:
     db_path = tmp_path / "pii_fixture.sqlite"
     con = sqlite3.connect(str(db_path))
     cur = con.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE customer (
             c_custkey INTEGER PRIMARY KEY,
             c_email TEXT,
@@ -47,10 +46,8 @@ def pii_sqlite_db(tmp_path: Path) -> Path:
             c_address TEXT,
             c_acctbal REAL
         )
-        """
-    )
-    cur.execute(
-        """
+        """)
+    cur.execute("""
         CREATE TABLE patient (
             patient_id INTEGER PRIMARY KEY,
             ssn TEXT,
@@ -58,18 +55,15 @@ def pii_sqlite_db(tmp_path: Path) -> Path:
             full_name TEXT,
             mrn TEXT
         )
-        """
-    )
-    cur.execute(
-        """
+        """)
+    cur.execute("""
         CREATE TABLE non_pii (
             id INTEGER PRIMARY KEY,
             amount REAL,
             created_at TEXT,
             status TEXT
         )
-        """
-    )
+        """)
     con.commit()
     con.close()
     return db_path

@@ -33,14 +33,12 @@ def test_clearing_a_cache_that_was_never_written_is_a_no_op(tmp_path):
     assert not (tmp_path / "never").exists()
 
 
-JOB = textwrap.dedent(
-    """
+JOB = textwrap.dedent("""
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.getOrCreate()
     spark.table("db.a").write.saveAsTable("db.b")
-    """
-)
+    """)
 
 
 def test_an_import_checks_its_proposal_without_creating_the_cache_folder(tmp_path, monkeypatch):

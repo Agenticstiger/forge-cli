@@ -553,8 +553,7 @@ class SchedulePlanner:
         # spliced inside quotes, a task param or an id carrying a quote closed the
         # literal and ran as code on every tick (or left a SyntaxError behind).
         default_id = str(contract.get("id"))
-        return {
-            "ZipFile": f"""
+        return {"ZipFile": f"""
 import json
 import boto3
 import logging
@@ -590,8 +589,7 @@ def handler(event, context):
         'statusCode': 200,
         'body': json.dumps({{'message': 'Workflow executed', 'tasks_completed': len(completed)}})
     }}
-"""
-        }
+"""}
 
     def _generate_s3_trigger_lambda_code(
         self, contract: Dict[str, Any], trigger: Dict[str, Any]
@@ -599,8 +597,7 @@ def handler(event, context):
         """Generate Lambda code for S3 trigger."""
         contract_id = contract.get("id", "unknown")
         workflow_fn = self.workflow_function_name(contract_id)
-        return {
-            "ZipFile": f"""
+        return {"ZipFile": f"""
 import json
 import boto3
 import logging
@@ -625,8 +622,7 @@ def handler(event, context):
             }}),
         )
     return {{'statusCode': 200}}
-"""
-        }
+"""}
 
     def _generate_dynamodb_trigger_lambda_code(
         self, contract: Dict[str, Any], trigger: Dict[str, Any]
@@ -634,8 +630,7 @@ def handler(event, context):
         """Generate Lambda code for DynamoDB trigger."""
         contract_id = contract.get("id", "unknown")
         workflow_fn = self.workflow_function_name(contract_id)
-        return {
-            "ZipFile": f"""
+        return {"ZipFile": f"""
 import json
 import boto3
 import logging
@@ -659,8 +654,7 @@ def handler(event, context):
             }}),
         )
     return {{'statusCode': 200}}
-"""
-        }
+"""}
 
     def _generate_event_trigger_lambda_code(
         self, contract: Dict[str, Any], trigger: Dict[str, Any]
@@ -668,8 +662,7 @@ def handler(event, context):
         """Generate Lambda code for EventBridge trigger."""
         contract_id = contract.get("id", "unknown")
         workflow_fn = self.workflow_function_name(contract_id)
-        return {
-            "ZipFile": f"""
+        return {"ZipFile": f"""
 import json
 import boto3
 import logging
@@ -691,8 +684,7 @@ def handler(event, context):
         }}),
     )
     return {{'statusCode': 200}}
-"""
-        }
+"""}
 
     def _generate_sqs_trigger_lambda_code(
         self, contract: Dict[str, Any], trigger: Dict[str, Any]
@@ -700,8 +692,7 @@ def handler(event, context):
         """Generate Lambda code for SQS trigger."""
         contract_id = contract.get("id", "unknown")
         workflow_fn = self.workflow_function_name(contract_id)
-        return {
-            "ZipFile": f"""
+        return {"ZipFile": f"""
 import json
 import boto3
 import logging
@@ -724,8 +715,7 @@ def handler(event, context):
             }}),
         )
     return {{'statusCode': 200}}
-"""
-        }
+"""}
 
     def _generate_state_machine_definition(
         self, contract: Dict[str, Any], orchestration: Dict[str, Any]

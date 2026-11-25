@@ -464,8 +464,7 @@ def _serve_pinned_over_http(
     )
     contract = tmp_path / "contract.fluid.yaml"
     contract.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             fluidVersion: "0.7.4"
             kind: DataProduct
             id: silver.demo.customer_segments_v1
@@ -486,8 +485,7 @@ def _serve_pinned_over_http(
                   platform: local
                   format: csv
                   location: { path: ./customers.csv, table: customer_segments }
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     env = {k: v for k, v in os.environ.items() if k not in _AUTH_ENV_VARS}

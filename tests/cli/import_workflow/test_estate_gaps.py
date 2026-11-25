@@ -177,9 +177,7 @@ def test_a_landing_read_with_a_run_date_is_a_consumed_source(tmp_path, monkeypat
 
 # ── Airflow Variables ─────────────────────────────────────────────────
 
-VARIABLE_DAG = (
-    DAG_HEAD
-    + """
+VARIABLE_DAG = DAG_HEAD + """
 from airflow.models import Variable
 
 ENV = Variable.get("environment", "dev")
@@ -195,7 +193,6 @@ with DAG(dag_id="legacy", schedule="@daily", default_args={"owner": "orders-team
         ],
     )
 """
-)
 
 
 def task_of(contract: Dict[str, Any]) -> Dict[str, Any]:

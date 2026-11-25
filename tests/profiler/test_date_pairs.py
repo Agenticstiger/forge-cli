@@ -436,7 +436,7 @@ def test_the_days_and_the_order_are_checked_in_one_call_on_one_partition(tmp_pat
         and len(call[0].edges) != 169  # not a calendar's hours and days of the week
     ]
     assert len(pair_calls) == 1  # one call for the one pair: the days and the order together
-    (days, order) = pair_calls[0]
+    days, order = pair_calls[0]
     # The days are the ladder from its first bin holding a record to its last; the order is the
     # same partition coarsened at day 1 (day 0 is its first edge), on the same outer edges.
     assert days.edges == tuple(encode(Fraction(each)) for each in dates.DAY_LADDER[8:18])

@@ -406,14 +406,12 @@ def test_tasks_with_different_owners_give_one_owner_and_a_report_line(project):
     assert not [x for x in report.unsupported if "owners" in x]  # one task: one owner
 
     (project / "dags" / "both.py").write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             from airflow import DAG
             from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
             with DAG("both", default_args={"owner": "team-a"}):
                 SparkSubmitOperator(task_id="x", application="s3://acme-code/jobs/orders_daily.py", owner="team-b")
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     _, report = pyspark()
@@ -482,8 +480,7 @@ def test_names_and_arguments_from_the_code_are_sanitised_and_redacted(project, c
 
 def test_conventions_map_paths_catalogs_layers_helpers_and_environments(project):
     (project / "jobs" / "lake.py").write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             import os
             from pyspark.sql import SparkSession
             from acme.io import read_table, write_table
@@ -497,13 +494,11 @@ def test_conventions_map_paths_catalogs_layers_helpers_and_environments(project)
             src.write.mode("append").parquet("s3://lake/curated/customers/")
             src.write.format("iceberg").save("glue.marts.rollup")
             src.write.saveAsTable("tmp_scratch")
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     (project / "conventions.yaml").write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             script_roots: {"s3://acme-code/jobs/": jobs}
             paths:
               - prefix: "s3://lake/curated/"
@@ -521,8 +516,7 @@ def test_conventions_map_paths_catalogs_layers_helpers_and_environments(project)
             ignore: {tables: ["^tmp_"]}
             products: {id: "{database}.{table}"}
             owners: {retail-data: {team: retail-data}}
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     contracts, report = pyspark()
@@ -951,16 +945,14 @@ def test_an_unread_command_is_listed_without_advice_about_script_roots(tmp_path,
     monkeypatch.chdir(tmp_path)
     (tmp_path / "dags").mkdir()
     (tmp_path / "dags" / "long.py").write_text(
-        textwrap.dedent(
-            f"""
+        textwrap.dedent(f"""
             from airflow import DAG
             from airflow.operators.bash import BashOperator
             from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
             with DAG("long"):
                 BashOperator(task_id="long", bash_command={"echo " + "x" * 5000!r})
                 SparkSubmitOperator(task_id="named", application="s3://code/jobs/a.py")
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     _contracts, report = AirflowImporter().import_to_contracts("dags", options={})

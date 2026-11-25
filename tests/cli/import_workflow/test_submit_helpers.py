@@ -156,9 +156,7 @@ def test_the_conventions_file_takes_the_key_and_says_what_it_is_for(tmp_path):
 
 
 def test_a_task_that_runs_a_named_helper_is_read_from_its_op_kwargs():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             stream = PythonOperator(
                 task_id="stream",
                 python_callable=tasks.run_stream_step,
@@ -170,9 +168,7 @@ def test_a_task_that_runs_a_named_helper_is_read_from_its_op_kwargs():
                 },
                 dag=dag,
             )
-            """
-        )
-    )
+            """))
     task = found["stream"]
     assert task.kind == "python" and task.callable == "acme_lib.emr_tasks.run_stream_step"
     (submit,) = task.submits
@@ -185,9 +181,7 @@ def test_a_task_that_runs_a_named_helper_is_read_from_its_op_kwargs():
 
 
 def test_a_helper_given_a_whole_dict_of_settings_is_read_by_its_key_path():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             MAINTAIN = {
                 "step_name": "maintain",
                 "additional_params": {
@@ -197,9 +191,7 @@ def test_a_helper_given_a_whole_dict_of_settings_is_read_by_its_key_path():
                 },
             }
             PythonOperator(task_id="maintain", python_callable=tasks.run_step, op_kwargs=MAINTAIN, dag=dag)
-            """
-        )
-    )
+            """))
     (submit,) = found["maintain"].submits
     assert (submit.script, submit.args, submit.config) == (
         "s3://acme-code/jobs/maintain.py",
@@ -209,15 +201,13 @@ def test_a_helper_given_a_whole_dict_of_settings_is_read_by_its_key_path():
 
 
 def test_a_helper_is_matched_by_the_last_parts_of_its_name_the_longest_entry_first():
-    source = _dag(
-        """
+    source = _dag("""
         from acme_lib.emr_tasks import run_stream_step
         from other_lib import run_stream_step as other_run
         PythonOperator(task_id="a", python_callable=tasks.run_stream_step, op_kwargs={"script_path": "s3://a.py"}, dag=dag)
         PythonOperator(task_id="b", python_callable=run_stream_step, op_kwargs={"script_path": "s3://b.py"}, dag=dag)
         PythonOperator(task_id="c", python_callable=other_run, op_kwargs={"script_path": "s3://c.py", "other": "s3://o.py"}, dag=dag)
-        """
-    )
+        """)
     found = tasks(
         source,
         {
@@ -229,28 +219,20 @@ def test_a_helper_is_matched_by_the_last_parts_of_its_name_the_longest_entry_fir
     assert [s.script for s in found["b"].submits] == ["s3://b.py"]
     assert [s.script for s in found["c"].submits] == ["s3://o.py"]  # the longer name wins
     # a name that only ends in the same letters is not the function
-    other = tasks(
-        _dag(
-            """
+    other = tasks(_dag("""
             PythonOperator(task_id="d", python_callable=tasks.prerun_stream_step, op_kwargs={"script_path": "s3://d.py"}, dag=dag)
-            """
-        )
-    )
+            """))
     assert other["d"].submits == []
 
 
 def test_a_helper_read_by_position_from_op_args_and_through_partial():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             from functools import partial
             import functools
             PythonOperator(task_id="args", python_callable=tasks.run_positional, op_args=[f"{CODE}/a.py", ["--day", "{{ ds }}"]], dag=dag)
             PythonOperator(task_id="partial", python_callable=partial(tasks.run_positional, f"{CODE}/b.py"), op_args=[["--x"]], dag=dag)
             PythonOperator(task_id="named", python_callable=functools.partial(tasks.run_stream_step, script_path=f"{CODE}/c.py"), dag=dag)
-            """
-        )
-    )
+            """))
     assert submits(found["args"]) == [
         ("spark-submit", "s3://acme-code/jobs/a.py", ("--day", "{{ ds }}"))
     ]
@@ -260,18 +242,14 @@ def test_a_helper_read_by_position_from_op_args_and_through_partial():
 
 
 def test_what_a_helper_is_not_given_is_said_not_guessed():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             PythonOperator(task_id="none", python_callable=tasks.run_stream_step, dag=dag)
             PythonOperator(task_id="by_position", python_callable=tasks.run_stream_step, op_args=["s3://x.py"], dag=dag)
             PythonOperator(task_id="no_key", python_callable=tasks.run_step, op_kwargs={"additional_params": {"other": 1}}, dag=dag)
             PythonOperator(task_id="not_a_dict", python_callable=tasks.run_step, op_kwargs={"additional_params": "x"}, dag=dag)
             PythonOperator(task_id="call", python_callable=tasks.run_step, op_kwargs=build_kwargs(), dag=dag)
             PythonOperator(task_id="spread", python_callable=tasks.run_stream_step, op_kwargs={**unknown}, dag=dag)
-            """
-        )
-    )
+            """))
 
     def why(task_id: str) -> str:
         (submit,) = found[task_id].submits
@@ -290,15 +268,11 @@ def test_what_a_helper_is_not_given_is_said_not_guessed():
 
 
 def test_a_script_that_waits_for_a_value_keeps_its_template_and_reason():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             from acme_cfg.paths import JOBS_ROOT
             PythonOperator(task_id="t", python_callable=tasks.run_stream_step, op_kwargs={"script_path": f"{JOBS_ROOT}/a.py", "config_bucket": "b", "config_key": Variable.get("conf_key")}, dag=dag)
             from airflow.models import Variable
-            """
-        )
-    )
+            """))
     (submit,) = found["t"].submits
     assert submit.script is None and submit.shown == "{JOBS_ROOT}/a.py"
     assert "JOBS_ROOT" in submit.why
@@ -308,11 +282,9 @@ def test_a_script_that_waits_for_a_value_keeps_its_template_and_reason():
 
 def test_op_kwargs_are_templated_fields_their_variables_are_filled():
     found = tasks(
-        _dag(
-            """
+        _dag("""
             PythonOperator(task_id="t", python_callable=tasks.run_stream_step, op_kwargs={"script_path": "{{ var.value.code_root }}/a.py", "config_bucket": "{{ var.value.conf }}", "config_key": "{{ ds }}.yaml"}, dag=dag)
-            """
-        ),
+            """),
         airflow_variables={"code_root": "s3://acme-code", "conf": "acme-conf"},
     )
     (submit,) = found["t"].submits
@@ -324,9 +296,7 @@ def test_op_kwargs_are_templated_fields_their_variables_are_filled():
 
 
 def test_a_function_of_the_dag_file_that_adds_emr_steps_itself():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             from airflow.models import Variable
 
             def submit_backfill(**kwargs):
@@ -357,18 +327,14 @@ def test_a_function_of_the_dag_file_that_adds_emr_steps_itself():
                 return response["StepIds"][0]
 
             backfill = PythonOperator(task_id="backfill", python_callable=submit_backfill, dag=dag)
-            """
-        )
-    )
+            """))
     task = found["backfill"]
     assert task.callable == "submit_backfill"
     assert submits(task) == [("emr-step", "s3://acme-code/jobs/backfill.py", ("<not constant>",))]
 
 
 def test_the_steps_may_be_built_before_the_call_or_be_a_constant_of_the_file():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             STEPS = [{"Name": "a", "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["spark-submit", f"{CODE}/a.py"]}}]
 
             def with_constant():
@@ -381,18 +347,14 @@ def test_the_steps_may_be_built_before_the_call_or_be_a_constant_of_the_file():
 
             PythonOperator(task_id="constant", python_callable=with_constant, dag=dag)
             PythonOperator(task_id="local", python_callable=with_local, dag=dag)
-            """
-        )
-    )
+            """))
     assert submits(found["constant"]) == [("emr-step", "s3://acme-code/jobs/a.py", ())]
     # the argument list is the step's, read once
     assert submits(found["local"]) == [("emr-step", "s3://acme-code/jobs/b.py", ("--full",))]
 
 
 def test_what_a_task_passes_is_what_the_functions_parameters_hold():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             def submit(script, *args, mode="cluster", **kwargs):
                 env = kwargs["env"]
                 day = kwargs.get("ds")
@@ -404,9 +366,7 @@ def test_what_a_task_passes_is_what_the_functions_parameters_hold():
 
             PythonOperator(task_id="orders", python_callable=submit, op_kwargs={"script": f"{CODE}/orders.py", "env": "prod"}, dag=dag)
             PythonOperator(task_id="customers", python_callable=submit, op_args=[f"{CODE}/customers.py", "--full"], op_kwargs={"env": "dev"}, dag=dag)
-            """
-        )
-    )
+            """))
     # the default of `mode` is not read for a task's own function (Airflow may pass the context
     # by that name), so it is the value of an option: skipped as one
     assert submits(found["orders"]) == [
@@ -418,25 +378,19 @@ def test_what_a_task_passes_is_what_the_functions_parameters_hold():
 
 
 def test_a_parameter_the_body_binds_again_does_not_hold_what_the_task_passed():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             def submit(script):
                 script = f"{script}.py"
                 boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", script]}}])
 
             PythonOperator(task_id="t", python_callable=submit, op_kwargs={"script": "s3://a"}, dag=dag)
-            """
-        )
-    )
+            """))
     (submit,) = found["t"].submits
     assert submit.script is None and "is a parameter" in submit.why
 
 
 def test_a_function_the_body_calls_is_followed_with_what_that_call_passes():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             def _step(script, extra=None, *, deploy="cluster"):
                 return {"Name": "s", "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["spark-submit", "--deploy-mode", deploy, script, extra]}}
 
@@ -453,9 +407,7 @@ def test_a_function_the_body_calls_is_followed_with_what_that_call_passes():
                 _submit("j-1", "helped.py")
 
             PythonOperator(task_id="t", python_callable=run, dag=dag)
-            """
-        )
-    )
+            """))
     got = submits(found["t"])
     # `_step(script)` builds the steps: its list is read in `_step` itself, as an argument list,
     # with the defaults of what the call does not pass (`extra` is None, which is not a word)
@@ -469,10 +421,7 @@ def test_following_stops_at_a_depth_and_never_loops():
         "\n".join(f"def f{i}(script):\n    f{i + 1}(script)\n" for i in range(10))
         + "def f10(script):\n    boto3.client('emr').add_job_flow_steps(JobFlowId='j', Steps=[{'HadoopJarStep': {'Args': ['spark-submit', script]}}])\n"
     )
-    found = tasks(
-        _dag(
-            chain
-            + """
+    found = tasks(_dag(chain + """
 def near(script):
     f9(script)
 
@@ -486,9 +435,7 @@ def again(script):
 PythonOperator(task_id="deep", python_callable=f0, op_kwargs={"script": "s3://deep.py"}, dag=dag)
 PythonOperator(task_id="near", python_callable=near, op_kwargs={"script": "s3://near.py"}, dag=dag)
 PythonOperator(task_id="loop", python_callable=loop, op_kwargs={"script": "s3://loop.py"}, dag=dag)
-"""
-        )
-    )
+"""))
     assert found["deep"].submits == []  # f10 is more than MAX_DEPTH calls down
     assert [s.script for s in found["near"].submits] == ["s3://near.py"]
     assert found["loop"].submits == []
@@ -517,8 +464,7 @@ PythonOperator(task_id="loop", python_callable=loop, op_kwargs={"script": "s3://
     ],
 )
 def test_a_command_the_function_runs_or_builds(line, expected):
-    source = _dag(
-        f"""
+    source = _dag(f"""
 import os
 import subprocess
 
@@ -526,15 +472,12 @@ def run(script, day=None, **kwargs):
     {line}
 
 PythonOperator(task_id="t", python_callable=run, op_kwargs={{"script": "s3://a.py"}}, dag=dag)
-"""
-    )
+""")
     assert [(s.script, s.args) for s in tasks(source)["t"].submits] == expected
 
 
 def test_emr_on_eks_serverless_run_job_flow_and_the_emr_hook():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             from airflow.providers.amazon.aws.hooks.emr import EmrContainerHook, EmrHook
 
             def eks(**kwargs):
@@ -571,9 +514,7 @@ def test_emr_on_eks_serverless_run_job_flow_and_the_emr_hook():
             PythonOperator(task_id="new_cluster", python_callable=new_cluster, dag=dag)
             PythonOperator(task_id="hook", python_callable=hook, dag=dag)
             PythonOperator(task_id="eks_hook", python_callable=eks_hook, dag=dag)
-            """
-        )
-    )
+            """))
     assert submits(found["eks"]) == [("emr-eks", "s3://acme-code/jobs/eks.py", ("--a",))]
     assert submits(found["serverless"]) == [("emr-serverless", "s3://acme-code/jobs/srv.py", ())]
     assert found["glue"].submits == []
@@ -586,9 +527,7 @@ def test_emr_on_eks_serverless_run_job_flow_and_the_emr_hook():
 
 
 def test_a_lambda_a_taskflow_function_and_a_callable_inside_the_dag_block():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             from airflow.decorators import task
 
             with dag:
@@ -603,9 +542,7 @@ def test_a_lambda_a_taskflow_function_and_a_callable_inside_the_dag_block():
                     boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", f"{CODE}/flow.py"]}}])
 
                 flow()
-            """
-        )
-    )
+            """))
     assert [s.script for s in found["inside"].submits] == ["s3://acme-code/jobs/inside.py"]
     assert [s.script for s in found["lam"].submits] == ["s3://acme-code/jobs/lam.py"]
     assert found["lam"].callable == "lambda"
@@ -614,9 +551,7 @@ def test_a_lambda_a_taskflow_function_and_a_callable_inside_the_dag_block():
 
 
 def test_a_name_bound_more_than_one_way_is_not_taken_for_a_function():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             def submit():
                 boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", "s3://a.py"]}}])
             submit = wrap(submit)
@@ -633,17 +568,13 @@ def test_a_name_bound_more_than_one_way_is_not_taken_for_a_function():
 
             PythonOperator(task_id="a", python_callable=submit, dag=dag)
             PythonOperator(task_id="b", python_callable=twice, dag=dag)
-            """
-        )
-    )
+            """))
     # `imported` is the library's function by the time the task is made, not the def above it
     assert found["a"].submits == [] and found["b"].submits == [] and found["c"].submits == []
 
 
 def test_a_function_whose_name_a_task_takes_later_is_the_function_until_then():
-    found = dags(
-        _dag(
-            """
+    found = dags(_dag("""
             import subprocess
 
             early = PythonOperator(task_id="early", python_callable=extract, dag=dag)
@@ -660,9 +591,7 @@ def test_a_function_whose_name_a_task_takes_later_is_the_function_until_then():
             late = PythonOperator(task_id="late", python_callable=lambda: extract(), dag=dag)
             load = PythonOperator(task_id="load", python_callable=lambda: load(), dag=dag)
             first >> extract >> later
-            """
-        )
-    )
+            """))
     (dag,) = found.dags
     by_id = {t.task_id: t for t in dag.tasks}
     for task_id in ("first", "extract"):  # before the assignment, and in its own value
@@ -678,9 +607,7 @@ def test_a_function_whose_name_a_task_takes_later_is_the_function_until_then():
 
 
 def test_a_function_a_task_in_a_loop_takes_the_name_of_is_not_taken_for_it():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             import subprocess
 
             def extract(**kwargs):
@@ -690,17 +617,13 @@ def test_a_function_a_task_in_a_loop_takes_the_name_of_is_not_taken_for_it():
                 print(name)
             for day in ("mon", "tue"):
                 extract = PythonOperator(task_id=f"extract_{day}", python_callable=extract, dag=dag)
-            """
-        )
-    )
+            """))
     # the second time round, `extract` is the first task: neither is said to run the function
     assert all(t.submits == [] for t in found.values())
 
 
 def test_the_functions_tasks_run_that_are_not_read_are_counted():
-    found = dags(
-        _dag(
-            """
+    found = dags(_dag("""
             def local_noop():
                 pass
             cb = local_noop
@@ -711,9 +634,7 @@ def test_the_functions_tasks_run_that_are_not_read_are_counted():
             PythonOperator(task_id="read", python_callable=local_noop, dag=dag)
             PythonOperator(task_id="expr", python_callable=pick()[0], dag=dag)
             PythonOperator(task_id="helper", python_callable=tasks.run_stream_step, op_kwargs={"script_path": "s3://x.py"}, dag=dag)
-            """
-        )
-    )
+            """))
     assert found.unread_callables == {
         "acme_lib.emr_tasks.create_cluster": 2,
         "acme_lib.emr_tasks.wait_for_cluster": 1,
@@ -723,14 +644,12 @@ def test_the_functions_tasks_run_that_are_not_read_are_counted():
 
 def test_a_dotted_helper_name_matches_whole_parts_only():
     found = tasks(
-        _dag(
-            """
+        _dag("""
             import acme_lib.myemr as other
             import acme_lib.emr as emr
             PythonOperator(task_id="near", python_callable=other.run_step, op_kwargs={"script_path": "s3://n.py"}, dag=dag)
             PythonOperator(task_id="exact", python_callable=emr.run_step, op_kwargs={"script_path": "s3://e.py"}, dag=dag)
-            """
-        ),
+            """),
         {"emr.run_step": {"script": "script_path"}},
     )
     assert found["near"].submits == []  # `myemr` is not `emr`
@@ -738,21 +657,15 @@ def test_a_dotted_helper_name_matches_whole_parts_only():
 
 
 def test_nested_partials_put_the_inner_arguments_first():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             from functools import partial
             PythonOperator(task_id="t", python_callable=partial(partial(tasks.run_positional, "s3://a.py"), ["--x"]), dag=dag)
-            """
-        )
-    )
+            """))
     assert submits(found["t"]) == [("spark-submit", "s3://a.py", ("--x",))]
 
 
 def test_a_function_that_calls_itself_back_is_read_once():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             import subprocess
 
             def f(script):
@@ -763,16 +676,12 @@ def test_a_function_that_calls_itself_back_is_read_once():
                 f(script)
 
             PythonOperator(task_id="t", python_callable=f, op_kwargs={"script": "s3://a.py"}, dag=dag)
-            """
-        )
-    )
+            """))
     assert submits(found["t"]) == [("emr-step", "s3://a.py", ())]
 
 
 def test_op_args_with_a_spread_that_does_not_fold_give_no_positions():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             import acme_cfg
             import subprocess
 
@@ -781,9 +690,7 @@ def test_op_args_with_a_spread_that_does_not_fold_give_no_positions():
 
             PythonOperator(task_id="helper", python_callable=tasks.run_positional, op_args=[*acme_cfg.ARGS, "y.py"], dag=dag)
             PythonOperator(task_id="function", python_callable=go, op_args=[*acme_cfg.ARGS, "y.py"], dag=dag)
-            """
-        )
-    )
+            """))
     # at run time the script is the spread's first item, not "y.py"
     (helper,) = found["helper"].submits
     assert helper.script is None and helper.why == "op_args is not all known"
@@ -792,15 +699,11 @@ def test_op_args_with_a_spread_that_does_not_fold_give_no_positions():
 
 
 def test_a_key_of_op_kwargs_a_later_spread_may_replace_is_not_known():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             import acme_cfg
             PythonOperator(task_id="before", python_callable=tasks.run_stream_step, op_kwargs={"script_path": "s3://a.py", **acme_cfg.KW}, dag=dag)
             PythonOperator(task_id="after", python_callable=tasks.run_stream_step, op_kwargs={**acme_cfg.KW, "script_path": "s3://b.py"}, dag=dag)
-            """
-        )
-    )
+            """))
     assert [s.script for s in found["before"].submits] == [None]
     assert [s.script for s in found["after"].submits] == ["s3://b.py"]
 
@@ -841,14 +744,10 @@ def test_a_function_named_like_an_emr_method_but_called_otherwise_is_followed(tm
 
 
 def test_a_script_that_is_a_number_is_not_a_script():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             PythonOperator(task_id="t", python_callable=tasks.run_positional, op_args=[7], dag=dag)
             PythonOperator(task_id="u", python_callable=tasks.run_stream_step, op_kwargs={"script_path": "s3://a.py", "config_bucket": "b", "config_key": 7}, dag=dag)
-            """
-        )
-    )
+            """))
     (t,) = found["t"].submits
     assert t.script is None and t.why == "it is not text"
     (u,) = found["u"].submits
@@ -856,9 +755,7 @@ def test_a_script_that_is_a_number_is_not_a_script():
 
 
 def test_a_list_that_is_a_piece_of_a_command_is_not_a_submit_of_its_own():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             import subprocess
 
             def go(script):
@@ -867,25 +764,19 @@ def test_a_list_that_is_a_piece_of_a_command_is_not_a_submit_of_its_own():
                 subprocess.run(cmd)
 
             PythonOperator(task_id="t", python_callable=go, op_kwargs={"script": "s3://a.py"}, dag=dag)
-            """
-        )
-    )
+            """))
     assert submits(found["t"]) == [("spark-submit", "s3://a.py", ())]
 
 
 def test_a_lambda_given_the_tasks_arguments():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             import subprocess
 
             def go(script):
                 subprocess.run(["spark-submit", script])
 
             PythonOperator(task_id="t", python_callable=lambda script, **ctx: go(script), op_args=["s3://a.py"], dag=dag)
-            """
-        )
-    )
+            """))
     assert submits(found["t"]) == [("spark-submit", "s3://a.py", ())]
 
 
@@ -1003,15 +894,10 @@ def test_a_function_many_tasks_run_with_the_same_arguments_is_read_once(monkeypa
         f'PythonOperator(task_id="t{i}", python_callable=submit, op_kwargs={{"script": "s3://a.py"}}, dag=dag)'
         for i in range(300)
     )
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
 def submit(script):
     boto3.client("emr").add_job_flow_steps(JobFlowId="j", Steps=[{"HadoopJarStep": {"Args": ["spark-submit", script]}}])
-"""
-            + many
-        )
-    )
+""" + many))
     assert len(calls) == 1
     assert all(submits(t) == [("emr-step", "s3://a.py", ())] for t in found.values())
     assert {t.submits[0].line for t in found.values()} == {t.line for t in found.values()}
@@ -1039,15 +925,12 @@ def test_many_tasks_with_their_own_arguments_cost_in_proportion(monkeypatch):
             f'PythonOperator(task_id="t{i}", python_callable=submit, op_kwargs={{"script": "s3://jobs/{i}.py"}}, dag=dag)'
             for i in range(count)
         )
-        return _dag(
-            """
+        return _dag("""
 def submit(script, **kwargs):
     client = boto3.client("emr")
     args = ["spark-submit", "--deploy-mode", "cluster", script, kwargs.get("day")]
     client.add_job_flow_steps(JobFlowId="j", Steps=[{"Name": "s", "HadoopJarStep": {"Jar": "command-runner.jar", "Args": args}}])
-"""
-            + many
-        )
+""" + many)
 
     counts = []
     for count in (250, 1_000):
@@ -1322,9 +1205,7 @@ def test_what_a_file_that_ran_out_read_of_a_function_is_not_handed_to_the_next(
 def test_a_command_line_is_charged_by_its_length(monkeypatch):
     monkeypatch.setattr(_callables, "MAX_VISITS", 300)
     heavy = "spark-submit " + " ".join(f"--conf k{i}=v" for i in range(100)) + " s3://jobs/b.py"
-    found = dags(
-        _dag(
-            f"""
+    found = dags(_dag(f"""
 import os
 
 def light(**kwargs):
@@ -1335,9 +1216,7 @@ def heavy(**kwargs):
 
 PythonOperator(task_id="light", python_callable=light, dag=dag)
 PythonOperator(task_id="heavy", python_callable=heavy, dag=dag)
-"""
-        )
-    )
+"""))
     by_id = {t.task_id: t for d in found.dags for t in d.tasks}
     assert [s.script for s in by_id["light"].submits] == ["s3://jobs/a.py"]
     # about 600 visits' worth of command line, with 300 to spend in the file
@@ -1346,9 +1225,7 @@ PythonOperator(task_id="heavy", python_callable=heavy, dag=dag)
 
 
 def test_an_emr_step_a_function_builds_is_that_functions_step():
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
             import os
 
             def _steps(script, args):
@@ -1364,9 +1241,7 @@ def test_an_emr_step_a_function_builds_is_that_functions_step():
 
             PythonOperator(task_id="built", python_callable=submit, op_kwargs={"script": "s3://jobs/a.py", "args": ["--day", "1"]}, dag=dag)
             PythonOperator(task_id="unread", python_callable=unread, op_kwargs={"script": "s3://jobs/b.py"}, dag=dag)
-            """
-        )
-    )
+            """))
     # the step the function builds is the step, submitted to EMR: no step of unknown script
     assert submits(found["built"]) == [("emr-step", "s3://jobs/a.py", ("--day", "1"))]
     # a step a function that is not read builds stays one whose script is not known, and a
@@ -1378,8 +1253,7 @@ def test_an_emr_step_a_function_builds_is_that_functions_step():
 
 def test_a_helper_never_takes_a_name_of_the_standard_library():
     found = tasks(
-        _dag(
-            """
+        _dag("""
             import os
             import subprocess
 
@@ -1390,8 +1264,7 @@ def test_a_helper_never_takes_a_name_of_the_standard_library():
             PythonOperator(task_id="t", python_callable=go, dag=dag)
             PythonOperator(task_id="s", python_callable=os.system, op_args=["s3://jobs/s.py"], dag=dag)
             PythonOperator(task_id="h", python_callable=tasks.run, op_kwargs={"script": "s3://jobs/h.py"}, dag=dag)
-            """
-        ),
+            """),
         {"run": {"script": "script"}, "system": {"script": 0}},
     )
     # the commands are read as the commands they are, not as the helpers `run` and `system`
@@ -1427,18 +1300,13 @@ def test_a_command_line_many_tasks_run_is_read_once(monkeypatch):
         f'PythonOperator(task_id="t{i}", python_callable=run, op_kwargs={{"day": "d{i}"}}, dag=dag)'
         for i in range(100)
     )
-    found = tasks(
-        _dag(
-            """
+    found = tasks(_dag("""
 import os
 CMD = "spark-submit --deploy-mode cluster s3://acme-code/jobs/a.py --full"
 
 def run(day, **kwargs):
     os.system(CMD)
-"""
-            + many
-        )
-    )
+""" + many))
     assert all(
         submits(t) == [("spark-submit", "s3://acme-code/jobs/a.py", ("--full",))]
         for t in found.values()
@@ -1646,14 +1514,12 @@ def test_a_config_module_and_a_variable_the_conventions_give_complete_the_script
     (project / "libs").mkdir()
     (project / "libs" / "paths.py").write_text('JOBS_ROOT = "s3://acme-code/jobs"\n', "utf-8")
     (project / "jobs" / "clicks.py").write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             from pyspark.sql import SparkSession
             spark = SparkSession.builder.getOrCreate()
             (spark.readStream.format("kafka").option("subscribe", "clicks_raw").load()
                 .writeStream.format("kafka").option("topic", "clicks").option("checkpointLocation", "s3://acme-state/clicks").start())
-            """
-        ),
+            """),
         "utf-8",
     )
     conventions = yaml.safe_load((project / "conventions.yaml").read_text("utf-8"))

@@ -13,7 +13,7 @@ This module is a **tier-0 shared leaf** — stdlib + ``pyyaml`` only, with no
 ``fluid_build.*`` upstreams. It sits below both ``cli`` and ``copilot`` so
 ``copilot.agents.base`` can read the voice fragment without importing anything
 under ``cli`` (the ``copilot -> cli`` edge the ``[tool.importlinter]`` contracts
-forbid). 
+forbid).
 The voice YAML files stay in ``cli/agent_specs/_defaults/agent_voice/`` (package
 data alongside the other prompt defaults); this leaf resolves that directory by
 a package-relative path — a *data-file* reference, not a code import of ``cli``.

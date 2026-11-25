@@ -77,12 +77,10 @@ SUFFIX = (
 def test_a_dag_id_with_capitals_keeps_its_airflow_block_under_a_fluid_id(tmp_path, monkeypatch):
     _project(
         tmp_path,
-        {
-            "nightly.py": """
+        {"nightly.py": """
             with DAG("Nightly_Orders_Dag", schedule="0 3 * * *", default_args={"owner": "retail"}) as dag:
                 SparkSubmitOperator(task_id="clean", application="s3://acme-code/jobs/clean.py")
-            """
-        },
+            """},
         ["clean"],
     )
     contracts, report = _import(tmp_path, monkeypatch)
@@ -104,12 +102,10 @@ def test_a_dag_id_with_capitals_keeps_its_airflow_block_under_a_fluid_id(tmp_pat
 def test_ids_that_fit_are_recorded_as_they_are_and_nothing_is_said(tmp_path, monkeypatch):
     _project(
         tmp_path,
-        {
-            "nightly.py": """
+        {"nightly.py": """
             with DAG("nightly.orders-v2", schedule=None, default_args={"owner": "retail"}) as dag:
                 SparkSubmitOperator(task_id="clean_orders", application="s3://acme-code/jobs/clean.py")
-            """
-        },
+            """},
         ["clean"],
     )
     contracts, report = _import(tmp_path, monkeypatch)
@@ -158,8 +154,7 @@ def test_two_ids_that_map_to_one_are_told_apart_in_file_order_and_said(tmp_path,
 def test_task_ids_are_mapped_and_every_dependency_names_the_recorded_id(tmp_path, monkeypatch):
     _project(
         tmp_path,
-        {
-            "etl.py": """
+        {"etl.py": """
             with DAG("etl", schedule=None, default_args={"owner": "retail"}) as dag:
                 start = EmptyOperator(task_id="Start_Cluster")
                 load_upper = SparkSubmitOperator(task_id="Load", application="s3://acme-code/jobs/upper.py")
@@ -167,8 +162,7 @@ def test_task_ids_are_mapped_and_every_dependency_names_the_recorded_id(tmp_path
                 report = SparkSubmitOperator(task_id="Daily Report", application="s3://acme-code/jobs/daily.py")
                 start >> load_upper >> report
                 start >> load >> report
-            """
-        },
+            """},
         ["upper", "lower", "daily"],
     )
     contracts, report = _import(tmp_path, monkeypatch)
@@ -239,13 +233,11 @@ def test_a_re_import_records_the_same_ids_and_says_the_same(tmp_path, monkeypatc
 def test_a_dag_id_that_is_not_a_constant_is_still_not_recorded(tmp_path, monkeypatch):
     _project(
         tmp_path,
-        {
-            "dyn.py": """
+        {"dyn.py": """
             import os
             with DAG(os.environ["DAG_NAME"], schedule=None, default_args={"owner": "retail"}) as dag:
                 SparkSubmitOperator(task_id="clean", application="s3://acme-code/jobs/clean.py")
-            """
-        },
+            """},
         ["clean"],
     )
     contracts, report = _import(tmp_path, monkeypatch)
@@ -255,13 +247,10 @@ def test_a_dag_id_that_is_not_a_constant_is_still_not_recorded(tmp_path, monkeyp
 
 def test_ids_recorded_under_another_id_are_listed_up_to_a_bound(tmp_path, monkeypatch):
     count = _proposal.MAX_ID_LINES + 5
-    dags = {
-        f"d{i:02d}.py": f"""
+    dags = {f"d{i:02d}.py": f"""
             with DAG("Nightly_{i:02d}", schedule=None, default_args={{"owner": "retail"}}) as dag:
                 SparkSubmitOperator(task_id="t", application="s3://acme-code/jobs/j{i:02d}.py")
-            """
-        for i in range(count)
-    }
+            """ for i in range(count)}
     _project(tmp_path, dags, [f"j{i:02d}" for i in range(count)])
     _contracts, report = _import(tmp_path, monkeypatch)
     lines = _mapped(report)
@@ -331,8 +320,7 @@ def test_a_task_named_after_the_function_it_runs_keeps_both_under_its_recorded_i
     it depends on that recorded id through the variable."""
     _project(
         tmp_path,
-        {
-            "nightly.py": """
+        {"nightly.py": """
             import subprocess
             from airflow.operators.python import PythonOperator
 
@@ -344,8 +332,7 @@ def test_a_task_named_after_the_function_it_runs_keeps_both_under_its_recorded_i
                 extract = PythonOperator(task_id="Extract", python_callable=extract)
                 daily = SparkSubmitOperator(task_id="extract", application="s3://acme-code/jobs/daily.py")
                 start >> extract >> daily
-            """
-        },
+            """},
         ["orders", "daily"],
     )
     contracts, report = _import(tmp_path, monkeypatch)

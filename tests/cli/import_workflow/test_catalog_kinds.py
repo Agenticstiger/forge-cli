@@ -32,23 +32,17 @@ LOG = logging.getLogger("test_catalog_kinds")
 
 SESSION = "from pyspark.sql import SparkSession\n"
 
-STREAM = (
-    SESSION
-    + """
+STREAM = SESSION + """
 spark = SparkSession.builder.getOrCreate()
 raw = (spark.readStream.format("kafka")
        .option("kafka.bootstrap.servers", "broker:9092").option("subscribe", "orders").load())
 (raw.writeStream.format("iceberg").option("checkpointLocation", "s3://state/orders")
     .toTable("glue_catalog.raw.orders"))
 """
-)
-BATCH = (
-    SESSION
-    + """
+BATCH = SESSION + """
 spark = SparkSession.builder.getOrCreate()
 spark.table("glue_catalog.raw.orders").write.format("iceberg").saveAsTable("glue_catalog.cur.b")
 """
-)
 
 
 def put(root: Path, files: Dict[str, str]) -> None:

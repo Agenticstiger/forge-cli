@@ -28,8 +28,7 @@ def _make_demo(tmp_path: Path) -> Path:
     )
     contract_path = tmp_path / "contract.fluid.yaml"
     contract_path.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             fluidVersion: "0.7.3"
             kind: DataProduct
             id: silver.demo.customer_segments_v1
@@ -58,8 +57,7 @@ def _make_demo(tmp_path: Path) -> Path:
                     - { name: segment, type: categorical }
                   metrics:
                     - { name: active_customers, type: simple, measure: customer_count }
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     return contract_path
@@ -161,8 +159,7 @@ def test_doctor_fails_on_missing_table_with_helpful_detail(tmp_path: Path):
     csv_path.write_text("customer_id\nC1\n", encoding="utf-8")
     contract = tmp_path / "contract.fluid.yaml"
     contract.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             fluidVersion: "0.7.3"
             kind: DataProduct
             id: silver.demo.bad_path_v1
@@ -182,8 +179,7 @@ def test_doctor_fails_on_missing_table_with_helpful_detail(tmp_path: Path):
                   location:
                     path: /this/path/does/not/exist.csv
                     table: missing
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     proc = _run_cli(
@@ -234,8 +230,7 @@ def test_serve_multi_expose_without_id_returns_helpful_error(tmp_path: Path):
     csv_path.write_text("customer_id\nC1\n", encoding="utf-8")
     contract = tmp_path / "contract.fluid.yaml"
     contract.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             fluidVersion: "0.7.3"
             kind: DataProduct
             id: silver.demo.multi_v1
@@ -252,8 +247,7 @@ def test_serve_multi_expose_without_id_returns_helpful_error(tmp_path: Path):
                 kind: table
                 contract: { schema: [{ name: customer_id, type: STRING, required: true }] }
                 binding: { platform: local, format: csv, location: { path: ./customers.csv, table: b } }
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     proc = _run_cli(

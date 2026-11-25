@@ -97,8 +97,7 @@ def test_existing_v0_store_migrates_to_current_version(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy_v0.sqlite3"
     # Build a v0-style store by hand — no user_version, schema only.
     raw = sqlite3.connect(str(db_path))
-    raw.execute(
-        """
+    raw.execute("""
         create table store (
             namespace text not null,
             key text not null,
@@ -109,8 +108,7 @@ def test_existing_v0_store_migrates_to_current_version(tmp_path: Path) -> None:
             fluid_version text,
             primary key (namespace, key)
         )
-        """
-    )
+        """)
     raw.execute(
         "insert into store values (?, ?, ?, ?, ?, ?, ?)",
         (

@@ -101,8 +101,7 @@ def test_abandoned_probe_does_not_keep_the_process_alive(tmp_path):
     Measured in a child because the effect is at exit. A non-daemon straggler (a
     ThreadPoolExecutor worker, joined at exit) would add its remaining ~10s here.
     """
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import time
         from fluid_build.cli import _welcome_scan as ws
 
@@ -111,8 +110,7 @@ def test_abandoned_probe_does_not_keep_the_process_alive(tmp_path):
         ws._probe_cloud_creds = lambda: time.sleep(10) or {}
         ws.run_welcome_scan()
         print(time.time(), flush=True)  # wall-clock stamp: the scan has returned
-        """
-    )
+        """)
     home = tmp_path / "_child_home"
     home.mkdir()
     proc = subprocess.run(
@@ -310,8 +308,7 @@ def test_probes_import_nothing_new_after_the_warm_up(tmp_path):
     module that would land back on the budget clock; add it to ``_WARM_MODULES``.
     """
     (tmp_path / "contract.fluid.yaml").write_text("metadata:\n  productType: SDP\n")
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import json, sys
         from pathlib import Path
         from fluid_build.cli import _welcome_scan as ws
@@ -334,8 +331,7 @@ def test_probes_import_nothing_new_after_the_warm_up(tmp_path):
         stdlib = sys.stdlib_module_names  # lazy stdlib helpers (heapq, ...) are noise
         new = set(sys.modules) - before
         print(json.dumps(sorted(m for m in new if m.split(".")[0] not in stdlib)))
-        """
-    )
+        """)
     home = tmp_path / "_child_home"
     home.mkdir()
     proc = subprocess.run(

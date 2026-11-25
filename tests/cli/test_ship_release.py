@@ -567,8 +567,7 @@ def test_junit_counts_unknown_as_a_failure_and_both_skips_as_skipped() -> None:
 # End to end: the identity repeats, and the run stays offline
 # ---------------------------------------------------------------------------
 
-_RECORDER = textwrap.dedent(
-    '''
+_RECORDER = textwrap.dedent('''
     """Test hook: record every network connection and process this interpreter starts."""
     import json, os, socket, subprocess
 
@@ -602,8 +601,7 @@ _RECORDER = textwrap.dedent(
         return _popen_init(self, args, *rest, **kwargs)
 
     subprocess.Popen.__init__ = popen_init
-    '''
-)
+    ''')
 
 
 def _cli(cwd: Path, *args: str, hook: Optional[Path] = None) -> subprocess.CompletedProcess:

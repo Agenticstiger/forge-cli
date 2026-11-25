@@ -474,7 +474,7 @@ def tofu_state_resources(workdir: str, *, env: Mapping[str, str]) -> List[Dict[s
     except ValueError:
         return []
     out: List[Dict[str, Any]] = []
-    stack = [((doc.get("values") or {}).get("root_module") or {})]
+    stack = [(doc.get("values") or {}).get("root_module") or {}]
     while stack:
         mod = stack.pop()
         out.extend(mod.get("resources") or [])

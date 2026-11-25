@@ -29,8 +29,7 @@ REQUEST_URL = (
     "https://agenticstiger.github.io/flux/engine/spec/profile-request/1-2-0/FluxProfileRequest.json"
 )
 
-CONTRACT: Dict[str, Any] = yaml.safe_load(
-    """
+CONTRACT: Dict[str, Any] = yaml.safe_load("""
 fluidVersion: "0.7.7"
 kind: DataProduct
 id: billing.follows
@@ -148,8 +147,7 @@ exposes:
     semantics:
       entities:
         - { name: product, type: primary, expr: product_id }
-"""
-)
+""")
 
 #: The two followed relationships of the standard tree: account to invoice (cap 3) to line (cap 2).
 FOLLOW_INVOICES = "account.id=invoice.account_id:3"

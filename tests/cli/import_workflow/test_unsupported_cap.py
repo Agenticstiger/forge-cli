@@ -16,16 +16,14 @@ from fluid_build.cli.import_workflow.registry import ImportReport
 
 pytestmark = pytest.mark.unit
 
-DAG = textwrap.dedent(
-    """
+DAG = textwrap.dedent("""
     from datetime import datetime
     from airflow import DAG
     from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
     with DAG(dag_id="dag_{n}", schedule=None, start_date=datetime(2026, 1, 1)) as dag:
         SparkSubmitOperator(task_id="task_{n}", application="s3://elsewhere/jobs/job_{n}.py")
-    """
-)
+    """)
 
 
 def test_an_estate_of_unjoined_tasks_lists_a_bounded_number_of_lines(tmp_path: Path):
