@@ -259,3 +259,35 @@ def test_athena_health_check_pings_workgroup_listing():
     assert health["status"] == "ok"
     assert health["engine"] == "athena"
     fake_client.list_work_groups.assert_called_once()
+
+
+def test_postgres_runs_each_request_in_a_read_only_transaction_it_rolls_back():
+    """In autocommit neither the connection's read-only flag nor a SET LOCAL reaches the
+    next statement. Each request is its own read-only transaction instead, rolled back
+    so no session setting a statement changes outlives it."""
+    driver = PostgresDriver(expose=_pg_expose(), contract={})
+    events = []
+    fake_cursor = MagicMock()
+    fake_cursor.__enter__ = lambda self: self
+    fake_cursor.__exit__ = lambda self, *a: None
+    fake_cursor.description = []
+    fake_cursor.fetchall.return_value = []
+    fake_cursor.execute.side_effect = lambda statement, *a: events.append(statement)
+    transaction = MagicMock()
+    transaction.__enter__ = lambda self: events.append("BEGIN")
+    transaction.__exit__ = lambda self, *a: events.append("ROLLBACK")
+    fake_conn = MagicMock()
+    fake_conn.transaction.return_value = transaction
+    fake_conn.cursor.return_value = fake_cursor
+    driver._connection = fake_conn
+
+    driver.execute(sql="SELECT id FROM t", params=(), timeout_seconds=2)
+
+    fake_conn.transaction.assert_called_once_with(force_rollback=True)
+    assert events == [
+        "BEGIN",
+        "SET TRANSACTION READ ONLY",
+        "SET LOCAL statement_timeout = 2000",
+        "SELECT id FROM t",
+        "ROLLBACK",
+    ]

@@ -177,6 +177,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Postgres driver's query timeout applies.** It was set with `SET LOCAL statement_timeout`
+  on an autocommit connection, where it lasted for no statement; inside each request's own
+  transaction it now holds until the request ends.
 - **A `%` in a contract expression no longer breaks a filtered `query` on Snowflake or
   Postgres.** With a caller's filter bound as a parameter, the connector reads the statement as a
   pyformat string, so a `LIKE 'EU%'` in a row filter or a metric filter made every such call fail.
@@ -390,6 +393,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyword, with no space after it, was left out of the keyword and character checks that read the
   rest of the statement, and out of the drivers' statement guard. Both now read everything after the
   keyword.
+- **The Postgres driver runs each request in a read-only transaction of its own and rolls it
+  back.** The shared connection ran in autocommit, where its read-only flag applied to no
+  statement, so a request could change a session setting that every later request on the
+  connection then ran under. A setting a statement changes is now undone when its request ends,
+  and every request is read-only.
 - **`query_sql`, contract expressions and the drivers' statement guard refuse more Postgres
   functions, on every expose.** `set_config` changes the session later requests run in; the
   pageinspect functions read raw pages, filtered rows included; `pgrowlocks` reports locked rows;
