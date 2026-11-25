@@ -773,9 +773,11 @@ jobs:
   # expose with row filters as a superuser or as a member of a predefined role
   # that reads past the tables an expose names. This runs that check against a
   # real Postgres 17 server, with one role per membership, held directly and
-  # through another role, and a plain role. Free and secret-less like the jobs
-  # above. Docker is CI-only for forge: the test skips wherever
-  # FLUID_TEST_POSTGRES_DSN is unset.
+  # through another role, and a plain role. It also runs the pg_catalog read
+  # that types a filtered caller's comparisons over a table, a view and a
+  # materialized view with enum, domain and citext columns. Free and
+  # secret-less like the jobs above. Docker is CI-only for forge: the tests
+  # skip wherever FLUID_TEST_POSTGRES_DSN is unset.
   # ──────────────────────────────────────────────────────────────
   postgres-role-check:
     name: Postgres role check
@@ -803,10 +805,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,postgres]"
-      - name: Run the role check against Postgres 17
+      - name: Run the role check and the catalog read against Postgres 17
         env:
           FLUID_TEST_POSTGRES_DSN: postgresql://postgres:fluid-ci-only@127.0.0.1:55433/postgres  # pragma: allowlist secret
-        run: python -m pytest -v -p no:randomly -m integration tests/output_ports/test_postgres_role_check_live.py
+        run: >-
+          python -m pytest -v -p no:randomly -m integration
+          tests/output_ports/test_postgres_role_check_live.py
+          tests/output_ports/test_postgres_catalog_types_live.py
 
   # ──────────────────────────────────────────────────────────────
   # DuckDB floor. pyproject.toml takes duckdb>=1.5.0 with no ceiling, and
@@ -942,6 +947,7 @@ jobs:
             tests/output_ports/test_mcp_policy_refs.py \
             tests/output_ports/test_mcp_row_filter_fence.py \
             tests/output_ports/test_pii_audit_circuit_token.py \
+            tests/output_ports/test_postgres_catalog_types_live.py \
             tests/output_ports/test_query_compiler.py \
             tests/output_ports/test_query_rls.py \
             tests/output_ports/test_quickstart_golden_path.py \
