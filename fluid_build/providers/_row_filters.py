@@ -97,7 +97,7 @@ def parse_predicate(where: str, at: str, *, dialect: Optional[str] = None) -> An
         from sqlglot import expressions as exp
         from sqlglot import parse_one
         from sqlglot.errors import SqlglotError
-    except ImportError:  # pragma: no cover - sqlglot is a base dependency
+    except ImportError:
         raise RowFilterError(
             f"{at}.where cannot be checked: sqlglot, a base dependency of forge-cli, is "
             "not installed, and an unchecked predicate is never applied.",

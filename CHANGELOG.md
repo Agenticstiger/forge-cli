@@ -365,10 +365,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client that states its own is ignored in every auth mode.
 - **The IaC row-filter check refuses a predicate with a subquery, a clause besides its WHERE, or a
   bind placeholder.** `EXISTS (SELECT ...)`, `HAVING`, `QUALIFY`, `WINDOW` and `?` / `:name` /
-  `$1` placeholders passed the check into the platform's row access policy or data cells filter,
-  and an unterminated quote escaped as a parser error. Each is now refused with the filter's
-  position, wherever the IaC emitters read row filters (`fluid generate iac`, `fluid apply`), and
-  so is a `rowFilters` value that is not a list (`{}`, `""`), which used to be read as no filter.
+  `@name` / `@@name` placeholders passed the check into the platform's row access policy or data
+  cells filter, and an unterminated quote escaped as a parser error. Each is now refused with the
+  filter's position, wherever the IaC emitters read row filters (`fluid generate iac`,
+  `fluid apply`), and so is a `rowFilters` value that is not a list (`{}`, `""`), which used to be
+  read as no filter.
 - **On an expose that restricts columns or filters rows, `query_sql` reads only the exposed
   table.** A statement may still read a CTE of its own where that CTE is in scope, `VALUES` and
   `UNNEST`; any other relation is refused, since a catalog view such as Postgres's `pg_stats` holds

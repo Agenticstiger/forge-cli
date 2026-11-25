@@ -1026,3 +1026,43 @@ def test_the_resources_do_not_serve_the_access_policy():
         assert "segment" in body  # the rest of the expose is still served
         for policy_text in ("rowFilters", "region = 'EU'", EU, EVERYONE, "columnRestrictions"):
             assert policy_text not in body, (uri, policy_text)
+
+
+# ---------------------------------------------------------------------
+# Every caller, and every reader of the filters, refuses what it cannot check
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("caller", [EU, EVERYONE], ids=["filtered", "unfiltered-reader"])
+def test_an_expression_with_a_subquery_is_refused_for_every_caller(caller):
+    """On an expose with row filters a contract expression may not hold a subquery, for a
+    reader no filter narrows as much as for a filtered caller."""
+    with pytest.raises(query_compiler.QueryValidationError, match="contains a subquery"):
+        query_compiler.compile_semantic_query(
+            expose=_expose(metric_filter="EXISTS (FROM customers WHERE amount > 0)"),
+            metric="revenue",
+            limit=10,
+            table_reference="customers",
+            dialect="duckdb",
+            caller_attributes=_as(caller),
+        )
+
+
+def test_without_sqlglot_no_row_filter_is_applied_unchecked(monkeypatch):
+    """sqlglot is a base dependency. Were it missing, every reader of the filters would
+    refuse rather than apply a predicate nothing checked."""
+    import sys
+
+    from fluid_build.iac.base import UnsupportedBindingError
+    from fluid_build.iac.row_access import row_filters_for
+    from fluid_build.providers._row_filters import RowFilterError, parse_row_filters
+
+    monkeypatch.setitem(sys.modules, "sqlglot", None)
+    with pytest.raises(RowFilterError, match="sqlglot"):
+        parse_row_filters(
+            _FILTERS, declared=set(_COLUMNS), where_at="exposes[customers].policy.authz.rowFilters"
+        )
+    with pytest.raises(query_compiler.RowFilterUnavailable):
+        query_compiler.row_filter_predicate(_expose(), _as(EU))
+    with pytest.raises(UnsupportedBindingError, match="sqlglot"):
+        row_filters_for(_expose())

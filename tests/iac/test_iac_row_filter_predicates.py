@@ -40,6 +40,9 @@ def _expose(where):
         pytest.param("region = 'EU' ORDER BY consent", id="order-by"),
         pytest.param("region = ?", id="positional-placeholder"),
         pytest.param("region = :region", id="named-placeholder"),
+        pytest.param("region = $1", id="numbered-placeholder"),
+        pytest.param("region = @v", id="at-parameter"),
+        pytest.param("region = @@x", id="session-parameter"),
         pytest.param("region = 'EU", id="unterminated-quote"),
     ],
 )
