@@ -332,6 +332,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The IaC row-filter check refuses a predicate with a subquery, a clause besides its WHERE, or a
+  bind placeholder.** `EXISTS (SELECT ...)`, `HAVING`, `QUALIFY`, `WINDOW` and `?` / `:name` /
+  `$1` placeholders passed the check into the platform's row access policy or data cells filter,
+  and an unterminated quote escaped as a parser error. Each is now refused with the filter's
+  position, wherever the IaC emitters read row filters (`fluid generate iac`, `fluid apply`).
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
