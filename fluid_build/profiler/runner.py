@@ -1217,6 +1217,33 @@ def profile_exposes(
     )
 
 
+def _hold_published_cells(
+    rates: "query_rates.Measured",
+    query_plans: "query_rates.QueryPlans",
+    fact_plans: Sequence["facts.FactPlan"],
+    tables_doc: Mapping[str, Mapping[str, Any]],
+    by_table: Mapping[str, sources.SourceColumns],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> None:
+    """Hold each queried table's published column cells beside the facts and queries reading them.
+
+    A column's cells join its table's set check only beside the parts whose texts read it
+    (:func:`fluid_build.profiler.query_rates.published_cells`).
+    """
+    for table in rates.tables:
+        named = set(query_plans.columns_of(table)) | {
+            column
+            for each in fact_plans
+            if each.reason is None and each.table == table
+            for column in each.columns
+        }
+        cells = query_rates.published_cells(
+            tables_doc.get(table, {}), by_table[table], backend, named, fractional_bits
+        )
+        rates.fold(table, cells)
+
+
 def _measured_for_request(
     contract: Mapping[str, Any],
     fact_plans: Sequence["facts.FactPlan"],
@@ -1265,20 +1292,9 @@ def _measured_for_request(
         ),
     ):
         rates = query_rates.measure(query_plans, by_table, backend, rule, links)
-        for queried in rates.tables:
-            # a column's published cells are held beside the facts and queries that read it
-            named = set(query_plans.columns_of(queried)) | {
-                column
-                for each in fact_plans
-                if each.reason is None and each.table == queried
-                for column in each.columns
-            }
-            rates.fold(
-                queried,
-                query_rates.published_cells(
-                    tables_doc.get(queried, {}), by_table[queried], backend, named, fractional_bits
-                ),
-            )
+        _hold_published_cells(
+            rates, query_plans, fact_plans, tables_doc, by_table, backend, fractional_bits
+        )
         invariants, fact_results, unmeasured = _fact_entries(
             contract, fact_plans, by_table, rule, tallies[0], rates
         )
