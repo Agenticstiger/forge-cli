@@ -342,6 +342,24 @@ def test_versions_per_entity_counts_the_entities_by_their_versions(stations):
     assert entry["sampleSize"] == disclosure.sample_size(want["entities"], RULE)
 
 
+def test_rows_with_no_entity_are_left_out_of_the_history(stations, tmp_path):
+    # Rows whose entity is null belong to no entity, so they never chain as one more entity.
+    result, rows = stations
+    first = date(2022, 1, 1)
+    keyless = [
+        {
+            "station_id": None,
+            "valid_from": _text(first + timedelta(days=30 * k), False),
+            "valid_to": _text(first + timedelta(days=30 * (k + 1)), False),
+            "status": STATUS[k % 3],
+            "sensor_model": MODELS[k % 2],
+        }
+        for k in range(25)
+    ]
+    with_keyless = _profile(tmp_path, _contract(), [*rows, *keyless])
+    assert _history_of(with_keyless) == _history_of(result)
+
+
 def test_first_starts_are_withheld_whole_on_the_year_ladder(stations):
     # Where each end is the next start, the end column's counts are the start column's less the
     # first starts, so published first starts would give a withheld cell of either column back.
