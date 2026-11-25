@@ -316,6 +316,39 @@ def test_a_relationship_into_a_window_by_another_column_is_left_out(tmp_path):
     assert "a parent has a row per version" in reason
 
 
+def test_children_per_entity_are_left_out_when_the_entity_is_a_counted_foreign_key(tmp_path):
+    # The entities children per entity count are then the distinct keys the profile withholds:
+    # beside the counted relationship's parents they would give the parents with no version back.
+    contract = _contract()
+    version = contract["exposes"][0]
+    version["semantics"]["relationships"] = [
+        {
+            "name": "site",
+            "to": "site",
+            "fromColumns": ["station_id"],
+            "toColumns": ["station_id"],
+            "cardinality": "many_to_one",
+        }
+    ]
+    contract["exposes"].append(
+        {
+            "exposeId": "site",
+            "kind": "table",
+            "contract": {"schema": [{"name": "station_id", "type": "int"}]},
+        }
+    )
+    sites = [{"station_id": n} for n in range(STATIONS + 3)]
+    result = profile_exposes(
+        contract,
+        [*_sources(tmp_path), ExposeSource("site", _write(tmp_path / "site.ndjson", sites))],
+        backend=load_backend(),
+    )
+    counted = {each["child"]["table"] for each in result.document["relationships"]}
+    assert counted == {"station_version"}
+    said = {(child, name): reason for child, name, reason in result.relationships_left_out}
+    assert "foreign key of a relationship this profile counts" in said[("reading", "station")]
+
+
 def test_a_window_without_a_natural_entity_leaves_the_relationship_out(tmp_path):
     contract = _contract()
     contract["exposes"][0]["semantics"]["entities"] = []

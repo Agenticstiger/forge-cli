@@ -813,6 +813,9 @@ def _plan_profile(
     relationships, relationships_left_out = _keys_not_counted_at_edges(
         relationships, relationships_left_out, edges
     )
+    relationships, relationships_left_out = _entities_beside_counted_keys(
+        relationships, relationships_left_out
+    )
     if request is not None:
         relationships = [_with_asks(each, request) for each in relationships]
     keys = _key_columns(relationships)
@@ -2042,6 +2045,37 @@ def _keys_not_counted_at_edges(
             each.parent_columns
         ) & edges.get(each.parent, frozenset()):
             out.append((each.child, each.name, "a key column is counted at its edges"))
+        else:
+            kept.append(each)
+    return kept, out
+
+
+#: Why children per entity are not counted where the entity is also a counted foreign key.
+_ENTITY_IS_A_COUNTED_KEY = (
+    "its target's natural entity is the foreign key of a relationship this profile counts, and "
+    "the entities it counts beside that relationship's parents would give the parents with no "
+    "version back"
+)
+
+
+def _entities_beside_counted_keys(
+    relationships: Sequence[Relationship],
+    left_out: Sequence[Tuple[str, str, str]],
+) -> Tuple[List[Relationship], List[Tuple[str, str, str]]]:
+    """*relationships* less any that counts the entities of a table whose entity is a counted key.
+
+    Children per entity count one parent per entity of the target, so they state the number of
+    entities. Where the target's entity is itself the foreign key of a counted relationship, that
+    number is the distinct count of the key :func:`_key_columns` withholds: beside that
+    relationship's parents it gives back the parents with no version, a cell of its histogram.
+    Such a relationship is named and left out; the choice reads the contract alone.
+    """
+    counted_keys = {(each.child, tuple(each.child_columns)) for each in relationships}
+    kept: List[Relationship] = []
+    out = list(left_out)
+    for each in relationships:
+        if each.entity and (each.parent, tuple(each.parent_columns)) in counted_keys:
+            out.append((each.child, each.name, _ENTITY_IS_A_COUNTED_KEY))
         else:
             kept.append(each)
     return kept, out
