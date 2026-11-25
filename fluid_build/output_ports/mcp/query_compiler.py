@@ -59,6 +59,7 @@ Borrow-before-build — intentional divergence (per /borrow-before-build):
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePath
@@ -1905,6 +1906,246 @@ def _refuse_unprojectable_reads(tree: Any, exposed_name: str, read: Optional[str
 # the same view as ``customers`` there.
 _DEFAULT_SCHEMA = {"duckdb": "main"}
 
+# Functions sqlglot leaves unparsed (``exp.Anonymous``) in some dialect that a statement on
+# an expose with row filters may still call, beside the listed typed ones.
+_ANONYMOUS_ALLOWED = frozenset({"age", "date_part", "now", "regexp_matches"})
+
+
+@functools.lru_cache(maxsize=1)
+def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
+    """The function classes a statement on an expose with row filters may call, and the
+    lower-cased names a call sqlglot leaves unparsed may have: theirs, and
+    :data:`_ANONYMOUS_ALLOWED`. Everything else is refused, as Trino's file-based access
+    control refuses a function no rule names."""
+    from sqlglot import exp
+
+    classes: Tuple[type, ...] = (
+        # AND, OR and COLLATE, which sqlglot models as functions
+        exp.Connector,
+        exp.Collate,
+        exp.AggFunc,
+        # window functions
+        exp.RowNumber,
+        exp.Rank,
+        exp.DenseRank,
+        exp.Lag,
+        exp.Lead,
+        exp.FirstValue,
+        exp.LastValue,
+        exp.NthValue,
+        exp.Ntile,
+        exp.PercentRank,
+        exp.CumeDist,
+        # conditional
+        exp.Case,
+        exp.If,
+        exp.Coalesce,
+        exp.Nullif,
+        exp.Greatest,
+        exp.Least,
+        # math
+        exp.Abs,
+        exp.Round,
+        exp.Floor,
+        exp.Ceil,
+        exp.Sqrt,
+        exp.Pow,
+        exp.Exp,
+        exp.Ln,
+        exp.Log,
+        exp.Sign,
+        # string
+        exp.Lower,
+        exp.Upper,
+        exp.Length,
+        exp.Substring,
+        exp.Concat,
+        exp.ConcatWs,
+        exp.Trim,
+        exp.Replace,
+        exp.Left,
+        exp.Right,
+        exp.Pad,
+        exp.StrPosition,
+        exp.Initcap,
+        exp.SplitPart,
+        exp.RegexpLike,
+        exp.RegexpReplace,
+        exp.RegexpExtract,
+        exp.MD5,
+        # date and time
+        exp.Extract,
+        exp.TimestampTrunc,
+        exp.DateTrunc,
+        exp.CurrentDate,
+        exp.CurrentTimestamp,
+        exp.DateAdd,
+        exp.DateSub,
+        exp.DateDiff,
+        exp.TimeToStr,
+        exp.ToChar,
+        exp.Year,
+        exp.Month,
+        exp.Day,
+        exp.DayOfWeek,
+        exp.Date,
+        # conversion, JSON and arrays
+        exp.Cast,
+        exp.TryCast,
+        exp.JSONExtract,
+        exp.JSONExtractScalar,
+        exp.JSONBExtract,
+        exp.JSONBExtractScalar,
+        exp.Array,
+        exp.Explode,
+        exp.Unnest,
+        # a predicate over a subquery, which sqlglot models as a function
+        exp.Exists,
+    )
+    names = {
+        name.lower()
+        for cls in exp.ALL_FUNCTIONS
+        if issubclass(cls, classes)
+        for name in cls.sql_names()
+    }
+    return classes, frozenset(names | _ANONYMOUS_ALLOWED)
+
+
+def _refuse_unlisted_functions(tree: Any) -> None:
+    """Refuse a call to a function :func:`_allowed_functions` does not list. A call that
+    names a schema is refused unless the schema is ``pg_catalog``: any other could hold a
+    function of an allowed name that reads anything. The deny-list of
+    :func:`names_refused_postgres_function` still applies on every expose."""
+    from sqlglot import exp
+
+    classes, names = _allowed_functions()
+    for func in tree.find_all(exp.Func):
+        if isinstance(func, exp.Anonymous):
+            parent = func.parent
+            schema = (
+                parent.this.name
+                if isinstance(parent, exp.Dot) and parent.expression is func
+                else ""
+            )
+            if (schema and schema.casefold() != "pg_catalog") or func.name.casefold() not in names:
+                written = f"{schema}.{func.name}" if schema else func.name
+                raise QueryValidationError(_unlisted_function(written))
+        elif not isinstance(func, classes):
+            raise QueryValidationError(_unlisted_function(func.sql_name().lower()))
+
+
+def _unlisted_function(name: str) -> str:
+    return (
+        f"sql calls {name}, which a statement on an expose with row filters may not call: it "
+        "may use aggregates, window functions, and the common conditional, math, string, "
+        "date, conversion, JSON and array functions."
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _condition_nodes() -> Tuple[type, ...]:
+    """What a condition may hold on an expose with row filters: comparisons, IN, BETWEEN,
+    IS, LIKE and EXISTS over columns and literals, joined by AND, OR and NOT. None of them
+    fails on a row's value, so a planner that runs one early, on a row the filter
+    removes, tells the caller nothing (Postgres calls such operators leakproof)."""
+    from sqlglot import exp
+
+    return (
+        exp.And,
+        exp.Or,
+        exp.Not,
+        exp.Paren,
+        exp.EQ,
+        exp.NEQ,
+        exp.GT,
+        exp.GTE,
+        exp.LT,
+        exp.LTE,
+        exp.NullSafeEQ,
+        exp.NullSafeNEQ,
+        exp.Is,
+        exp.In,
+        exp.Between,
+        exp.Like,
+        exp.ILike,
+        exp.Escape,
+        exp.Exists,
+        exp.Any,
+        exp.All,
+        exp.Column,
+        exp.Identifier,
+        exp.Literal,
+        exp.Null,
+        exp.Boolean,
+        exp.Neg,
+        exp.Tuple,
+    )
+
+
+def _refuse_conditions_that_can_fail(tree: Any) -> None:
+    """Refuse what a planner could evaluate on a row the row filter removes and that could
+    fail there, so that an error would tell the caller the row exists.
+
+    A planner may merge the filtered projection into the statement and run a WHERE or a
+    JOIN's ON on rows before the filter. Each condition may therefore hold only
+    :func:`_condition_nodes` (a subquery in it is checked as its own statement), and a
+    subquery, a derived table or a CTE may select only columns, literals, ``*``,
+    aggregates and window functions: a value it computes could be pushed into a condition
+    of the statement around it. The outer statement's own select list, its aggregates,
+    HAVING and window functions see only the rows the filter keeps."""
+    from sqlglot import exp
+
+    allowed = _condition_nodes()
+    subqueries = (exp.Subquery, exp.Select, exp.SetOperation)
+    conditions = [where.this for where in tree.find_all(exp.Where)]
+    conditions += [join.args["on"] for join in tree.find_all(exp.Join) if join.args.get("on")]
+    for condition in conditions:
+        for node in condition.walk(prune=lambda n: isinstance(n, subqueries)):
+            if isinstance(node, subqueries):
+                continue
+            if not isinstance(node, allowed) or (
+                isinstance(node, exp.Neg) and not isinstance(node.this, exp.Literal)
+            ):
+                raise QueryValidationError(
+                    f"sql filters with {node.sql()[:80]!r}; on an expose with row filters a "
+                    "condition compares columns and literals with =, <>, <, >, IN, BETWEEN, IS "
+                    "and LIKE (an engine may evaluate it on a row the filter removes, where "
+                    "anything that can fail would tell the caller the row exists)."
+                )
+    outer = set(map(id, _outermost_selects(tree)))
+    for select in tree.find_all(exp.Select):
+        if id(select) in outer:
+            continue
+        for value in select.expressions:
+            inner = value.this if isinstance(value, exp.Alias) else value
+            if not isinstance(
+                inner, (exp.Column, exp.Star, exp.Literal, exp.Null, exp.Boolean, exp.Window)
+            ) and not isinstance(inner, exp.AggFunc):
+                raise QueryValidationError(
+                    f"sql computes {value.sql()[:80]!r} in a subquery; on an expose with row "
+                    "filters a subquery, a derived table or a CTE selects columns, literals, "
+                    "aggregates and window functions, and the computing happens in the "
+                    "outer select."
+                )
+
+
+def _outermost_selects(tree: Any) -> List[Any]:
+    """The selects whose values are the statement's result: the statement itself, or each
+    branch of a set operation."""
+    from sqlglot import exp
+
+    found: List[Any] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.Subquery):
+            stack.append(node.this)
+        elif isinstance(node, exp.SetOperation):
+            stack.extend((node.this, node.expression))
+        elif isinstance(node, exp.Select):
+            found.append(node)
+    return found
+
 
 def duckdb_catalog(expose: Mapping[str, Any]) -> str:
     """The catalog DuckDB gives the database a binding opens: the stem of
@@ -2068,6 +2309,11 @@ def _project_exposed_table(
         raise unreadable
     tree = statements[0]
     _require_plain_sources(tree)
+    if predicate is not None:
+        # A filtered caller: only listed functions, and nothing a planner could run on a
+        # row the filter removes that would fail there.
+        _refuse_unlisted_functions(tree)
+        _refuse_conditions_that_can_fail(tree)
     exposed_name = exposed.name.casefold()
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
     _refuse_another_schemas_table(tables, exposed, read, catalog)

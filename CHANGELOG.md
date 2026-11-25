@@ -425,6 +425,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connect it checks whether the role is a superuser or a member of `pg_read_server_files`,
   `pg_write_server_files`, `pg_execute_server_program` or `pg_monitor`. If it is, every read of an
   expose with row filters is refused with that reason, and any other expose logs a warning.
+- **On an expose with row filters, `query_sql` calls only listed functions and keeps its conditions
+  to comparisons.** A caller a filter narrows may use aggregates, window functions and the common
+  conditional, math, string, date, conversion, JSON and array functions, unqualified or under
+  `pg_catalog`; any other function is refused. A WHERE or JOIN condition may only compare columns
+  and literals (`=`, `<>`, `<`, `>`, `IN`, `BETWEEN`, `IS`, `LIKE`, `EXISTS`). An engine can
+  evaluate a condition on a row the filter removes, so a cast, a division or a function that fails
+  there would tell the caller the row exists; a value a subquery computes is refused for the same
+  reason. A reader no filter narrows is not limited.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -627,6 +635,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_prepared_statements` and `pg_cursors` views.
 - **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
   read the name as a string. Write the column name bare.
+- **A caller a row filter narrows writes `query_sql` conditions as comparisons.** Compare columns
+  with literals in WHERE and JOIN conditions, and compute values (casts, arithmetic, functions) in
+  the outer select list; only listed functions may be called.
 - **sqlglot 30.1 or newer is required.** 26.16 and older record no identifier positions, so the MCP
   output port refused every row filter on them, and releases before 30.1 refuse some valid
   `query_sql` reads on an expose with row filters (an `EXISTS` subquery, for one).

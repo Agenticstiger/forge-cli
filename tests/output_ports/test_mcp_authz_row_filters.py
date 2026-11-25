@@ -1158,3 +1158,137 @@ def test_duckdb_reads_the_exposed_table_under_the_catalog_its_binding_opens(db_f
             compile_it()
     else:
         assert "_fluid_rows.region = 'EU'" in compile_it().sql
+
+
+# ---------------------------------------------------------------------
+# A filtered caller calls only listed functions
+# ---------------------------------------------------------------------
+
+
+def _compile_for(sql: str, caller: str = EU, dialect: str = "duckdb"):
+    return query_compiler.compile_free_form_sql(
+        sql=sql,
+        table_reference="customers",
+        limit=10,
+        expose=_expose(),
+        caller_attributes=_as(caller),
+        dialect=dialect,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql", "named"),
+    [
+        ("postgres", "SELECT my_lookup(region) FROM customers", "my_lookup"),
+        ("postgres", "SELECT public.lower(region) FROM customers", "public.lower"),
+        ("duckdb", "SELECT hash(region) FROM customers", "hash"),
+        ("postgres", "SELECT pg_backend_pid() FROM customers", "pg_backend_pid"),
+    ],
+)
+def test_a_filtered_caller_may_call_only_listed_functions(dialect, sql, named):
+    with pytest.raises(query_compiler.QueryValidationError, match=f"calls {named},"):
+        _compile_for(sql, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        ("postgres", "SELECT pg_catalog.lower(region) FROM customers"),
+        ("postgres", "SELECT lower(segment), count(*), sum(amount) FROM customers GROUP BY 1"),
+        ("duckdb", "SELECT row_number() OVER (ORDER BY id) AS n, upper(segment) FROM customers"),
+        ("duckdb", "SELECT date_part('year', now()) AS y, CAST(amount AS DOUBLE) FROM customers"),
+        ("postgres", "SELECT coalesce(segment, '-'), round(amount / 3.0, 1) FROM customers"),
+    ],
+)
+def test_a_filtered_caller_may_call_the_listed_functions(dialect, sql):
+    assert "_fluid_rows.region = 'EU'" in _compile_for(sql, dialect=dialect).sql
+
+
+def test_an_unfiltered_reader_is_not_limited_to_the_listed_functions():
+    """A reader no filter narrows reads every row, so no row is withheld from it."""
+    assert "my_lookup" in _compile_for("SELECT my_lookup(region) FROM customers", EVERYONE).sql
+
+
+# ---------------------------------------------------------------------
+# Nothing that could fail on a withheld row runs where a planner could run it early
+# ---------------------------------------------------------------------
+
+_CAN_FAIL = [
+    pytest.param("SELECT id FROM customers WHERE 1 / (amount - 20) > 0", id="division"),
+    pytest.param("SELECT id FROM customers WHERE CAST(segment AS INT) > 0", id="cast"),
+    pytest.param("SELECT id FROM customers WHERE amount % 3 = 0", id="modulo"),
+    pytest.param("SELECT id FROM customers WHERE amount * 1000 > 0", id="arithmetic"),
+    pytest.param("SELECT id FROM customers WHERE lower(segment) = 'retail'", id="function"),
+    pytest.param(
+        "SELECT a.id FROM customers AS a JOIN customers AS b ON a.id = b.amount / 10",
+        id="join-condition",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "dialect", ["duckdb", "postgres", "snowflake", "bigquery", "athena", "databricks"]
+)
+@pytest.mark.parametrize("sql", _CAN_FAIL)
+def test_a_condition_that_can_fail_is_refused_on_every_engine(sql, dialect):
+    with pytest.raises(query_compiler.QueryValidationError, match="filters with"):
+        _compile_for(sql, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The keyword checks refuse a nested SELECT on every engine, so query_sql cannot
+        # write these today; the fence is the second layer, checked here directly.
+        pytest.param(
+            "SELECT id FROM customers WHERE EXISTS (FROM customers c WHERE 1 / c.amount > 0)",
+            id="subquery-condition",
+        ),
+        pytest.param(
+            "SELECT r FROM (FROM customers SELECT 100 / amount AS r) AS x WHERE r > 1",
+            id="derived-value",
+        ),
+        pytest.param(
+            "WITH c AS (FROM customers SELECT CAST(segment AS INT) AS s) FROM c WHERE s > 0",
+            id="cte-value",
+        ),
+    ],
+)
+def test_a_value_a_subquery_computes_is_refused_where_it_could_be_pushed_down(sql):
+    with pytest.raises(query_compiler.QueryValidationError, match="filters with|in a subquery"):
+        query_compiler._project_exposed_table(
+            sql,
+            table_reference="customers",
+            allowed=list(_COLUMNS),
+            dialect="duckdb",
+            predicate="((_fluid_rows.region = 'EU'))",
+        )
+
+
+_CANNOT_FAIL = [
+    "SELECT id FROM customers WHERE amount > 15 ORDER BY id",
+    "SELECT id FROM customers WHERE segment IN ('retail', 'x') AND amount BETWEEN 0 AND 100",
+    "SELECT id FROM customers WHERE segment LIKE 'ret%' OR tenant_id IS NULL ORDER BY id",
+    "SELECT id FROM customers WHERE NOT EXISTS (FROM customers c WHERE c.id = 99) ORDER BY id",
+    "SELECT count(*) AS n FROM customers HAVING count(*) > 0",
+    "SELECT id, 100 / amount AS r, CAST(segment AS VARCHAR) AS s FROM customers ORDER BY id",
+]
+
+
+def test_a_withheld_row_that_would_make_a_condition_fail_changes_nothing(con):
+    """With a withheld row whose values would make the refused conditions fail, every
+    condition a filtered caller may write gives the same rows as without it."""
+    with_trap = duckdb.connect()
+    with_trap.execute(
+        "CREATE TABLE customers (id INTEGER, region VARCHAR, segment VARCHAR, amount INTEGER, "
+        "tenant_id VARCHAR, secret VARCHAR)"
+    )
+    with_trap.executemany(
+        "INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)",
+        [*_ROWS, (5, "US", "not-a-number", 0, "t9", "S5")],
+    )
+    try:
+        for sql in _CANNOT_FAIL:
+            assert _free_form(with_trap, sql, _as(EU)) == _free_form(con, sql, _as(EU)), sql
+    finally:
+        with_trap.close()
