@@ -32,12 +32,16 @@ The free-form ``query_sql`` path (gated by ``--allow-sql``) goes
 through :func:`compile_free_form_sql` instead, which adds a stricter
 SELECT-only check on top of the allowlist.
 
-A query reads one expose. ``semantics.relationships`` (schema 0.7.7) is
-information here: ``describe`` returns it with the rest of the semantics
-block, and no query joins on it (cross-expose joins are phase 2 of
-RFC-semantics-tier1). A dimension's ``typeParams.validityParams`` is
-ignored: a validity window's bounds group like any time dimension, and
-no query is filtered to the version current at a point in time.
+A query reads one expose, plus the versions an as-of relationship reaches.
+``semantics.relationships`` (schema 0.7.7) is information in ``describe``; a
+dimension or filter key ``<relationship>.<column>`` on a relationship that
+declares ``asOf`` reads ``column`` of the version of the target valid on the
+row's ``asOf`` value, when the caller supplies the target
+(:class:`RelatedTable`). The target is read only through its own governed
+projection. No other relationship is joined. A dimension's
+``typeParams.validityParams`` is otherwise ignored: a validity window's bounds
+group like any time dimension, and no query is filtered to the version current
+at a point in time.
 
 Borrow-before-build — intentional divergence (per /borrow-before-build):
     Surveyed **MetricFlow** (dbt-labs, Apache-2.0; the OSI / Open
@@ -63,6 +67,7 @@ import decimal
 import functools
 import re
 from dataclasses import dataclass, field
+from datetime import date as _date
 from pathlib import Path
 from typing import (
     Any,
@@ -488,6 +493,34 @@ _PROJECTION_COLUMN = (
 _PROJECTION_OPEN_RE = re.compile(
     r"\(SELECT " + _PROJECTION_COLUMN + r"(?:, " + _PROJECTION_COLUMN + r")* FROM "
 )
+# The opening of the window subquery of an as-of join, as the compiler renders it: the
+# key, start and end of the version, the columns read, then the next start and the count of
+# versions starting together (:func:`fluid_build.fluid_sql.as_of_columns`), every one a bare
+# or quoted identifier aliased to a bare or quoted identifier, and nothing else. The
+# relation it reads is the target's governed projection, whose own opening
+# :data:`_PROJECTION_OPEN_RE` strips; the rest of the join stays scanned.
+_AS_OF_COLUMN = _PROJECTION_COLUMN + " AS " + _PROJECTION_COLUMN
+_AS_OF_OPEN_RE = re.compile(
+    r"\(SELECT "
+    + _AS_OF_COLUMN
+    + r"(?:, "
+    + _AS_OF_COLUMN
+    + r"){2,}, LEAD\("
+    + _PROJECTION_COLUMN
+    + r"\) OVER \(PARTITION BY "
+    + _PROJECTION_COLUMN
+    + " ORDER BY "
+    + _PROJECTION_COLUMN
+    + r"\) AS "
+    + _PROJECTION_COLUMN
+    + r", COUNT\(\*\) OVER \(PARTITION BY "
+    + _PROJECTION_COLUMN
+    + ", "
+    + _PROJECTION_COLUMN
+    + r"\) AS "
+    + _PROJECTION_COLUMN
+    + " FROM "
+)
 
 
 # A statement's leading ``SELECT`` keyword, after any opening parentheses. The keyword
@@ -511,11 +544,12 @@ def strip_projection_open(sql_body: str) -> str:
     The remainder (table reference, row-filter predicate, alias, outer clauses) is
     still scanned in full: only the opening goes, so a ``SELECT`` anywhere else in the
     statement (a union branch, a scalar subquery over another column list) is still
-    refused. The shape removed is the one :func:`compile_semantic_query` renders
-    for an expose that restricts columns or rows, and :func:`compile_free_form_sql` for
-    every expose.
+    refused. The shapes removed are the ones :func:`compile_semantic_query` renders:
+    the projection of an expose that restricts columns or rows (also each as-of target's),
+    and the opening of an as-of join's window subquery; and :func:`compile_free_form_sql`
+    renders the projection for every expose.
     """
-    return _PROJECTION_OPEN_RE.sub("(", sql_body)
+    return _PROJECTION_OPEN_RE.sub("(", _AS_OF_OPEN_RE.sub("(", sql_body))
 
 
 def _resolve_measure_alias(
@@ -957,13 +991,20 @@ class CompiledQuery:
     the alias set here and the driver applies it.
     """
 
+    joined_row_filters: Tuple[str, ...] = ()
+    """The row-filter predicates of the tables an as-of relationship reaches, each applied
+    inside that table's own governed projection. Like :attr:`row_filter`, they are policy the
+    caller is not shown (see :meth:`shown_sql`)."""
+
     def shown_sql(self) -> str:
-        """:attr:`sql` as the caller may see it: the row-filter predicate, which is
-        policy the ``describe`` tool does not return either, replaced by
-        ``(<row filter>)``."""
-        if not self.row_filter:
-            return self.sql
-        return self.sql.replace(self.row_filter, ROW_FILTER_SHOWN)
+        """:attr:`sql` as the caller may see it: every row-filter predicate (the base
+        expose's and each joined table's), which is policy the ``describe`` tool does not
+        return either, replaced by ``(<row filter>)``."""
+        shown = self.sql
+        predicates = {p for p in (self.row_filter, *self.joined_row_filters) if p}
+        for predicate in sorted(predicates, key=len, reverse=True):
+            shown = shown.replace(predicate, ROW_FILTER_SHOWN)
+        return shown
 
     def render_sql_for_dialect(self, dialect: str) -> str:
         """Re-render the SQL with the given dialect's placeholder
@@ -1343,6 +1384,389 @@ def _render_measure_expression(
     return f"{_semantics_builder.aggregate_call(measure_name, measure, expr_raw)} AS {projection_alias}"
 
 
+@dataclass(frozen=True)
+class RelatedTable:
+    """The table an as-of relationship reaches, supplied by the caller (the server).
+
+    ``expose`` is the relationship's target expose (its ``exposeId`` must equal the
+    relationship's ``to``); ``table_reference`` is its driver-built table expression, treated
+    as opaque text like the base one. ``restricted_columns`` and ``redacted_columns`` are the
+    target's own column sets, computed the way the base expose's are: a restricted column
+    cannot be read, filtered on or joined on, and a redacted one is projected redacted.
+    The target is read only through its own governed projection (its declared columns less
+    the restricted ones, and its row filter for the same caller), never from the table.
+    """
+
+    expose: Mapping[str, Any]
+    table_reference: str
+    restricted_columns: Tuple[str, ...] = ()
+    redacted_columns: Tuple[str, ...] = ()
+
+
+_WINDOW_KINDS = frozenset({"date", "timestamp", "timestamptz"})
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_COLUMN_SET_TYPES = (tuple, list, set, frozenset)
+
+
+def _listed(name: str, names: Iterable[str]) -> bool:
+    """Whether ``name`` is one of ``names``, compared case-folded like an engine folds it."""
+    folded = name.casefold()
+    return any(folded == other.casefold() for other in names)
+
+
+def _declared_types(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Declared ``contract.schema`` column name → declared type, or ``None`` when the
+    contract or its schema is not a mapping and a list of mappings."""
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    if not isinstance(schema, list) or not all(isinstance(c, Mapping) for c in schema):
+        return None
+    return {c["name"]: c.get("type") for c in schema if isinstance(c.get("name"), str)}
+
+
+def _window_kind(declared: Any) -> Optional[str]:
+    """The FLUID SQL/1 kind of a declared column type, or ``None`` when it has none."""
+    from fluid_build.fluid_sql import column_type as sql_column_type
+
+    parsed = sql_column_type(declared)
+    return None if parsed is None else parsed.type.kind
+
+
+@dataclass
+class _Reach:
+    """One as-of join in a query: the target reached through one relationship."""
+
+    number: int
+    relationship: str
+    alias: str
+    table_reference: str
+    readable: Tuple[str, ...]
+    row_predicate: Optional[str]
+    redacted: Tuple[str, ...]
+    restricted: Tuple[str, ...]
+    target_id: Any
+    target_types: Dict[str, Any]
+    join: str
+    from_column: str
+    as_of: str
+    key: str
+    start: str
+    end: str
+    open_end: Optional[str]
+    closed: bool
+    names: Dict[str, str]  # fresh names of the window subquery: k, s, e, n, m
+    columns: Dict[str, str] = field(default_factory=dict)  # column read -> fresh name
+
+
+class _AsOfJoins:
+    """The as-of joins one query reads through (RFC-versioned-relationships section 2.2).
+
+    A dimension or filter key ``<relationship>.<column>`` reads ``column`` of the version of
+    the target the base row's ``asOf`` value falls in. :meth:`read` checks everything the join
+    depends on and refuses with the reason; nothing the caller names reaches the SQL except
+    through ``validate_ident``. The window subquery projects only fresh names, distinct from
+    every declared base column, so an unqualified base column is never ambiguous, and it
+    reads the target's governed projection, never its table: a version the caller may not
+    read is not in the relation when the window functions run, so it never bounds a visible
+    version or reveals where it starts.
+    """
+
+    def __init__(
+        self,
+        *,
+        expose: Mapping[str, Any],
+        index: _SemanticIndex,
+        related: Optional[Mapping[str, RelatedTable]],
+        restricted: Tuple[str, ...],
+        caller_attributes: Optional[Mapping[str, Any]],
+        dialect: Optional[str],
+        taken: Iterable[str],
+    ) -> None:
+        if related is not None and not isinstance(related, Mapping):
+            raise QueryValidationError("related must map a relationship name to its table")
+        self._expose = expose
+        self._types = {name: column.get("type") for name, column in index.columns.items()}
+        self._related: Mapping[str, RelatedTable] = related or {}
+        self._restricted = restricted
+        self._caller_attributes = caller_attributes
+        self._dialect = dialect
+        self._taken: Set[str] = {name.casefold() for name in taken if isinstance(name, str)}
+        self._reaches: Dict[str, _Reach] = {}
+
+    @property
+    def reaches(self) -> List[_Reach]:
+        return list(self._reaches.values())
+
+    @property
+    def joined_row_filters(self) -> Tuple[str, ...]:
+        return tuple(r.row_predicate for r in self._reaches.values() if r.row_predicate)
+
+    def _fresh(self, name: str) -> str:
+        from fluid_build.fluid_sql import fresh_name
+
+        return fresh_name(name, self._taken)
+
+    def _declared(self, relationship: str) -> Optional[Mapping[str, Any]]:
+        semantics = self._expose.get("semantics")
+        listed = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+        if listed is None:
+            return None
+        if not isinstance(listed, list):
+            raise QueryValidationError(
+                f"{self._expose.get('exposeId')!r} declares semantics.relationships as "
+                "something other than a list."
+            )
+        found: Optional[Mapping[str, Any]] = None
+        for entry in listed:
+            if not isinstance(entry, Mapping):
+                raise QueryValidationError(
+                    f"{self._expose.get('exposeId')!r} declares a relationship that is not "
+                    "a mapping."
+                )
+            if entry.get("name") == relationship and found is None:
+                found = entry
+        return found
+
+    def read(self, key: str, *, subject: str) -> Optional[Tuple[str, str, bool]]:
+        """``(output alias, SQL expression, redacted)`` for ``<relationship>.<column>``, or
+        ``None`` when ``key`` is not a reference through a relationship (the caller then
+        treats it as any other name)."""
+        if not self._related or not isinstance(key, str) or key.count(".") != 1:
+            return None
+        relationship, column = key.split(".")
+        if not relationship or not column:
+            return None
+        declared = self._declared(relationship)
+        if declared is None and relationship not in self._related:
+            return None
+        reach = self._reach(relationship, declared, subject)
+        validate_ident(column)
+        target_types = reach.target_types
+        if column not in target_types:
+            raise QueryValidationError(
+                f"{subject} reads column {column!r}, which {reach.target_id!r} "
+                f"(reached through relationship {relationship!r}) does not declare in "
+                f"contract.schema."
+            )
+        if _listed(column, reach.restricted):
+            raise QueryValidationError(
+                f"{subject} reads column {column!r} of {reach.target_id!r}, "
+                f"which is restricted by that expose's policy. The governed query path "
+                f"enforces the same column-level deny rules through a relationship."
+            )
+        if column not in reach.readable:
+            raise QueryValidationError(
+                f"{subject} reads column {column!r} of {reach.target_id!r}, which "
+                "is not one of the columns its contract.schema lets a query read."
+            )
+        fresh = reach.columns.get(column)
+        if fresh is None:
+            fresh = self._fresh(f"fluid_c{reach.number}_{len(reach.columns) + 1}")
+            reach.columns[column] = fresh
+        return (
+            validate_ident(f"{relationship}_{column}"),
+            f"{reach.alias}.{fresh}",
+            _listed(column, reach.redacted),
+        )
+
+    def _reach(
+        self, relationship: str, declared: Optional[Mapping[str, Any]], subject: str
+    ) -> "_Reach":
+        existing = self._reaches.get(relationship)
+        if existing is not None:
+            return existing
+
+        def refuse(why: str) -> QueryValidationError:
+            return QueryValidationError(
+                f"{subject} reads through relationship {relationship!r}, which this query "
+                f"cannot join: {why}"
+            )
+
+        validate_ident(relationship)
+        supplied = self._related.get(relationship)
+        if not isinstance(supplied, RelatedTable):
+            raise refuse("the table it reaches was not supplied on this query path")
+        if declared is None:
+            raise refuse(f"{self._expose.get('exposeId')!r} declares no relationship by that name")
+        as_of_raw = declared.get("asOf")
+        if not isinstance(as_of_raw, str) or not as_of_raw:
+            raise refuse("it is declared without asOf, and only an as-of relationship is joined")
+        target = supplied.expose
+        to = declared.get("to")
+        if not isinstance(target, Mapping) or target.get("exposeId") != to:
+            raise refuse(f"the table supplied is not the expose it targets ({to!r})")
+        semantics = target.get("semantics")
+        try:
+            window = (
+                _semantics_builder.version_window(semantics)
+                if isinstance(semantics, Mapping)
+                else None
+            )
+        except (TypeError, AttributeError, KeyError, ValueError, StopIteration):
+            window = None
+        if window is None:
+            raise refuse(f"{to!r} declares no well-formed validity window")
+        nfc = _semantics_builder.nfc
+        key, start, end = nfc(window.key), nfc(window.start_column), nfc(window.end_column)
+        to_columns = declared.get("toColumns")
+        if not isinstance(to_columns, list) or [nfc(c) for c in to_columns] != [key]:
+            raise refuse(f"toColumns must be exactly [{key!r}], the natural key of {to!r}")
+        from_columns = declared.get("fromColumns")
+        if (
+            not isinstance(from_columns, list)
+            or len(from_columns) != 1
+            or not isinstance(from_columns[0], str)
+        ):
+            raise refuse("fromColumns must name exactly one column")
+        from_column, as_of = nfc(from_columns[0]), nfc(as_of_raw)
+        target_types = _declared_types(target)
+        if target_types is None:
+            raise refuse(f"{to!r} declares no contract.schema list of columns")
+        for name, types, owner in (
+            (as_of, self._types, "the expose"),
+            (from_column, self._types, "the expose"),
+            (key, target_types, "the target"),
+            (start, target_types, "the target"),
+            (end, target_types, "the target"),
+        ):
+            validate_ident(name)
+            if name not in types:
+                raise refuse(f"column {name!r} is not declared in contract.schema of {owner}")
+        kind = _window_kind(self._types[as_of])
+        if kind not in _WINDOW_KINDS:
+            raise refuse(f"asOf column {as_of!r} is not a date or timestamp column")
+        if _window_kind(target_types[start]) != kind or _window_kind(target_types[end]) != kind:
+            raise refuse(
+                f"asOf column {as_of!r} and the window bounds "
+                f"({start!r}, {end!r}) are not columns of one type"
+            )
+        if window.chain == "dayBefore" and kind != "date":
+            raise refuse("chain: dayBefore takes date columns only")
+        open_end: Optional[str] = None
+        if window.open_end is not None:
+            try:
+                literal = _ISO_DATE.fullmatch(window.open_end) and _date.fromisoformat(
+                    window.open_end
+                )
+            except ValueError:
+                literal = None
+            if kind != "date" or not literal:
+                raise refuse(
+                    f"the open end {window.open_end!r} of {to!r} is not a "
+                    "YYYY-MM-DD date of a date window, and no other literal is written"
+                )
+            open_end = f"DATE '{window.open_end}'"
+        for name, names, owner in (
+            (as_of, self._restricted, "the expose"),
+            (from_column, self._restricted, "the expose"),
+        ):
+            if _listed(name, names):
+                raise refuse(
+                    f"it joins on column {name!r} of {owner}, which is restricted by policy; "
+                    "a join on a denied column is an inference oracle"
+                )
+        for label, columns in (
+            ("restricted_columns", supplied.restricted_columns),
+            ("redacted_columns", supplied.redacted_columns),
+        ):
+            if not isinstance(columns, _COLUMN_SET_TYPES) or not all(
+                isinstance(c, str) for c in columns
+            ):
+                raise refuse(f"the {label} supplied for the table are not a collection of names")
+        restricted = _clean_column_names(supplied.restricted_columns)
+        for name in (key, start, end):
+            if _listed(name, restricted):
+                raise refuse(
+                    f"it joins on column {name!r} of the target, which is restricted by "
+                    "policy; a join on a denied column is an inference oracle"
+                )
+        if not isinstance(supplied.table_reference, str) or not supplied.table_reference.strip():
+            raise refuse("the table reference is empty")
+        validate_sql_expression_allowlist(supplied.table_reference)
+        # The target is read through its own governed projection, as the base expose is:
+        # its declared columns less the restricted ones, and the rows its row filter
+        # leaves this caller. A target filter that cannot be resolved for the caller (no
+        # principal it names, a filter that cannot be applied) refuses the whole call.
+        readable = tuple(readable_columns(target, restricted))
+        for name in (key, start, end):
+            if name not in readable:
+                raise refuse(f"column {name!r} is not one its contract.schema lets a query read")
+        predicate = row_filter_predicate(target, self._caller_attributes, dialect=self._dialect)
+        number = len(self._reaches) + 1
+        join_type = declared.get("joinType", "left")
+        if join_type not in ("left", "inner"):
+            raise refuse(f"joinType {join_type!r} is neither left nor inner")
+        join = "JOIN" if join_type == "inner" else "LEFT JOIN"
+        # A name read inside the window subquery must not be shadowed by one it projects.
+        self._taken.update(name.casefold() for name in target_types)
+        reach = _Reach(
+            number=number,
+            relationship=relationship,
+            alias=self._fresh(f"fluid_l{number}"),
+            table_reference=supplied.table_reference,
+            readable=readable,
+            row_predicate=predicate,
+            redacted=_clean_column_names(supplied.redacted_columns),
+            restricted=restricted,
+            target_id=to,
+            target_types=target_types,
+            join=join,
+            from_column=from_column,
+            as_of=as_of,
+            key=key,
+            start=start,
+            end=end,
+            open_end=open_end,
+            closed=window.closed,
+            names={
+                part: self._fresh(f"fluid_{part}{number}") for part in ("k", "s", "e", "n", "m")
+            },
+        )
+        self._reaches[relationship] = reach
+        return reach
+
+    def render(self, reach: "_Reach") -> str:
+        """The join of one reach: the window subquery over the target's governed projection,
+        then the key equality and the as-of condition (the shape of
+        :func:`fluid_build.data_rules._compile._as_of_join`)."""
+        from fluid_build.fluid_sql import as_of_columns, as_of_condition, as_of_nonempty
+
+        names = reach.names
+        following, matches = as_of_columns(reach.start, reach.key)
+        projected = [
+            f"{reach.key} AS {names['k']}",
+            f"{reach.start} AS {names['s']}",
+            f"{reach.end} AS {names['e']}",
+            *(f"{column} AS {fresh}" for column, fresh in reach.columns.items()),
+            f"{following} AS {names['n']}",
+            f"{matches} AS {names['m']}",
+        ]
+        governed = f"SELECT {', '.join(reach.readable)} FROM {reach.table_reference}"
+        if reach.row_predicate is not None:
+            governed += (
+                f" AS {ROW_FILTER_ALIAS} WHERE {reach.row_predicate}"
+                f"{_postgres_fence(self._dialect)}"
+            )
+        versions = as_of_nonempty(reach.start, reach.end, reach.open_end, reach.closed)
+        window = (
+            f"SELECT {', '.join(projected)} FROM ({governed}) AS _fluid_target_{reach.number} "
+            f"WHERE {versions}"
+        )
+        a = reach.alias
+        valid = as_of_condition(
+            date=reach.as_of,
+            start=f"{a}.{names['s']}",
+            end=f"{a}.{names['e']}",
+            following=f"{a}.{names['n']}",
+            matches=f"{a}.{names['m']}",
+            open_end=reach.open_end,
+            closed=reach.closed,
+        )
+        return (
+            f"{reach.join} ({window}) AS {a} ON {reach.from_column} = {a}.{names['k']} AND {valid}"
+        )
+
+
 def compile_semantic_query(
     *,
     expose: Mapping[str, Any],
@@ -1356,6 +1780,7 @@ def compile_semantic_query(
     dialect: Optional[str] = None,
     restricted_columns: Iterable[str] = (),
     redacted_columns: Iterable[str] = (),
+    related: Optional[Mapping[str, RelatedTable]] = None,
 ) -> CompiledQuery:
     """Compile one ``query`` payload into a :class:`CompiledQuery`.
 
@@ -1430,6 +1855,19 @@ def compile_semantic_query(
 
     Every term of the WHERE is parenthesised, so a measure-, dimension- or
     filter-expression with an ``OR`` in it cannot widen a predicate ANDed to it.
+
+    ``related`` maps a relationship name to the table that relationship reaches
+    (:class:`RelatedTable`). A dimension or a filter key ``<relationship>.<column>``
+    (exactly one dot) on one of the expose's ``semantics.relationships[]`` that declares
+    ``asOf`` reads ``column`` of the version of the target the row's ``asOf`` value falls in
+    (RFC-versioned-relationships section 2.2), through one ``LEFT JOIN`` (``JOIN`` for
+    ``joinType: inner``) per relationship. The join's window subquery reads the target's own
+    governed projection, ``(SELECT <readable columns> FROM <table> [AS _fluid_rows WHERE
+    <predicate>])``, where the predicate is the target's row filter for the same caller: a
+    version the caller may not read is not in the relation the window functions run over, so
+    it never bounds a visible version. A relationship that cannot be joined is refused with
+    the reason. With ``related`` empty or ``None`` the statement is what it always was and a
+    dotted name is refused like any unknown name.
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
@@ -1500,6 +1938,26 @@ def compile_semantic_query(
     if metric_filter is not None:
         _check_expression(metric_filter, f"Metric {metric!r} filter")
 
+    joins = _AsOfJoins(
+        expose=expose,
+        index=index,
+        related=related,
+        restricted=restricted,
+        caller_attributes=caller_attributes,
+        dialect=dialect,
+        taken=[
+            *index.columns,
+            *index.dimensions,
+            *index.measures,
+            *index.metrics,
+            *(name.replace(".", "_") for name in (dimensions or []) if isinstance(name, str)),
+            *(name.replace(".", "_") for name in (filters or {}) if isinstance(name, str)),
+            *((metric,) if isinstance(metric, str) else ()),
+            *((measure,) if isinstance(measure, str) else ()),
+            _PROJECTION_ALIAS,
+            ROW_FILTER_ALIAS,
+        ],
+    )
     select_parts: List[str] = []
     group_columns: List[str] = []
     projection_aliases: List[str] = []
@@ -1511,8 +1969,15 @@ def compile_semantic_query(
     for dimension_name in dimensions or []:
         if not isinstance(dimension_name, str):
             raise QueryValidationError("Dimension names must be strings")
-        alias, expr = _resolve_dimension(dimension_name, index, dialect=dialect)
-        _check_expression(expr, f"Dimension {dimension_name!r}")
+        reached = joins.read(dimension_name, subject=f"Dimension {dimension_name!r}")
+        if reached is not None:
+            # A column of a related version: the compiler's own reference to the joined
+            # relation, whose columns are the ones its governed projection holds.
+            alias, expr, reached_redacted = reached
+        else:
+            alias, expr = _resolve_dimension(dimension_name, index, dialect=dialect)
+            _check_expression(expr, f"Dimension {dimension_name!r}")
+            reached_redacted = False
         already = dimension_aliases.get(alias.casefold())
         if already is not None:
             if already == expr:
@@ -1534,7 +1999,9 @@ def compile_semantic_query(
         projection_aliases.append(alias)
         # A dimension projects raw column values, so a PII source column
         # must be redacted under WHATEVER alias it is projected as.
-        if _first_referenced_column(expr, redacted, dialect) is not None:
+        if reached_redacted or (
+            reached is None and _first_referenced_column(expr, redacted, dialect) is not None
+        ):
             redacted_aliases.append(alias)
 
     # The projection is aliased to the METRIC name when the caller asked
@@ -1571,8 +2038,14 @@ def compile_semantic_query(
     for filter_key, filter_value in (filters or {}).items():
         if not isinstance(filter_key, str):
             raise QueryValidationError("Filter keys must be strings")
-        validate_ident(filter_key)
-        if filter_key not in index.dimensions and filter_key not in index.columns:
+        reached = joins.read(filter_key, subject=f"Filter key {filter_key!r}")
+        if reached is None:
+            validate_ident(filter_key)
+        if (
+            reached is None
+            and filter_key not in index.dimensions
+            and filter_key not in index.columns
+        ):
             raise QueryValidationError(
                 f"Filter key {filter_key!r} is not a known dimension or "
                 f"contract column. Filters must reference predeclared "
@@ -1586,21 +2059,25 @@ def compile_semantic_query(
                     f"Filter value for {filter_key!r} must be a scalar; "
                     f"got {type(filter_value).__name__}"
                 )
-        if filter_key in index.dimensions:
-            # Same expression as the SELECT/GROUP BY, grain truncation
-            # included — filtering `order_date = '1992-01-02'` must match the
-            # values the projection returns.
-            _, dimension_expr = _resolve_dimension(filter_key, index, dialect=dialect)
+        if reached is not None:
+            # A column of a related version: the compiler's own reference, already checked.
+            dimension_expr = reached[1]
         else:
-            dimension_expr = validate_ident(filter_key)
-        # An equality filter on a denied column is a working inference
-        # oracle even though the column never appears in the projection:
-        # ``filters: {ACCOUNT_BALANCE: 9999.99}`` returns the revenue of
-        # exactly the rows carrying that balance. Reject the reference.
-        _check_expression(dimension_expr, f"Filter key {filter_key!r}")
-        # The dimension's expression is free SQL, so it is parenthesised: an ``OR`` in
-        # it must not become the top-level operator of the WHERE it is ANDed into.
-        _require_balanced_parentheses(dimension_expr, subject=f"Filter key {filter_key!r}")
+            if filter_key in index.dimensions:
+                # Same expression as the SELECT/GROUP BY, grain truncation
+                # included — filtering `order_date = '1992-01-02'` must match the
+                # values the projection returns.
+                _, dimension_expr = _resolve_dimension(filter_key, index, dialect=dialect)
+            else:
+                dimension_expr = validate_ident(filter_key)
+            # An equality filter on a denied column is a working inference
+            # oracle even though the column never appears in the projection:
+            # ``filters: {ACCOUNT_BALANCE: 9999.99}`` returns the revenue of
+            # exactly the rows carrying that balance. Reject the reference.
+            _check_expression(dimension_expr, f"Filter key {filter_key!r}")
+            # The dimension's expression is free SQL, so it is parenthesised: an ``OR`` in
+            # it must not become the top-level operator of the WHERE it is ANDed into.
+            _require_balanced_parentheses(dimension_expr, subject=f"Filter key {filter_key!r}")
         placeholder_index = len(params)
         where_clauses.append(f"(({dimension_expr}) = :p_{placeholder_index})")
         params.append(filter_value)
@@ -1627,6 +2104,7 @@ def compile_semantic_query(
     sql_lines: List[str] = [
         "SELECT " + ", ".join(select_parts),
         f"FROM {source}",
+        *(joins.render(reach) for reach in joins.reaches),
     ]
     if where_clauses:
         sql_lines.append("WHERE " + " AND ".join(where_clauses))
@@ -1664,6 +2142,7 @@ def compile_semantic_query(
         row_cap=limit if group_columns else None,
         row_filter=row_predicate,
         redacted_columns=tuple(redacted_aliases),
+        joined_row_filters=joins.joined_row_filters,
     )
 
 

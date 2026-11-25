@@ -55,6 +55,7 @@ from .drivers import (
 from .policy import OutputPortPolicy
 from .query_compiler import (
     CompiledQuery,
+    RelatedTable,
     compile_free_form_sql,
     compile_semantic_query,
 )
@@ -110,6 +111,7 @@ __all__ = [
     "derive_advertised_tools",
     # Query compilation
     "CompiledQuery",
+    "RelatedTable",
     "compile_free_form_sql",
     "compile_semantic_query",
     # Drivers
