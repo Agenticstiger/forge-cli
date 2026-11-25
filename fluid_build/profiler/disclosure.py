@@ -52,7 +52,9 @@ A withheld value is written with that code and no value, except in a count table
 or a quantile (:data:`ONE_CODE`, PROFILE-SPEC §3), whose withheld groups and cells
 are all written ``C``, whatever withheld them: a code that named the check would
 tell a reader a range, ``A`` that a cell holds fewer than ``minimumCell`` records,
-and a total the reader knows can turn the range into the count. The profiler's
+and a total the reader knows can turn the range into the count. ``C`` says nothing
+of a cell's size, though where a date statistic would otherwise have shown a zero it
+says the cell is not empty (below). The profiler's
 summary still counts them by the check, as ACRO's outcome table keeps each
 suppressed cell's reasons apart from the table it releases.
 
@@ -81,6 +83,21 @@ What the group checks leave readable, on purpose:
   it is withheld too, under ``D``, so the withheld one cannot be recovered by
   differencing against the ungrouped figures. The records a ``groupBy`` null
   leaves out of every group count as one more group there, never written.
+
+What the date statistics leave readable, on purpose:
+
+* Where a profile chooses between a published zero and a withheld cell, the choice
+  reads the records. A level of a date pair's ``order`` that a contract rule empties
+  is published as ``0`` only when no record lies there, ``structural: ["childless"]``
+  is stated only when no parent lacks a child, and a date span or a pair's day
+  histogram takes its grain, or is left out, by whether its end bins hold
+  ``minimumCell`` records. So a withheld level a rule empties, a missing
+  ``childless`` or a coarser grain tells a reader that at least one record lies
+  there: never how many beyond what ``A`` would say, and never a value.
+* A relationship's day histogram counts child rows, so the children of one parent
+  can fill an end bin, and a published outer edge then bounds the days from that
+  parent's date to its children's to that bin: an interval, as a threshold on rows
+  bounds one record's value in any histogram.
 
 Where this differs from ACRO 1.1.0, on purpose:
 

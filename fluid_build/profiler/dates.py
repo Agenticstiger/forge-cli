@@ -1036,7 +1036,11 @@ def _dates_reason(
 def _joined_days(
     sides: _Sides, columns: Tuple[str, str], joined: Sequence[Tuple[int, int]]
 ) -> "Counter[int]":
-    """The whole days from each child's parent date to its own, over the rows where both are known."""
+    """The whole days from each child's parent date to its own, over the rows where both are known.
+
+    Counted by child row, so one parent's children can fill an end bin: what that leaves
+    readable is :mod:`~fluid_build.profiler.disclosure`'s to say.
+    """
     parent_days = sides.parent_dates.days_of(columns[0])
     child_days = sides.child_dates.days_of(columns[1])
     assert parent_days is not None and child_days is not None
