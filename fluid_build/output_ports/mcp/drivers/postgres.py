@@ -138,9 +138,12 @@ class PostgresDriver(EngineDriver):
         # The compiler uses fully-qualified table reference baked into
         # the SQL string; psycopg does the parameter-binding for the
         # caller's filter/limit values.
-        rendered = _PARAM_REWRITE.sub(r"%(p_\1)s", sql)
-        guard_against_injection_markers(rendered)
         bound: Dict[str, Any] = {f"p_{index}": value for index, value in enumerate(params)}
+        # With parameters bound psycopg reads the statement as a pyformat string, so a
+        # literal ``%`` (a LIKE pattern or a modulo in a contract expression or a row
+        # filter) is doubled before the bind markers are written in.
+        rendered = _PARAM_REWRITE.sub(r"%(p_\1)s", sql.replace("%", "%%") if bound else sql)
+        guard_against_injection_markers(rendered)
         with connection.cursor() as cursor:
             if timeout_seconds is not None and timeout_seconds > 0:
                 # Postgres supports per-statement timeouts via SET

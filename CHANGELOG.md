@@ -177,6 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `%` in a contract expression no longer breaks a filtered `query` on Snowflake or
+  Postgres.** With a caller's filter bound as a parameter, the connector reads the statement as a
+  pyformat string, so a `LIKE 'EU%'` in a row filter or a metric filter made every such call fail.
+  The drivers now double a literal `%` whenever parameters are bound.
 - **`fluid profile --request` names every ask it does not form.** A profile request can ask for a
   table's date pairs and calendar, a workload, a relationship's dates and exposure, and the
   consumers' queries. The request was read whole and the asks it did not form were dropped without a

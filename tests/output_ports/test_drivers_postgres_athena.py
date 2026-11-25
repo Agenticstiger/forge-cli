@@ -144,6 +144,30 @@ def test_postgres_execute_rewrites_named_placeholders_to_psycopg_form():
     assert result.rows == ({"customer_id": "C1"},)
 
 
+def test_postgres_a_literal_percent_survives_pyformat_binding():
+    """psycopg reads a statement with bound parameters as a pyformat string, so a ``%``
+    in a LIKE pattern is doubled; with no parameters it is left as written."""
+    driver = PostgresDriver(expose=_pg_expose(), contract={})
+    fake_conn = MagicMock()
+    fake_cursor = MagicMock()
+    fake_cursor.__enter__ = lambda self: self
+    fake_cursor.__exit__ = lambda self, *a: None
+    fake_cursor.description = []
+    fake_cursor.fetchall.return_value = []
+    fake_conn.cursor.return_value = fake_cursor
+    driver._connection = fake_conn
+
+    sql = "SELECT count(*) FROM t WHERE (region LIKE 'EU%') AND (segment = :p_0)"
+    driver.execute(sql=sql, params=("smb",))
+    called_sql, bound = fake_cursor.execute.call_args_list[-1].args
+    assert "LIKE 'EU%%'" in called_sql and bound == {"p_0": "smb"}
+    assert called_sql % {"p_0": "'smb'"} == sql.replace(":p_0", "'smb'")
+    driver.execute(sql="SELECT count(*) FROM t WHERE region LIKE 'EU%'", params=())
+    assert fake_cursor.execute.call_args_list[-1].args == (
+        "SELECT count(*) FROM t WHERE region LIKE 'EU%'",
+    )
+
+
 def test_postgres_close_is_idempotent():
     driver = PostgresDriver(expose=_pg_expose(), contract={})
     fake_conn = MagicMock()
