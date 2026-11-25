@@ -11,6 +11,7 @@ data's.
 from __future__ import annotations
 
 import json
+import types
 from datetime import date, timedelta
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Sequence
@@ -938,6 +939,55 @@ def test_the_report_counts_published_entries_and_names_no_record_count(tmp_path)
     assert "Exposure of exposes[customers] in exposes[orders]:" in joined
     # No line holds a number but how many entries were published and how many there are.
     assert not any(str(CUSTOMERS) in line for line in lines)
+
+
+def _group(status="F", cells=("F", "F")):
+    return {"status": status, "cellStatus": list(cells)}
+
+
+def _pair(day, order):
+    return {"statistics": [{"groups": day}], "order": {"groups": order}}
+
+
+def test_a_pair_is_published_whole_only_when_every_group_of_it_is():
+    from fluid_build.cli import profile_cmd
+
+    whole = _pair([_group()], [_group()])
+    order_cell_withheld = _pair([_group()], [_group(cells=("F", "D"))])
+    day_cell_withheld = _pair([_group(cells=("D", "F"))], [_group()])
+    order_withheld = _pair([_group()], [_group("D", ())])
+    nothing = _pair([_group("D", ())], [_group("D", ())])
+    no_histogram = {"statistics": [], "order": {"groups": [_group()]}}
+    assert profile_cmd._published_pairs([whole]) == (1, 0)
+    assert profile_cmd._published_pairs([order_cell_withheld, day_cell_withheld]) == (0, 2)
+    assert profile_cmd._published_pairs([order_withheld]) == (0, 1)
+    assert profile_cmd._published_pairs([nothing, no_histogram]) == (0, 1)
+    assert profile_cmd._pairs_line([whole, whole, nothing]) == "2 of 3 published."
+    assert (
+        profile_cmd._pairs_line([whole, whole, whole, order_cell_withheld, nothing])
+        == "3 of 5 published whole, 1 in part."
+    )
+
+
+def test_the_report_names_a_pair_published_in_part():
+    from fluid_build.cli import profile_cmd
+
+    whole = _pair([_group()], [_group()])
+    part = _pair([_group()], [_group(cells=("F", "D"))])
+    document = {
+        "tables": {"loans": {"datePairs": [whole, part]}},
+        "relationships": [
+            {"parent": {"table": "a"}, "child": {"table": "b"}, "dates": [part]},
+        ],
+    }
+    lines: List[str] = []
+    profile_cmd._report_dates(
+        lambda text, **_: lines.append(text), types.SimpleNamespace(document=document)
+    )
+    assert lines == [
+        "exposes[loans]: Date pairs: 1 of 2 published whole, 1 in part.",
+        "Dates of exposes[a] in exposes[b]: 0 of 1 published whole, 1 in part.",
+    ]
 
 
 def test_counting_the_cells_of_a_histogram_equals_counting_its_records():

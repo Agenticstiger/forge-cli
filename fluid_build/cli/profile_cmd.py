@@ -1058,13 +1058,30 @@ def _report_timings(say: Any, result: Any, timings: Any) -> None:
     )
 
 
-def _published_days(entries: Any) -> int:
-    """How many pairs publish their day histogram: one is left out when an end bin is small."""
-    return sum(
-        1
-        for each in entries
-        if each["statistics"] and each["statistics"][0]["groups"][0]["status"] == "F"
-    )
+def _published_pairs(entries: Any) -> Tuple[int, int]:
+    """How many pairs are published whole and how many only in part.
+
+    A pair is whole when it holds a day histogram and every group of that histogram and of
+    its order is published with none of its cells withheld; in part when some group is and
+    some is not. A pair none of whose groups is published is neither.
+    """
+    whole = part = 0
+    for each in entries:
+        held = [*each["statistics"], *([each["order"]] if each.get("order") else [])]
+        shown, total = _published_groups(held)
+        if each["statistics"] and total and shown == total:
+            whole += 1
+        elif shown:
+            part += 1
+    return whole, part
+
+
+def _pairs_line(entries: Any) -> str:
+    """``N of M published``, naming the pairs published in part when there are any."""
+    whole, part = _published_pairs(entries)
+    if part:
+        return f"{whole} of {len(entries)} published whole, {part} in part."
+    return f"{whole} of {len(entries)} published."
 
 
 def _published_groups(statistics: Any) -> Tuple[int, int]:
@@ -1117,15 +1134,13 @@ def _report_dates(say: Any, result: Any) -> None:
     for expose_id, table in result.document["tables"].items():
         pairs = table.get("datePairs", ())
         if pairs:
-            say(
-                f"exposes[{expose_id}]: Date pairs: {_published_days(pairs)} of {len(pairs)} published."
-            )
+            say(f"exposes[{expose_id}]: Date pairs: {_pairs_line(pairs)}")
     for entry in result.document.get("relationships", ()):
         where = f"exposes[{entry['parent']['table']}] in exposes[{entry['child']['table']}]"
         dates = entry.get("dates", ())
         if dates:
             say(
-                f"Dates of {where}: {_published_days(dates)} of {len(dates)} published.",
+                f"Dates of {where}: {_pairs_line(dates)}",
                 soft_wrap=True,
             )
         if "structural" in entry:
