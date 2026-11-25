@@ -18,6 +18,9 @@ runs of the same contract with the same Forge give the same ``identity`` (and
 ``identity_digest``); timings, the CI run and report times are in
 ``provenance``.
 
+With ``--artifacts LOCK``, the external files the lock lists (``_release_lock``) are
+copied to ``external/<name>/<file>`` and named, by digest and source, in ``identity``.
+
 Standard library only at module scope (``fluid --help`` imports ``ship``).
 """
 
@@ -169,8 +172,15 @@ def refusal(
     not_selected: Mapping[int, str],
     opts: st.ShipOptions,
 ) -> Optional[str]:
-    """Why a run cannot build a release in ``release_dir``, or ``None``."""
+    """Why a run cannot build a release in ``release_dir``, or ``None``. A lock of external
+    files (``--artifacts``) is read here, before any stage, and refused when the release
+    could not seal it."""
     if release_dir is None:
+        if opts.artifacts:
+            return (
+                f"--artifacts {opts.artifacts} names files to seal into a release, and this run "
+                "publishes none: add --release-dir DIR"
+            )
         return None
     if os.path.lexists(release_dir):
         return (
@@ -188,6 +198,13 @@ def refusal(
             "--release-dir needs stages 1-4 (bundle to validate-artifacts) in this "
             f"invocation, and stage {num} {st.STAGE_NAMES[num]} does not run ({why})"
         )
+    if opts.artifacts:
+        from . import _release_lock
+
+        try:
+            _release_lock.load(opts.artifacts)
+        except ReleaseError as exc:
+            return str(exc)
     return None
 
 
@@ -285,11 +302,18 @@ def _plan_digests(root: Path) -> Dict[str, str]:
 
 
 def build_identity(
-    opts: st.ShipOptions, root: Path, *, with_plan: bool, applied: bool = False
+    opts: st.ShipOptions,
+    root: Path,
+    *,
+    with_plan: bool,
+    applied: bool = False,
+    external: Sequence[Any] = (),
 ) -> Dict[str, Any]:
     """What identifies the release: the same for two clean runs of the same
     contract, environment, emit set and Forge version. Reads only local files.
-    ``applied``: stage 7 ran, so its mode (a dry run, or a real apply) is part of it."""
+    ``applied``: stage 7 ran, so its mode (a dry run, or a real apply) is part of it.
+    ``external``: the files the ``--artifacts`` lock lists (``_release_lock.ExternalArtifact``),
+    recorded by name, digest and source, never by where they sit on this machine."""
     import fluid_build
 
     manifest = _bundle_manifest(root)
@@ -333,6 +357,8 @@ def build_identity(
         identity["plan"] = plan
     if applied:
         identity["apply_mode"] = opts.mode
+    if external:
+        identity["external"] = [a.entry.identity() for a in external]
     return identity
 
 
@@ -360,6 +386,24 @@ def _copy_artifacts(root: Path, staging: Path) -> None:
             raise ReleaseError(f"{st.ARTIFACTS_DIR}{rel} {problem}")
         _copy(root / st.ARTIFACTS_DIR / rel, staging / "artifacts" / rel)
     _copy(manifest_path, staging / "artifacts" / "MANIFEST.json")
+
+
+def _copy_external(staging: Path, identity: Mapping[str, Any], external: Sequence[Any]) -> None:
+    """Each external file to ``external/<name>/<file>``, hashed again once copied: the release
+    holds the bytes its identity names, or nothing is published."""
+    from fluid_build.cli._attestation import _sha256_file
+
+    if list(identity.get("external") or []) != [a.entry.identity() for a in external]:
+        raise ReleaseError("the release's identity names other external files than it copies")
+    for artifact in external:
+        entry = artifact.entry
+        dest = staging / entry.release_path
+        _copy(artifact.local, dest)
+        if _sha256_file(dest) != entry.sha256:
+            raise ReleaseError(
+                f"{entry.path} ({entry.name}) changed while the run ran: its bytes are no longer "
+                f"the sha256 {entry.sha256} the lock names"
+            )
 
 
 def copy_reports(staging: Path, report_dir: Path, root: Path, passed: Collection[int]) -> None:
@@ -437,13 +481,16 @@ def publish(
     gates: List[Dict[str, Any]],
     provenance: Mapping[str, Any],
     with_plan: bool,
+    external: Sequence[Any] = (),
 ) -> None:
     """Fill ``staging`` (its reports are already there), write the index last and
-    rename it to ``release_dir``. On any error nothing is renamed."""
+    rename it to ``release_dir``. On any error nothing is renamed. ``external``: the
+    files ``identity`` names under ``external`` (``_release_lock.ExternalArtifact``)."""
     try:
         _copy(root / st.BUNDLE_PATH, staging / "bundle.tgz")
         _write_bundle_provenance(root, staging, release_dir, identity["bundle"]["manifest_digest"])
         _copy_artifacts(root, staging)
+        _copy_external(staging, identity, external)
         if with_plan:
             _copy(root / st.PLAN_PATH, staging / "plan.json")
         index = {

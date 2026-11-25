@@ -317,6 +317,7 @@ def validate_cli_path(
     mode: str = "read",
     must_exist: bool = True,
     file_type: str = "path",
+    any_extension: bool = False,
 ) -> Path:
     """Validate an operator-supplied CLI path argument.
 
@@ -351,6 +352,9 @@ def validate_cli_path(
             command will create.
         file_type: Human-readable noun used in error messages
             (``"contract"``, ``"plan"``, ``"report"``, ...).
+        any_extension: Read a file of any type and size: an external file a
+            release carries (``fluid ship --artifacts``). The traversal,
+            forbidden-path, depth and symlink rules still apply.
 
     Returns:
         The resolved, validated :class:`pathlib.Path`.
@@ -409,7 +413,7 @@ def validate_cli_path(
             suffix = resolved.suffix.lower()
             name_lower = resolved.name.lower()
             is_bundle = any(name_lower.endswith(ext) for ext in _BUNDLE_EXTENSIONS)
-            if not is_bundle:
+            if not is_bundle and not any_extension:
                 validator._validate_file_extension(resolved)
                 validator._validate_file_size(resolved)
     else:
