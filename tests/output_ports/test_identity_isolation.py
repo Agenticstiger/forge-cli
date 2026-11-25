@@ -67,7 +67,7 @@ _EXPOSE_MODEL_GATE: Dict[str, Any] = {
 }
 
 # An expose whose ``policy.authz.rowFilters`` give each tenant principal its own
-# rows — used to prove caller_attributes isolate per request all the way into
+# rows, used to prove caller_attributes isolate per request all the way into
 # the compiled SQL the driver would execute.
 _TENANT_EXPOSE: Dict[str, Any] = {
     "exposeId": "demo",
@@ -459,9 +459,9 @@ def test_compiler_compiles_distinct_tenant_predicates() -> None:
 #    (a) The verified and self-attested attribute dicts were flattened
 #        together, so "crypto wins" held only for the keys the JWT claim
 #        mapping happened to produce (the default mapping yields four).
-#        An attribute outside that set — or ANY custom
+#        An attribute outside that set (or ANY custom
 #        FLUID_MCP_JWT_CLAIM_MAPPING, which replaces rather than merges
-#        the defaults — was satisfied by the caller's own claim.
+#        the defaults) was satisfied by the caller's own claim.
 #    (b) model / use_case were promoted from self-attestation whenever
 #        the mapping didn't produce them, letting a client walk past the
 #        agentPolicy gate under a valid token.

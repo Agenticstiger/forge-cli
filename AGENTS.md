@@ -312,7 +312,7 @@ through that gateway, the contract is the policy.
 
 Outside the gateway, the **`fluid_build.output_ports.iam_compiler`** module
 emits Snowflake row-access policies + Postgres `CREATE POLICY` statements from
-the contract's `agentPolicy` — defence-in-depth so a direct warehouse query
+the contract's `agentPolicy`, as defence in depth, so a direct warehouse query
 (an analyst with their own Snowflake role) is also gated by the contract. Its
 row filters still come from the old `policy.rowFilters` key, which the gateway
 refuses; `fluid apply` writes `policy.authz.rowFilters` into BigQuery, Lake

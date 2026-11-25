@@ -157,9 +157,9 @@ _QUERY_SQL_SCHEMA: Dict[str, Any] = {
                 "by the fully-qualified name shown in describe.binding."
                 "tableReference (the server does NOT rewrite the FROM clause). "
                 "The server runs sql_safety.validate_sql_expression_allowlist on "
-                "the body, rejects references to restricted/PII columns, and — "
-                "when the contract declares row filters (policy.authz.rowFilters) "
-                "— reads the table only through the rows your verified principal "
+                "the body, rejects references to restricted/PII columns, and, "
+                "when the contract declares row filters (policy.authz.rowFilters), "
+                "reads the table only through the rows your verified principal "
                 "may read, wherever the statement reads it. Refused unless the "
                 "server was started with --allow-sql."
             ),

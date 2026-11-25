@@ -764,9 +764,9 @@ class OutputPortMcpServer:
         dict made "crypto wins" hold only for the keys the JWT claim mapping
         happens to produce (the default mapping yields five:
         ``sub`` / ``model`` / ``use_case`` / ``tenant_id`` /
-        ``jurisdiction``). Any attribute outside that set — or, before
+        ``jurisdiction``). Any attribute outside that set (or, before
         ``FLUID_MCP_JWT_CLAIM_MAPPING`` was made to merge over the defaults
-        rather than replace them, any custom mapping at all — was then
+        rather than replace them, any custom mapping at all) was then
         satisfied by the caller's own claim, and a client could re-attest
         ``model`` / ``useCase`` past the agentPolicy gate.
         So: when the transport stamps ``fluid_auth_kind`` (JWT / mTLS
@@ -1050,7 +1050,7 @@ class OutputPortMcpServer:
         identity (resolved by :meth:`_resolve_request_identity`),
         threaded explicitly into the data-tool handlers so each
         concurrent HTTP client's ``policy.authz.rowFilters`` resolve
-        against ITS OWN principal — not whatever happens to be cached on
+        against ITS OWN principal, not whatever happens to be cached on
         the shared SessionState.
 
         Each handler is sync today — driver SDKs (snowflake-connector,

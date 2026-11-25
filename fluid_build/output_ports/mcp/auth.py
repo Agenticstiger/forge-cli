@@ -17,7 +17,7 @@ Two pluggable schemes that the gateway selects via
   configured claims into ``caller_attributes`` (so the principal a
   ``policy.authz.rowFilters`` entry names, and the agentPolicy model
   and use case, come from the issuer rather than from the client).
-  Industry-standard pattern — works with Auth0, Okta, Keycloak, AWS
+  Industry-standard pattern: works with Auth0, Okta, Keycloak, AWS
   Cognito, Google IAP, Azure AD.
 
 mTLS (client-cert-bound identity) is best handled by the reverse
@@ -54,7 +54,7 @@ from typing import Any, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, Uni
 #: These are not decoration. ``model`` and ``use_case`` are the inputs to the
 #: agentPolicy gate (``decide()`` in fluid_build.policy.decision), and ``sub``
 #: attributes each call on the audit trail. Losing ``model`` or ``use_case`` does
-#: not fail — it silently widens access, which is why
+#: not fail: it silently widens access, which is why
 #: ``FLUID_MCP_JWT_CLAIM_MAPPING`` MERGES over these rather than replacing them.
 #:
 #: No claim maps to :data:`PRINCIPAL_ATTR` by default: an operator whose exposes
@@ -133,7 +133,7 @@ class AuthDecision:
     """Result of validating a request's auth header.
 
     ``allowed`` is the gate. ``caller_attributes`` populates the
-    verified caller attributes the gateway's policy reads — JWT claims
+    verified caller attributes the gateway's policy reads. JWT claims
     show up here as e.g. ``{"sub": "alice@corp.example", "model":
     "claude-haiku", "principal": "group:analysts@corp.example"}`` per the
     configured claim mapping.
