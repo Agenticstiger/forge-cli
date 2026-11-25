@@ -160,6 +160,19 @@ def test_the_clip_keeps_a_rounded_end_inside_the_declared_range():
     )
 
 
+def test_an_end_is_left_withheld_when_a_record_lies_outside_the_declared_range():
+    low, high = _ms(2024, 3, 15), _ms(2024, 3, 28)
+    below = _holders((_ms(2024, 3, 2), 1), (_ms(2024, 3, 20), 20))
+    assert disclosure.round_extreme("min", below, RULE, date=True, floor=low) is None
+    above = _holders((_ms(2024, 3, 20), 20), (_ms(2024, 3, 30), 1))
+    assert disclosure.round_extreme("max", above, RULE, date=True, ceiling=high) is None
+    # the other end of the same column is unaffected
+    assert disclosure.round_extreme("max", below, RULE, date=True, ceiling=high) == (
+        high,
+        "month",
+    )
+
+
 # -- a profile ----------------------------------------------------------------------------
 
 

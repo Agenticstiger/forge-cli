@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   few records hold the exact value.** Where fewer than `minimumCell` records hold a DATE or
   timestamp column's smallest or largest value, the end is now the first (min) or last (max)
   value of the finest UTC day (timestamps only), month or year holding at least `minimumCell`
-  records, status `F`, clipped to the range the contract declares; with no such bucket the end
+  records, status `F`, clipped to the range the contract declares, and only when the true end lies inside it (a
+  record outside the range leaves that end withheld); with no such bucket the end
   stays withheld as before. A published end says only that its bucket holds that many records and
   that none lies beyond it, as a date span's outer edge does. A profile or a request answer names
   each rounded end and its unit per table under Rounded extremes; a column whose ends pass

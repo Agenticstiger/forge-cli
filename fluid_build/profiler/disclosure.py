@@ -557,13 +557,17 @@ def round_extreme(
     largest for ``"max"``. The first, finest bucket holding at least ``minimumCell`` records
     gives ``(value, unit)``: the bucket's first millisecond for a minimum, its last day (a
     DATE) or last millisecond (a timestamp) for a maximum, clipped to *floor* and *ceiling*,
-    the range the contract declares. ``None`` when no bucket up to the year holds that many
+    the range the contract declares, and only when the true extreme lies inside that range. ``None`` when no bucket up to the year holds that many
     records, or when the bucket lies outside the years 1 to 9999. Whole-number arithmetic on
     milliseconds throughout.
     """
     if not holders:
         return None
     pivot = min(holders) if end == "min" else max(holders)
+    if (floor is not None and pivot < floor) or (ceiling is not None and pivot > ceiling):
+        # a record lies outside the declared range: clipping would put the end on the wrong
+        # side of it, so the end stays withheld
+        return None
     day = pivot // _MS_PER_DAY
     try:
         buckets = _calendar_buckets(day, date)
