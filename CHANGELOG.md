@@ -177,6 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Snowflake OpenTofu provider is held below 2.24.** Version 2.24 changed the preview
+  `snowflake_table` resource, and forge does not emit those changes yet, so a fresh workspace
+  failed `tofu validate` on any Snowflake table with columns. The provider now resolves to
+  2.23.x.
 - **The Postgres driver's query timeout applies.** It was set with `SET LOCAL statement_timeout`
   on an autocommit connection, where it lasted for no statement; inside each request's own
   transaction it now holds until the request ends.
