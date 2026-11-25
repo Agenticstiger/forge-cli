@@ -20,7 +20,7 @@ import copy
 import importlib.util
 import json
 from fractions import Fraction
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import pytest
 import yaml

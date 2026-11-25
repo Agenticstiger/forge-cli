@@ -31,7 +31,6 @@ from tests.profiler.test_release_dates_nulls import (  # noqa: F401  (workspace 
     SEED,
     _again,
     _argv,
-    _asked,
     _columns,
     _event,
     _follow_plan,
