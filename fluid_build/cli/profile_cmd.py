@@ -386,10 +386,8 @@ def _refusal(event: str, detail: str, context: Dict[str, str]) -> Any:
     )
 
 
-def run(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """Profile the expose and write the document; return the exit code."""
-    from fluid_build.cli import _profile_release
-
+def _refuse_before_reading(args: argparse.Namespace) -> None:
+    """Refuse the flag combinations the profile turns away before anything else is looked at."""
     if getattr(args, "strict", False) and getattr(args, "request", None) is None:
         raise _refusal(
             "profile_strict_needs_request",
@@ -401,6 +399,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             },
         )
     _refuse_timings_with_release(args)
+
+
+def run(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """Profile the expose and write the document; return the exit code."""
+    from fluid_build.cli import _profile_release
+
+    _refuse_before_reading(args)
     if _profile_release.wanted(args):
         return _profile_release.run(args, logger)
     from fluid_build._console import cprint_literal

@@ -226,6 +226,30 @@ def _timed(timings: Optional[StageTimings], stage: str, expose_id: str) -> Any:
     return nullcontext() if timings is None else timings.stage(stage, expose_id)
 
 
+@contextmanager
+def _shared(
+    timings: Optional[StageTimings],
+    stage: str,
+    tables: Optional[Callable[[], Sequence[str]]] = None,
+) -> Iterator[None]:
+    """Time work that spans tables: spread over the tables *tables* names once the block ends.
+
+    *tables* is a callable because the block can decide them; with none, the block is the
+    document's write. Nothing is timed without *timings*, and nothing is added if the block
+    raises.
+    """
+    if timings is None:
+        yield
+        return
+    started = time.perf_counter()
+    yield
+    took = time.perf_counter() - started
+    if tables is None:
+        timings.write += took
+    else:
+        timings.spread(stage, tables(), took)
+
+
 @dataclass(frozen=True)
 class ColumnPlan:
     name: str
@@ -818,25 +842,25 @@ def profile_exposes(
     by_expose = {plan.expose_id: (plan, read) for plan, read in zip(plans, reads, strict=True)}
     answered = _Groupings()
     if request is not None:
-        grouping_started = time.perf_counter() if timings is not None else 0.0
-        answered = _answer_groupings(
-            request,
-            plans,
-            reads,
-            declared,
-            unfiltered,
-            relationships,
-            held,
-            backend,
-            fractional_bits,
-        )
+        # The groupings span tables: their time is shared among the tables they group.
+        with _shared(
+            timings,
+            "measure",
+            lambda: [plan.expose_id for plan in plans if plan.expose_id in answered.grouped_by]
+            or [plan.expose_id for plan in plans],
+        ):
+            answered = _answer_groupings(
+                request,
+                plans,
+                reads,
+                declared,
+                unfiltered,
+                relationships,
+                held,
+                backend,
+                fractional_bits,
+            )
         declared = list(answered.declared)
-        if timings is not None:
-            # The groupings span tables: their time is shared among the tables they group.
-            grouped_tables = [
-                plan.expose_id for plan in plans if plan.expose_id in answered.grouped_by
-            ] or [plan.expose_id for plan in plans]
-            timings.spread("measure", grouped_tables, time.perf_counter() - grouping_started)
     tallies: Tuple["Counter[str]", "Counter[str]"] = (Counter(), Counter())
     tables_doc: Dict[str, Dict[str, Any]] = {}
     results: List[TableResult] = []
@@ -919,36 +943,23 @@ def profile_exposes(
     fact_results: Tuple[FactResult, ...] = ()
     invariants: List[Dict[str, Any]] = []
     if request is not None:
-        by_table = {plan.expose_id: read for plan, read in zip(plans, reads, strict=True)}
-        fact_started = time.perf_counter() if timings is not None else 0.0
-        invariants, fact_results, unmeasured = _fact_entries(
-            contract, fact_plans, by_table, rule, tallies[0]
+        invariants, fact_results, more = _measured_for_request(
+            contract,
+            fact_plans,
+            plans,
+            reads,
+            asked,
+            answered,
+            tables_doc,
+            backend=backend,
+            rule=rule,
+            tallies=tallies,
+            fractional_bits=fractional_bits,
+            row_floor=row_floor,
+            held=held,
+            timings=timings,
         )
-        if timings is not None:
-            fact_tables = list(
-                dict.fromkeys(each.table for each in fact_plans if each.reason is None)
-            )
-            if fact_tables:
-                timings.spread("measure", fact_tables, time.perf_counter() - fact_started)
-        unanswered = (*unanswered, *unmeasured)
-        unanswered = (*unanswered, *answered.not_measured)
-        for plan, read in zip(plans, reads, strict=True):
-            table = asked[plan.expose_id]
-            with _timed(timings, "measure", plan.expose_id):
-                pairs, missing_pairs = ranks.column_pairs(
-                    table,
-                    {column.name: column.domain for column in plan.columns},
-                    read,
-                    backend,
-                    rule,
-                    tallies[0],
-                    fractional_bits,
-                    row_floor=row_floor,
-                    held=held.get(plan.expose_id, frozenset()),
-                )
-            if pairs:
-                tables_doc[plan.expose_id]["columnPairs"] = pairs
-            unanswered = (*unanswered, *missing_pairs)
+        unanswered = (*unanswered, *more)
     unanswered = (*unanswered, *date_notes)
     if request is not None:
         unanswered = (*unanswered, *_unread_date_asks(request, relationships, matched))
@@ -956,19 +967,17 @@ def profile_exposes(
         from fluid_build import __version__
 
         producer = document.producer_uri(__version__)
-    write_started = time.perf_counter() if timings is not None else 0.0
-    built = document.build_document(
-        producer=producer,
-        rule=rule,
-        tables=tables_doc,
-        fractional_bits=fractional_bits,
-        relationships=relationship_docs,
-        invariants=invariants,
-    )
-    canonical = document.canonical_bytes(built)
-    backend.check_document(canonical.decode("utf-8"))
-    if timings is not None:
-        timings.write += time.perf_counter() - write_started
+    with _shared(timings, "write"):
+        built = document.build_document(
+            producer=producer,
+            rule=rule,
+            tables=tables_doc,
+            fractional_bits=fractional_bits,
+            relationships=relationship_docs,
+            invariants=invariants,
+        )
+        canonical = document.canonical_bytes(built)
+        backend.check_document(canonical.decode("utf-8"))
     tally, cell_tally = tallies
     published = tally.pop(disclosure.FREE, 0)
     return ProfileResult(
@@ -985,6 +994,58 @@ def profile_exposes(
         not_measured=unanswered,
         facts=fact_results,
     )
+
+
+def _measured_for_request(
+    contract: Mapping[str, Any],
+    fact_plans: Sequence["facts.FactPlan"],
+    plans: Sequence[ExposePlan],
+    reads: Sequence[sources.SourceColumns],
+    asked: Mapping[str, RequestTable],
+    answered: "_Groupings",
+    tables_doc: Dict[str, Dict[str, Any]],
+    *,
+    backend: StatisticsBackend,
+    rule: disclosure.DisclosureRule,
+    tallies: Tuple["Counter[str]", "Counter[str]"],
+    fractional_bits: int,
+    row_floor: Optional[int],
+    held: Mapping[str, FrozenSet[str]],
+    timings: Optional[StageTimings],
+) -> Tuple[List[Dict[str, Any]], Tuple[FactResult, ...], Tuple[Tuple[str, str], ...]]:
+    """What only a request measures once the tables are: its facts and its column pairs.
+
+    The keyword arguments are what the tables were measured with. Writes each table's ``columnPairs`` into *tables_doc*;
+    returns the invariants, the fact results and the lines this adds under Not measured.
+    """
+    by_table = {plan.expose_id: read for plan, read in zip(plans, reads, strict=True)}
+    with _shared(
+        timings,
+        "measure",
+        lambda: list(dict.fromkeys(each.table for each in fact_plans if each.reason is None)),
+    ):
+        invariants, fact_results, unmeasured = _fact_entries(
+            contract, fact_plans, by_table, rule, tallies[0]
+        )
+    left: Tuple[Tuple[str, str], ...] = (*unmeasured, *answered.not_measured)
+    for plan, read in zip(plans, reads, strict=True):
+        table = asked[plan.expose_id]
+        with _timed(timings, "measure", plan.expose_id):
+            pairs, missing_pairs = ranks.column_pairs(
+                table,
+                {column.name: column.domain for column in plan.columns},
+                read,
+                backend,
+                rule,
+                tallies[0],
+                fractional_bits,
+                row_floor=row_floor,
+                held=held.get(plan.expose_id, frozenset()),
+            )
+        if pairs:
+            tables_doc[plan.expose_id]["columnPairs"] = pairs
+        left = (*left, *missing_pairs)
+    return invariants, fact_results, left
 
 
 def _date_pair_tables(
