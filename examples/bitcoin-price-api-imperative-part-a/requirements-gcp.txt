@@ -1,7 +1,7 @@
 # GCP Cloud Function Requirements
 # Core dependencies
 requests>=2.33.0
-pandas>=2.0.0
+pandas>=3.1.1
 
 # Floors for packages installed underneath the ones in this file, raised past their
 # published advisories.
