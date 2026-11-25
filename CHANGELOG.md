@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot form one is named under Not measured. The document names format 1-3-0. A request or a
   private release writes no history.
 
+- **A private release counts children per entity of a versioned table.** With `--privacy-unit`
+  and `--follow`, a relationship into a table with a validity window, whose `toColumns` are its
+  natural entity, is released as children per entity: the parents are the distinct entity keys of
+  the rows the unit keeps, and the table's repeated key is no longer refused. It is charged as a
+  histogram whose parents are the unit's rows of that table, and released only where an entity
+  cannot sit in two units: the unit does not reach the table, or follows it by its natural entity
+  or by a column a `dependency` makes stable per entity. Otherwise it is named under not released,
+  with that reason. Records that put one entity's versions in two units are refused with
+  `profile_release_entity_units`, naming the table and the columns only. A grouping by a parent
+  column needs a column stable per entity, and the release never writes a `history` member.
+
 - **`fluid profile` counts children per entity through a relationship into a versioned table.**
   A relationship whose `toColumns` are exactly the natural entity of a table that declares a
   validity window is counted one parent per entity, not one per version: the parents are the
@@ -31,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disagree on any other. Dates and exposure are not formed through such a relationship, and say
   so. A relationship into a window by any other columns stays left out, with its reason, and
   `--strict` refuses an ask of it before any record is read.
+
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
   active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
   histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed

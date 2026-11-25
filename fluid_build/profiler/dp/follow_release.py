@@ -21,6 +21,14 @@ before anything is measured, from the seed and from each parent's own children, 
   (squared ``m_T**2``), released only when the unit follows the relationship or does not reach the
   parent, with the parent column's contract levels as its groups.
 
+A relationship that reaches an entity of a table with a validity window
+(RFC-versioned-relationships section 2) counts its children per entity, not per version: the
+parents are the distinct entity keys among the target's kept rows, and the target's parent key
+repeats by design, so it is not checked for repeated keys. The charge is the same as for a table
+whose rows are parents, argued per entity in :func:`plan_follow_release`. It is released only where
+an entity cannot span two units (:func:`_entity_units_reason`), and a release whose records put an
+entity's versions in two units is refused (``profile_release_entity_units``).
+
 Where the unit follows a relationship the children per parent lie in the integer bins ``0``
 to the cap; elsewhere in a fixed public ladder that ends at 10**9, and a count beyond it refuses
 the release, naming the relationship only. Every group key is a contract level or a public bin
@@ -183,6 +191,9 @@ class RelationStat:
     #: L1 and squared L2 sensitivity to one unit.
     l1: int
     sensitivity: int
+    #: The relationship reaches an entity: its parents are the distinct entity keys of the parent
+    #: table, one for each entity and not one for each version.
+    entity: bool = False
 
     @property
     def groups(self) -> int:
@@ -262,6 +273,12 @@ class FollowReleasePlan:
     key_sets: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
     #: The key column tuples that name a parent row, which must be unique.
     parent_sets: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
+    #: The entities a statistic of the release counts under a unit that reaches their table:
+    #: ``(table, entity columns, parent table of the edge into it, that edge's parent columns, its
+    #: child columns on the table)``. The records must put an entity's versions in one unit.
+    entity_units: Tuple[
+        Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]], ...
+    ] = ()
 
     @property
     def selects(self) -> bool:
@@ -298,6 +315,7 @@ def _declared_relationships(
             if child is None or parent is None or len(child) != len(parent):
                 continue
             name = entry.get("name")
+            stable = runner._entity_stable(exposes[str(entry["to"])], parent)
             found.append(
                 runner.Relationship(
                     expose_id,
@@ -305,9 +323,34 @@ def _declared_relationships(
                     str(entry["to"]),
                     child,
                     parent,
+                    entity=stable is not None,
+                    stable=stable or frozenset(),
                 )
             )
     return found
+
+
+def _entity_units_reason(
+    relationship: runner.Relationship, tree: FollowPlan, m_parent: int
+) -> Optional[str]:
+    """Why a statistic over the entities of *relationship*'s parent cannot be released, or ``None``.
+
+    An entity of a versioned table is released only when it cannot span two units: the unit does
+    not reach the table (``m_T = 0``, its rows are fixed), or reaches it through a followed
+    relationship whose child columns on the table are the natural entity or columns a
+    ``dependency`` makes stable per entity, so every version of an entity follows the same parent
+    row. The unit's own expose is no such table: each of its rows is a unit. The reason is
+    decided by the contract and the flags alone.
+    """
+    if m_parent == 0:
+        return None
+    edge = tree.edge_into(relationship.parent)
+    if edge is not None and set(edge.spec.child_columns) <= relationship.stable:
+        return None
+    return (
+        "an entity's versions could follow different units: follow "
+        f"{relationship.parent} by its natural entity or by a column stable per entity"
+    )
 
 
 def _asked_statistics(request: Request, relationship: runner.Relationship) -> Tuple[str, ...]:
@@ -493,7 +536,29 @@ def plan_follow_release(
     ]
     used_keys: Dict[str, List[Tuple[str, ...]]] = {}
     parent_sets: List[Tuple[str, Tuple[str, ...]]] = []
+    entity_units: List[Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]]] = []
     extra_read: Dict[str, List[str]] = {}
+    entities = {
+        (each.parent, each.parent_columns, each.child, each.child_columns)
+        for each in declared
+        if each.entity
+    }
+
+    def note_entities(each: runner.Relationship) -> None:
+        """A statistic counts the entities of a reached table: its records must put each in one unit."""
+        edge = tree.edge_into(each.parent)
+        if each.entity and edge is not None:
+            item = (
+                each.parent,
+                each.parent_columns,
+                edge.parent,
+                edge.spec.parent_columns,
+                edge.spec.child_columns,
+            )
+            if item not in entity_units:
+                entity_units.append(item)
+                note_keys(edge.parent, edge.spec.parent_columns)
+                note_keys(edge.child, edge.spec.child_columns)
 
     def note_keys(table: str, names: Tuple[str, ...]) -> None:
         if names not in used_keys.setdefault(table, []):
@@ -503,7 +568,13 @@ def plan_follow_release(
     for edge in tree.edges:
         note_keys(edge.parent, edge.spec.parent_columns)
         note_keys(edge.child, edge.spec.child_columns)
-        parent_sets.append((edge.parent, edge.spec.parent_columns))
+        if (
+            edge.parent,
+            edge.spec.parent_columns,
+            edge.child,
+            edge.spec.child_columns,
+        ) not in entities:
+            parent_sets.append((edge.parent, edge.spec.parent_columns))  # an entity's key repeats
     for each in declared:
         counted, group_by, linked = asked_for.relationship_asks(request, each)
         stats = _asked_statistics(request, each)
@@ -517,12 +588,16 @@ def plan_follow_release(
             f"{each.parent}({', '.join(each.parent_columns)})"
         )
         m_parent, m_child = reach.get(each.parent, 0), reach.get(each.child, 0)
+        why_units = _entity_units_reason(each, tree, m_parent) if each.entity else None
         for name in stats:
             if name != "marginalHistogram/1":
                 not_released.append((f"{name} of {spelled}", _NOT_NOISY))
         if counted:
             others = m_child - (followed.max_children * m_parent if followed is not None else 0)
-            if m_parent >= 1 and others == 0:
+            if why_units is not None:
+                not_released.append((f"children per parent of {spelled}", why_units))
+                l1 = squared = 0
+            elif m_parent >= 1 and others == 0:
                 l1, squared = m_parent, m_parent * m_parent
             elif m_parent == 0 and m_child >= 1:
                 l1, squared = 2 * m_child, 2 * m_child * m_child
@@ -560,12 +635,24 @@ def plan_follow_release(
                     None,
                     l1,
                     squared,
+                    each.entity,
                 )
                 relations.append(base)
                 note_keys(each.parent, each.parent_columns)
                 note_keys(each.child, each.child_columns)
-                parent_sets.append((each.parent, each.parent_columns))
+                if each.entity:
+                    note_entities(each)
+                else:
+                    parent_sets.append((each.parent, each.parent_columns))
                 for name in group_by:
+                    if each.entity and name not in each.stable:
+                        not_released.append(
+                            (
+                                f"children per parent of {spelled} grouped by {each.parent}.{name}",
+                                f"{name}: {runner._UNSTABLE}",
+                            )
+                        )
+                        continue
                     made, why = _group_structure(
                         contract,
                         backend,
@@ -601,6 +688,12 @@ def plan_follow_release(
                 not_released.append(
                     (what, f"the unit does not reach {each.child}, so its rows are fixed")
                 )
+                continue
+            if each.entity and parent_column not in each.stable:
+                not_released.append((what, f"{parent_column}: {runner._UNSTABLE}"))
+                continue
+            if why_units is not None:
+                not_released.append((what, why_units))
                 continue
             if followed is None and m_parent != 0:
                 not_released.append(
@@ -662,6 +755,7 @@ def plan_follow_release(
             extra_read.setdefault(each.parent, []).append(parent_column)
             note_keys(each.parent, each.parent_columns)
             note_keys(each.child, each.child_columns)
+            note_entities(each)
             label = _label_of(contract, each.parent, parent_column) if m_parent == 0 else None
             if label is not None:
                 warnings.append(_warning(each.parent, parent_column, label))
@@ -784,6 +878,7 @@ def plan_follow_release(
         structure=structure,
         key_sets=tuple((table, names) for table, sets in used_keys.items() for names in sets),
         parent_sets=tuple(dict.fromkeys(parent_sets)),
+        entity_units=tuple(entity_units),
     )
     parts = follow_parts(plan, {})
     if not parts:
@@ -992,7 +1087,9 @@ def encode_follow_rows(
 
     A refusal names a table, a column and a row, never a value or how many. Each parent key must
     name one row: a key held by two rows would make the stated sensitivity understate what one
-    unit changes.
+    unit changes. The one exception is the key of a relationship that reaches an entity, which a
+    table with a validity window repeats by design: there each entity must follow one parent row
+    of the table the unit reaches it through, or the entity would sit in two units.
     """
     exact: Dict[str, Dict[str, List[Any]]] = {}
     counts: Dict[str, int] = {}
@@ -1027,6 +1124,14 @@ def encode_follow_rows(
                 "key to name one row",
                 {"next": "key the relationship by columns that are unique in the parent table"},
             )
+    for table, entity, edge_parent, edge_parent_names, edge_child_names in plan.entity_units:
+        _one_unit_each(
+            table,
+            entity,
+            keys[(table, entity)],
+            keys[(table, edge_child_names)],
+            keys[(edge_parent, edge_parent_names)],
+        )
     placed: Dict[Tuple[str, str], List[Optional[int]]] = {}
     for (table, name), column in plan.structure.items():
         found = exact[table][name]
@@ -1084,6 +1189,40 @@ def encode_follow_rows(
             grid=grid,
         )
     return FollowRows(counts=counts, tables=encoded, contents=contents, keys=keys, placed=placed)
+
+
+def _one_unit_each(
+    table: str,
+    entity: Tuple[str, ...],
+    entities: Sequence[Optional[bytes]],
+    follows: Sequence[Optional[bytes]],
+    parents: Sequence[Optional[bytes]],
+) -> None:
+    """Refuse a table whose entity follows more than one parent row of the table above it.
+
+    *entities* and *follows* are each row's entity key and its key into the parent table of the
+    edge the unit reaches the table through, *parents* the keys of that table's rows. A row that
+    follows no row (a null key, a key no row holds) is dropped by the truncation, so it is none
+    of an entity's rows here. An entity whose rows follow two rows would be in two units, and
+    removing one unit would change the other's count of it: the stated sensitivity needs one
+    unit for each entity. Names the table and the columns, never a value or a row.
+    """
+    held = {key for key in parents if key is not None}
+    seen: Dict[bytes, bytes] = {}
+    for key, follow in zip(entities, follows, strict=True):
+        if key is None or follow is None or follow not in held:
+            continue
+        if seen.setdefault(key, follow) != follow:
+            raise ReleaseRefused(
+                "profile_release_entity_units",
+                f"an entity of {table!r} ({', '.join(map(repr, entity))}) has versions that follow "
+                "different rows of the table the unit reaches it through, so one entity would be "
+                "in more than one unit and the stated sensitivity would not hold",
+                {
+                    "next": "follow the table by its natural entity, or keep the column stable "
+                    "per entity in the data"
+                },
+            )
 
 
 def _released_in(plan: FollowReleasePlan, table: str, name: str) -> Optional[ReleasedColumn]:
@@ -1168,7 +1307,12 @@ def _relation_counts(
     kept: Mapping[str, Sequence[int]],
     backend: StatisticsBackend,
 ) -> List[int]:
-    """The cells of one relationship histogram, group by group, before noise."""
+    """The cells of one relationship histogram, group by group, before noise.
+
+    A parent is a row of the parent table, or, where the relationship reaches an entity, each
+    distinct non-null entity key among its kept rows. An entity is in the group of its rows'
+    value of the grouping column when they all agree, and in none when they do not.
+    """
     parents = rows.keys[(relation.parent, relation.parent_columns)]
     children = rows.keys[(relation.child, relation.child_columns)]
     parent_rows: Sequence[int] = (
@@ -1178,7 +1322,15 @@ def _relation_counts(
         kept[relation.child] if relation.child in kept else range(rows.counts[relation.child])
     )
     tally = Counter(key for at in child_rows if (key := children[at]) is not None)
-    counts = [tally.get(key, 0) if (key := parents[at]) is not None else 0 for at in parent_rows]
+    if relation.entity:
+        entities = list(
+            dict.fromkeys(key for at in parent_rows if (key := parents[at]) is not None)
+        )
+        counts = [tally.get(key, 0) for key in entities]
+    else:
+        counts = [
+            tally.get(key, 0) if (key := parents[at]) is not None else 0 for at in parent_rows
+        ]
     cells = _children_cells(relation, counts, backend, plan.fractional_bits)
     width = relation.cells
     flat = [0] * (relation.groups * width)
@@ -1186,9 +1338,21 @@ def _relation_counts(
         for cell in cells:
             flat[cell] += 1
     else:
-        groups = rows.placed[(relation.parent, relation.group.name)]
-        for at, cell in zip(parent_rows, cells, strict=True):
-            group = groups[at]
+        placed = rows.placed[(relation.parent, relation.group.name)]
+        if relation.entity:
+            of_entity: Dict[bytes, Optional[int]] = {}
+            for at in parent_rows:
+                key = parents[at]
+                if key is None:
+                    continue
+                if key in of_entity and of_entity[key] != placed[at]:
+                    of_entity[key] = None
+                else:
+                    of_entity.setdefault(key, placed[at])
+            groups: List[Optional[int]] = [of_entity[key] for key in entities]
+        else:
+            groups = [placed[at] for at in parent_rows]
+        for group, cell in zip(groups, cells, strict=True):
             if group is not None:
                 flat[group * width + cell] += 1
     return flat
