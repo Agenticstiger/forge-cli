@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` publishes the history of a table with a validity window.** A table whose
+  contract declares a slowly changing dimension (one natural entity and a start and an end
+  dimension, both DATE or both timestamp columns) gets a `history` in a default profile: the
+  entities by their number of versions, their first starts, the days from a version's start to the
+  next one's, how consecutive versions meet (the same instant, the day before, a gap or an
+  overlap, with the zeros the contract's `chain` declares published as zeros), how the last
+  version ends, and, for each categorical column that declares its levels, its value on the first
+  version and the changes between versions, with the changes counted by the column that moves.
+  Each member goes through the same disclosure checks as every other statistic, and a table that
+  cannot form one is named under Not measured. The document names format 1-3-0. A request or a
+  private release writes no history.
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
   active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
   histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed

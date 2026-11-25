@@ -65,6 +65,7 @@ from fluid_build.profiler import (
     document,
     facts,
     grouped,
+    history,
     ranks,
     sources,
 )
@@ -1000,6 +1001,15 @@ def profile_exposes(
             )  # fmt: skip
         )
     )
+    if request is None:  # a request has no ask for a history, and a bundle's table has its own
+        date_notes.extend(
+            history.form_histories(
+                history.HistoryStage(
+                    raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
+                    tallies, fractional_bits, timings,
+                )  # fmt: skip
+            )
+        )
     counted_entries: Dict[int, Tuple[Dict[str, Any], RelationshipResult]] = {
         position: _children_per_parent(
             each,

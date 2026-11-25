@@ -1105,6 +1105,47 @@ def _pairs_line(entries: Any) -> str:
     return f"{whole} of {len(entries)} published."
 
 
+def _history_members(history: Any) -> List[Any]:
+    """The statistics a table's history holds: its five members, each tracked column's two, reasons."""
+    members = [
+        history[key]
+        for key in ("versionsPerEntity", "firstStart", "versionLength", "chain", "lastVersion")
+    ]
+    for column in history.get("columns", {}).values():
+        members.extend([column["initial"], column["transitions"]])
+    if "reasons" in history:
+        members.append(history["reasons"])
+    return members
+
+
+def _member_published(member: Any) -> Tuple[bool, bool]:
+    """Whether some cell of a history member is published, and whether some is withheld."""
+    shown = hidden = False
+    for group in member["groups"]:
+        if group["status"] != "F":
+            hidden = True
+            continue
+        cells = group.get("cellStatus") or ["F"]
+        shown = shown or "F" in cells
+        hidden = hidden or any(status != "F" for status in cells)
+    return shown, hidden
+
+
+def _history_line(history: Any) -> str:
+    """``N of M members published``, naming the members published in part when there are any.
+
+    A member is whole when every group of it is published with none of its cells withheld, in
+    part when some cell of it is published and some is not. Never a count of records.
+    """
+    members = _history_members(history)
+    states = [_member_published(each) for each in members]
+    whole = sum(1 for shown, hidden in states if shown and not hidden)
+    part = sum(1 for shown, hidden in states if shown and hidden)
+    if part:
+        return f"{whole} of {len(members)} members published whole, {part} in part."
+    return f"{whole} of {len(members)} members published."
+
+
 def _published_groups(statistics: Any) -> Tuple[int, int]:
     """How many of the groups of these statistics are published, and how many there are.
 
@@ -1145,6 +1186,9 @@ def _report_structure(say: Any, result: Any) -> None:
         if per:
             shown, total = _published_groups(per)
             say(f"{where}Per-entity statistics: {shown} of {total} published.", soft_wrap=True)
+        history = table.get("history")
+        if history:
+            say(f"{where}History: {_history_line(history)}", soft_wrap=True)
 
 
 def _report_dates(say: Any, result: Any) -> None:
