@@ -92,6 +92,7 @@ from fluid_build.profiler._stats import (
     MeasuredGroup,
     MeasuredStatistic,
     ReadRefused,
+    Request,
     RequestTable,
     StatisticsBackend,
 )
@@ -108,6 +109,7 @@ __all__ = [
     "PairContext",
     "RelationshipAsks",
     "checked",
+    "contract_unformed",
     "choose_lifetimes",
     "declared_empty_levels",
     "histogram",
@@ -158,6 +160,9 @@ _TIMESTAMP_PAIR = (
 _KEY_COLUMN = "a key of a counted relationship, which its children per parent describe"
 _EXPOSURE_DATE = "an exposure is formed over DATE columns, whose days are whole"
 _NO_DAY_HISTOGRAM = "its first or last day bin holds fewer than the least cell, so its days have no outer edge to publish"
+_NO_WINDOW = (
+    "an exposure states its window, and the parent's start has no published span or declared range"
+)
 _TOO_MANY = f"a profile holds at most {MOST_ENTRIES} of them"
 
 # ---------------------------------------------------------------------------
@@ -675,6 +680,12 @@ class TableDates:
             )
         return self.whole_days[name]
 
+    def records_reason(self, name: str) -> Optional[str]:
+        """Why the column takes no date statistic because of its records, or ``None``."""
+        if self.of(name) is None:
+            return f"a value of {self.plan.expose_id}.{name} is not a whole day"
+        return None
+
     def why_not(
         self, name: str, held: FrozenSet[str], table: str, timestamp: str = _TIMESTAMP_PAIR
     ) -> Optional[str]:
@@ -682,16 +693,65 @@ class TableDates:
 
         *timestamp* is the reason a column that is not a DATE gives.
         """
-        column = next((each for each in self.plan.columns if each.name == name), None)
-        if column is None:
-            return f"{table}.{name} is not a column fluid profile reads"
-        if name in held:
-            return _KEY_COLUMN
-        if not (column.domain == "timestamp" and column.date):
-            return timestamp
-        if self.of(name) is None:
-            return f"a value of {table}.{name} is not a whole day"
-        return None
+        return plan_reason(self.plan, name, held, table, timestamp) or self.records_reason(name)
+
+
+def plan_reason(
+    plan: "ExposePlan",
+    name: str,
+    held: FrozenSet[str],
+    table: str,
+    timestamp: str = _TIMESTAMP_PAIR,
+) -> Optional[str]:
+    """Why a column takes no date statistic, from the contract alone, or ``None``.
+
+    The column is not one fluid profile reads, a key of a counted relationship, or not a DATE
+    column. Whether a value is a whole day is the records' to say (:meth:`TableDates.records_reason`).
+    """
+    column = next((each for each in plan.columns if each.name == name), None)
+    if column is None:
+        return f"{table}.{name} is not a column fluid profile reads"
+    if name in held:
+        return _KEY_COLUMN
+    if not (column.domain == "timestamp" and column.date):
+        return timestamp
+    return None
+
+
+#: A column a date statistic reads: its table's dates, the column, the table's key columns held
+#: by a counted relationship, and the table's name.
+DateColumn = Tuple[TableDates, str, FrozenSet[str], str]
+
+
+def first_reason(columns: Sequence[DateColumn], timestamp: str = _TIMESTAMP_PAIR) -> Optional[str]:
+    """Why the columns take no date statistic together, or ``None``: the contract's reasons first.
+
+    Every column's contract reason is looked at before any column's records, so a reason that
+    is the contract's does not depend on what the records hold (:func:`plan_reasons` gives it
+    without them).
+    """
+    plan_first = plan_reasons(
+        [(each.plan, name, held, table) for each, name, held, table in columns], timestamp
+    )
+    if plan_first is not None:
+        return plan_first
+    for each, name, _, _ in columns:
+        reason = each.records_reason(name)
+        if reason is not None:
+            return reason
+    return None
+
+
+def plan_reasons(
+    columns: Sequence[Tuple["ExposePlan", str, FrozenSet[str], str]],
+    timestamp: str = _TIMESTAMP_PAIR,
+) -> Optional[str]:
+    """The first of the columns' contract reasons (:func:`plan_reason`), or ``None``."""
+    for plan, name, held, table in columns:
+        reason = plan_reason(plan, name, held, table, timestamp)
+        if reason is not None:
+            return reason
+    return None
 
 
 def table_dates(
@@ -742,6 +802,13 @@ class DateStage:
         return self.held.get(table, frozenset())
 
 
+def _bounded(items: Sequence[Any], what: str) -> Tuple[List[Any], List[Tuple[str, str]]]:
+    """At most :data:`MOST_ENTRIES` of *items*, and the note naming *what* when some are cut."""
+    if len(items) > MOST_ENTRIES:
+        return list(items[:MOST_ENTRIES]), [(f"{what} past the first {MOST_ENTRIES}", _TOO_MANY)]
+    return list(items), []
+
+
 def _candidate_pairs(
     plan: "ExposePlan", held: FrozenSet[str], asked: Optional[RequestTable]
 ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
@@ -761,9 +828,8 @@ def _candidate_pairs(
         )
     else:
         pairs = [(each.start, each.end) for each in asked.date_pairs]
-    if len(pairs) > MOST_ENTRIES:
-        notes.append((f"date pairs of {table} past the first {MOST_ENTRIES}", _TOO_MANY))
-        pairs = pairs[:MOST_ENTRIES]
+    pairs, cut = _bounded(pairs, f"date pairs of {table}")
+    notes.extend(cut)
     return pairs, notes
 
 
@@ -799,7 +865,7 @@ def table_date_pairs(
     entries: List[Dict[str, Any]] = []
     for start, end in pairs:
         what = f"date pair {start} to {end} of {table}"
-        reason = dates.why_not(start, held, table) or dates.why_not(end, held, table)
+        reason = first_reason([(dates, start, held, table), (dates, end, held, table)])
         if reason is not None:
             notes.append((what, reason))
             continue
@@ -1010,11 +1076,7 @@ def _relationship_pairs(
         pairs = [(parent, child) for parent in parents for child in children]
     else:
         pairs = list(asked)
-    notes: List[Tuple[str, str]] = []
-    if len(pairs) > MOST_ENTRIES:
-        notes.append((f"dates of {sides.link} past the first {MOST_ENTRIES}", _TOO_MANY))
-        pairs = pairs[:MOST_ENTRIES]
-    return pairs, notes
+    return _bounded(pairs, f"dates of {sides.link}")
 
 
 def _dates_reason(
@@ -1025,9 +1087,12 @@ def _dates_reason(
 ) -> Optional[str]:
     """Why a parent and child date take no pair, or ``None`` when they do."""
     parent_column, child_column = columns
-    reason = sides.parent_dates.why_not(
-        parent_column, stage.held_of(sides.parent), sides.parent
-    ) or sides.child_dates.why_not(child_column, stage.held_of(sides.child), sides.child)
+    reason = first_reason(
+        [
+            (sides.parent_dates, parent_column, stage.held_of(sides.parent), sides.parent),
+            (sides.child_dates, child_column, stage.held_of(sides.child), sides.child),
+        ]
+    )
     if reason is None and index is None:
         reason = f"a key of {sides.parent} names more than one parent, so a child has no one parent"
     return reason
@@ -1222,17 +1287,15 @@ def _exposure_reason(
 ) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
     """Why a lifetime of *table* forms no exposure (or its window when it does): ``(reason, window)``."""
     held = stage.held_of(table)
-    reason = dates.why_not(start, held, table, _EXPOSURE_DATE) or (
-        dates.why_not(end, held, table, _EXPOSURE_DATE) if end is not None else None
+    reason = first_reason(
+        [(dates, start, held, table)] + ([] if end is None else [(dates, end, held, table)]),
+        _EXPOSURE_DATE,
     )
     if reason is not None:
         return reason, None
     window = _window(stage.raw_exposes[table], stage.tables_doc.get(table, {}), start)
     if window is None:
-        return (
-            "an exposure states its window, and the parent's start has no published span "
-            "or declared range"
-        ), None
+        return _NO_WINDOW, None
     return None, window
 
 
@@ -1288,10 +1351,7 @@ def _exposure(
         if asked is None
         else list(asked)
     )
-    notes: List[Tuple[str, str]] = []
-    if len(lifetimes) > MOST_ENTRIES:
-        notes.append((f"exposure of {sides.link} past the first {MOST_ENTRIES}", _TOO_MANY))
-        lifetimes = lifetimes[:MOST_ENTRIES]
+    lifetimes, notes = _bounded(lifetimes, f"exposure of {sides.link}")
     counted = stage.lifetimes.get(sides.parent)
     entries: List[Dict[str, Any]] = []
     for start, end in lifetimes:
@@ -1364,3 +1424,70 @@ def _days_metric(
         verdict = disclosure.check_sum([Fraction(each) for each in days.values()], rule)
     total = sum(days.values())
     return _count_metric(backend, rule, tally, total, verdict, total, parents)
+
+
+# ---------------------------------------------------------------------------
+# What the contract alone rules out, before any record is read
+# ---------------------------------------------------------------------------
+
+
+def contract_unformed(
+    request: Request,
+    plans: Mapping[str, "ExposePlan"],
+    held: Mapping[str, FrozenSet[str]],
+    relationships: Sequence["Relationship"],
+) -> List[Tuple[str, str]]:
+    """Each date pair, relationship date and exposure the contract rules out: ``(what, reason)``.
+
+    The same asks, in the same words, as :func:`table_date_pairs`, :func:`_date_entries` and
+    :func:`_exposure` name once the records are read, for the reasons that need none: a column
+    the profile does not read, a key of a counted relationship, a column that is not a DATE, and
+    the most entries a profile holds. *relationships* are the declared relationships the profile
+    reads, which a request's dates and exposure are asked of. Never a value.
+    """
+    found: List[Tuple[str, str]] = []
+    for table in request.tables:
+        plan = plans[table.expose_id]
+        kept, cut = _bounded(
+            [(each.start, each.end) for each in table.date_pairs],
+            f"date pairs of {table.expose_id}",
+        )
+        found.extend(cut)
+        for start, end in kept:
+            held_here = held.get(table.expose_id, frozenset())
+            reason = plan_reasons(
+                [(plan, start, held_here, table.expose_id), (plan, end, held_here, table.expose_id)]
+            )
+            if reason is not None:
+                found.append((f"date pair {start} to {end} of {table.expose_id}", reason))
+    from fluid_build.profiler import request as asked_for
+
+    for relationship in relationships:
+        asked_dates, asked_exposure = asked_for.relationship_dates_asks(request, relationship)
+        parent, child = relationship.parent, relationship.child
+        link = f"{child}({', '.join(relationship.child_columns)}) to {parent}"
+        pairs, cut = _bounded(asked_dates, f"dates of {link}")
+        found.extend(cut)
+        for parent_column, child_column in pairs:
+            reason = plan_reasons(
+                [
+                    (plans[parent], parent_column, held.get(parent, frozenset()), parent),
+                    (plans[child], child_column, held.get(child, frozenset()), child),
+                ]
+            )
+            if reason is not None:
+                found.append(
+                    (f"dates {parent}.{parent_column} to {child}.{child_column} of {link}", reason)
+                )
+        lifetimes, cut = _bounded(asked_exposure, f"exposure of {link}")
+        found.extend(cut)
+        for start, end in lifetimes:
+            columns = [start] if end is None else [start, end]
+            reason = plan_reasons(
+                [(plans[parent], name, held.get(parent, frozenset()), parent) for name in columns],
+                _EXPOSURE_DATE,
+            )
+            if reason is not None:
+                span = start if end is None else f"{start} to {end}"
+                found.append((f"exposure {parent}.{span} of {link}", reason))
+    return found

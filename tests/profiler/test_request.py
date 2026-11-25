@@ -364,10 +364,15 @@ def test_strict_refuses_a_request_with_an_ask_it_does_not_form_before_a_read(
     assert not (workspace / "p.json").exists()
 
 
-def test_strict_accepts_a_request_that_asks_only_for_what_it_forms(workspace, registry, capsys):
-    rc = main(_argv("--strict", "--out", "p.json"))
-    assert rc == 0, capsys.readouterr().out
-    assert (workspace / "p.json").is_file()
+def test_strict_refuses_what_the_contract_rules_out_and_names_it_without_strict(
+    workspace, registry, capsys
+):
+    # The request asks a mean of a timestamp column, which no type allows: strict refuses it
+    # before a read, and the same run without strict names it under Not measured.
+    (workspace / "orders.ndjson").unlink()  # a read would be a different refusal
+    out = _refused(capsys, _argv("--strict", "--out", "p.json"), "profile_request_not_formed")
+    assert "mean/1 of orders.placed_at" in out and "no record was read" in out
+    assert not (workspace / "p.json").exists()
 
 
 def test_strict_needs_a_request(workspace, registry, capsys):

@@ -486,6 +486,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             request=asked,
             row_floor=getattr(args, "row_floor", None),
             timings=timings,
+            strict=getattr(args, "strict", False),
         )
         write_started = time.perf_counter()
         _write(out, result.canonical)

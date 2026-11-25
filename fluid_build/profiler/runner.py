@@ -701,6 +701,7 @@ def profile_exposes(
     request: Optional[Request] = None,
     row_floor: Optional[int] = None,
     timings: Optional[StageTimings] = None,
+    strict: bool = False,
 ) -> ProfileResult:
     """Profile each of *exposes* of *contract*, each from its own source, into one document.
 
@@ -720,6 +721,10 @@ def profile_exposes(
 
     With *timings*, each table's read, measure and check seconds, and the document's write,
     are added to it; without, nothing is timed.
+
+    With *strict* and a *request*, the profile is refused before any record is read when the
+    contract and the request show an ask cannot be formed (:func:`_refuse_unformable`); an ask
+    only the records leave unanswered is still named under Not measured.
     """
     if row_floor is not None and (
         isinstance(row_floor, bool) or not 2 <= row_floor <= disclosure.MAX_COUNT
@@ -807,6 +812,23 @@ def profile_exposes(
     if request is not None:
         relationships = [_with_asks(each, request) for each in relationships]
     keys = _key_columns(relationships)
+    if strict and request is not None:
+        _refuse_unformable(
+            contract,
+            request,
+            plans,
+            declared,
+            unfiltered,
+            uncovered,
+            relationships,
+            relationships_left_out,
+            held,
+            keys,
+            matched,
+            fact_plans,
+            backend,
+            fractional_bits,
+        )
     reads: List[sources.SourceColumns] = []
     for exposed, plan in zip(exposes, plans, strict=True):
         with _timed(timings, "read", plan.expose_id):
@@ -937,7 +959,7 @@ def profile_exposes(
                 },
                 keys=keys,
                 matched=matched,
-                metric_names=frozenset(_METRICS),
+                metric_domains=_metric_domains(backend),
             )
         )
     fact_results: Tuple[FactResult, ...] = ()
@@ -1046,6 +1068,145 @@ def _measured_for_request(
             tables_doc[plan.expose_id]["columnPairs"] = pairs
         left = (*left, *missing_pairs)
     return invariants, fact_results, left
+
+
+def _metric_domains(backend: StatisticsBackend) -> Dict[str, FrozenSet[str]]:
+    """The domains each metric the profile forms is defined for."""
+    return {
+        metric.name: frozenset(metric.domains)
+        for metric in backend.metrics()
+        if metric.name in _METRICS
+    }
+
+
+def _no_fixed_mean(
+    plan: ExposePlan,
+    declared: Optional[DeclaredBlock],
+    keys: FrozenSet[str],
+    grouped_by: FrozenSet[str],
+) -> FrozenSet[str]:
+    """The number columns of *plan* that take no ``mean/1`` of their own: :func:`_profile_table`'s."""
+    domains = {column.name: column.domain for column in plan.columns}
+    return (
+        _binned_numbers(declared, plan)
+        | keys
+        | {name for name in grouped_by if domains.get(name) == NUMBER}
+    )
+
+
+def _unread_reasons(
+    contract: Mapping[str, Any],
+    request: Request,
+    relationships: Sequence[Relationship],
+    left_out: Sequence[Tuple[str, str, str]],
+    matched: Set[int],
+) -> Dict[int, str]:
+    """Why each listed relationship that names a declared one is not read, by its position."""
+    read = {
+        (each.child, each.parent, each.child_columns, each.parent_columns) for each in relationships
+    }
+    names = {(child, name): why for child, name, why in left_out}
+    exposes = {
+        str(item.get("exposeId")): item
+        for item in iter_exposes(dict(contract))
+        if item.get("exposeId")
+    }
+    found: Dict[int, str] = {}
+    for position, link in enumerate(request.relationships):
+        key = (link.child.table, link.parent.table, link.child.columns, link.parent.columns)
+        if position not in matched or key in read:
+            continue
+        semantics = exposes.get(link.child.table, {}).get("semantics")
+        declared = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+        reason = "the relationship is not one whose two tables and keys the profile reads"
+        for raw in declared if isinstance(declared, list) else ():
+            if (
+                isinstance(raw, Mapping)
+                and raw.get("to") == link.parent.table
+                and _column_names(raw.get("fromColumns")) == link.child.columns
+                and _column_names(raw.get("toColumns")) == link.parent.columns
+            ):
+                reason = names.get((link.child.table, str(raw.get("name") or "?")), reason)
+                break
+        found[position] = reason
+    return found
+
+
+def _refuse_unformable(
+    contract: Mapping[str, Any],
+    request: Request,
+    plans: Sequence[ExposePlan],
+    declared: Sequence[Optional[DeclaredBlock]],
+    unfiltered: Mapping[str, Optional[DeclaredBlock]],
+    uncovered: Sequence[Tuple[Tuple[str, str], ...]],
+    relationships: Sequence[Relationship],
+    relationships_left_out: Sequence[Tuple[str, str, str]],
+    held: Mapping[str, FrozenSet[str]],
+    keys: Mapping[str, FrozenSet[str]],
+    matched: Set[int],
+    fact_plans: Sequence["facts.FactPlan"],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> None:
+    """``--strict``: refuse the request when the contract shows an ask of it cannot be formed.
+
+    Nothing is read. Every reason is the one the profile names the ask with once the records
+    are read, from the same function, less the reasons only the records decide
+    (:func:`~fluid_build.profiler.request.decided_by_records`): a small cell, a column with no
+    published span, a value that is not a whole day, a key that names more than one parent, a
+    column with no non-null record. The groupings are chosen over tables with no record, which
+    changes none of their reasons (a group is a level or a bin the contract fixes).
+    """
+    from fluid_build.profiler import request as asked_for
+
+    by_plan = {plan.expose_id: plan for plan in plans}
+    empty = [
+        sources.SourceColumns("", 0, {column.name: [] for column in plan.columns}) for plan in plans
+    ]
+    answered = _answer_groupings(
+        request, plans, empty, declared, unfiltered, relationships, held, backend, fractional_bits
+    )
+    no_mean = {
+        plan.expose_id: _no_fixed_mean(
+            plan,
+            block,
+            keys.get(plan.expose_id, frozenset()),
+            answered.grouped_by.get(plan.expose_id, frozenset()),
+        )
+        for plan, block in zip(plans, answered.declared, strict=True)
+    }
+    found: List[Tuple[str, str]] = list(asked_for.unformed(request))
+    found.extend(
+        asked_for.contract_unformed(
+            request,
+            plans=by_plan,
+            defaults=unfiltered,
+            uncovered={
+                plan.expose_id: dict(missing)
+                for plan, missing in zip(plans, uncovered, strict=True)
+            },
+            keys=keys,
+            no_mean=no_mean,
+            matched=matched,
+            unread=_unread_reasons(
+                contract, request, relationships, relationships_left_out, matched
+            ),
+            metric_domains=_metric_domains(backend),
+        )
+    )
+    found.extend(answered.not_measured)
+    found.extend(dates.contract_unformed(request, by_plan, held, relationships))
+    found.extend(calendars.contract_unformed(request, by_plan, held))
+    for table in request.tables:
+        domains = {column.name: column.domain for column in by_plan[table.expose_id].columns}
+        found.extend(
+            ranks.contract_unformed(table, domains, held.get(table.expose_id, frozenset()))
+        )
+    found.extend((f"fact {each.name}", each.reason) for each in fact_plans if each.reason)
+    found.extend(_unread_date_asks(request, relationships, matched))
+    refused = [item for item in dict.fromkeys(found) if not asked_for.decided_by_records(item[1])]
+    if refused:
+        raise asked_for.refuse_asks(refused)
 
 
 def _date_pair_tables(

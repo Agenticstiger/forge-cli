@@ -58,6 +58,7 @@ from fluid_build.profiler._stats import (
     MeasuredGroup,
     MeasuredStatistic,
     ReadRefused,
+    Request,
     RequestTable,
     StatisticsBackend,
     calendar_levels,
@@ -69,8 +70,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Structure",
+    "calendar_asks",
     "calendar_counts",
     "civil",
+    "contract_unformed",
     "edge_fit",
     "form_structure",
     "withhold_beside_relationships",
@@ -509,32 +512,60 @@ def _week_entries(
     return found
 
 
-def _calendar_columns(table: _Table, notes: List[Tuple[str, str]]) -> List[str]:
-    """The columns a table's calendar covers, in order, at most the format's bound."""
-    names = {each.name for each in table.plan.columns if each.domain == "timestamp"}
-    if table.asked is None:
+def calendar_asks(
+    expose_id: str,
+    plan: "ExposePlan",
+    asked: Optional[RequestTable],
+    held: FrozenSet[str],
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """The columns a table's calendar covers, in order, at most the format's bound.
+
+    Decided by the contract and the request alone: the second value is each ask left out with
+    why (a key of a counted relationship, the columns past the bound).
+    """
+    notes: List[Tuple[str, str]] = []
+    names = {each.name for each in plan.columns if each.domain == "timestamp"}
+    if asked is None:
         listed = [
             each.name
-            for each in table.plan.columns
-            if each.domain == "timestamp" and each.name not in table.held
+            for each in plan.columns
+            if each.domain == "timestamp" and each.name not in held
         ]
     else:
-        listed = [each for each in table.asked.calendar if each in names]
+        listed = [each for each in asked.calendar if each in names]
         notes.extend(
-            (f"calendar of {table.expose_id}.{each}", _KEY_COLUMN)
-            for each in listed
-            if each in table.held
+            (f"calendar of {expose_id}.{each}", _KEY_COLUMN) for each in listed if each in held
         )
-        listed = [each for each in listed if each not in table.held]
+        listed = [each for each in listed if each not in held]
     limit = most_calendar_entries()
     if len(listed) > limit:
         notes.append(
             (
-                f"calendar of {table.expose_id} past the first {limit}",
+                f"calendar of {expose_id} past the first {limit}",
                 f"a profile holds at most {limit} of them",
             )
         )
-    return listed[:limit]
+    return listed[:limit], notes
+
+
+def contract_unformed(
+    request: Request, plans: Mapping[str, "ExposePlan"], held: Mapping[str, FrozenSet[str]]
+) -> List[Tuple[str, str]]:
+    """Each calendar ask the contract rules out, with why: what :func:`table_calendar` names."""
+    found: List[Tuple[str, str]] = []
+    for table in request.tables:
+        _, notes = calendar_asks(
+            table.expose_id, plans[table.expose_id], table, held.get(table.expose_id, frozenset())
+        )
+        found.extend(notes)
+    return found
+
+
+def _calendar_columns(table: _Table, notes: List[Tuple[str, str]]) -> List[str]:
+    """The columns a table's calendar covers, in order, at most the format's bound."""
+    listed, left_out = calendar_asks(table.expose_id, table.plan, table.asked, table.held)
+    notes.extend(left_out)
+    return listed
 
 
 def table_calendar(table: _Table) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
