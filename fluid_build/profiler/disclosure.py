@@ -42,6 +42,23 @@ withheld because no record lies below the witness, though a published minimum
 already shows that, and one whose witness is the largest value is withheld because
 no record lies above it, though a published maximum already shows that.
 
+A DATE or timestamp column's two ends are top and bottom coded where the exact value
+fails that check, as SDC tools do (sdcMicro ``topBotCoding``; ARX's date hierarchies,
+day to month to year, as a global recoding): :func:`round_extreme` takes the UTC
+calendar buckets that hold the smallest (or largest) value, from the finest (the day,
+for a timestamp; for a DATE the exact value is the day), the month, the year, and
+publishes the first that holds at least ``minimumCell`` records, as the bucket's
+first value (``min``) or last value at the column's resolution (``max``: its last day
+for a DATE, its last millisecond for a timestamp), status ``F``. The value is clipped
+to the range the contract declares, which is public. No bucket up to the year holding
+that many records leaves the end ``A``. This says nothing a date span's outer edge
+does not (:func:`fluid_build.profiler.defaults.date_span` publishes an edge only where
+each end bin holds at least ``minimumCell`` records): a published end says only that
+its bucket holds at least ``minimumCell`` records and that no record lies beyond the
+bucket, so a bucket of that many records places no record in it. The unit is chosen
+from bucket counts that are each at least ``minimumCell`` or not used, so a unit that
+was passed over says only that its bucket was too small, as a withheld cell does.
+
 A verdict names the check that fired with an SDMX ``CL_CONF_STATUS`` 1.4 code:
 ``A`` for a small count (a zero cell, a cell below the threshold, or a value too
 few records hold), ``O`` and ``T`` for dominance by one or two records, ``M`` for
@@ -125,11 +142,13 @@ reason names the rule that fired, never a value.
 
 from __future__ import annotations
 
+import calendar
 import math
 import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
+from datetime import date as _date
 from fractions import Fraction
 from typing import (
     AbstractSet,
@@ -171,6 +190,7 @@ __all__ = [
     "check_sum",
     "check_support",
     "pinned_children_cells",
+    "round_extreme",
     "round_count",
     "sample_size",
     "suppress_differencing",
@@ -512,6 +532,72 @@ def check_order_statistic(holders: int, rule: DisclosureRule) -> Verdict:
     if holders >= rule.minimum_cell:
         return PUBLISHED
     return Verdict(SMALL_COUNT, f"fewer than {rule.minimum_cell} records hold the value")
+
+
+_MS_PER_DAY = 86_400_000
+#: ``date.toordinal()`` of 1970-01-01: the proleptic Gregorian day number of the epoch.
+_EPOCH_ORDINAL = 719_163
+
+
+def round_extreme(
+    end: str,
+    holders: Mapping[int, int],
+    rule: DisclosureRule,
+    *,
+    date: bool,
+    floor: Optional[int] = None,
+    ceiling: Optional[int] = None,
+) -> Optional[Tuple[int, str]]:
+    """Round the ``"min"`` or ``"max"`` end of a date or timestamp column to a calendar bucket.
+
+    *holders* is the number of records holding each value, in whole milliseconds since the
+    epoch, of the column's non-null values; *date* says the column is a DATE (its values are
+    midnights, and its smallest unit is the day). The buckets are UTC calendar days (a
+    timestamp only), months and years holding the smallest value for ``"min"`` and the
+    largest for ``"max"``. The first, finest bucket holding at least ``minimumCell`` records
+    gives ``(value, unit)``: the bucket's first millisecond for a minimum, its last day (a
+    DATE) or last millisecond (a timestamp) for a maximum, clipped to *floor* and *ceiling*,
+    the range the contract declares. ``None`` when no bucket up to the year holds that many
+    records, or when the bucket lies outside the years 1 to 9999. Whole-number arithmetic on
+    milliseconds throughout.
+    """
+    if not holders:
+        return None
+    pivot = min(holders) if end == "min" else max(holders)
+    day = pivot // _MS_PER_DAY
+    try:
+        buckets = _calendar_buckets(day, date)
+    except (ValueError, OverflowError):
+        return None
+    for unit, first, after in buckets:
+        low, high = first * _MS_PER_DAY, after * _MS_PER_DAY
+        if sum(count for value, count in holders.items() if low <= value < high) >= (
+            rule.minimum_cell
+        ):
+            if end == "min":
+                shown = low if floor is None else max(low, floor)
+            else:
+                shown = high - (_MS_PER_DAY if date else 1)
+                shown = shown if ceiling is None else min(shown, ceiling)
+            return shown, unit
+    return None
+
+
+def _calendar_buckets(day: int, date: bool) -> List[Tuple[str, int, int]]:
+    """The ``(unit, first day, day after)`` buckets holding epoch day *day*, finest first.
+
+    A DATE column has no day bucket: its exact value is the day, and was checked already.
+    """
+    found: List[Tuple[str, int, int]] = []
+    if not date:
+        found.append(("day", day, day + 1))
+    moment = _date.fromordinal(day + _EPOCH_ORDINAL)
+    month_first = _date(moment.year, moment.month, 1).toordinal() - _EPOCH_ORDINAL
+    length = calendar.monthrange(moment.year, moment.month)[1]
+    found.append(("month", month_first, month_first + length))
+    year_first = _date(moment.year, 1, 1).toordinal() - _EPOCH_ORDINAL
+    found.append(("year", year_first, year_first + (366 if calendar.isleap(moment.year) else 365)))
+    return found
 
 
 def check_group_count(k: int, rule: DisclosureRule) -> Verdict:

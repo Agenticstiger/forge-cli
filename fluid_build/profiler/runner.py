@@ -256,6 +256,10 @@ class ColumnPlan:
     domain: str
     #: The contract types the column ``date``: a ``YYYY-MM-DD`` text in it is that day.
     date: bool = False
+    #: A date or timestamp's ``(floor, ceiling)`` in milliseconds since the epoch, from the
+    #: contract's range rules: ``None`` for a bound it does not declare. ``None`` as a whole
+    #: when the contract states a range this does not read, and the ends are then not rounded.
+    extreme_bounds: Optional[Tuple[Optional[int], Optional[int]]] = None
 
 
 @dataclass(frozen=True)
@@ -303,6 +307,9 @@ class TableResult:
     #: Each date or timestamp column with no declared range that has no date span, with why:
     #: it keeps the ladder's quantiles (:func:`_date_spans`).
     no_span: Tuple[Tuple[str, str], ...] = ()
+    #: Each end of a date or timestamp column published rounded to a calendar unit:
+    #: ``(column, "min" or "max", unit)``.
+    rounded_extremes: Tuple[Tuple[str, str, str], ...] = ()
 
 
 #: The bins a parent's number of children is counted in: 0, 1, 2, 3 to 4, 5 to 9, 10 to 19,
@@ -456,8 +463,44 @@ def plan_expose(contract: Mapping[str, Any], expose_id: str) -> ExposePlan:
             skipped.append((name, reason or ""))
         else:
             is_date = _base_type(entry.get("type")) == "date"
-            columns.append(ColumnPlan(name=name, domain=domain, date=is_date))
+            columns.append(
+                ColumnPlan(
+                    name=name,
+                    domain=domain,
+                    date=is_date,
+                    extreme_bounds=_extreme_bounds(entry, is_date) if domain == TIMESTAMP else None,
+                )
+            )
     return ExposePlan(expose_id=expose_id, columns=tuple(columns), skipped=tuple(skipped))
+
+
+_MS_PER_DAY = 86_400_000
+
+
+def _extreme_bounds(
+    entry: Mapping[str, Any], date: bool
+) -> Optional[Tuple[Optional[int], Optional[int]]]:
+    """The floor and ceiling in milliseconds a rounded end of the column is clipped to.
+
+    From the ``range`` rules, as :func:`defaults.declared_instant_sides` reads them: a strict
+    bound is one step inside (a day for a DATE, a millisecond for a timestamp), and a DATE's
+    bounds are taken to whole days inside the range. ``None`` when a range rule is not read.
+    """
+    sides = defaults.declared_instant_sides(entry)
+    if sides is None:
+        return None
+    step = _MS_PER_DAY if date else 1
+    low, high = sides
+    floor = ceiling = None
+    if low is not None:
+        floor = low[0] * 1000 + (step if low[1] else 0)
+        if date:
+            floor = -(-floor // _MS_PER_DAY) * _MS_PER_DAY
+    if high is not None:
+        ceiling = high[0] * 1000 - (step if high[1] else 0)
+        if date:
+            ceiling = ceiling // _MS_PER_DAY * _MS_PER_DAY
+    return floor, ceiling
 
 
 def _empty(value: Any) -> bool:
@@ -475,8 +518,12 @@ def _column(
     declares_mean: bool = False,
     withhold: FrozenSet[str] = frozenset(),
     asked: Optional[RequestColumn] = None,
+    rounded: Optional[List[Tuple[str, str, str]]] = None,
 ) -> Dict[str, Any]:
     """One column of the table: its domain, then its checked metrics and statistics.
+
+    *rounded* collects each end of the column published rounded to a calendar unit, as
+    ``(column, "min" or "max", unit)`` (:func:`_check_described`).
 
     *asked* is the request's entry for the column: only the metrics and the ``mean/1`` it lists.
 
@@ -499,6 +546,7 @@ def _column(
             tally,
             withhold,
             None if asked is None else frozenset(asked.metrics),
+            rounded,
         ),
     }
     statistics = (
@@ -520,6 +568,7 @@ def _column_metrics(
     tally: "Counter[str]",
     withhold: FrozenSet[str] = frozenset(),
     listed: Optional[FrozenSet[str]] = None,
+    rounded: Optional[List[Tuple[str, str, str]]] = None,
 ) -> Dict[str, Any]:
     """The checked ``metrics`` object of one column, from its values as read.
 
@@ -554,6 +603,10 @@ def _column_metrics(
             verdict, shown = counted, value
             if counted.published:
                 verdict, shown = _check_described(name, value, present, holders, rule)
+                if name in ("min", "max") and not verdict.published and name not in withhold:
+                    verdict, shown = _round_end(
+                        column, name, verdict, shown, holders, rule, rounded
+                    )
         if name in withhold:
             verdict = disclosure.Verdict(disclosure.SECONDARY, "counts what a histogram withholds")
         entry: Dict[str, Any] = {
@@ -594,6 +647,32 @@ def _check_described(
                 return verdict, value
         return disclosure.PUBLISHED, value
     raise AssertionError(f"no disclosure rule for metric {name!r}")
+
+
+def _round_end(
+    column: ColumnPlan,
+    name: str,
+    verdict: disclosure.Verdict,
+    value: Any,
+    holders: "Counter[Any]",
+    rule: disclosure.DisclosureRule,
+    rounded: Optional[List[Tuple[str, str, str]]],
+) -> Tuple[disclosure.Verdict, Any]:
+    """A date or timestamp end too few records hold, rounded to the finest unit enough share.
+
+    :func:`disclosure.round_extreme` decides; an end it cannot round keeps its verdict.
+    """
+    if column.extreme_bounds is None or verdict.status != disclosure.SMALL_COUNT:
+        return verdict, value
+    floor, ceiling = column.extreme_bounds
+    found = disclosure.round_extreme(
+        name, holders, rule, date=column.date, floor=floor, ceiling=ceiling
+    )
+    if found is None:
+        return verdict, value
+    if rounded is not None:
+        rounded.append((column.name, name, found[1]))
+    return disclosure.PUBLISHED, found[0]
 
 
 #: PROFILE-SPEC §3: an ungrouped statistic has one group, keyed by the empty string.
@@ -2397,6 +2476,7 @@ def _profile_table(
         | keys
         | {name for name in grouped_by if domains.get(name) != NUMBER}
     )
+    rounded: List[Tuple[str, str, str]] = []
     columns_doc = {
         column.name: _column(
             column,
@@ -2410,6 +2490,7 @@ def _profile_table(
             (frozenset({"distinctCount"}) if column.name in counted else frozenset())
             | (_BINNED_WITHHELD if column.name in binned else frozenset()),
             None if asked is None else asked.column(column.name),
+            rounded,
         )
         for column in plan.columns
     }
@@ -2440,6 +2521,7 @@ def _profile_table(
         withheld_statistics=none_published,
         partly_withheld_statistics=some_published,
         left_out=tuple(left_out),
+        rounded_extremes=tuple(rounded),
     )
 
 

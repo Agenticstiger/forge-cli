@@ -119,7 +119,12 @@ support, which lists the levels that hold records, or the group sizes of a
 statistic grouped by the column, which repeat its level counts; and under
 --bundle a declared level that holds no record is absent from a grouped
 statistic, which shows its zero. A published min or
-max shows that no record lies below or above it. A quantile whose value is the
+max shows that no record lies below or above it. Where fewer than minimumCell
+records hold a DATE or timestamp column's min or max, it is rounded instead to the
+first value (min) or last value (max) of the finest UTC day (timestamps), month or
+year holding at least minimumCell records, clipped to the range the contract
+declares; the report names each rounded end and its unit under Rounded extremes,
+and with no such bucket the end is withheld. A quantile whose value is the
 column's smallest or largest shows the same, and is withheld for it, as a zero
 is.
 
@@ -1238,3 +1243,13 @@ def _report_table(say: Any, table: Any, prefix: str, grid: str) -> None:
             f"{prefix}{table.plan.expose_id}.{name}: no date span: {reason}.",
             soft_wrap=True,
         )
+    if table.rounded_extremes:
+        say(f"{prefix}Rounded extremes: {_named_rounded(table.rounded_extremes)}.", soft_wrap=True)
+
+
+def _named_rounded(rounded: Any) -> str:
+    """``read_on min to month, max to day; installed_at max to year``: each rounded end."""
+    by_column: Dict[str, List[str]] = {}
+    for name, end, unit in rounded:
+        by_column.setdefault(name, []).append(f"{end} to {unit}")
+    return "; ".join(f"{name} {', '.join(ends)}" for name, ends in by_column.items())

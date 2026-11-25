@@ -83,6 +83,7 @@ __all__ = [
     "number_ladder",
     "timestamp_bins",
     "declared_instants",
+    "declared_instant_sides",
 ]
 
 #: The quantile levels declared on every number, date and timestamp: the quartiles and
@@ -353,8 +354,51 @@ def declared_instants(column: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
     together, so the tightest bound of each side is kept. ``None`` unless both ends are declared,
     each a whole second, and ``low < high``: such a column takes the ladder.
     """
+    bounds = _instant_bounds(column)
+    if bounds is None:
+        return None
     low: Optional[int] = None
     high: Optional[int] = None
+    for operator, seconds in bounds:
+        if operator in (">", ">="):
+            low = seconds if low is None or seconds > low else low
+        else:
+            high = seconds if high is None or seconds < high else high
+    if low is None or high is None or low >= high:
+        return None
+    return low, high
+
+
+#: One side of a declared instant range: its seconds since the epoch and whether it is strict.
+InstantSide = Optional[Tuple[int, bool]]
+
+
+def declared_instant_sides(column: Mapping[str, Any]) -> Optional[Tuple[InstantSide, InstantSide]]:
+    """The ``(low, high)`` a date or timestamp's ``range`` rules declare, each side on its own.
+
+    As :func:`declared_instants` reads them, but a side no rule declares is ``None`` instead of
+    voiding the pair, and each side says whether its rule is strict (``>``, ``<``). ``None`` for
+    the whole range when a ``range`` rule is not one this reads (the column then declares what
+    cannot be told, and a caller that clips to it does not round).
+    """
+    bounds = _instant_bounds(column)
+    if bounds is None:
+        return None
+    low: InstantSide = None
+    high: InstantSide = None
+    for operator, seconds in bounds:
+        strict = operator in (">", "<")
+        if operator in (">", ">="):
+            if low is None or seconds > low[0] or (seconds == low[0] and strict):
+                low = (seconds, strict)
+        elif high is None or seconds < high[0] or (seconds == high[0] and strict):
+            high = (seconds, strict)
+    return low, high
+
+
+def _instant_bounds(column: Mapping[str, Any]) -> Optional[List[Tuple[str, int]]]:
+    """Every bound the column's ``range`` rules state as ``(operator, seconds)``, or ``None``."""
+    found: List[Tuple[str, int]] = []
     rules = column.get("validationRules")
     for rule in rules if isinstance(rules, list) else ():
         if not isinstance(rule, Mapping) or str(rule.get("type") or "").lower() != "range":
@@ -372,20 +416,14 @@ def declared_instants(column: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
             for part in re.split(r"\s+and\s+", constraint.strip(), flags=re.IGNORECASE):
                 bound = _INSTANT_BOUND.match(part)
                 if not bound:
-                    pairs = [("", None)]
-                    break
+                    return None
                 text = next(t for t in bound.groups()[1:] if t is not None)
                 pairs.append((bound.group(1), _read_instant(text)))
         for operator, seconds in pairs:
             if seconds is None:
                 return None
-            if operator in (">", ">="):
-                low = seconds if low is None or seconds > low else low
-            else:
-                high = seconds if high is None or seconds < high else high
-    if low is None or high is None or low >= high:
-        return None
-    return low, high
+            found.append((operator, seconds))
+    return found
 
 
 def _spell(seconds: int) -> str:
