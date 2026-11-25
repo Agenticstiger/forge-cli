@@ -440,3 +440,32 @@ def test_a_withheld_fact_writes_the_band_of_its_rows_only_where_it_covers_every_
     assert fared["big"] == (False, "A") and fared["paid_big"][0] is False
     assert _statistic(result, "big")["sampleSize"] == {"min": 98, "max": 102}
     assert _statistic(result, "paid_big")["sampleSize"] == {"min": 0}
+
+
+# ---- counts published already: parts the check holds and never withholds ----------------------
+
+_SMALL_ONLY = replace(disclosure.ACRO_DEFAULT, zeros_disclosive=False)
+_OUT, _IN = 1, 2
+
+
+def _fixed_check(cells, passed):
+    return disclosure.suppress_differencing(
+        cells, passed, _SMALL_ONLY, lambda order: [], (_OUT, _IN), fixed={1, 2}
+    )
+
+
+def test_a_part_that_differences_a_fixed_count_to_a_small_cell_is_withheld():
+    # positions: a query, then a published cell and the cells withheld beside it
+    cells = {(_IN, _IN, _OUT): 149, (_IN, _OUT, _IN): 3, (_OUT, _OUT, _IN): 148}
+    assert _fixed_check(cells, [0]) == {0}
+
+
+def test_a_small_cell_only_fixed_counts_set_apart_withholds_nothing():
+    # every record beside the published cell holds the query: withholding it merges nothing
+    cells = {(_IN, _IN, _OUT): 100, (_OUT, _IN, _OUT): 120, (_IN, _OUT, _IN): 5}
+    assert _fixed_check(cells, [0]) == frozenset()
+
+
+def test_a_fixed_count_is_never_withheld():
+    cells = {(_IN, _IN, _OUT): 149, (_IN, _OUT, _IN): 3, (_OUT, _OUT, _IN): 148}
+    assert _fixed_check(cells, [0, 1, 2]) == {0}

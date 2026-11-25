@@ -676,6 +676,7 @@ def suppress_differencing(
     rule: DisclosureRule,
     factors: Callable[[Sequence[int]], Factors],
     states: Sequence[int],
+    fixed: AbstractSet[int] = frozenset(),
 ) -> FrozenSet[int]:
     """The facts of one table to withhold so that together they give back no small cell.
 
@@ -720,10 +721,11 @@ def suppress_differencing(
 
     The check covers the facts of one table among themselves and against the table's row
     count, not a fact's overlap with a histogram's cells, a column's counts or a
-    relationship's counts. Two exposes are two tables to it, even when the data owner reads
-    both from the same records, so facts asked of each are not checked together. Noise is
-    what the ONS credits with protecting against
-    differencing, in its comparison of post-tabular methods (2024), and the release under
+    relationship's counts, unless those are given as *fixed* parts (the consumer queries hold
+    a column's published cells that way). Two exposes are two tables to it, even when the
+    data owner reads both from the same records, so facts asked of each are not checked
+    together. Noise is what the ONS credits with protecting against differencing, in its
+    comparison of post-tabular methods (2024), and the release under
     differential privacy (``fluid profile --privacy-unit``) is the profiler's way to
     publish counts with noise. The pattern is the coordinated secondary suppression of
     linked tables that the Handbook on Statistical Disclosure Control (2nd edition, section
@@ -731,12 +733,19 @@ def suppress_differencing(
     combination of the facts' states is held to the threshold, which errs toward
     withholding, where an audit such as sdcTable's ``attack()`` solves for the bounds a
     reader can put on each suppressed cell.
+
+    *fixed* holds the positions of counts published already, such as a column's published
+    cells, which the check holds in every combination and never withholds. A cell only they
+    touch withholds the parts it differs in from the nearest held combination with the same
+    fixed states; when no such combination is held, merging every other part leaves the cell
+    as it is, so it is the published counts' own and withholds nothing here.
     """
-    candidates = frozenset(passed)
+    pinned = frozenset(fixed)
+    candidates = frozenset(passed) - pinned
     shown = set(candidates)
     width = len(next(iter(cells), ()))
     while shown:
-        order = sorted(shown)
+        order = sorted(shown | pinned)
         formed: Mapping[Combination, int]
         if len(order) == width:
             # Every fact is published: the combinations are the ones given, not formed again.
@@ -747,7 +756,7 @@ def suppress_differencing(
                 if count > 0:
                     projected[tuple(combination[at] for at in order)] += count
             formed = projected
-        touched = _touched(formed, order, rule, factors, states)
+        touched = _touched(formed, order, rule, factors, states, pinned)
         if not touched:
             break
         shown -= touched
@@ -760,22 +769,32 @@ def _touched(
     rule: DisclosureRule,
     factors: Callable[[Sequence[int]], Factors],
     states: Sequence[int],
+    fixed: AbstractSet[int] = frozenset(),
 ) -> Set[int]:
-    """The facts (positions) that touch a small cell of *formed*, else those touching a zero cell."""
+    """The facts (positions) that touch a small cell of *formed*, else those touching a zero cell.
+
+    A position in *fixed* is never returned (:func:`suppress_differencing`).
+    """
     width = len(order)
+    kept = frozenset(at for at, position in enumerate(order) if position in fixed)
+    most = width - len(kept)
 
     def changed(cell: Combination, at: int) -> List[Combination]:
         return [cell[:at] + (state,) + cell[at + 1 :] for state in states if state != cell[at]]
 
     def touching(cell: Combination) -> Set[int]:
-        return {at for at in range(width) if any(other in formed for other in changed(cell, at))}
+        return {
+            at
+            for at in range(width)
+            if at not in kept and any(other in formed for other in changed(cell, at))
+        }
 
     touched: Set[int] = set()
     for cell, count in formed.items():
-        if len(touched) == width:
+        if len(touched) == most:
             break
         if count < rule.minimum_cell:
-            touched |= touching(cell) or _differing_from_nearest(cell, formed)
+            touched |= touching(cell) or _differing_from_nearest(cell, formed, kept)
     if touched or not rule.zeros_disclosive:
         return {order[at] for at in touched}
     local = {position: at for at, position in enumerate(order)}
@@ -795,8 +814,8 @@ def _touched(
                 if zero in looked_at:
                     continue
                 looked_at.add(zero)
-                touched |= touching(zero) or _differing_from_nearest(zero, formed)
-                if len(touched) == width:
+                touched |= touching(zero) or _differing_from_nearest(zero, formed, kept)
+                if len(touched) == most:
                     return {order[at] for at in touched}
     return {order[at] for at in touched}
 
@@ -810,12 +829,18 @@ def _put_together(
     return tuple(placed[at] if at in placed else next(others) for at in range(width))
 
 
-def _differing_from_nearest(cell: Combination, formed: Iterable[Combination]) -> Set[int]:
-    """Where *cell* differs from the held combinations nearest it; every fact if none is held."""
+def _differing_from_nearest(
+    cell: Combination, formed: Iterable[Combination], kept: AbstractSet[int] = frozenset()
+) -> Set[int]:
+    """Where *cell* differs from the held combinations nearest it; every fact if none is held.
+
+    With *kept* (the local positions of fixed counts), only the held combinations with the same
+    states there are looked at, and none held returns nothing.
+    """
     nearest: Optional[int] = None
     found: Set[int] = set()
     for other in formed:
-        if other == cell:
+        if other == cell or any(cell[at] != other[at] for at in kept):
             continue
         differ = {
             at for at, (mine, theirs) in enumerate(zip(cell, other, strict=True)) if mine != theirs
@@ -824,6 +849,8 @@ def _differing_from_nearest(cell: Combination, formed: Iterable[Combination]) ->
             nearest, found = len(differ), differ
         elif len(differ) == nearest:
             found |= differ
+    if kept:
+        return found
     return found or set(range(len(cell)))
 
 
