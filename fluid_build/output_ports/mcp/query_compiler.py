@@ -446,16 +446,22 @@ def _allowed_columns(index: "_SemanticIndex", restricted: Iterable[str]) -> List
     return _allowed_names(list(index.columns), restricted)
 
 
-def _allowed_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
+def _kept_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
+    """``declared`` less ``restricted`` and repeats, compared without regard to case,
+    in order."""
     denied = {name.casefold() for name in restricted}
-    allowed: List[str] = []
+    kept: List[str] = []
     seen: Set[str] = set()
     for name in declared:
         folded = name.casefold()
-        if folded in denied or folded in seen:
-            continue
-        seen.add(folded)
-        allowed.append(name)
+        if folded not in denied and folded not in seen:
+            seen.add(folded)
+            kept.append(name)
+    return kept
+
+
+def _allowed_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
+    allowed = _kept_names(declared, restricted)
     if not allowed:
         raise QueryValidationError(
             "This expose restricts columns or filters rows, but contract.schema declares "
@@ -1730,14 +1736,8 @@ def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) 
     schema order. A restricted column is never read, so only the others must be plain
     identifiers: the projection selects each by its name. Fails closed when a column it
     selects is not one, or when every declared column is restricted."""
-    denied = {name.casefold() for name in restricted}
     readable: List[str] = []
-    seen: Set[str] = set()
-    for name in declared_columns(expose):
-        folded = name.casefold()
-        if folded in denied or folded in seen:
-            continue
-        seen.add(folded)
+    for name in _kept_names(declared_columns(expose), restricted):
         try:
             readable.append(validate_ident(name))
         except ValueError:
