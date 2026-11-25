@@ -95,6 +95,14 @@ is written as a fact withheld by it (``D``); a group that is the only way to a w
 size withholds the others the same way, so some groups of a query may be published and others
 withheld. Nothing is published that depends on a query's text.
 
+**One way per table.** A run counts one table's records one way: as its rows (a fact asked of the
+table, a table unit, a view unit) or as its entities by one column (an entity unit). A fact
+decides first, then the first query in the request's order that is answered; a query whose unit
+counts the table another way is refused before any read with :data:`COUNTED_ANOTHER_WAY`. The
+rows and the entities of a table are two populations, checked as two sets, and where every
+entity holds one row they are the same records: a query over the rows and one over the
+entities would differ by one record that no set check sees.
+
 **Errors that depend on a record.** A condition that could raise an error depending on a row's
 value (a cast, arithmetic, a ``CASE``, an unlisted function) is refused before any read with
 :data:`CAN_FAIL`, by the fence and function allowlist the MCP gateway applies to a filtered
@@ -105,10 +113,12 @@ query or which record.
 
 **What is left.** A query is checked as a set with the table's facts and the other queries and
 units over that table, not with a column's level histogram, ``nullCount`` or row count beside
-it (facts have the same limit). A counted entity population is checked apart from the parent
-table's own facts and queries: two sets over the same rows, never crossed with each other, so a
-query over the parent's rows and one over its entities are not differenced together; a query
-and a published histogram cell differ only at the rounding precision. Where the parent table
+it (facts have the same limit), and an entity unit's population is not checked with its table's
+own statistics, which count the same records where every entity holds one row. A counted entity
+population is checked apart from the parent table's own facts and queries: two sets over the
+same rows, never crossed with each other, so a query over the parent's rows and one over its
+entities are not differenced together. A reader can difference such counts, and the rounding
+hides the difference only when neither count lies at a rounding edge. Where the parent table
 repeats a key (records that break its declared key), an entity is counted once for each parent
 row that holds its key, and so is its unit's ``k``. The cost is bounded and public: at most
 :data:`MOST_QUERIES` queries, each statement limited in time and memory, run in a locked
@@ -147,6 +157,7 @@ from fluid_build.profiler.consumer_queries import Checked, Refused, Table
 
 __all__ = [
     "CAN_FAIL",
+    "COUNTED_ANOTHER_WAY",
     "ENTITIES_PAST_BOUND",
     "ENTITY_ONLY",
     "HISTORY_ENTITY",
@@ -232,6 +243,13 @@ CAN_FAIL = (
     "value, so fluid profile does not run it: compare columns with constants of their own type, "
     "joined by AND, OR and NOT"
 )
+COUNTED_ANOTHER_WAY = (
+    "a fact or an earlier query counts the same table's records another way (as its rows, or as "
+    "its entities by another column); two sets over one table's records could give a record "
+    "back by differencing, so fluid profile counts a table's records one way per run"
+)
+#: How a unit counts its table's records: as the rows, or as the entities of one column.
+_ROWS: Tuple[str, ...] = ("rows",)
 _KEPT = "fluid profile answers a query that keeps some of its unit's records: "
 _LEVELS = ["false", "true"]
 #: A record's outcome under a query: the query does not return it, or returns it.
@@ -411,9 +429,16 @@ def plan_queries(
         return QueryPlans()
     schema = _schema_of(contract, request)
     rows = {table: _row_column(columns) for table, columns in schema.items()}
-    planner = _Planner(schema, rows, enum_levels, contract)
+    planner = _Planner(
+        schema, rows, enum_levels, contract, facts=[fact.table for fact in request.facts]
+    )
     plans = tuple(planner.plan(index, each) for index, each in enumerate(request.queries))
     return QueryPlans(plans, schema, rows)
+
+
+def _way_of(plan: QueryPlan) -> Tuple[str, ...]:
+    """How *plan*'s unit counts its table's records: the rows, or the entities of one column."""
+    return _ROWS if plan.entity is None else ("entities", plan.entity.key)
 
 
 def _schema_of(contract: Mapping[str, Any], request: Request) -> Dict[str, Table]:
@@ -468,6 +493,7 @@ class _Planner:
         rows: Mapping[str, str],
         enum_levels: Callable[[str], Sequence[str]],
         contract: Mapping[str, Any],
+        facts: Sequence[str] = (),
     ) -> None:
         self._schema = schema
         self._rows = rows
@@ -488,10 +514,19 @@ class _Planner:
         self._parts: Dict[str, int] = {}
         self._grouped: Dict[Tuple[str, str], int] = {}
         self._unit_parts: Set[Tuple[str, str]] = set()
+        #: How each table's records are counted this run: a fact counts its rows, and the first
+        #: answered query over a table counts them as its unit does.
+        self._ways: Dict[str, Tuple[str, ...]] = {table: _ROWS for table in facts}
 
     # -- one query ---------------------------------------------------------------------------
 
     def plan(self, index: int, query: RequestQuery) -> QueryPlan:
+        planned = self._plan(index, query)
+        if planned.reason is None and planned.table is not None:
+            self._ways.setdefault(planned.table, _way_of(planned))
+        return planned
+
+    def _plan(self, index: int, query: RequestQuery) -> QueryPlan:
         blank = QueryPlan(index, query.name)
         if index >= MOST_QUERIES:
             return blank.refused(f"past the {MOST_QUERIES:,} queries a request may list")
@@ -890,6 +925,9 @@ class _Planner:
         return None
 
     def _room(self, plan: QueryPlan) -> Optional[str]:
+        way = _way_of(plan)
+        if self._ways.get(plan.table or "", way) != way:
+            return COUNTED_ANOTHER_WAY
         unit = plan.unit
         if self._per_unit.get(unit, 0) >= MOST_PER_UNIT:
             return f"past the {MOST_PER_UNIT} queries over one unit that fluid profile answers"

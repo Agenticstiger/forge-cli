@@ -39,12 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose key is null or names no parent, or the distinct values of the column, and a query over it is checked as a set with whether the entity is in the
   unit and, where the relationship's children-per-parent histogram withholds a bin, that bin;
   any other aggregate, and a table's natural entity, is named before any read, and so are the
-  units and queries over one table's entities past the number one set check can count. A sum or average over a decimal of more than 18 digits is refused before any read (its total could overflow depending on the records), and decimals of up to 38 digits now load exactly. A condition that could raise an error depending on a
+  units and queries over one table's entities past the number one set check can count. A run
+  counts one table's records one way: as its rows (a fact of the table, a table unit or a view
+  unit) or as its entities by one column. A fact decides first, then the first answered query in
+  request order, and a query whose unit counts the table another way is named before any read. A sum or average over a decimal of more than 18 digits is refused before any read (its total could overflow depending on the records), and decimals of up to 38 digits now load exactly. A condition that could raise an error depending on a
   row's value is refused before any read with the gateway's own condition fence, and any failure
   that still depends on the records withholds every query of the run with one fixed message, so
   a run says at most that some statement failed, never which. A query is checked as a set with the
   table's facts and the other queries over it, not with a column's level histogram, `nullCount`
-  or row count beside it. The report adds `Queries: N of M published whole`.
+  or row count beside it, and an entity unit is not checked with its table's own statistics,
+  which count the same records where every entity holds one row: a reader can difference such
+  counts, and the rounding hides the difference only when neither count lies at a rounding edge.
+  The report adds `Queries: N of M published whole`.
 
 
 - **`fluid profile` can check a consumer query and run it in a locked process.** A query a profile

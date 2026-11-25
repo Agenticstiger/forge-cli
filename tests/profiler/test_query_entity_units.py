@@ -45,7 +45,9 @@ ORDERS_BY_CUSTOMER = {
 }
 
 
-def _contract(*, dependency: bool = False, validity: bool = False) -> Dict[str, Any]:
+def _contract(
+    *, dependency: bool = False, validity: bool = False, invariant: bool = False
+) -> Dict[str, Any]:
     orders: Dict[str, Any] = {
         "exposeId": "orders",
         "contract": {
@@ -64,6 +66,10 @@ def _contract(*, dependency: bool = False, validity: bool = False) -> Dict[str, 
         orders["contract"]["invariants"] = [
             {"id": "customer_fixes_status", "dependency": {"from": ["customer_id"], "to": ["note"]}}
         ]
+    if invariant:
+        orders["contract"].setdefault("invariants", []).append(
+            {"id": "large", "check": "quantity > 50"}
+        )
     customers: Dict[str, Any] = {
         "exposeId": "customers",
         "contract": {
@@ -132,7 +138,7 @@ def _column(name: str, domain: str) -> _stats.RequestColumn:
     return _stats.RequestColumn(name, domain, ())
 
 
-def _request(*queries, counted: bool = True) -> _stats.Request:
+def _request(*queries, counted: bool = True, facts=()) -> _stats.Request:
     link = _stats.RequestRelationship(
         _stats.RequestEnd("customers", ("customer_id",)),
         _stats.RequestEnd("orders", ("customer_id",)),
@@ -150,7 +156,7 @@ def _request(*queries, counted: bool = True) -> _stats.Request:
             _stats.RequestTable("orders", False, (_column("customer_id", "number"),)),
         ),
         (link,) if counted else (),
-        (),
+        tuple(facts),
         tuple(queries),
     )
 
@@ -168,6 +174,7 @@ def _profile(
     counted: bool = True,
     strict: bool = False,
     gone: bool = False,
+    facts=(),
 ):
     if gone:
         sources = [ExposeSource("customers", str(tmp_path / "a")), ExposeSource("orders", "b")]
@@ -180,7 +187,7 @@ def _profile(
         contract or CONTRACT,
         sources,
         backend=FakeBackend(),
-        request=_request(*queries, counted=counted),
+        request=_request(*queries, counted=counted, facts=facts),
         strict=strict,
     )
 
@@ -716,3 +723,77 @@ def test_a_sum_that_cannot_overflow_is_still_answered(kind, aggregate):
         _wide_contract(precision, scale), _request(each), FakeBackend().enum_levels
     )
     assert [plan.reason for plan in planned.plans] == [None]
+
+
+# ---- one table, counted one way ---------------------------------------------------------------
+
+#: Customers 0 to 999 hold one order each, so their orders and their entities are the same records.
+SINGLES = {**{n: 1 for n in range(1000)}, **{1000 + n: COUNTS[n % 7] for n in range(400)}}
+ROWS_OVER = _stats.RequestQuery(
+    "rows_over",
+    "SELECT order_id FROM orders WHERE quantity > 2 AND customer_id < 998",
+    table="orders",
+)
+MOST = "SELECT customer_id, max(quantity) AS m FROM orders GROUP BY customer_id"
+ENTITIES_OVER = _on_unit(
+    "entities_over",
+    _over(MOST, '"v"."m" > 2 AND "v"."customer_id" < 998 AND "v"."customer_id" <> 5'),
+    MOST,
+)
+
+
+@pytest.mark.parametrize("quantity", [5, 1])
+def test_a_table_counted_as_rows_is_not_counted_as_entities_too(tmp_path, quantity):
+    # Unchecked together, the two counts would differ by customer 5's one order alone.
+    orders = _orders(counts=SINGLES)
+    assert orders[5]["customer_id"] == 5
+    orders[5]["quantity"] = quantity
+    result = _profile(tmp_path, ROWS_OVER, ENTITIES_OVER, orders=orders)
+    said = _said(result)
+    assert said["query entities_over"] == query_rates.COUNTED_ANOTHER_WAY
+    assert "query rows_over" not in said
+    assert [each["name"] for each in result.document["queries"]] == ["rows_over"]
+
+
+def test_a_table_counted_as_entities_is_not_counted_as_rows_too(tmp_path):
+    result = _profile(tmp_path, ENTITIES_OVER, ROWS_OVER, orders=_orders(counts=SINGLES))
+    said = _said(result)
+    assert said["query rows_over"] == query_rates.COUNTED_ANOTHER_WAY
+    assert "query entities_over" not in said
+    assert [each["name"] for each in result.document["queries"]] == ["entities_over"]
+
+
+def test_a_fact_of_the_table_counts_its_rows_before_any_query(tmp_path):
+    fact = _stats.RequestFact("orders.large", "orders", "large")
+    result = _profile(tmp_path, ENTITIES_OVER, contract=_contract(invariant=True), facts=(fact,))
+    assert _said(result)["query entities_over"] == query_rates.COUNTED_ANOTHER_WAY
+    assert "queries" not in result.document or not result.document["queries"]
+
+
+def test_strict_refuses_a_table_counted_two_ways_before_any_read(tmp_path):
+    assert not asked_for.decided_by_records(query_rates.COUNTED_ANOTHER_WAY)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, ROWS_OVER, ENTITIES_OVER, strict=True, gone=True)
+    assert query_rates.COUNTED_ANOTHER_WAY in str(refused.value.context)
+
+
+def test_one_table_is_grouped_by_one_entity_column_per_run():
+    contract = _contract()
+    orders = contract["exposes"][1]
+    orders["contract"]["schema"].append({"name": "store_id", "type": "int"})
+    sold_at = {
+        "name": "sold_at",
+        "to": "stores",
+        "fromColumns": ["store_id"],
+        "toColumns": ["store_id"],
+        "cardinality": "many_to_one",
+    }
+    orders["semantics"] = {
+        "relationships": [*ORDERS_BY_CUSTOMER["semantics"]["relationships"], sold_at]
+    }
+    by_store = "SELECT store_id, count(*) AS n FROM orders GROUP BY store_id"
+    second = _on_unit("by_store", _over(by_store, '"v"."n" >= 2', "store_id"), by_store)
+    planned = query_rates.plan_queries(
+        contract, _request(_on_unit("many", MANY), second), FakeBackend().enum_levels
+    )
+    assert [plan.reason for plan in planned.plans] == [None, query_rates.COUNTED_ANOTHER_WAY]
