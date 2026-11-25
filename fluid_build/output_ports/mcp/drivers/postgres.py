@@ -35,6 +35,7 @@ Borrowed-not-built per /borrow-before-build:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -254,13 +255,21 @@ class PostgresDriver(EngineDriver):
         if self.logger is not None:
             redacted = {k: ("***" if k in {"password", "passfile"} else v) for k, v in opts.items()}
             self.logger.debug("postgres_connect: %s", redacted)
-        self._connection = psycopg.connect(**opts)
-        # Transactions psycopg starts are read-only (execute runs each request in one):
-        # the gateway never writes.
-        self._connection.read_only = True
-        self._connection.autocommit = True
-        self._check_the_role(self._connection)
-        return self._connection
+        connection = psycopg.connect(**opts)
+        try:
+            # Transactions psycopg starts are read-only (execute runs each request in
+            # one): the gateway never writes.
+            connection.read_only = True
+            connection.autocommit = True
+            self._check_the_role(connection)
+        except BaseException:
+            # Kept only once the role check has passed: a check that failed for any
+            # reason (a timeout, a refused role) runs again on the next request.
+            with contextlib.suppress(Exception):
+                connection.close()
+            raise
+        self._connection = connection
+        return connection
 
     def _check_the_role(self, connection: Any) -> None:
         """Refuse to serve an expose with row filters as a role that reaches past the
@@ -274,8 +283,6 @@ class PostgresDriver(EngineDriver):
         if not held:
             return
         if declares_row_filters(self.expose):
-            connection.close()
-            self._connection = None
             raise RowFilterUnavailable(
                 f"the gateway connects to Postgres as a role that is {', '.join(held)}. Such a "
                 "role can read a table's files and the write-ahead log, so the rows a row "

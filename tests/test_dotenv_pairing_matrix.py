@@ -96,6 +96,15 @@ def project(tmp_path: Path) -> Path:
     return root
 
 
+def _unprivileged_connection() -> Any:
+    """A stub connection whose role check answers: not a superuser, no privileged role."""
+    from unittest.mock import MagicMock
+
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(False, [])]
+    return connection
+
+
 def _keyring_holds(monkeypatch: pytest.MonkeyPatch, provider: Optional[str]) -> None:
     """The operator saved ``OPERATOR_KEY`` for ``provider`` with ``fluid ai setup``."""
     import fluid_build.llm.providers as llm_providers
@@ -1363,7 +1372,7 @@ def test_a_docker_compose_postgres_dotenv(project: Path, monkeypatch: pytest.Mon
 
     calls: List[Dict[str, Any]] = []
     fake = types.ModuleType("psycopg")
-    fake.connect = lambda **opts: calls.append(opts) or types.SimpleNamespace()  # type: ignore[attr-defined]
+    fake.connect = lambda **opts: calls.append(opts) or _unprivileged_connection()  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "psycopg", fake)
     (project / ".env").write_text(
         "POSTGRES_HOST=db\nPOSTGRES_PORT=5432\nPOSTGRES_USER=app\n"

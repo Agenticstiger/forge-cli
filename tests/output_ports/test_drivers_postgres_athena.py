@@ -344,3 +344,43 @@ def test_postgres_warns_about_a_privileged_role_on_an_expose_without_row_filters
     with caplog.at_level("WARNING"):
         assert driver._get_connection() is connection
     assert "postgres_privileged_role" in caplog.text and "pg_monitor" in caplog.text
+
+
+def test_postgres_checks_the_role_again_after_a_check_that_failed(monkeypatch):
+    """A connection counts only once its role check has passed: a check that failed for
+    any reason (a timeout here) runs again on the next request."""
+    import sys
+    import types
+
+    from fluid_build.output_ports.mcp.query_compiler import RowFilterUnavailable
+
+    answers = [RuntimeError("canceling statement due to statement timeout"), [(True, [])]]
+    connections = []
+
+    def connect(**_):
+        cursor = MagicMock()
+        cursor.__enter__ = lambda self: self
+        cursor.__exit__ = lambda self, *a: None
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            cursor.execute.side_effect = answer
+        else:
+            cursor.fetchall.return_value = answer
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
+    expose = _pg_expose()
+    expose["policy"] = {
+        "authz": {"rowFilters": [{"principal": "group:a@x.example", "where": "id > 0"}]}
+    }
+    driver = PostgresDriver(expose=expose, contract={})
+    with pytest.raises(RuntimeError, match="statement timeout"):
+        driver._get_connection()
+    assert driver._connection is None
+    with pytest.raises(RowFilterUnavailable, match="superuser"):
+        driver._get_connection()
+    assert driver._connection is None
+    assert len(connections) == 2 and all(c.close.called for c in connections)
