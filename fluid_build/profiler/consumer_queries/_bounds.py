@@ -1,6 +1,5 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from FLUX flux_engine/consumers/_bounds.py at 19dfe48, Apache-2.0
 
 """Bounds on the cost of reading a consumer query, applied before the work they bound.
 
@@ -23,6 +22,8 @@ Two refusals live here because each must come before sqlglot does the work it pr
   ...`` of a long projection, grows as the product. The nodes these add are counted first, scope
   by scope from the innermost, and a text that adds more than the canonical tree may hold is
   refused before ``qualify`` writes any of them.
+
+Adapted from FLUX ``flux_engine/consumers/_bounds.py`` at 19dfe48 (Apache-2.0).
 """
 
 from __future__ import annotations

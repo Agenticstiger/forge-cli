@@ -1,6 +1,5 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from FLUX flux_engine/consumers/_child.py and _frames.py at 19dfe48, Apache-2.0
 
 """The query process: statements over a locked DuckDB.
 
@@ -36,6 +35,8 @@ exactly one statement and it is a ``SELECT``. A result is a whole number, the ro
 count (booleans, whole numbers, text and ``NULL`` for the group, a whole count), or one boolean
 per row packed into bits. DuckDB's own message never leaves the process: it can quote a value of
 a table. Nothing is printed or logged.
+
+Adapted from FLUX ``flux_engine/consumers/_child.py`` and ``_frames.py`` at 19dfe48 (Apache-2.0).
 """
 
 from __future__ import annotations

@@ -47,10 +47,13 @@ def test_the_two_parts_are_listed() -> None:
 def test_a_new_module_of_the_package_has_the_attribution_line() -> None:
     from pathlib import Path
 
+    import ast
+
     root = Path(package.__file__).parent
     for name in ("_allow", "_bounds", "_order", "check", "_child", "runner"):
-        head = (root / f"{name}.py").read_text(encoding="utf-8").splitlines()[:4]
-        assert any(
-            line.startswith("# Adapted from FLUX flux_engine/consumers/") and "Apache-2.0" in line
-            for line in head
-        ), name
+        text = (root / f"{name}.py").read_text(encoding="utf-8")
+        docstring = ast.get_docstring(ast.parse(text)) or ""
+        assert "Adapted from FLUX ``flux_engine/consumers/" in docstring, name
+        assert "(Apache-2.0)" in docstring, name
+        # The licence header stays the two lines the header writer keeps.
+        assert text.splitlines()[2] == "", name

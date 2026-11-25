@@ -1,6 +1,5 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from FLUX flux_engine/consumers/check.py at 19dfe48, Apache-2.0
 
 """A consumer query is checked with sqlglot before anything runs it.
 
@@ -40,6 +39,8 @@ The checks, in order
 A hostile text ends in a refusal and never in a raise: a ``RecursionError`` is refused as
 ``recursion`` and any other error nobody named as ``internal``, with the exception's class name
 and nothing of the text.
+
+Adapted from FLUX ``flux_engine/consumers/check.py`` at 19dfe48 (Apache-2.0).
 """
 
 from __future__ import annotations

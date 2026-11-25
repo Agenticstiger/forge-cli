@@ -1,6 +1,5 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from FLUX flux_engine/consumers/runner.py at 19dfe48, Apache-2.0
 
 """Statements over a profile's tables, in a locked DuckDB in a process of their own.
 
@@ -30,6 +29,8 @@ rest ``crashed``.
 **What a result holds.** Whole numbers, booleans, group keys and bits, and a status with a
 reason of this module's own words. DuckDB's message is never passed on (it can quote a value of
 a table), nothing of the tables is printed or logged, and the reasons name no value.
+
+Adapted from FLUX ``flux_engine/consumers/runner.py`` at 19dfe48 (Apache-2.0).
 """
 
 from __future__ import annotations

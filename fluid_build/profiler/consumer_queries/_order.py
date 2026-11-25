@@ -1,6 +1,5 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from FLUX flux_engine/consumers/_order.py at 19dfe48, Apache-2.0
 
 """Total orders: when ``LIMIT``, ``OFFSET`` and a window may depend on an ``ORDER BY``.
 
@@ -27,6 +26,8 @@ under its contract names, so a key the contract declares is found by name. A der
 declared key: only the output-row rule applies to it. A key column the contract allows to be
 null can tie in a database that holds several nulls; the contract's own declaration is taken as
 given. Names are compared as sqlglot folds them (``str.lower``).
+
+Adapted from FLUX ``flux_engine/consumers/_order.py`` at 19dfe48 (Apache-2.0).
 """
 
 from __future__ import annotations

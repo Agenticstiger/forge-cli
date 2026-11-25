@@ -1,6 +1,5 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from FLUX flux_engine/consumers/_allow.py at 19dfe48, Apache-2.0
 
 """The closed lists a consumer query is checked against.
 
@@ -12,6 +11,8 @@ does not name is refused: there is no denylist to forget a name from.
 
 The tree is walked without recursion, and the node and depth caps are counted while it is walked,
 so a hostile text stops the walk before the walk can exhaust the stack.
+
+Adapted from FLUX ``flux_engine/consumers/_allow.py`` at 19dfe48 (Apache-2.0).
 """
 
 from __future__ import annotations
