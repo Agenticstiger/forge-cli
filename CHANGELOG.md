@@ -696,6 +696,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names or strings written with Unicode escapes (`U&"..."`). It also refuses `set_config`, the
   pageinspect functions, `pgrowlocks`, `pg_prepared_statement`, `pg_cursor` and the
   `pg_prepared_statements` and `pg_cursors` views.
+- **`query_sql` and `sample` read only the columns `contract.schema` declares, on every expose.**
+  `sample` no longer returns a column the contract does not declare. On an expose without column
+  restrictions or row filters, and for a reader of one with row filters, a `query_sql` statement
+  that joins another table or reads a catalog view is now refused, and one that names an
+  undeclared column fails on that column: declare the column, or read the other table through
+  its own expose. Both tools refuse an expose whose `contract.schema` declares no column, or a
+  column whose name is not a plain identifier (a letter or underscore, then letters, digits and
+  underscores).
 - **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
   read the name as a string. Write the column name bare.
 - **A caller a row filter narrows writes `query_sql` conditions as typed comparisons.** The

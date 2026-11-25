@@ -200,8 +200,9 @@ OUTPUT_PORT_TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
     "sample": ToolCapability(
         name="sample",
         description=(
-            "Return up to --max-sample-rows rows of the bound expose. "
-            "Restricted columns are masked."
+            "Return up to --max-sample-rows rows of the bound expose, with the "
+            "columns contract.schema declares. Restricted columns are left out "
+            "and PII columns masked."
         ),
         input_schema=_SAMPLE_SCHEMA,
     ),
