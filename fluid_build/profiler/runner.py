@@ -1350,11 +1350,7 @@ def _relationship_dates(
     ]
     # A relationship that reaches an entity forms no dates and no exposure: what it was asked is
     # named, and what is left of it is its children per entity.
-    notes: List[Tuple[str, str]] = []
-    for position, rel in enumerate(relationships):
-        if rel.entity:
-            notes.extend(_entity_date_notes(rel, asks[position]))
-            asks[position] = ((), ())
+    notes = _drop_entity_asks(relationships, asks)
     dates.choose_lifetimes(stage, relationships, [exposure for _, exposure in asks])
     docs: List[Dict[str, Any]] = []
     for position, rel in enumerate(relationships):
@@ -1370,14 +1366,34 @@ def _relationship_dates(
             )
         notes.extend(extra_notes)
         if entry is None and extras:
-            entry = {
-                "parent": {"table": rel.parent, "columns": list(rel.parent_columns)},
-                "child": {"table": rel.child, "columns": list(rel.child_columns)},
-                "statistics": [],
-            }
+            entry = _bare_entry(rel)
         if entry is not None:
             docs.append({**entry, **extras})
     return docs, notes
+
+
+def _drop_entity_asks(
+    relationships: Sequence[Relationship], asks: List[Any]
+) -> List[Tuple[str, str]]:
+    """Name what each relationship that reaches an entity was asked, and leave it nothing to form.
+
+    *asks* holds each relationship's (dates, exposure) asks, and is changed in place.
+    """
+    notes: List[Tuple[str, str]] = []
+    for position, rel in enumerate(relationships):
+        if rel.entity:
+            notes.extend(_entity_date_notes(rel, asks[position]))
+            asks[position] = ((), ())
+    return notes
+
+
+def _bare_entry(rel: Relationship) -> Dict[str, Any]:
+    """The ``relationships[]`` entry of a relationship the profile does not count."""
+    return {
+        "parent": {"table": rel.parent, "columns": list(rel.parent_columns)},
+        "child": {"table": rel.child, "columns": list(rel.child_columns)},
+        "statistics": [],
+    }
 
 
 #: Why a relationship that reaches an entity forms no dates and no exposure.

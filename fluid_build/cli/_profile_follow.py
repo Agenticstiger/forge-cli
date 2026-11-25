@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__all__ = ["report", "unknown_values_notes"]
+__all__ = ["columns_text", "report", "say_not_released", "unknown_values_notes"]
 
 _KIND = {
     "clique": "clique of",
@@ -53,6 +53,21 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
             + "."
         )
     return notes
+
+
+def columns_text(table: Any) -> str:
+    """The columns of a released table as a report line names them: a date pair reads start to end."""
+    joiner = " to " if table.kind in ("pairDays", "pairOrder") else ", "
+    return joiner.join(table.columns)
+
+
+def say_not_released(say: Any, plan: Any, drawn: Any) -> None:
+    """Say what the release does not hold, one line for each reason: the plan's and the cap's."""
+    by_reason: Dict[str, List[str]] = {}
+    for what, reason in (*plan.not_released, *drawn.left_out):
+        by_reason.setdefault(reason, []).append(what)
+    for reason, items in by_reason.items():
+        say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
 
 
 def _words(plan: Any) -> List[str]:
@@ -164,12 +179,7 @@ def report(
                 soft_wrap=True,
             )
             continue
-        if table.kind in ("relationship", "link"):
-            what = table.label
-        elif table.kind in ("pairDays", "pairOrder"):
-            what = " to ".join(table.columns)
-        else:
-            what = ", ".join(table.columns)
+        what = table.label if table.kind in ("relationship", "link") else columns_text(table)
         say(
             f"  {_KIND[table.kind]} {what}{place}: noise scale {table.scale}, share rho "
             f"{table.share}, squared L2 sensitivity {table.sensitivity} for one unit",
@@ -189,11 +199,7 @@ def report(
             "from the release record" if rederived else f"chosen with {plan.clique_method.upper()}"
         )
         say(f"Cliques {origin}: {listed or 'none'}.", soft_wrap=True)
-    by_reason: Dict[str, List[str]] = {}
-    for what, reason in (*plan.not_released, *drawn.left_out):
-        by_reason.setdefault(reason, []).append(what)
-    for reason, items in by_reason.items():
-        say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
+    say_not_released(say, plan, drawn)
     if rederived:
         say("Drawn again from the release record: the profile has the recorded digest.")
     say(f"Wrote {out} (readable by you alone; read it before you share it).", soft_wrap=True)

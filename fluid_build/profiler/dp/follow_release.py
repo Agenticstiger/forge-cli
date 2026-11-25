@@ -111,6 +111,7 @@ from fluid_build.profiler.dp.release import (
     other_table_pairs,
     pair_cells,
     pair_label,
+    paired_columns,
     place_known,
     place_values,
     public_structures,
@@ -368,6 +369,58 @@ def _entity_units_reason(
     )
 
 
+def _edge_key(edge: Any) -> Tuple[str, Tuple[str, ...], str, Tuple[str, ...]]:
+    """The tables and key columns a followed edge joins."""
+    return (edge.parent, edge.spec.parent_columns, edge.child, edge.spec.child_columns)
+
+
+def _entity_relationships(
+    declared: Sequence[runner.Relationship],
+) -> Set[Tuple[str, Tuple[str, ...], str, Tuple[str, ...]]]:
+    """The relationships that reach an entity of a versioned table, by their joined key columns."""
+    return {
+        (each.parent, each.parent_columns, each.child, each.child_columns)
+        for each in declared
+        if each.entity
+    }
+
+
+def _note_entity_units(
+    tree: FollowPlan,
+    each: runner.Relationship,
+    entity_units: List[Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]]],
+    note_keys: Callable[[str, Tuple[str, ...]], None],
+) -> None:
+    """A statistic counts the entities of a reached table: its records must put each in one unit."""
+    edge = tree.edge_into(each.parent)
+    if each.entity and edge is not None:
+        item = (
+            each.parent,
+            each.parent_columns,
+            edge.parent,
+            edge.spec.parent_columns,
+            edge.spec.child_columns,
+        )
+        if item not in entity_units:
+            entity_units.append(item)
+            note_keys(edge.parent, edge.spec.parent_columns)
+            note_keys(edge.child, edge.spec.child_columns)
+
+
+def _unstable_reason(column: str) -> str:
+    """Why a column that is not stable per entity cannot group an entity's children."""
+    return f"{column}: {runner._UNSTABLE}"
+
+
+def _entity_link_reason(
+    each: runner.Relationship, parent_column: str, why_units: Optional[str]
+) -> Optional[str]:
+    """Why a statistic grouped through a link into an entity table is not released, or ``None``."""
+    if each.entity and parent_column not in each.stable:
+        return _unstable_reason(parent_column)
+    return why_units
+
+
 def _asked_statistics(request: Request, relationship: runner.Relationship) -> Tuple[str, ...]:
     """The statistics the request lists for *relationship*, once each."""
     found: List[str] = []
@@ -571,27 +624,10 @@ def plan_follow_release(
     parent_sets: List[Tuple[str, Tuple[str, ...]]] = []
     entity_units: List[Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]]] = []
     extra_read: Dict[str, List[str]] = {}
-    entities = {
-        (each.parent, each.parent_columns, each.child, each.child_columns)
-        for each in declared
-        if each.entity
-    }
+    entities = _entity_relationships(declared)
 
     def note_entities(each: runner.Relationship) -> None:
-        """A statistic counts the entities of a reached table: its records must put each in one unit."""
-        edge = tree.edge_into(each.parent)
-        if each.entity and edge is not None:
-            item = (
-                each.parent,
-                each.parent_columns,
-                edge.parent,
-                edge.spec.parent_columns,
-                edge.spec.child_columns,
-            )
-            if item not in entity_units:
-                entity_units.append(item)
-                note_keys(edge.parent, edge.spec.parent_columns)
-                note_keys(edge.child, edge.spec.child_columns)
+        _note_entity_units(tree, each, entity_units, note_keys)
 
     def note_keys(table: str, names: Tuple[str, ...]) -> None:
         if names not in used_keys.setdefault(table, []):
@@ -601,12 +637,7 @@ def plan_follow_release(
     for edge in tree.edges:
         note_keys(edge.parent, edge.spec.parent_columns)
         note_keys(edge.child, edge.spec.child_columns)
-        if (
-            edge.parent,
-            edge.spec.parent_columns,
-            edge.child,
-            edge.spec.child_columns,
-        ) not in entities:
+        if _edge_key(edge) not in entities:
             parent_sets.append((edge.parent, edge.spec.parent_columns))  # an entity's key repeats
     for each in declared:
         counted, group_by, linked = asked_for.relationship_asks(request, each)
@@ -682,7 +713,7 @@ def plan_follow_release(
                         not_released.append(
                             (
                                 f"children per parent of {spelled} grouped by {each.parent}.{name}",
-                                f"{name}: {runner._UNSTABLE}",
+                                _unstable_reason(name),
                             )
                         )
                         continue
@@ -724,11 +755,9 @@ def plan_follow_release(
                     (what, f"the unit does not reach {each.child}, so its rows are fixed")
                 )
                 continue
-            if each.entity and parent_column not in each.stable:
-                not_released.append((what, f"{parent_column}: {runner._UNSTABLE}"))
-                continue
-            if why_units is not None:
-                not_released.append((what, why_units))
+            why_link = _entity_link_reason(each, parent_column, why_units)
+            if why_link is not None:
+                not_released.append((what, why_link))
                 continue
             if followed is None and m_parent != 0:
                 not_released.append(
@@ -822,7 +851,7 @@ def plan_follow_release(
         needed = (
             set(each.name for each in released)
             | set(extra_read.get(table, ()))
-            | {name for pair in found.date_pairs for name in pair}
+            | set(paired_columns(found.date_pairs))
         )
         read = tuple(column for column in found.expose_plan.columns if column.name in needed)
         asked = found.asked
@@ -1436,15 +1465,7 @@ def _relation_counts(
         kept[relation.child] if relation.child in kept else range(rows.counts[relation.child])
     )
     tally = Counter(key for at in child_rows if (key := children[at]) is not None)
-    if relation.entity:
-        entities = list(
-            dict.fromkeys(key for at in parent_rows if (key := parents[at]) is not None)
-        )
-        counts = [tally.get(key, 0) for key in entities]
-    else:
-        counts = [
-            tally.get(key, 0) if (key := parents[at]) is not None else 0 for at in parent_rows
-        ]
+    counts, entities = _children_per_parent(relation, parents, parent_rows, tally)
     cells = _children_cells(relation, counts, backend, plan.fractional_bits)
     width = relation.cells
     flat = [0] * (relation.groups * width)
@@ -1454,15 +1475,7 @@ def _relation_counts(
     else:
         placed = rows.placed[(relation.parent, relation.group.name)]
         if relation.entity:
-            of_entity: Dict[bytes, Optional[int]] = {}
-            for at in parent_rows:
-                key = parents[at]
-                if key is None:
-                    continue
-                if key in of_entity and of_entity[key] != placed[at]:
-                    of_entity[key] = None
-                else:
-                    of_entity.setdefault(key, placed[at])
+            of_entity = _entity_groups(parents, parent_rows, placed)
             groups: List[Optional[int]] = [of_entity[key] for key in entities]
         else:
             groups = [placed[at] for at in parent_rows]
@@ -1470,6 +1483,46 @@ def _relation_counts(
             if group is not None:
                 flat[group * width + cell] += 1
     return flat
+
+
+def _children_per_parent(
+    relation: RelationStat,
+    parents: Sequence[Optional[bytes]],
+    parent_rows: Sequence[int],
+    tally: Mapping[bytes, int],
+) -> Tuple[List[int], List[bytes]]:
+    """The children of each parent, and the entity keys they are of when the parent is an entity.
+
+    A parent is a row of the parent table, or, where the relationship reaches an entity, each
+    distinct non-null entity key among its rows (the keys are then the second value).
+    """
+    if not relation.entity:
+        return [
+            tally.get(key, 0) if (key := parents[at]) is not None else 0 for at in parent_rows
+        ], []
+    entities = list(dict.fromkeys(key for at in parent_rows if (key := parents[at]) is not None))
+    return [tally.get(key, 0) for key in entities], entities
+
+
+def _entity_groups(
+    parents: Sequence[Optional[bytes]],
+    parent_rows: Sequence[int],
+    placed: Sequence[Optional[int]],
+) -> Dict[bytes, Optional[int]]:
+    """The group each entity is in: its rows' value of the grouping column when they all agree.
+
+    An entity whose rows disagree is in no group (``None``), and a row with no key is no entity.
+    """
+    of_entity: Dict[bytes, Optional[int]] = {}
+    for at in parent_rows:
+        key = parents[at]
+        if key is None:
+            continue
+        if key in of_entity and of_entity[key] != placed[at]:
+            of_entity[key] = None
+        else:
+            of_entity.setdefault(key, placed[at])
+    return of_entity
 
 
 def _link_counts(link: LinkStat, rows: FollowRows, kept: Mapping[str, Sequence[int]]) -> List[int]:
@@ -1481,15 +1534,7 @@ def _link_counts(link: LinkStat, rows: FollowRows, kept: Mapping[str, Sequence[i
     )
     child_rows: Sequence[int] = kept[link.child]
     by = rows.placed[(link.parent, link.by.name)]
-    reached: Dict[bytes, Optional[int]] = {}
-    for at in parent_rows:
-        key = parents[at]
-        if key is None:
-            continue
-        if key in reached and reached[key] != by[at]:
-            reached[key] = None
-        else:
-            reached.setdefault(key, by[at])
+    reached = _entity_groups(parents, parent_rows, by)
     cells = rows.placed[(link.child, link.column.name)]
     width = link.column.size
     flat = [0] * (link.by.size * width)

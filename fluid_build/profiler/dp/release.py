@@ -788,7 +788,7 @@ def plan_release(
     read_names = (
         {each.name for each in released}
         | set(unit_plan.key_columns)
-        | {name for pair in found.date_pairs for name in pair}
+        | set(paired_columns(found.date_pairs))
     )
     missing_keys = [name for name in unit_plan.key_columns if name not in readable]
     if missing_keys:
@@ -1154,6 +1154,11 @@ def place_known(
     return cells
 
 
+def paired_columns(pairs: Sequence[Tuple[str, str]]) -> Tuple[str, ...]:
+    """The columns of the date pairs, each once, in the order they first appear."""
+    return tuple(dict.fromkeys(name for pair in pairs for name in pair))
+
+
 def day_bin(days: int) -> int:
     """The bin of :data:`dates.DAY_LADDER` that *days* falls in; a day beyond an end is in that end."""
     return bisect_right(_INNER_DAYS, days)
@@ -1175,7 +1180,7 @@ def pair_cells(
     row, never a value.
     """
     whole: Dict[str, List[Optional[int]]] = {}
-    for name in dict.fromkeys(name for pair in plan.date_pairs for name in pair):
+    for name in paired_columns(plan.date_pairs):
         found: List[Optional[int]] = []
         for index, value in enumerate(exact[name]):
             if value is None:
@@ -2015,9 +2020,9 @@ def _table_block(
     for table in tables:
         cells = values_of[table.label]
         if table.kind == CLIQUE:
-            entry = _clique_entry(plan, table, cells)
-            binned = binned or entry["definition"] == "cliqueMarginal/2"
-            cliques.append(entry)
+            clique = _clique_entry(plan, table, cells)
+            binned = binned or clique["definition"] == "cliqueMarginal/2"
+            cliques.append(clique)
             continue
         if table.kind == RANK:
             first, second = table.columns

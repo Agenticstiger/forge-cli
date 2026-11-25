@@ -686,10 +686,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             read_tables = [plan.table]
             named = plan.table
         if getattr(args, "strict", False):
-            # a date pair the contract shows cannot be formed is a refusal before any record is read
-            unformed = [item for item in plan.not_released if item[0].startswith("date pair ")]
-            if unformed:
-                raise asked_for.refuse_asks(unformed)
+            _refuse_unformed_pairs(plan)
         _only_the_read_tables(args.source, contract, read_tables)
         exposes = profile_cmd._expose_sources(contract, read_tables, args.source, args.table)
         out = profile_cmd._out_path(args.out, named, [each.source for each in exposes])
@@ -803,6 +800,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         rederived=rederive,
     )
     return 0
+
+
+def _refuse_unformed_pairs(plan: Any) -> None:
+    """Under ``--strict``, refuse before any record is read a date pair the contract shows cannot be formed."""
+    from fluid_build.profiler import request as asked_for
+
+    unformed = [item for item in plan.not_released if item[0].startswith("date pair ")]
+    if unformed:
+        raise asked_for.refuse_asks(unformed)
 
 
 def _only_the_read_tables(given: Sequence[str], contract: Any, tables: Sequence[str]) -> None:
@@ -948,11 +954,7 @@ def _report(
                 soft_wrap=True,
             )
             continue
-        shown = (
-            " to ".join(table.columns)
-            if table.kind in ("pairDays", "pairOrder")
-            else ", ".join(table.columns)
-        )
+        shown = _profile_follow.columns_text(table)
         say(
             f"  {_KIND[table.kind]} {shown}: noise scale {table.scale}, "
             f"share rho {table.share}, squared L2 sensitivity {plan.sensitivity} for one entity",
@@ -977,11 +979,7 @@ def _report(
             "from the release record" if rederived else f"chosen with {plan.clique_method.upper()}"
         )
         say(f"Cliques {origin}: {chosen}.", soft_wrap=True)
-    by_reason: Dict[str, List[str]] = {}
-    for what, reason in (*plan.not_released, *drawn.left_out):
-        by_reason.setdefault(reason, []).append(what)
-    for reason, items in by_reason.items():
-        say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
+    _profile_follow.say_not_released(say, plan, drawn)
     if rederived:
         say("Drawn again from the release record: the profile has the recorded digest.")
     say(f"Wrote {out} (readable by you alone; read it before you share it).", soft_wrap=True)
