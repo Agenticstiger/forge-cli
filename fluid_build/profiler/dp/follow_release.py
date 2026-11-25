@@ -77,6 +77,7 @@ from fluid_build.profiler.dp.release import (
     LEVELS,
     LINK,
     NO_CELL,
+    PAIR_DAYS,
     PAIRS,
     RANK,
     RELATION,
@@ -100,10 +101,15 @@ from fluid_build.profiler.dp.release import (
     _table_not_released,
     _TableColumns,
     _version,
+    added_units,
     agrees,
     decimal_text,
+    fit_prefix,
+    left_out_reason,
+    noise_label,
     other_table_pairs,
     pair_cells,
+    pair_label,
     place_known,
     place_values,
     public_structures,
@@ -123,6 +129,7 @@ __all__ = [
     "LinkStat",
     "RelationStat",
     "TablePlan",
+    "admit",
     "build_follow_record",
     "check_follow_record",
     "check_selection_available",
@@ -1034,9 +1041,79 @@ def follow_parts(
     return tuple(parts)
 
 
+def admit(
+    plan: FollowReleasePlan, cliques: Mapping[str, Sequence[Sequence[str]]]
+) -> Tuple[FollowReleasePlan, Tuple[Tuple[str, str], ...]]:
+    """The plan a release holds, once its added parts are fitted into the cap, and what is left out.
+
+    The parts the release always held keep their place and are never left out. The added parts
+    are admitted in this order while the release's cells stay within
+    ``selection.MOST_RELEASE_CELLS``: every date pair (the tables in the plan's order, the pairs
+    in the request's), then every column that may hold a null (tables, then columns, in the plan's
+    order), then every link statistic whose counted child column may hold a null. The first that
+    does not fit is left out and so is every one after it. A left-out part is named by its label
+    and the reason, never a count. The decision reads the cliques only, which are released under the
+    selection's share. The plan comes back as it was when every added part fits.
+    """
+    parts = follow_parts(plan, cliques)
+    by_label = {each.part.label: each.part for each in parts}
+    pairs: List[Tuple[Part, ...]] = []
+    columns: List[Tuple[Part, ...]] = []
+    for each in plan.tables:
+        mine = release_parts(each.plan, cliques.get(each.table, ()))
+        own_pairs, own_columns = added_units(each.plan, mine)
+        for found, into in ((own_pairs, pairs), (own_columns, columns)):
+            into.extend(
+                tuple(by_label[f"{each.table}/{part.label}"] for part in unit) for unit in found
+            )
+    links = [(by_label[link.label],) for link in plan.links if link.column.nullable]
+    units = [*pairs, *columns, *links]
+    if not units:
+        return plan, ()
+    added = {part.label for unit in units for part in unit}
+    fixed = sum(each.part.cells for each in parts if each.part.label not in added)
+    fits = fit_prefix(fixed, [sum(part.cells for part in unit) for unit in units])
+    if fits == len(units):
+        return plan, ()
+    gone = {part.label for unit in units[fits:] for part in unit}
+    reason = left_out_reason()
+    left = tuple((part.label, reason) for unit in units[fits:] for part in unit)
+    tables: List[TablePlan] = []
+    for each in plan.tables:
+        inner = each.plan
+        kept = replace(
+            inner,
+            columns=tuple(
+                column
+                for column in inner.columns
+                if f"{each.table}/{noise_label((column.name,))}" not in gone
+            ),
+            date_pairs=tuple(
+                pair
+                for pair in inner.date_pairs
+                if f"{each.table}/{pair_label(PAIR_DAYS, *pair)}" not in gone
+            ),
+        )
+        tables.append(replace(each, plan=kept))
+    return (
+        replace(
+            plan,
+            tables=tuple(tables),
+            links=tuple(link for link in plan.links if link.label not in gone),
+        ),
+        left,
+    )
+
+
 def describe(
     plan: FollowReleasePlan, cliques: Mapping[str, Sequence[Sequence[str]]]
 ) -> Tuple[Fraction, Tuple[ReleasedTable, ...]]:
+    """The share of each part and the parts, checked against the cells a release may hold.
+
+    The added parts are fitted into the cap first (:func:`admit`); the parts the release always
+    held are refused when they alone hold too many.
+    """
+    plan, _ = admit(plan, cliques)
     parts = follow_parts(plan, cliques)
     cells = sum(each.part.cells for each in parts)
     if cells > selection.MOST_RELEASE_CELLS:
@@ -1290,6 +1367,10 @@ class FollowRelease:
     selected: Optional[Mapping[str, Tuple[Tuple[str, ...], ...]]]
     selection_rho: Fraction
     share: Fraction
+    #: The plan of what was released: the plan without the added parts that did not fit.
+    plan: Optional[FollowReleasePlan] = None
+    #: Each added part left out, ``(label, reason)``, in the order they were to be fitted in.
+    left_out: Tuple[Tuple[str, str], ...] = ()
 
     @property
     def measurement_rho(self) -> Fraction:
@@ -1483,6 +1564,7 @@ def draw_follow(
             released[each.table] = tuple(tuple(c) for c in joined)
     if chosen is not None and not chosen:
         chosen = None
+    plan, left_out = admit(plan, released)
     share, tables = describe(plan, released)
     measured = measure_counts(plan, rows, kept, tables, backend)
     values_of: Dict[str, Tuple[str, ...]] = {}
@@ -1521,6 +1603,8 @@ def draw_follow(
         selected=chosen,
         selection_rho=sum((selection_share(each.plan) for each in plan.tables), Fraction(0)),
         share=share,
+        plan=plan,
+        left_out=left_out,
     )
 
 

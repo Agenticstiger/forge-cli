@@ -958,7 +958,7 @@ def _report(
             f"share rho {table.share}, squared L2 sensitivity {plan.sensitivity} for one entity",
             soft_wrap=True,
         )
-    for line in _profile_follow.unknown_values_notes(plan):
+    for line in _profile_follow.unknown_values_notes(drawn.plan or plan):
         say(line, soft_wrap=True)
     if ranked:
         say(
@@ -978,7 +978,7 @@ def _report(
         )
         say(f"Cliques {origin}: {chosen}.", soft_wrap=True)
     by_reason: Dict[str, List[str]] = {}
-    for what, reason in plan.not_released:
+    for what, reason in (*plan.not_released, *drawn.left_out):
         by_reason.setdefault(reason, []).append(what)
     for reason, items in by_reason.items():
         say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)

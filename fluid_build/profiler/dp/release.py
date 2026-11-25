@@ -102,6 +102,8 @@ __all__ = [
     "ReleasedColumn",
     "ReleasedTable",
     "SCHEMA_URL_1_2_0",
+    "added_units",
+    "admit",
     "build_record",
     "check_record",
     "check_selection_available",
@@ -110,7 +112,10 @@ __all__ = [
     "encode_rows",
     "measure_counts",
     "epsilon_at_delta",
+    "fit_prefix",
+    "left_out_reason",
     "noise_label",
+    "pair_label",
     "parse_rho",
     "plan_release",
     "release_parts",
@@ -650,10 +655,13 @@ def _plan_columns(
         if asked.column(name) is not None:
             why_not.setdefault(name, "a key column: its values name an entity")
 
-    # The cells: a column of two or more levels holds at least its size in any structure.
-    cells = sum(each.size for each in released if each.size >= 2)
+    # The cells: a column of two or more levels holds at least its size in any structure. A column
+    # that may hold a null is an added part: it is fitted into the cap once the cliques are known
+    # (:func:`admit`), so it does not count here.
+    required = [each for each in released if not each.nullable]
+    cells = sum(each.size for each in required if each.size >= 2)
     if cells > selection.MOST_RELEASE_CELLS or any(
-        each.size > selection.MOST_RELEASE_CELLS for each in released
+        each.size > selection.MOST_RELEASE_CELLS for each in required
     ):
         raise _refuse(
             "profile_release_too_many_cells",
@@ -1351,6 +1359,10 @@ class Release:
     #: Each count table's noisy values before the tables are made to agree, then after, exact.
     noisy: Tuple[Tuple[Fraction, ...], ...] = field(default=(), repr=False)
     consistent: Tuple[Tuple[Fraction, ...], ...] = field(default=(), repr=False)
+    #: The plan of what was released: the plan without the added parts that did not fit.
+    plan: Optional["ReleasePlan"] = field(default=None, repr=False)
+    #: Each added part left out, ``(label, reason)``, in the order they were to be fitted in.
+    left_out: Tuple[Tuple[str, str], ...] = ()
 
     @property
     def measurement_rho(self) -> Fraction:
@@ -1421,15 +1433,103 @@ def release_parts(plan: ReleasePlan, cliques: Sequence[Sequence[str]]) -> Tuple[
         parts.append(
             Part(
                 PAIR_DAYS,
-                f"pair/days/{start}/{end}",
+                pair_label(PAIR_DAYS, start, end),
                 (start, end),
                 (len(dates.DAY_LADDER) - 1,),
             )
         )
         parts.append(
-            Part(PAIR_ORDER, f"pair/order/{start}/{end}", (start, end), (len(dates.ORDER_LEVELS),))
+            Part(
+                PAIR_ORDER,
+                pair_label(PAIR_ORDER, start, end),
+                (start, end),
+                (len(dates.ORDER_LEVELS),),
+            )
         )
     return tuple(parts)
+
+
+def pair_label(kind: str, start: str, end: str) -> str:
+    """The label of the noise stream of a date pair's days (:data:`PAIR_DAYS`) or order."""
+    return f"pair/{'days' if kind == PAIR_DAYS else 'order'}/{start}/{end}"
+
+
+def added_units(
+    plan: ReleasePlan, parts: Sequence[Part]
+) -> Tuple[List[Tuple[Part, ...]], List[Tuple[Part, ...]]]:
+    """The added parts of *parts* as units: the date pairs, then the nullable columns.
+
+    A unit is released whole or not at all: a pair's days and order together, a column's histogram.
+    The pairs are in the request's order, the columns in the plan's order.
+    """
+    by_label = {part.label: part for part in parts}
+    pairs: List[Tuple[Part, ...]] = [
+        (by_label[pair_label(PAIR_DAYS, start, end)], by_label[pair_label(PAIR_ORDER, start, end)])
+        for start, end in plan.date_pairs
+    ]
+    columns: List[Tuple[Part, ...]] = [
+        (by_label[noise_label((each.name,))],) for each in plan.columns if each.nullable
+    ]
+    return pairs, columns
+
+
+def left_out_reason() -> str:
+    """Why an added part that does not fit under the cap is not released. Never a count."""
+    return (
+        f"the release's parts would hold more cells than the {selection.MOST_RELEASE_CELLS:,} a "
+        "release may measure"
+    )
+
+
+def fit_prefix(fixed: int, units: Sequence[int]) -> int:
+    """How many of the added *units* (their cells, in priority order) fit beside *fixed* cells.
+
+    A prefix: the first unit that does not fit ends it, so what is released never depends on which
+    later unit happens to be small. When *fixed* alone is over the cap none fits.
+    """
+    total = fixed
+    for place, cells in enumerate(units):
+        if total + cells > selection.MOST_RELEASE_CELLS:
+            return place
+        total += cells
+    return len(units)
+
+
+def admit(
+    plan: ReleasePlan, cliques: Sequence[Sequence[str]]
+) -> Tuple[ReleasePlan, Tuple[Tuple[str, str], ...]]:
+    """The plan a release holds, once its added parts are fitted into the cap, and what is left out.
+
+    The parts the release always held (the cliques and the histograms of required columns, the
+    rank correlations) keep their place and are never left out. The added parts (every date pair,
+    then every column that may hold a null) are admitted in that order while the release's cells
+    stay within ``selection.MOST_RELEASE_CELLS``: the first that does not fit is left out and so is
+    every one after it. Each left-out part is named with its label and the reason, never a count.
+    The decision reads the cliques, which are released under the selection's share, and nothing
+    else: it is post-processing and costs no privacy. The plan comes back as it was when every
+    added part fits.
+    """
+    parts = release_parts(plan, cliques)
+    pairs, columns = added_units(plan, parts)
+    units = [*pairs, *columns]
+    if not units:
+        return plan, ()
+    added = {part.label for unit in units for part in unit}
+    fixed = sum(part.cells for part in parts if part.label not in added)
+    fits = fit_prefix(fixed, [sum(part.cells for part in unit) for unit in units])
+    if fits == len(units):
+        return plan, ()
+    gone = {part.label for unit in units[fits:] for part in unit}
+    reason = left_out_reason()
+    left = tuple((part.label, reason) for unit in units[fits:] for part in unit)
+    kept = replace(
+        plan,
+        columns=tuple(each for each in plan.columns if noise_label((each.name,)) not in gone),
+        date_pairs=tuple(
+            pair for pair in plan.date_pairs if pair_label(PAIR_DAYS, *pair) not in gone
+        ),
+    )
+    return kept, left
 
 
 def agrees(plan: ReleasePlan, table: "ReleasedTable") -> bool:
@@ -1452,8 +1552,10 @@ def _describe(
 ) -> Tuple[Fraction, Tuple[ReleasedTable, ...]]:
     """The share of each part and the parts, checked against the cells a release may hold.
 
-    The cells are added up, and refused when too many, before any table is allocated.
+    The added parts are fitted into the cap first (:func:`admit`). The cells are then added up,
+    and refused when the parts the release always held are too many, before any table is allocated.
     """
+    plan, _ = admit(plan, cliques)
     parts = release_parts(plan, cliques)
     cells = sum(part.cells for part in parts)
     if cells > selection.MOST_RELEASE_CELLS:
@@ -1685,6 +1787,7 @@ def draw(
     else:
         released = ()
     try:
+        plan, left_out = admit(plan, released)
         share, tables = _describe(plan, released)
     except ReleaseRefused as refused:
         if chosen is None or refused.event != "profile_release_too_many_cells":
@@ -1760,6 +1863,8 @@ def draw(
         share=share,
         noisy=tuple(noisy),
         consistent=tuple(agreed_of[each.label] for each in counted),
+        plan=plan,
+        left_out=left_out,
     )
 
 

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A private release fits its added parts within the cells it may measure.** With
+  `--privacy-unit`, a date pair's days and order, a column the contract does not declare required
+  and a link statistic over such a column are fitted into the 65,536 cells a release may measure
+  once its cliques are chosen: the date pairs first, then the columns, then the links, each while
+  the release stays within the cap. The first that does not fit is left out, and so is every one
+  after it. The report names each part left out with the reason, never a count. The parts a
+  release always held keep their place, and a release whose other parts alone hold too many cells
+  still refuses. A release with no added part over the cap is drawn as before.
 - **A private release holds nullable columns and date pairs.** With `--privacy-unit`, own rows or
   `--follow`, a column the contract does not declare `required: true` is released like a required
   one: its public levels or bins, a noisy histogram with a share of its own, counting the column's

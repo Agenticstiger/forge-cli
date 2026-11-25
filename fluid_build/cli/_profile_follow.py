@@ -175,7 +175,7 @@ def report(
             f"{table.share}, squared L2 sensitivity {table.sensitivity} for one unit",
             soft_wrap=True,
         )
-    for each in plan.tables:
+    for each in (drawn.plan or plan).tables:
         for line in unknown_values_notes(each.plan, each.table):
             say(line, soft_wrap=True)
     if plan.selects:
@@ -190,7 +190,7 @@ def report(
         )
         say(f"Cliques {origin}: {listed or 'none'}.", soft_wrap=True)
     by_reason: Dict[str, List[str]] = {}
-    for what, reason in plan.not_released:
+    for what, reason in (*plan.not_released, *drawn.left_out):
         by_reason.setdefault(reason, []).append(what)
     for reason, items in by_reason.items():
         say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
