@@ -177,6 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Snowflake OpenTofu provider is held below 2.24.** Version 2.24 changed the preview
+  `snowflake_table` resource, and forge does not emit those changes yet, so a fresh workspace
+  failed `tofu validate` on any Snowflake table with columns. The provider now resolves to
+  2.23.x.
 - **`fluid profile --request` names every ask it does not form.** A profile request can ask for a
   table's date pairs and calendar, a workload, a relationship's dates and exposure, and the
   consumers' queries. The request was read whole and the asks it did not form were dropped without a

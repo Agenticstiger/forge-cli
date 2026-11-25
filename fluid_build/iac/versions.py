@@ -27,7 +27,11 @@ REQUIRED_TOFU_VERSION = ">= 1.12"
 PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     "google": {"source": "hashicorp/google", "version": "~> 6.0"},
     "aws": {"source": "hashicorp/aws", "version": "~> 6.0"},
-    "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.23"},
+    # Held below 2.24: that release changed the preview ``snowflake_table``
+    # resource (``column.nullable`` became ``column.not_null``), which the
+    # plugin does not emit yet. Moving to 2.24 changes the emitter and this pin
+    # together.
+    "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.23.0"},
     # Confluent Cloud — Tableflow (managed Kafka→Iceberg) + Glue catalog /
     # provider integration. The managed control plane owns compaction +
     # snapshot-expiry (RFC-streaming-extension §15).
