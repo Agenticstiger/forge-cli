@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through
+  `runpy` and marks a run FAILED on any `SystemExit`, code 0 included, so a build that wrote its
+  rows still ended `FAILED: SystemExit: 0` and `fluid apply --mode amend-and-build` reported it
+  failed. The runner now returns normally on success and exits only with a failure's code. EMR
+  runs are unchanged.
+
 ## [0.41.0] — 2026-11-25
 
 ### Added
