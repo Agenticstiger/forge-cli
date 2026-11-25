@@ -147,7 +147,7 @@ def _refusal(call: Callable[[], Any]) -> str:
         result = call()
     except Exception as exc:  # noqa: BLE001 - the type is the assertion
         return type(exc).__name__
-    pytest.fail(f"returned instead of refusing: {result!r}")
+    raise AssertionError(f"returned instead of refusing: {result!r}")
 
 
 def _sample_ids(state, attrs) -> List[int]:

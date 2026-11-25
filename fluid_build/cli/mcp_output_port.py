@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Tuple
 
 from ._common import CLIError, load_contract_with_overlay
 
@@ -930,6 +930,8 @@ def _row_filter_gate_unsatisfiable(
         if row_filter_predicate(expose, {}, dialect=registered_driver_name(expose)) is None:
             return None
     except RowFilterIdentityMissing:
+        # Every filter applies once a request names a principal; whether a request can
+        # carry a verified one is checked below.
         pass
     except Exception as exc:  # noqa: BLE001 - every other failure refuses every call
         return (
