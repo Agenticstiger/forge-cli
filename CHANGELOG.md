@@ -420,26 +420,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that restricts columns or filters rows, `other.customers` was read as the exposed table, so the
   caller saw its filtered rows under another table's name. A read now names the table unqualified
   or as the expose binds it. On DuckDB an unqualified binding's schema is `main` and its catalog is
-  the database the binding opens: `memory`, or the database file's name without its extension.
+  the database the binding opens: `memory`, or the database file's name up to its first dot.
 - **More Postgres functions are refused on every expose: those that read server files, the
   write-ahead log or logical-decoding changes, or touch the session, sequences, locks or other
   sessions.** `query_sql`, contract expressions and the drivers' statement guard refuse
-  `pg_read_*`, `pg_ls_*`, `pg_file_*`, `lo_*`, `pg_get_wal*`, `pg_logical*`, `pg_create_*`,
-  `pg_advisory*`, `pg_sleep*`, `current_setting`, `nextval`, `setval`, `pg_relation_filepath`,
-  `pg_cancel_backend`, `pg_terminate_backend` and `pg_reload_conf`. A role allowed to call the
-  file and write-ahead-log readers reads the rows a row filter withholds.
+  `pg_read_*`, `pg_ls_*`, `pg_file_*`, the large-object functions, `pg_get_wal*`, `pg_logical*`,
+  `pg_create_*`, `pg_advisory*`, `pg_try_advisory*`, `pg_sleep*`, `current_setting`, `nextval`,
+  `setval`, `currval`, `pg_relation_filepath`, `pg_cancel_backend`, `pg_terminate_backend`,
+  `pg_reload_conf`, `pg_switch_wal`, `pg_notify` and the replication-slot functions. A role allowed
+  to call the file and write-ahead-log readers reads the rows a row filter withholds.
 - **The Postgres driver refuses to serve an expose with row filters as a privileged role.** At
   connect it checks whether the role is a superuser or a member of `pg_read_server_files`,
   `pg_write_server_files`, `pg_execute_server_program` or `pg_monitor`. If it is, every read of an
-  expose with row filters is refused with that reason, and any other expose logs a warning.
+  expose with row filters is refused with that reason, and any other expose logs a warning. A
+  connection is kept only once its check has passed, so a check that failed runs again.
 - **On an expose with row filters, `query_sql` calls only listed functions and keeps its conditions
-  to comparisons.** A caller a filter narrows may use aggregates, window functions and the common
-  conditional, math, string, date, conversion, JSON and array functions, unqualified or under
-  `pg_catalog`; any other function is refused. A WHERE or JOIN condition may only compare columns
-  and literals (`=`, `<>`, `<`, `>`, `IN`, `BETWEEN`, `IS`, `LIKE`, `EXISTS`). An engine can
-  evaluate a condition on a row the filter removes, so a cast, a division or a function that fails
-  there would tell the caller the row exists; a value a subquery computes is refused for the same
-  reason. A reader no filter narrows is not limited.
+  to comparisons.** A caller a filter narrows may use aggregates, window functions and each
+  engine's common conditional, math, string, date, conversion, JSON and array functions, unqualified
+  or under `pg_catalog`; any other function, a function another schema qualifies, and
+  `OPERATOR(...)` are refused. A WHERE, JOIN, HAVING or QUALIFY condition may only compare columns
+  with constants or other columns (`=`, `<>`, `<`, `>`, `IN`, `BETWEEN`, `IS`, `LIKE`, `EXISTS`).
+  A constant may be a literal, a cast or an interval of one, or the current date or time, and
+  HAVING and QUALIFY may also use aggregates and window functions. Where the contract declares
+  column types, a string column is compared only with strings. An engine can evaluate a condition
+  on a row the filter removes, so a cast, a division or a function that fails there would tell the
+  caller the row exists; a value a subquery computes is refused for the same reason. A reader no
+  filter narrows is not limited, and the `query_sql` tool's description now states these limits.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -643,11 +649,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
   read the name as a string. Write the column name bare.
 - **A caller a row filter narrows writes `query_sql` conditions as comparisons.** Compare columns
-  with literals in WHERE and JOIN conditions, and compute values (casts, arithmetic, functions) in
-  the outer select list; only listed functions may be called.
+  with constants in WHERE, JOIN, HAVING and QUALIFY conditions, compare a declared string column
+  only with strings, and compute values (casts, arithmetic, functions) in the outer select list;
+  only listed functions may be called.
 - **sqlglot 30.1 or newer is required.** 26.16 and older record no identifier positions, so the MCP
   output port refused every row filter on them, and releases before 30.1 refuse some valid
-  `query_sql` reads on an expose with row filters (an `EXISTS` subquery, for one).
+  `query_sql` reads on an expose with row filters (a DuckDB `EXISTS (FROM ...)` subquery, for one).
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so

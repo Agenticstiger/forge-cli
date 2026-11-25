@@ -29,6 +29,7 @@ statement guard, so the filter has to hold in the SQL itself.
 from __future__ import annotations
 
 import logging
+import re
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
@@ -1292,3 +1293,145 @@ def test_a_withheld_row_that_would_make_a_condition_fail_changes_nothing(con):
             assert _free_form(with_trap, sql, _as(EU)) == _free_form(con, sql, _as(EU)), sql
     finally:
         with_trap.close()
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        ("postgres", "SELECT id FROM customers WHERE amount >= 5::bigint"),
+        ("postgres", "SELECT id FROM customers WHERE amount > CAST('5' AS INT)"),
+        ("postgres", "SELECT id FROM customers WHERE id = ANY(ARRAY[1, 3])"),
+        ("postgres", "SELECT id FROM customers WHERE segment <> ALL(ARRAY['x'])"),
+        ("duckdb", "SELECT id FROM customers WHERE now() - INTERVAL '1 day' < now()"),
+        ("duckdb", "SELECT segment, count(*) FROM customers GROUP BY segment HAVING count(*) > 1"),
+        (
+            "duckdb",
+            "SELECT id FROM customers QUALIFY row_number() OVER (PARTITION BY segment ORDER BY id) = 1",
+        ),
+        ("duckdb", "SELECT count(*) FILTER (WHERE CAST(amount AS INT) > 5) FROM customers"),
+    ],
+)
+def test_constants_aggregates_and_windows_are_allowed_in_conditions(dialect, sql):
+    """A constant has the same value on every row, and an aggregate or a window function
+    in HAVING or QUALIFY, or an aggregate's FILTER, is a value of the kept rows."""
+    assert "_fluid_rows.region = 'EU'" in _compile_for(sql, dialect=dialect).sql
+
+
+@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery", "databricks"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT segment FROM customers GROUP BY segment HAVING CAST(segment AS INT) = 1",
+        "SELECT id FROM customers QUALIFY CAST(segment AS INT) = row_number() OVER (ORDER BY id)",
+    ],
+    ids=["having", "qualify"],
+)
+def test_having_and_qualify_are_fenced_like_a_where(sql, dialect):
+    """A HAVING or QUALIFY term over a plain column is a WHERE an optimizer may push down."""
+    with pytest.raises(query_compiler.QueryValidationError, match="filters with"):
+        _compile_for(sql, dialect=dialect)
+
+
+def _typed() -> Dict[str, Any]:
+    expose = _expose()
+    types = {"id": "integer", "amount": "integer", "secret": "string", "segment": "varchar(20)"}
+    expose["contract"]["schema"] = [
+        {"name": name, **({"type": types[name]} if name in types else {})} for name in _COLUMNS
+    ]
+    return expose
+
+
+@pytest.mark.parametrize(
+    ("sql", "refused"),
+    [
+        ("SELECT id FROM customers WHERE secret = 5", True),
+        ("SELECT id FROM customers WHERE segment IN (1, 2)", True),
+        ("SELECT id FROM customers WHERE secret BETWEEN 1 AND 5", True),
+        ("SELECT id FROM customers WHERE secret = 5::bigint", True),
+        ("SELECT id FROM customers AS a, customers AS b WHERE a.secret = b.amount", True),
+        ("SELECT id FROM customers WHERE secret = '5'", False),
+        ("SELECT id FROM customers WHERE amount = 5 AND amount <> '6'", False),
+        ("SELECT id FROM customers WHERE region = 5", False),
+    ],
+)
+def test_a_declared_string_column_is_compared_only_with_strings(sql, refused):
+    """The engine would cast every row's value of the string column, and fail on a
+    withheld one. ``region`` declares no type, so nothing is known about it."""
+
+    def compile_it():
+        return query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=10,
+            expose=_typed(),
+            caller_attributes=_as(EU),
+            dialect="snowflake",
+        )
+
+    if refused:
+        with pytest.raises(query_compiler.QueryValidationError, match="a string column"):
+            compile_it()
+    else:
+        compile_it()
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        (
+            "postgres",
+            "SELECT to_date(segment, 'YYYY'), random(), cardinality(ARRAY[1]) FROM customers",
+        ),
+        ("bigquery", "SELECT SAFE_DIVIDE(amount, 2), ARRAY_LENGTH([1]) FROM customers"),
+        ("snowflake", "SELECT TO_NUMBER(segment), PARSE_JSON(segment) FROM customers"),
+        (
+            "databricks",
+            "SELECT to_date(segment), date_add(segment, 1), size(array(1)) FROM customers",
+        ),
+        ("duckdb", "SELECT strlen(segment), quarter(DATE '2024-01-01'), typeof(id) FROM customers"),
+    ],
+)
+def test_the_common_functions_of_each_engine_are_listed(dialect, sql):
+    assert "_fluid_rows.region = 'EU'" in _compile_for(sql, dialect=dialect).sql
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql", "named"),
+    [
+        ("postgres", "SELECT current_user FROM customers", "CURRENT_USER"),
+        ("postgres", "SELECT x.pg_catalog.age(region) FROM customers", "x.pg_catalog.age"),
+        (
+            "postgres",
+            "SELECT amount OPERATOR(public.+) 1 FROM customers",
+            "amount OPERATOR(public.+)",
+        ),
+    ],
+)
+def test_a_refusal_names_what_the_caller_wrote(dialect, sql, named):
+    with pytest.raises(query_compiler.QueryValidationError, match=rf"calls {re.escape(named)}"):
+        _compile_for(sql, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    ("sql", "refused"),
+    [
+        ("SELECT id FROM data.main.customers", False),
+        ('SELECT id FROM "data.v1".main.customers', True),
+    ],
+)
+def test_duckdb_names_a_database_file_up_to_its_first_dot(sql, refused):
+    def compile_it():
+        return query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=10,
+            expose=_bound_to("/data/data.v1.duckdb"),
+            caller_attributes=_as(EU),
+            dialect="duckdb",
+        )
+
+    if refused:
+        with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
+            compile_it()
+    else:
+        compile_it()

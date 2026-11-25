@@ -62,7 +62,7 @@ from __future__ import annotations
 import functools
 import re
 from dataclasses import dataclass, field
-from pathlib import PurePath
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
@@ -1908,7 +1908,9 @@ _DEFAULT_SCHEMA = {"duckdb": "main"}
 
 # Functions sqlglot leaves unparsed (``exp.Anonymous``) in some dialect that a statement on
 # an expose with row filters may still call, beside the listed typed ones.
-_ANONYMOUS_ALLOWED = frozenset({"age", "date_part", "now", "regexp_matches"})
+_ANONYMOUS_ALLOWED = frozenset(
+    {"age", "all", "any", "date_part", "now", "regexp_matches", "some", "strlen"}
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1954,6 +1956,13 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.Ln,
         exp.Log,
         exp.Sign,
+        exp.Trunc,
+        exp.Cbrt,
+        exp.Degrees,
+        exp.Radians,
+        exp.Pi,
+        exp.Rand,
+        exp.SafeDivide,
         # string
         exp.Lower,
         exp.Upper,
@@ -1973,6 +1982,19 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.RegexpReplace,
         exp.RegexpExtract,
         exp.MD5,
+        exp.SHA,
+        exp.SHA2,
+        exp.SHA2Digest,
+        exp.Hex,
+        exp.Repeat,
+        exp.Reverse,
+        exp.StartsWith,
+        exp.EndsWith,
+        exp.Contains,
+        exp.Ascii,
+        exp.Chr,
+        exp.Translate,
+        exp.Levenshtein,
         # date and time
         exp.Extract,
         exp.TimestampTrunc,
@@ -1988,17 +2010,59 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.Month,
         exp.Day,
         exp.DayOfWeek,
+        exp.DayOfMonth,
+        exp.DayOfYear,
+        exp.Week,
+        exp.WeekOfYear,
+        exp.Quarter,
+        exp.Hour,
+        exp.Minute,
+        exp.Second,
         exp.Date,
+        exp.DateFromParts,
+        exp.DateStrToDate,
+        exp.StrToDate,
+        exp.StrToTime,
+        exp.TimeStrToTime,
+        exp.TimeToTimeStr,
+        exp.TsOrDsToDate,
+        exp.TsOrDsAdd,
+        exp.UnixToTime,
+        exp.TimeToUnix,
+        exp.UnixDate,
+        exp.LastDay,
+        exp.AddMonths,
+        exp.MonthsBetween,
+        exp.TimestampAdd,
+        exp.TimestampSub,
+        exp.TimestampDiff,
+        exp.DatetimeAdd,
+        exp.DatetimeSub,
+        exp.DatetimeDiff,
+        exp.CurrentTime,
         # conversion, JSON and arrays
         exp.Cast,
         exp.TryCast,
+        exp.ToNumber,
+        exp.ToDouble,
+        exp.Typeof,
         exp.JSONExtract,
         exp.JSONExtractScalar,
         exp.JSONBExtract,
         exp.JSONBExtractScalar,
+        exp.ParseJSON,
+        exp.JSONFormat,
         exp.Array,
+        exp.ArraySize,
+        exp.ArrayContains,
+        exp.ArrayToString,
+        exp.ArrayDistinct,
+        exp.ArraySort,
+        exp.ArrayConcat,
         exp.Explode,
         exp.Unnest,
+        exp.GenerateSeries,
+        exp.Struct,
         # a predicate over a subquery, which sqlglot models as a function
         exp.Exists,
     )
@@ -2011,7 +2075,7 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
     return classes, frozenset(names | _ANONYMOUS_ALLOWED)
 
 
-def _refuse_unlisted_functions(tree: Any) -> None:
+def _refuse_unlisted_functions(tree: Any, read: Optional[str] = None) -> None:
     """Refuse a call to a function :func:`_allowed_functions` does not list. A call that
     names a schema is refused unless the schema is ``pg_catalog``: any other could hold a
     function of an allowed name that reads anything. The deny-list of
@@ -2022,16 +2086,22 @@ def _refuse_unlisted_functions(tree: Any) -> None:
     for func in tree.find_all(exp.Func):
         if isinstance(func, exp.Anonymous):
             parent = func.parent
-            schema = (
-                parent.this.name
-                if isinstance(parent, exp.Dot) and parent.expression is func
-                else ""
+            qualifier = (
+                parent.this if isinstance(parent, exp.Dot) and parent.expression is func else None
             )
-            if (schema and schema.casefold() != "pg_catalog") or func.name.casefold() not in names:
-                written = f"{schema}.{func.name}" if schema else func.name
+            # One qualifier, and only pg_catalog: ``x.pg_catalog.f`` names another
+            # database's schema on some engines.
+            plain = qualifier is None or (
+                isinstance(qualifier, exp.Identifier) and qualifier.name.casefold() == "pg_catalog"
+            )
+            if not plain or func.name.casefold() not in names:
+                written = func.name if qualifier is None else f"{qualifier.sql()}.{func.name}"
                 raise QueryValidationError(_unlisted_function(written))
         elif not isinstance(func, classes):
-            raise QueryValidationError(_unlisted_function(func.sql_name().lower()))
+            raise QueryValidationError(_unlisted_function(func.sql(dialect=read)[:80]))
+    for operator in tree.find_all(exp.Operator):
+        # ``OPERATOR(schema.op)`` calls the function behind an operator a schema defines.
+        raise QueryValidationError(_unlisted_function(operator.sql(dialect=read)[:80]))
 
 
 def _unlisted_function(name: str) -> str:
@@ -2082,7 +2152,108 @@ def _condition_nodes() -> Tuple[type, ...]:
     )
 
 
-def _refuse_conditions_that_can_fail(tree: Any) -> None:
+# Declared column types that a comparison would cast row by row when the other side is
+# not a string: a string column compared with a number fails on a value such as 'S1'.
+_STRING_TYPE_RE = re.compile(r"(?i)^(?:n?(?:var)?char|character(?: varying)?|string|str|text)\b")
+
+
+def _declared_column_types(expose: Mapping[str, Any]) -> Dict[str, bool]:
+    """``{column name (case-folded): whether its declared type is a string type}`` for
+    every ``contract.schema`` column that declares a type."""
+    found: Dict[str, bool] = {}
+    for column in (expose.get("contract") or {}).get("schema") or []:
+        if isinstance(column, Mapping) and isinstance(column.get("name"), str):
+            declared = column.get("type")
+            if isinstance(declared, str) and declared.strip():
+                found[column["name"].casefold()] = bool(_STRING_TYPE_RE.match(declared.strip()))
+    return found
+
+
+def _refuse_a_casting_comparison(node: Any, string_columns: Mapping[str, bool]) -> None:
+    """Refuse a comparison that would cast a string column row by row: a declared string
+    column against a number or a boolean, or against a column of another declared type."""
+    from sqlglot import exp
+
+    if isinstance(node, exp.In):
+        sides = [node.this, *node.expressions]
+    elif isinstance(node, exp.Between):
+        sides = [node.this, node.args.get("low"), node.args.get("high")]
+    else:
+        sides = [node.this, node.expression]
+
+    def kind(side: Any) -> Optional[str]:
+        if isinstance(side, exp.Column) and side.name.casefold() in string_columns:
+            return "string" if string_columns[side.name.casefold()] else "other"
+        if isinstance(side, exp.Literal):
+            return "string" if side.is_string else "other"
+        if isinstance(side, (exp.Boolean, exp.Neg)):
+            return "other"
+        if isinstance(side, (exp.Cast, exp.TryCast)) and side.find(exp.Column) is None:
+            return "string" if side.to.is_type(*exp.DataType.TEXT_TYPES) else "other"
+        return None
+
+    kinds = {kind(side) for side in sides} - {None}
+    columns = [s for s in sides if isinstance(s, exp.Column) and kind(s) == "string"]
+    if columns and kinds == {"string", "other"}:
+        raise QueryValidationError(
+            f"sql compares {columns[0].sql()!r}, a string column, with a value of another "
+            "type; on an expose with row filters write the value as a string literal (the "
+            "engine would cast every row's value, and fail on a withheld one)."
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def _constant_nodes() -> Tuple[type, ...]:
+    """What a constant in a condition may be built from: a literal, a cast or an interval
+    of one, the current date or time, ARRAY[...] of them, and + or - between them. A
+    constant has the same value on every row, so evaluating it early on a row the filter
+    removes tells the caller nothing."""
+    from sqlglot import exp
+
+    return (
+        exp.Literal,
+        exp.Null,
+        exp.Boolean,
+        exp.Neg,
+        exp.Paren,
+        exp.Cast,
+        exp.TryCast,
+        exp.DataType,
+        exp.DataTypeParam,
+        exp.Interval,
+        exp.Var,
+        exp.CurrentDate,
+        exp.CurrentTimestamp,
+        exp.CurrentTime,
+        exp.Array,
+        exp.Tuple,
+        exp.Add,
+        exp.Sub,
+        exp.Anonymous,
+    )
+
+
+def _is_constant(node: Any) -> bool:
+    """Whether ``node`` is a constant :func:`_constant_nodes` builds, reading no column."""
+    from sqlglot import exp
+
+    allowed = _constant_nodes()
+    for part in node.walk():
+        if not isinstance(part, allowed):
+            return False
+        if isinstance(part, exp.Anonymous) and part.name.casefold() not in {
+            "now",
+            "all",
+            "any",
+            "some",
+        }:
+            return False
+    return True
+
+
+def _refuse_conditions_that_can_fail(
+    tree: Any, string_columns: Optional[Mapping[str, bool]] = None, read: Optional[str] = None
+) -> None:
     """Refuse what a planner could evaluate on a row the row filter removes and that could
     fail there, so that an error would tell the caller the row exists.
 
@@ -2097,17 +2268,42 @@ def _refuse_conditions_that_can_fail(tree: Any) -> None:
 
     allowed = _condition_nodes()
     subqueries = (exp.Subquery, exp.Select, exp.SetOperation)
-    conditions = [where.this for where in tree.find_all(exp.Where)]
-    conditions += [join.args["on"] for join in tree.find_all(exp.Join) if join.args.get("on")]
-    for condition in conditions:
-        for node in condition.walk(prune=lambda n: isinstance(n, subqueries)):
-            if isinstance(node, subqueries):
+    comparisons = (
+        exp.EQ,
+        exp.NEQ,
+        exp.GT,
+        exp.GTE,
+        exp.LT,
+        exp.LTE,
+        exp.NullSafeEQ,
+        exp.NullSafeNEQ,
+        exp.In,
+        exp.Between,
+    )
+    # A HAVING or QUALIFY term over a plain column is a WHERE an optimizer may push down;
+    # its aggregates and window functions are values of the rows the filter keeps.
+    # An aggregate's own FILTER (WHERE ...) is part of the aggregate: it sees kept rows.
+    conditions = [
+        (where.this, ())
+        for where in tree.find_all(exp.Where)
+        if not isinstance(where.parent, exp.Filter)
+    ]
+    conditions += [(join.args["on"], ()) for join in tree.find_all(exp.Join) if join.args.get("on")]
+    conditions += [
+        (node.this, (exp.AggFunc, exp.Window)) for node in tree.find_all(exp.Having, exp.Qualify)
+    ]
+    for condition, kept in conditions:
+        stops = subqueries + kept
+        for node in condition.walk(prune=lambda n: isinstance(n, stops) or _is_constant(n)):
+            if isinstance(node, stops) or _is_constant(node):
                 continue
+            if isinstance(node, comparisons):
+                _refuse_a_casting_comparison(node, string_columns or {})
             if not isinstance(node, allowed) or (
                 isinstance(node, exp.Neg) and not isinstance(node.this, exp.Literal)
             ):
                 raise QueryValidationError(
-                    f"sql filters with {node.sql()[:80]!r}; on an expose with row filters a "
+                    f"sql filters with {node.sql(dialect=read)[:80]!r}; on an expose with row filters a "
                     "condition compares columns and literals with =, <>, <, >, IN, BETWEEN, IS "
                     "and LIKE (an engine may evaluate it on a row the filter removes, where "
                     "anything that can fail would tell the caller the row exists)."
@@ -2122,7 +2318,7 @@ def _refuse_conditions_that_can_fail(tree: Any) -> None:
                 inner, (exp.Column, exp.Star, exp.Literal, exp.Null, exp.Boolean, exp.Window)
             ) and not isinstance(inner, exp.AggFunc):
                 raise QueryValidationError(
-                    f"sql computes {value.sql()[:80]!r} in a subquery; on an expose with row "
+                    f"sql computes {value.sql(dialect=read)[:80]!r} in a subquery; on an expose with row "
                     "filters a subquery, a derived table or a CTE selects columns, literals, "
                     "aggregates and window functions, and the computing happens in the "
                     "outer select."
@@ -2148,14 +2344,17 @@ def _outermost_selects(tree: Any) -> List[Any]:
 
 
 def duckdb_catalog(expose: Mapping[str, Any]) -> str:
-    """The catalog DuckDB gives the database a binding opens: the stem of
-    ``binding.location.dbFile`` (``warehouse`` for ``warehouse.duckdb``), or ``memory``
-    when the binding opens none, as the DuckDB driver does."""
+    """The catalog DuckDB gives the database a binding opens: the file name of
+    ``binding.location.dbFile`` up to its first dot (``warehouse`` for
+    ``warehouse.duckdb``), or ``memory`` when the binding opens none, as the DuckDB
+    driver opens it."""
     binding = expose.get("binding") if isinstance(expose, Mapping) else None
     location = binding.get("location") if isinstance(binding, Mapping) else None
     db_file = location.get("dbFile") if isinstance(location, Mapping) else None
     if isinstance(db_file, str) and db_file and db_file != ":memory:":
-        return PurePath(db_file).stem
+        # The driver opens the resolved path, and DuckDB names a database after its
+        # file name up to the first dot (``data`` for ``data.v1.duckdb``).
+        return Path(db_file).expanduser().resolve().name.split(".", 1)[0]
     return "memory"
 
 
@@ -2266,6 +2465,7 @@ def _project_exposed_table(
     dialect: Optional[str],
     predicate: Optional[str] = None,
     catalog: str = "",
+    string_columns: Optional[Mapping[str, bool]] = None,
 ) -> str:
     """Rewrite caller SQL so every read of the exposed table goes through a projection
     of the ``allowed`` columns, limited to the rows ``predicate`` selects.
@@ -2312,8 +2512,8 @@ def _project_exposed_table(
     if predicate is not None:
         # A filtered caller: only listed functions, and nothing a planner could run on a
         # row the filter removes that would fail there.
-        _refuse_unlisted_functions(tree)
-        _refuse_conditions_that_can_fail(tree)
+        _refuse_unlisted_functions(tree, read)
+        _refuse_conditions_that_can_fail(tree, string_columns, read)
     exposed_name = exposed.name.casefold()
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
     _refuse_another_schemas_table(tables, exposed, read, catalog)
@@ -2450,7 +2650,7 @@ def compile_free_form_sql(
             "server (table_to_xml, query_to_xml, cursor_to_xml, schema_to_xml, "
             "database_to_xml, ts_stat, ts_rewrite, connectby, crosstab, dblink, pgstattuple, "
             "pg_stat_*, pgrowlocks, get_raw_page and the other pageinspect functions, "
-            "pg_read_*, pg_ls_*, lo_*, pg_get_wal_*, pg_logical_*, pg_cursor, "
+            "pg_read_*, pg_ls_*, the lo_ functions, pg_get_wal_*, pg_logical_*, pg_cursor, "
             "pg_prepared_statement, set_config, current_setting, nextval, setval, pg_sleep, "
             "pg_advisory_* and their variants), name the pg_cursors or pg_prepared_statements "
             'views, or write a name or a string with Unicode escapes (U&"..."). Select the '
@@ -2505,6 +2705,7 @@ def compile_free_form_sql(
             dialect=dialect,
             predicate=row_predicate,
             catalog=duckdb_catalog(expose),
+            string_columns=_declared_column_types(expose),
         )
     # Append the server-side cap, but only when the caller didn't already supply a
     # trailing ``LIMIT <n>`` (a second one is a syntax error on most engines).

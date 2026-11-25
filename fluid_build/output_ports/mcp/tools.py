@@ -160,8 +160,14 @@ _QUERY_SQL_SCHEMA: Dict[str, Any] = {
                 "the body, rejects references to restricted/PII columns, and, "
                 "when the contract declares row filters (policy.authz.rowFilters), "
                 "reads the table only through the rows your verified principal "
-                "may read, wherever the statement reads it. Refused unless the "
-                "server was started with --allow-sql."
+                "may read, wherever the statement reads it. A caller the row "
+                "filters narrow may call only common aggregate, window, "
+                "conditional, math, string, date, conversion, JSON and array "
+                "functions, writes WHERE, ON, HAVING and QUALIFY conditions as "
+                "comparisons (=, <>, <, >, IN, BETWEEN, IS, LIKE, EXISTS) of "
+                "columns with constants, and computes values only in the outer "
+                "select list. Refused unless the server was started with "
+                "--allow-sql."
             ),
         },
         "limit": _LIMIT_PROP,
@@ -203,7 +209,9 @@ OUTPUT_PORT_TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
         description=(
             "Run caller-supplied SELECT SQL against the bound expose. "
             "Available only when the server is started with --allow-sql. "
-            "Refuses any statement that references a restricted column."
+            "Refuses any statement that references a restricted column; on an "
+            "expose with row filters, a narrowed caller's functions and "
+            "conditions are limited (see the sql argument)."
         ),
         requires_sql_allowlist=True,
         input_schema=_QUERY_SQL_SCHEMA,
