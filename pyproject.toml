@@ -86,7 +86,11 @@ dependencies = [
   # forge/core/validators.py and the from_ddl parser. (providers/_sql_safety.py
   # does not use it.)
   # Borrowed-not-built per /borrow-before-build: https://github.com/tobymao/sqlglot
-  "sqlglot>=25.0",
+  # 26.20 is the oldest release run and found to apply a row filter. 26.16 and older
+  # record no identifier positions, which the gateway needs to qualify a predicate's
+  # columns, so they refuse every row filter (26.17 to 26.19 add the positions but were
+  # not run).
+  "sqlglot>=26.20",
   # Bitol-vendor-listed Python library for ODCS v3.1.0. Provides typed
   # Pydantic v2 models + ``from_file()`` / ``to_yaml()`` for lossless
   # ODCS YAML I/O. Maintained by the ``datacontract`` org (same folks
