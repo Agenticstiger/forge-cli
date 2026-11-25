@@ -27,8 +27,7 @@ ALLOWLIST = "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST"
 def _contract(tmp_path: Path, *, host: str, ref: str) -> Path:
     path = tmp_path / "contract.fluid.yaml"
     path.write_text(
-        textwrap.dedent(
-            f"""\
+        textwrap.dedent(f"""\
             fluidVersion: "0.7.7"
             kind: DataProduct
             id: ci.secret_check
@@ -46,8 +45,7 @@ def _contract(tmp_path: Path, *, host: str, ref: str) -> Path:
                       database: app
                       user: app
                       secretRef: {ref}
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     return path

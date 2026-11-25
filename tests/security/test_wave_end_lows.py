@@ -295,28 +295,24 @@ def _job(source: str) -> Any:
     ],
 )
 def test_the_spark_settings_shapes_are_read_for_the_default_checkpoint(settings: str) -> None:
-    facts = _job(
-        f"""
+    facts = _job(f"""
         from pyspark import SparkConf
         from pyspark.sql import SparkSession
         conf = {settings}
         spark = SparkSession.builder.getOrCreate()
         spark.readStream.table("a.b").writeStream.toTable("a.c")
-        """
-    )
+        """)
     assert [w.checkpoint for w in facts.writes] == ["s3a://b/ckpt"]
 
 
 def test_a_credential_setting_is_never_kept() -> None:
-    facts = _job(
-        """
+    facts = _job("""
         from pyspark import SparkConf
         conf = SparkConf().setAll([("spark.hadoop.fs.s3a.secret.key", "HUNTER2VALUE")])
         spark2 = SparkSession.builder.config(key="spark.hadoop.fs.s3a.secret.key",
                                              value="HUNTER2VALUE").getOrCreate()
         spark2.readStream.table("a.b").writeStream.toTable("a.c")
-        """
-    )
+        """)
     assert "HUNTER2VALUE" not in repr(facts.__dict__)
     assert [w.checkpoint for w in facts.writes] == [None]
 

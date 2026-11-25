@@ -88,8 +88,7 @@ def test_a_classic_dag_with_spark_submit_tasks():
 
 
 def test_airflow_3_spellings_and_the_dag_decorator():
-    found = dags(
-        """
+    found = dags("""
         from airflow.sdk import dag, task
         from airflow.providers.standard.operators.bash import BashOperator
 
@@ -107,8 +106,7 @@ def test_airflow_3_spellings_and_the_dag_decorator():
             submit >> check()
 
         etl_flow()
-        """
-    )
+        """)
     (dag,) = found.dags
     assert (dag.dag_id, dag.schedule_kind, dag.schedule, dag.owner) == (
         "etl_flow",
@@ -134,8 +132,7 @@ def test_a_dag_decorator_function_never_called_is_not_a_dag_airflow_creates():
 
 
 def test_an_aliased_import_is_still_seen():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG as AirflowDag
         from airflow.providers.apache.spark.operators import spark_submit as ss
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator as Go
@@ -143,8 +140,7 @@ def test_an_aliased_import_is_still_seen():
         with AirflowDag("aliased") as d:
             Go(task_id="a", application="/j/a.py")
             ss.SparkSubmitOperator(task_id="b", application="/j/b.py")
-        """
-    )
+        """)
     assert [(t.task_id, t.submits[0].script) for t in dag.tasks] == [
         ("a", "/j/a.py"),
         ("b", "/j/b.py"),
@@ -152,14 +148,12 @@ def test_an_aliased_import_is_still_seen():
 
 
 def test_a_class_that_only_has_an_airflow_looking_name_is_not_an_operator():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from acme.ops import SparkSubmitOperator
         with DAG("d"):
             SparkSubmitOperator(task_id="mine", application="/j/a.py")
-        """
-    )
+        """)
     assert dag.tasks == []
 
 
@@ -180,8 +174,7 @@ def test_the_conventions_can_map_a_project_operator_to_a_known_kind():
 
 
 def test_emr_add_steps_and_create_job_flow():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator, EmrCreateJobFlowOperator
 
@@ -204,8 +197,7 @@ def test_emr_add_steps_and_create_job_flow():
                 job_flow_overrides={"Name": "c", "Steps": [STEPS[0]]},
             )
             from_file = EmrAddStepsOperator(task_id="file", job_flow_id="j-1", steps="steps.json")
-        """
-    )
+        """)
     add, create, from_file = dag.tasks
     assert [(s.runtime, s.script, s.args) for s in add.submits] == [
         ("emr-step", "s3://code/jobs/orders.py", ("--day", "2026-01-01")),
@@ -217,8 +209,7 @@ def test_emr_add_steps_and_create_job_flow():
 
 
 def test_emr_on_eks_and_serverless_job_drivers():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.providers.amazon.aws.operators.emr import EmrContainerOperator, EmrServerlessStartJobOperator
 
@@ -233,8 +224,7 @@ def test_emr_on_eks_and_serverless_job_drivers():
                 application_id="app",
                 job_driver={"sparkSubmit": {"entryPoint": "s3://code/b.py", "entryPointArguments": ["--y"]}},
             )
-        """
-    )
+        """)
     eks, srv = dag.tasks
     assert [(s.runtime, s.script, s.args) for s in eks.submits] == [
         ("emr-eks", "s3://code/a.py", ("--x", "1"))
@@ -245,8 +235,7 @@ def test_emr_on_eks_and_serverless_job_drivers():
 
 
 def test_glue_and_databricks_submits():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
         from airflow.providers.databricks.operators.databricks import DatabricksSubmitRunOperator
@@ -255,8 +244,7 @@ def test_glue_and_databricks_submits():
             GlueJobOperator(task_id="glue", job_name="j", script_location="s3://code/g.py", script_args={"--a": "1", "--b": "2"})
             DatabricksSubmitRunOperator(task_id="dbx", spark_python_task={"python_file": "dbfs:/jobs/d.py", "parameters": ["p"]})
             DatabricksSubmitRunOperator(task_id="dbx2", json={"spark_python_task": {"python_file": "dbfs:/jobs/e.py"}})
-        """
-    )
+        """)
     glue, dbx, dbx2 = dag.tasks
     assert [(s.runtime, s.script, s.args) for s in glue.submits] == [
         ("glue", "s3://code/g.py", ("--a", "1", "--b", "2"))
@@ -268,8 +256,7 @@ def test_glue_and_databricks_submits():
 
 
 def test_bash_submits_only_when_the_command_is_a_spark_submit_of_a_python_script():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
         with DAG("b"):
@@ -278,8 +265,7 @@ def test_bash_submits_only_when_the_command_is_a_spark_submit_of_a_python_script
             BashOperator(task_id="c", bash_command="dbt run")
             BashOperator(task_id="d", bash_command=f"spark-submit {unknown}/d.py --x")
             BashOperator(task_id="e", bash_command="spark-submit 'unbalanced")
-        """
-    )
+        """)
     by_id = {t.task_id: t.submits for t in dag.tasks}
     assert by_id["a"][0].script == "/j/a.py" and by_id["a"][0].args == ("x",)
     assert by_id["b"][0].script is None and "no Python script" in by_id["b"][0].why
@@ -291,29 +277,25 @@ def test_bash_submits_only_when_the_command_is_a_spark_submit_of_a_python_script
 
 
 def test_a_script_with_a_jinja_field_is_kept_and_marked():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
         with DAG("t"):
             SparkSubmitOperator(task_id="a", application="{{ var.value.jobs }}/a.py")
-        """
-    )
+        """)
     (submit,) = dag.tasks[0].submits
     assert submit.script == "{{ var.value.jobs }}/a.py" and submit.templated
 
 
 def test_a_script_that_is_not_a_constant_is_unresolved_with_its_reason():
-    dag = one(
-        """
+    dag = one("""
         import os
         from airflow import DAG
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
         with DAG("t"):
             SparkSubmitOperator(task_id="a", application=Variable.get("job"))
             SparkSubmitOperator(task_id="b")
-        """
-    )
+        """)
     first, second = (t.submits[0] for t in dag.tasks)
     assert first.script is None and "call to" in first.why
     assert second.script is None and second.why == "no script is named"
@@ -375,8 +357,7 @@ def test_a_dag_id_that_is_not_a_constant_is_noted_and_not_read_further():
 
 
 def test_dags_and_operators_built_in_loops_and_factories():
-    found = dags(
-        """
+    found = dags("""
         from airflow import DAG
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
@@ -399,8 +380,7 @@ def test_dags_and_operators_built_in_loops_and_factories():
         for q in ["p"]:
             with DAG("in_loop"):
                 pass
-        """
-    )
+        """)
     by_id = {d.shown: d for d in found.dags}
     assert any("built by the function make()" in n for n in by_id["name"].notes)
     assert by_id["name"].dag_id is None
@@ -413,8 +393,7 @@ def test_dags_and_operators_built_in_loops_and_factories():
 
 
 def test_dynamic_mapping_and_chain_over_a_list_are_noted():
-    found = dags(
-        """
+    found = dags("""
         from airflow import DAG
         from airflow.models.baseoperator import chain
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
@@ -422,8 +401,7 @@ def test_dynamic_mapping_and_chain_over_a_list_are_noted():
             a = SparkSubmitOperator(task_id="a", application="/j/a.py")
             SparkSubmitOperator.partial(task_id="p", application="/j/p.py").expand(application_args=[["1"], ["2"]])
             chain(*tasks)
-        """
-    )
+        """)
     (dag,) = found.dags
     mapped = next(t for t in dag.tasks if t.task_id == "p")
     assert mapped.submits[0].script == "/j/p.py"
@@ -432,19 +410,16 @@ def test_dynamic_mapping_and_chain_over_a_list_are_noted():
 
 
 def test_dag_factory_files_are_noted_not_read():
-    found = dags(
-        """
+    found = dags("""
         import dagfactory
         factory = dagfactory.DagFactory("config.yml")
         dagfactory.load_yaml_dags(globals_dict=globals(), config_filepath="config.yml")
-        """
-    )
+        """)
     assert not found.dags and any("dag-factory" in n for n in found.notes)
 
 
 def test_an_operator_outside_any_dag_is_noted():
-    found = dags(
-        """
+    found = dags("""
         from airflow import DAG
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
         with DAG("a"):
@@ -452,8 +427,7 @@ def test_an_operator_outside_any_dag_is_noted():
         with DAG("b"):
             pass
         SparkSubmitOperator(task_id="stray", application="/j/s.py")
-        """
-    )
+        """)
     assert all(not d.tasks for d in found.dags)
     assert any("outside any DAG" in n for n in found.notes)
 
@@ -467,8 +441,7 @@ def test_a_file_without_a_dag_has_none():
 
 
 def test_every_dependency_spelling():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.models.baseoperator import chain, cross_downstream
         from airflow.operators.bash import BashOperator
@@ -489,8 +462,7 @@ def test_every_dependency_spelling():
             g.set_upstream(f)
             chain(g, h)
             BashOperator(task_id="i", bash_command="x") >> BashOperator(task_id="j", bash_command="x")
-        """
-    )
+        """)
     assert edges(dag) == sorted(
         [
             ("a", "b"),
@@ -507,8 +479,7 @@ def test_every_dependency_spelling():
 
 
 def test_cross_downstream_and_a_parenthesised_chain():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.models.baseoperator import cross_downstream
         from airflow.operators.bash import BashOperator
@@ -518,11 +489,9 @@ def test_cross_downstream_and_a_parenthesised_chain():
             c = BashOperator(task_id="c", bash_command="x")
             d = BashOperator(task_id="d", bash_command="x")
             cross_downstream([a, b], [c, d])
-        """
-    )
+        """)
     assert edges(dag) == [("a", "c"), ("a", "d"), ("b", "c"), ("b", "d")]
-    nested = one(
-        """
+    nested = one("""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
         with DAG("deps3"):
@@ -530,14 +499,12 @@ def test_cross_downstream_and_a_parenthesised_chain():
             b = BashOperator(task_id="b", bash_command="x")
             c = BashOperator(task_id="c", bash_command="x")
             a >> (b >> c)
-        """
-    )
+        """)
     assert edges(nested) == [("a", "c"), ("b", "c")]
 
 
 def test_two_dags_in_one_file_keep_their_tasks_and_edges_apart():
-    found = dags(
-        """
+    found = dags("""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
         with DAG("one") as one_dag:
@@ -546,8 +513,7 @@ def test_two_dags_in_one_file_keep_their_tasks_and_edges_apart():
             a >> b
         two = DAG("two")
         c = BashOperator(task_id="c", bash_command="x", dag=two)
-        """
-    )
+        """)
     first, second = found.dags
     assert [t.task_id for t in first.tasks] == ["a", "b"] and edges(first) == [("a", "b")]
     assert [t.task_id for t in second.tasks] == ["c"] and second.edges == []
@@ -559,8 +525,7 @@ def test_two_dags_in_one_file_keep_their_tasks_and_edges_apart():
 def test_airflow_is_never_imported_and_the_file_never_runs(tmp_path):
     before, inside, after = (tmp_path / name for name in ("before", "inside", "after"))
     sys.modules.pop("airflow", None)
-    found = dags(
-        f"""
+    found = dags(f"""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
         open({str(before)!r}, "w").write("x")
@@ -569,8 +534,7 @@ def test_airflow_is_never_imported_and_the_file_never_runs(tmp_path):
             BashOperator(task_id="t", bash_command="rm -rf /")
         open({str(after)!r}, "w").write("x")
         raise SystemExit(2)
-        """
-    )
+        """)
     assert [d.dag_id for d in found.dags] == ["d"]
     assert not (before.exists() or inside.exists() or after.exists())
     assert "airflow" not in sys.modules
@@ -580,14 +544,12 @@ def test_airflow_is_never_imported_and_the_file_never_runs(tmp_path):
 
 
 def bash_submits(command: str):
-    dag = one(
-        f"""
+    dag = one(f"""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
         with DAG("b"):
             BashOperator(task_id="t", bash_command={command!r})
-        """
-    )
+        """)
     return dag.tasks[0].submits
 
 
@@ -690,15 +652,13 @@ def test_a_shell_variable_as_the_script_is_not_a_constant():
 
 
 def test_a_field_that_did_not_fold_is_a_hole_the_rest_of_the_command_is_still_read():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
         with DAG("b"):
             BashOperator(task_id="a", bash_command=f"spark-submit --master {master} /jobs/main.py --day {day}")
             BashOperator(task_id="b", bash_command=f"spark-submit {script} --x")
-        """
-    )
+        """)
     first, second = (t.submits[0] for t in dag.tasks)
     assert (first.script, first.args) == ("/jobs/main.py", ("--day", "<not constant>"))
     assert first.command == "spark-submit --master {master} /jobs/main.py --day {day}"
@@ -707,31 +667,27 @@ def test_a_field_that_did_not_fold_is_a_hole_the_rest_of_the_command_is_still_re
 
 
 def test_a_command_the_file_does_not_define_but_that_mentions_spark_submit_is_reported():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.operators.bash import BashOperator
         with DAG("b"):
             BashOperator(task_id="a", bash_command=build("spark-submit"))
             BashOperator(task_id="b", bash_command=build("dbt"))
-        """
-    )
+        """)
     first, second = (t.submits for t in dag.tasks)
     assert len(first) == 1 and first[0].script is None
     assert second == []
 
 
 def test_an_emr_step_skips_option_values_too():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
         STEPS = [{"Name": "s", "HadoopJarStep": {"Jar": "command-runner.jar",
                   "Args": ["spark-submit", "--py-files", "s3://code/deps.py", "--deploy-mode", "cluster", "s3://code/main.py", "x"]}}]
         with DAG("e"):
             EmrAddStepsOperator(task_id="add", job_flow_id="j", steps=STEPS)
-        """
-    )
+        """)
     (submit,) = dag.tasks[0].submits
     assert (submit.script, submit.args) == ("s3://code/main.py", ("x",))
 
@@ -767,8 +723,7 @@ def test_a_wide_cross_dependency_is_read_in_bounded_time_and_capped():
 
 
 def test_a_dependency_written_twice_is_recorded_once():
-    dag = one(
-        """
+    dag = one("""
         from airflow import DAG
         from airflow.operators.empty import EmptyOperator
         with DAG("d"):
@@ -777,14 +732,12 @@ def test_a_dependency_written_twice_is_recorded_once():
             a >> b
             b << a
             a.set_downstream(b)
-        """
-    )
+        """)
     assert edges(dag) == [("a", "b")]
 
 
 def test_a_task_group_in_a_dependency_is_said_to_be_unread_and_the_rest_still_linked():
-    found = dags(
-        """
+    found = dags("""
         from airflow import DAG
         from airflow.utils.task_group import TaskGroup
         from airflow.operators.empty import EmptyOperator
@@ -795,8 +748,7 @@ def test_a_task_group_in_a_dependency_is_said_to_be_unread_and_the_rest_still_li
                 inner = EmptyOperator(task_id="inner")
             start >> work >> end
             start >> end
-        """
-    )
+        """)
     assert edges(found.dags[0]) == [("start", "end")]
     notes = [n for n in found.notes if "a dependency on `work`" in n]
     assert len(notes) == 1 and notes[0].startswith("dag.py:")
@@ -816,8 +768,7 @@ def test_unread_dependencies_are_a_few_notes_and_a_count_not_one_per_operand():
 
 
 def test_an_edge_label_is_not_a_task_and_does_not_cut_the_dependency():
-    found = dags(
-        """
+    found = dags("""
         from airflow import DAG
         from airflow.utils.edgemodifier import Label
         from airflow.operators.empty import EmptyOperator
@@ -826,8 +777,7 @@ def test_an_edge_label_is_not_a_task_and_does_not_cut_the_dependency():
             b = EmptyOperator(task_id="b")
             c = EmptyOperator(task_id="c")
             a >> Label("ok") >> b >> Label("then") >> c
-        """
-    )
+        """)
     assert edges(found.dags[0]) == [("a", "b"), ("b", "c")]
     assert not [n for n in found.notes if "Label" in n]
 

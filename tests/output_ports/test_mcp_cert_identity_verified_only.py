@@ -239,8 +239,7 @@ def _write_contract(tmp_path: Path, *, cn_filter: bool) -> Path:
         "customer_id,segment\nC0001,enterprise\nC0002,smb\nC0003,consumer\n",
         encoding="utf-8",
     )
-    text = textwrap.dedent(
-        """\
+    text = textwrap.dedent("""\
         fluidVersion: "0.7.4"
         kind: DataProduct
         id: silver.demo.customer_segments_v1
@@ -261,8 +260,7 @@ def _write_contract(tmp_path: Path, *, cn_filter: bool) -> Path:
               platform: local
               format: csv
               location: { path: ./customers.csv, table: customer_segments }
-        """
-    )
+        """)
     if cn_filter:
         text += (
             "    policy:\n"

@@ -201,15 +201,13 @@ def load(text: str) -> C.Conventions:
 
 
 def test_the_variables_of_the_selected_environment_are_kept():
-    conv = load(
-        """
+    conv = load("""
         environment: prod
         environments: {prod: {ENV: prod}}
         airflow_variables:
           prod: {environment: prod, prefix: ""}
           dev: {environment: dev}
-        """
-    )
+        """)
     assert dict(conv.airflow_variables) == {"environment": "prod", "prefix": ""}
     assert dict(conv.variables) == {"ENV": "prod"}
 
@@ -310,8 +308,7 @@ def test_a_variable_read_through_star_arguments_is_not_read(call):
 def test_a_template_is_filled_only_where_airflow_renders_one():
     module = parse_module(
         "dag.py",
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             from airflow import DAG
             from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
@@ -328,8 +325,7 @@ def test_a_template_is_filled_only_where_airflow_renders_one():
                     application="s3://{{ var.value.env }}/job.py",
                     application_args=["--env", "{{ var.value.env }}"],
                 )
-            """
-        ).encode("utf-8"),
+            """).encode("utf-8"),
     )
     folder = Folder(module, airflow_variables={"env": "prod", "cron": "0 1 * * *", "own": "alice"})
     dag = read_dags(module, folder).dags[0]
@@ -432,14 +428,12 @@ def test_an_environment_value_with_a_credential_name_is_not_substituted():
 
 
 def test_only_the_selected_environment_is_judged():
-    conv = load(
-        """
+    conv = load("""
         environment: dev
         airflow_variables:
           prod: {db_password: Q1, region: eu}
           dev: {region: us}
-        """
-    )
+        """)
     assert dict(conv.airflow_variables) == {"region": "us"} and conv.withheld == ()
 
 

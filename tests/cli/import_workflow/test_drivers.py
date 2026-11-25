@@ -31,19 +31,16 @@ DRIVER = {
 
 
 def spark_job(table: str) -> str:
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
         from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.getOrCreate()
         spark.table("raw.{table}").write.saveAsTable("silver.{table}")
-        """
-    ).lstrip("\n")
+        """).lstrip("\n")
 
 
 def dag_source(args: str = '["--job-list", "silver", "--run-date", "{{ ds }}"]') -> str:
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
         from airflow import DAG
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
@@ -53,8 +50,7 @@ def dag_source(args: str = '["--job-list", "silver", "--run-date", "{{ ds }}"]')
                 application="s3://code/pkg/driver.py",
                 application_args={args},
             )
-        """
-    ).lstrip("\n")
+        """).lstrip("\n")
 
 
 def conventions(**driver: Any) -> str:
@@ -501,8 +497,7 @@ def test_a_script_that_is_no_driver_is_matched_as_before(tmp_path, monkeypatch):
 
 
 def two_tasks(args_a: str, args_b: str = '["--job-list", "silver"]') -> str:
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
         from airflow import DAG
         from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
@@ -512,8 +507,7 @@ def two_tasks(args_a: str, args_b: str = '["--job-list", "silver"]') -> str:
             second = SparkSubmitOperator(
                 task_id="second", application="s3://code/pkg/driver.py", application_args={args_b})
             first >> second
-        """
-    ).lstrip("\n")
+        """).lstrip("\n")
 
 
 def test_two_tasks_that_name_one_list_say_a_missing_job_once(tmp_path, monkeypatch):

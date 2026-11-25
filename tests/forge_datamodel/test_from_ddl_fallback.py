@@ -47,15 +47,13 @@ class TestFallbackColumnParsing:
 
     def test_basic_columns_with_inline_primary_key(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE orders (
                 order_id VARCHAR(64) PRIMARY KEY,
                 customer_id VARCHAR(64) NOT NULL,
                 order_total DECIMAL(18,2)
             );
-            """
-        )
+            """)
         assert len(tables) == 1
         table = tables[0]
         assert table.name == "orders"
@@ -70,14 +68,12 @@ class TestFallbackColumnParsing:
 
     def test_varchar_length_qualifier(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE labels (
                 label VARCHAR(128),
                 code CHAR(3)
             );
-            """
-        )
+            """)
         cols = {c.name: c for c in tables[0].columns}
         assert cols["label"].logical_type == "VARCHAR"
         assert cols["label"].qualifiers["length"] == 128
@@ -85,14 +81,12 @@ class TestFallbackColumnParsing:
 
     def test_decimal_precision_and_scale_qualifiers(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE metrics (
                 amount DECIMAL(18,4),
                 ratio NUMERIC(9)
             );
-            """
-        )
+            """)
         cols = {c.name: c for c in tables[0].columns}
         assert cols["amount"].qualifiers["precision"] == 18
         assert cols["amount"].qualifiers["scale"] == 4
@@ -101,28 +95,24 @@ class TestFallbackColumnParsing:
 
     def test_array_nested_type_qualifier(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE events (
                 event_id VARCHAR(32),
                 tags ARRAY<STRING>
             );
-            """
-        )
+            """)
         tags = {c.name: c for c in tables[0].columns}["tags"]
         assert tags.logical_type == "ARRAY"
         assert tags.qualifiers["nested_type"] == "STRING"
 
     def test_inline_dash_comment_is_captured(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE accounts (
                 account_id VARCHAR(32),  -- the natural key
                 status STRING
             );
-            """
-        )
+            """)
         cols = {c.name: c for c in tables[0].columns}
         assert cols["account_id"].comment == "the natural key"
         assert cols["status"].comment is None
@@ -140,28 +130,24 @@ class TestFallbackTableLevelKeys:
 
     def test_table_level_primary_key(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE customers (
                 customer_id VARCHAR(64),
                 customer_name STRING,
                 PRIMARY KEY (customer_id)
             );
-            """
-        )
+            """)
         assert tables[0].primary_keys == ["customer_id"]
 
     def test_named_constraint_composite_primary_key(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE line_items (
                 order_id VARCHAR(64),
                 line_no VARCHAR(8),
                 CONSTRAINT pk_line_items PRIMARY KEY (order_id, line_no)
             );
-            """
-        )
+            """)
         assert tables[0].primary_keys == ["order_id", "line_no"]
         # The CONSTRAINT line is not mistaken for a column.
         assert [c.name for c in tables[0].columns] == ["order_id", "line_no"]
@@ -172,14 +158,12 @@ class TestFallbackTableShapes:
 
     def test_partition_and_cluster_lines_are_skipped(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE t (
                 id VARCHAR(16),
                 CLUSTER BY (id)
             );
-            """
-        )
+            """)
         assert [c.name for c in tables[0].columns] == ["id"]
 
     def test_schema_qualified_name_reduced_to_simple(self, monkeypatch):
@@ -196,8 +180,7 @@ class TestFallbackTableShapes:
 
     def test_multiple_tables_in_one_script(self, monkeypatch):
         parser = _fallback_parser(monkeypatch)
-        tables = parser.parse_ddl_content(
-            """
+        tables = parser.parse_ddl_content("""
             CREATE TABLE a (
                 a_id VARCHAR(8)
             );
@@ -205,8 +188,7 @@ class TestFallbackTableShapes:
                 b_id VARCHAR(8),
                 label STRING
             );
-            """
-        )
+            """)
         assert [t.name for t in tables] == ["a", "b"]
         assert [c.name for c in tables[1].columns] == ["b_id", "label"]
 

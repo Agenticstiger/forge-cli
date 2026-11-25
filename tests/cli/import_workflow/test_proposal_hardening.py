@@ -320,15 +320,13 @@ def test_a_dag_id_that_does_not_match_is_recorded_and_said_once_for_all_its_jobs
     )
     (tmp_path / "dags").mkdir()
     (tmp_path / "dags" / "bad.py").write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             from airflow import DAG
             from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
             with DAG("Bad DAG Id") as dag:
                 SparkSubmitOperator(task_id="Bad Task", application="jobs/one.py")
                 SparkSubmitOperator(task_id="Bad Task Two", application="jobs/two.py")
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     contracts, report = propose(tmp_path, dags=str(tmp_path / "dags"))
@@ -729,14 +727,12 @@ def test_a_task_that_submits_one_job_twice_is_one_entry_on_the_build(tmp_path, m
     write(tmp_path, {"jobs/ok.py": 'df.write.saveAsTable("retail.out")\n'})
     (tmp_path / "dags").mkdir()
     (tmp_path / "dags" / "twice.py").write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             from airflow import DAG
             from airflow.operators.bash import BashOperator
             with DAG("twice"):
                 BashOperator(task_id="t", bash_command="spark-submit jobs/ok.py --a 1; spark-submit jobs/ok.py --a 2")
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     (contract,), report = propose(tmp_path, dags=str(tmp_path / "dags"))
@@ -1186,14 +1182,12 @@ def test_the_trigger_of_a_build_is_the_trigger_of_the_outputs_it_owns(tmp_path, 
     monkeypatch.chdir(tmp_path)
     write(
         tmp_path,
-        {
-            "jobs/mixed.py": """
+        {"jobs/mixed.py": """
             spark = SparkSession.builder.getOrCreate()
             spark.readStream.table("s.a").writeStream.trigger(availableNow=True).toTable("a.once")
             spark.readStream.table("s.b").writeStream.trigger(processingTime="1 minute").toTable("a.live")
             spark.table("s.c").write.saveAsTable("a.batch")
-            """
-        },
+            """},
     )
     contracts, _ = propose(tmp_path)
     kinds = {

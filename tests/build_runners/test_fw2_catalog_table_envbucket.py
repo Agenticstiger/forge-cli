@@ -200,8 +200,7 @@ def test_glue_with_an_unresolved_template_is_unchanged(unset):
     assert iceberg_sink_preflight(contract, "ingest") is None
 
 
-_CONTRACT_YAML = (
-    """\
+_CONTRACT_YAML = """\
 fluidVersion: 0.7.6
 kind: DataProduct
 domain: sales
@@ -245,9 +244,7 @@ builds:
       deployment:
         mode: bring-your-own
         server_url: http://c:8083
-"""
-    % _VAR
-)
+""" % _VAR
 
 
 @pytest.mark.parametrize("value", [None, "", "acme-lake"], ids=["unset", "empty", "set"])

@@ -33,8 +33,7 @@ DSN = "postgresql://reader:dsn-password-9c2e@db.example.com/crm"  # pragma: allo
 def _contract(tmp_path: Path, ref: str) -> Path:
     path = tmp_path / "contract.fluid.yaml"
     path.write_text(
-        textwrap.dedent(
-            f"""\
+        textwrap.dedent(f"""\
             fluidVersion: "0.7.7"
             kind: DataProduct
             id: ci.no_echo
@@ -52,8 +51,7 @@ def _contract(tmp_path: Path, ref: str) -> Path:
                       database: crm
                       user: reader
                       secretRef: "{ref}"
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     return path

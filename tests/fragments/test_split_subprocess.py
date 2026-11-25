@@ -90,8 +90,7 @@ def make_trees(tmp_path: Path, files: Dict[str, str] = FILES) -> "tuple[Path, Pa
 
 # ── I-31 ────────────────────────────────────────────────────────────────
 
-_NO_RUAMEL = textwrap.dedent(
-    """
+_NO_RUAMEL = textwrap.dedent("""
     import sys
 
     # Block ruamel: any import of it now raises ImportError.
@@ -119,8 +118,7 @@ _NO_RUAMEL = textwrap.dedent(
     assert not leaked(), leaked()
     print("FLUID_BUILD_FILE=" + fluid_build.__file__)
     sys.exit(rc)
-    """
-)
+    """)
 
 
 @pytest.mark.parametrize(
@@ -161,14 +159,12 @@ def test_i31_importing_the_split_modules_leaves_ruamel_unimported_even_when_it_i
     None
 ):
     """Not blocked: if ruamel is installed, the split path still must not pull it in."""
-    code = textwrap.dedent(
-        """
+    code = textwrap.dedent("""
         import sys
         import fluid_build.cli.split, fluid_build.cli._split_text, fluid_build.cli.forge_contract_fragments
         from fluid_build.cli import main
         assert not [m for m in sys.modules if m == "ruamel" or m.startswith("ruamel.")]
-        """
-    )
+        """)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FLUID_", "PYTHON"))}
     env["PYTHONPATH"] = str(REPO)
 
@@ -241,16 +237,14 @@ def test_i39_split_help_in_a_real_process_lists_the_parts(tmp_path: Path) -> Non
 
 # ── I-18: an extension validator sees a block that moved to a file ──────
 
-_VALIDATOR = textwrap.dedent(
-    """
+_VALIDATOR = textwrap.dedent("""
     def validate(extensions, errors):
         acme = extensions.get("acme")
         if not isinstance(acme, dict):
             errors.append("acme block missing")
         elif acme.get("region") != "eu":
             errors.append("region must be eu, got %r" % (acme.get("region"),))
-    """
-)
+    """)
 
 _EXTENSION_CONTRACT = """\
 fluidVersion: "0.7.6"

@@ -39,35 +39,27 @@ def why(value: Any) -> str:
 
 
 def test_a_list_added_to_in_a_straight_line_folds_to_the_whole_of_it():
-    value = fold(
-        """
+    value = fold("""
         ARGS = ["spark-submit"]
         ARGS += ["--deploy-mode", "cluster"]
         ARGS += ["job.py"] + ["--date", "d"]
         x = ARGS
-        """
-    )
+        """)
     assert value == ["spark-submit", "--deploy-mode", "cluster", "job.py", "--date", "d"]
     assert value.complete
 
 
 def test_a_string_added_to_in_a_straight_line_folds_to_the_whole_of_it():
-    assert (
-        fold(
-            """
+    assert fold("""
             NAME = "spark-submit"
             NAME += " --deploy-mode cluster"
             NAME += f" {'job'}.py"
             x = NAME
-            """
-        )
-        == "spark-submit --deploy-mode cluster job.py"
-    )
+            """) == "spark-submit --deploy-mode cluster job.py"
 
 
 def test_a_loop_over_the_items_of_a_dict_adds_once_per_item_in_order():
-    value = fold(
-        """
+    value = fold("""
         CFG = {"A": "1", "B": "2"}
         ARGS = ["start"]
         for k, v in CFG.items():
@@ -75,8 +67,7 @@ def test_a_loop_over_the_items_of_a_dict_adds_once_per_item_in_order():
             ARGS += ["-x"]
         ARGS += ["end"]
         x = ARGS
-        """
-    )
+        """)
     assert value == ["start", "--conf", "A=1", "-x", "--conf", "B=2", "-x", "end"]
     assert value.complete
 
@@ -92,43 +83,35 @@ def test_a_loop_over_the_items_of_a_dict_adds_once_per_item_in_order():
     ],
 )
 def test_a_loop_goes_through_the_keys_values_or_items_that_fold(iterable, expected):
-    value = fold(
-        f"""
+    value = fold(f"""
         CFG = {{"A": "1", "B": "2"}}
         OUT = []
         for item in {iterable}:
             OUT += [item]
         x = OUT
-        """
-    )
+        """)
     assert value == expected
 
 
 def test_nested_loops_and_a_target_of_a_pair():
-    value = fold(
-        """
+    value = fold("""
         PAIRS = [("a", 1), ("b", 2)]
         OUT = []
         for name, n in PAIRS:
             for suffix in ["x", "y"]:
                 OUT += [f"{name}{n}{suffix}"]
         x = OUT
-        """
-    )
+        """)
     assert value == ["a1x", "a1y", "b2x", "b2y"]
 
 
 def test_the_loop_variable_is_still_not_a_constant_outside_the_loop():
-    assert "loop variable" in why(
-        fold(
-            """
+    assert "loop variable" in why(fold("""
             OUT = []
             for k in ["a"]:
                 OUT += [k]
             x = k
-            """
-        )
-    )
+            """))
 
 
 def test_a_name_read_before_the_last_statement_is_not_whole_yet():
@@ -145,16 +128,14 @@ def test_a_name_read_before_the_last_statement_is_not_whole_yet():
 def test_a_name_read_in_a_function_sees_the_whole_of_it():
     module = parse_module(
         "m.py",
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             ARGS = ["a"]
 
             def f():
                 return ARGS
 
             ARGS += ["b"]
-            """
-        ).encode("utf-8"),
+            """).encode("utf-8"),
     )
     folder = Folder(module)
     function = next(n for n in module.tree.body if isinstance(n, ast.FunctionDef))
@@ -199,43 +180,37 @@ def test_a_name_with_no_assignment_before_its_additions_is_not_folded():
 
 
 def test_an_addition_that_does_not_fold_leaves_the_list_incomplete():
-    value = fold(
-        """
+    value = fold("""
         import os
         ARGS = ["a"]
         ARGS += [os.environ["NOPE"]]
         ARGS += unknown()
         ARGS += ["c"]
         x = ARGS
-        """
-    )
+        """)
     assert value.complete is False
     assert value[0] == "a" and value[-1] == "c"
     assert isinstance(value[1], Unresolved)
 
 
 def test_a_loop_over_something_that_does_not_fold_leaves_the_list_incomplete():
-    value = fold(
-        """
+    value = fold("""
         ARGS = ["a"]
         for k in unknown():
             ARGS += [k]
         x = ARGS
-        """
-    )
+        """)
     assert value == ["a"] and value.complete is False
 
 
 def test_a_loop_over_a_dict_with_a_spread_that_does_not_fold_is_incomplete():
-    value = fold(
-        """
+    value = fold("""
         CFG = {"A": "1", **other()}
         ARGS = []
         for k in CFG:
             ARGS += [k]
         x = ARGS
-        """
-    )
+        """)
     assert value.complete is False
 
 
@@ -255,27 +230,23 @@ def test_a_name_that_adds_to_itself_does_not_loop():
 
 def test_the_loop_is_bounded(monkeypatch):
     monkeypatch.setattr(_fold, "MAX_LOOP_ITERATIONS", 3)
-    value = fold(
-        """
+    value = fold("""
         OUT = []
         for i in [1, 2, 3, 4, 5]:
             OUT += [i]
         x = OUT
-        """
-    )
+        """)
     assert value == [1, 2, 3] and value.complete is False
 
 
 def test_the_steps_are_bounded(monkeypatch):
     monkeypatch.setattr(_fold, "MAX_RECIPE_STEPS", 4)
-    value = fold(
-        """
+    value = fold("""
         OUT = []
         for i in [1, 2, 3, 4, 5]:
             OUT += [i]
         x = OUT
-        """
-    )
+        """)
     assert "too much work" in why(value)
 
 
@@ -320,14 +291,12 @@ def test_a_loop_with_a_target_that_is_not_names_is_not_folded():
 
 
 def test_a_pair_that_does_not_fit_the_target_leaves_the_list_incomplete():
-    value = fold(
-        """
+    value = fold("""
         OUT = ["a"]
         for k, v in [("x", 1), ("y",)]:
             OUT += [k]
         x = OUT
-        """
-    )
+        """)
     assert value == ["a", "x"] and value.complete is False
 
 
@@ -339,16 +308,14 @@ def test_the_text_a_string_is_built_of_counts_against_the_work_of_the_module(mon
 
 def test_a_list_built_by_additions_is_as_long_as_a_literal_may_be(monkeypatch):
     monkeypatch.setattr(_fold, "MAX_ITEMS", 5)
-    value = fold(
-        """
+    value = fold("""
         OUT = []
         OUT += [1, 2]
         OUT += [3, 4]
         OUT += [5, 6]
         OUT += [7, 8]
         x = OUT
-        """
-    )
+        """)
     assert value == [1, 2, 3, 4, 5] and value.complete is False
 
 
@@ -396,8 +363,7 @@ def test_a_loop_that_binds_its_own_variable_again_is_not_unrolled(rebinding):
 
 
 def test_a_loop_variable_is_not_the_value_of_a_module_constant_of_the_same_spelling():
-    value = fold_in_main(
-        """
+    value = fold_in_main("""
         x = "global"
         CONST = f"{x}/data"
 
@@ -407,55 +373,44 @@ def test_a_loop_variable_is_not_the_value_of_a_module_constant_of_the_same_spell
             for x in ["a", "b"]:
                 ARGS += [CONST]
             OUT = ARGS
-        """
-    )
+        """)
     assert value == ["global/data", "global/data"]
 
 
 def test_a_loop_variable_is_still_the_item_where_the_step_uses_it():
-    value = fold_in_main(
-        """
+    value = fold_in_main("""
         def main():
             ARGS = []
             for x in ["a", "b"]:
                 ARGS += [f"{x}/data"]
             OUT = ARGS
-        """
-    )
+        """)
     assert value == ["a/data", "b/data"]
 
 
 def test_a_list_that_is_another_name_for_one_that_is_added_to_changes_too():
     # ARGS += [...] changes the list BASE names
     assert isinstance(
-        fold(
-            """
+        fold("""
             BASE = ["--a"]
             ARGS = BASE
             ARGS += ["--b"]
             x = BASE
-            """
-        ),
+            """),
         Unresolved,
     )
     # a name made after the last addition only reads the finished list
-    assert (
-        fold(
-            """
+    assert fold("""
         ARGS = ["--a"]
         ARGS += ["--b"]
         BASE = ARGS
         x = BASE
-        """
-        )
-        == ["--a", "--b"]
-    )
+        """) == ["--a", "--b"]
 
 
 def test_a_list_given_to_a_helper_that_adds_to_its_parameter_changes():
     assert isinstance(
-        fold(
-            """
+        fold("""
             def extend(args):
                 args += ["--x"]
 
@@ -463,29 +418,24 @@ def test_a_list_given_to_a_helper_that_adds_to_its_parameter_changes():
             BASE = ["--a"]
             extend(BASE)
             x = BASE
-            """
-        ),
+            """),
         Unresolved,
     )
 
 
 def test_a_set_has_no_order_and_no_duplicates_to_add_or_to_loop_over():
-    added = fold(
-        """
+    added = fold("""
         ARGS = ["--x"]
         ARGS += {"a", "a"}
         x = ARGS
-        """
-    )
+        """)
     assert added == ["--x", "a"] and added.complete is False
-    looped = fold(
-        """
+    looped = fold("""
         ARGS = ["--x"]
         for item in {"a", "b"}:
             ARGS += [item]
         x = ARGS
-        """
-    )
+        """)
     assert looped.complete is False
 
 
@@ -505,8 +455,7 @@ def test_a_loop_whose_body_binds_its_variable_in_a_match_is_not_unrolled(rebindi
 
 
 def test_a_loop_variable_that_a_function_of_the_file_sets_through_global_is_not_the_item():
-    value = fold(
-        """
+    value = fold("""
         ARGS = []
 
 
@@ -519,8 +468,7 @@ def test_a_loop_variable_that_a_function_of_the_file_sets_through_global_is_not_
             f()
             ARGS += [str(i)]
         x = ARGS
-        """
-    )
+        """)
     assert getattr(value, "complete", False) is False or isinstance(value, Unresolved)
 
 

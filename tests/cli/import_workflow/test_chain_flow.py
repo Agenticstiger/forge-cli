@@ -60,22 +60,19 @@ def states(source: str) -> Dict[str, FrozenSet[int]]:
 
 
 def test_a_straight_line_keeps_the_last_assignment():
-    got = states(
-        """
+    got = states("""
         w = base
         use("a")
         w = w.trigger(1)
         use("b")
         w = w.trigger(2)
         use("c")
-        """
-    )
+        """)
     assert got == {"a": {0}, "b": {1}, "c": {2}}
 
 
 def test_an_if_with_an_else_has_either_arm_and_an_if_without_has_the_path_through_none():
-    got = states(
-        """
+    got = states("""
         w = base
         if a:
             w = w.trigger(1)
@@ -85,68 +82,58 @@ def test_an_if_with_an_else_has_either_arm_and_an_if_without_has_the_path_throug
         if b:
             w = w.trigger(3)
         use("one")
-        """
-    )
+        """)
     assert got == {"both": {1, 2}, "one": {1, 2, 3}}
 
 
 def test_a_use_inside_an_arm_has_only_the_state_of_that_arm():
-    got = states(
-        """
+    got = states("""
         w = base
         if a:
             w = w.trigger(1)
             use("in")
         else:
             use("out")
-        """
-    )
+        """)
     assert got == {"in": {1}, "out": {0}}  # the state before the use statement
 
 
 @pytest.mark.parametrize("ender", ["return", "raise ValueError"])
 def test_an_arm_that_ends_does_not_reach_what_follows_the_if(ender):
-    got = states(
-        f"""
+    got = states(f"""
         def f():
             w = base
             if a:
                 w = w.trigger(1)
                 {ender}
             use("after")
-        """
-    )
+        """)
     assert got == {"after": {0}}
 
 
 def test_what_follows_a_return_is_not_reached():
-    got = states(
-        """
+    got = states("""
         def f():
             w = base
             return 1
             use("never")
-        """
-    )
+        """)
     assert got["never"] is None
 
 
 def test_a_loop_may_not_run_and_a_second_pass_sees_what_the_first_left():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             use("top")
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"top": {0, 1}, "after": {0, 1}}
 
 
 def test_a_loop_else_runs_unless_the_loop_breaks():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             if i:
@@ -154,64 +141,54 @@ def test_a_loop_else_runs_unless_the_loop_breaks():
         else:
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1}}  # the path through the break keeps 0
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             pass
         else:
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {1}}  # with no break the else always runs, after no pass or many
 
 
 def test_a_while_loop_is_read_like_a_for_loop():
-    got = states(
-        """
+    got = states("""
         w = base
         while a:
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1}}
 
 
 def test_a_try_body_may_stop_anywhere_and_a_handler_starts_from_what_it_may_have_set():
-    got = states(
-        """
+    got = states("""
         w = base
         try:
             w = w.trigger(1)
         except E:
             use("handler")
         use("after")
-        """
-    )
+        """)
     assert got == {"handler": {0, 1}, "after": {0, 1}}
 
 
 def test_a_handler_may_start_from_a_first_assignment_the_body_makes():
-    got = states(
-        """
+    got = states("""
         try:
             w = base
             w = w.trigger(1)
         except E:
             use("handler")
-        """
-    )
+        """)
     assert got == {"handler": {0, 1}}
 
 
 def test_the_else_of_a_try_runs_after_the_body():
-    got = states(
-        """
+    got = states("""
         w = base
         try:
             pass
@@ -220,40 +197,34 @@ def test_the_else_of_a_try_runs_after_the_body():
         else:
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1}}  # the else after a body that finished, or the handler's 0
 
 
 def test_a_use_in_finally_has_every_way_there():
-    got = states(
-        """
+    got = states("""
         w = base
         try:
             w = w.trigger(1)
         finally:
             use("final")
         use("after")
-        """
-    )
+        """)
     assert got == {"final": {0, 1}, "after": {1}}
 
 
 def test_a_with_body_runs():
-    got = states(
-        """
+    got = states("""
         w = base
         with x:
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {1}}
 
 
 def test_a_match_may_take_no_case():
-    got = states(
-        """
+    got = states("""
         w = base
         match x:
             case 1:
@@ -261,8 +232,7 @@ def test_a_match_may_take_no_case():
             case _:
                 w = w.trigger(2)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1, 2}}
 
 
@@ -274,8 +244,7 @@ def test_a_body_that_costs_too_much_is_not_read(monkeypatch):
 
 
 def test_a_break_takes_what_was_set_before_it_out_of_the_loop():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             w = w.trigger(1)
@@ -283,15 +252,13 @@ def test_a_break_takes_what_was_set_before_it_out_of_the_loop():
                 break
             w = w.trigger(2)
         use("after")
-        """
-    )
+        """)
     # the break leaves 1; a pass that ends leaves 2; no pass leaves 0
     assert got == {"after": {0, 1, 2}}
 
 
 def test_a_continue_ends_the_pass_with_what_was_set_before_it():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             use("top")
@@ -300,27 +267,23 @@ def test_a_continue_ends_the_pass_with_what_was_set_before_it():
                 continue
             w = w.trigger(2)
         use("after")
-        """
-    )
+        """)
     assert got == {"top": {0, 1, 2}, "after": {0, 1, 2}}
 
 
 def test_what_follows_a_break_in_its_block_is_not_reached():
-    got = states(
-        """
+    got = states("""
         w = base
         while True:
             break
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0}}
 
 
 def test_a_break_runs_the_finally_it_leaves():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             try:
@@ -328,14 +291,12 @@ def test_a_break_runs_the_finally_it_leaves():
             finally:
                 w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1}}  # no pass leaves 0; the break went through the finally
 
 
 def test_a_continue_runs_the_finally_it_leaves_and_the_next_pass_starts_after_it():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             use("top")
@@ -344,14 +305,12 @@ def test_a_continue_runs_the_finally_it_leaves_and_the_next_pass_starts_after_it
             finally:
                 w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"top": {0, 1}, "after": {0, 1}}
 
 
 def test_a_break_in_a_handler_runs_the_finally_too():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             try:
@@ -361,14 +320,12 @@ def test_a_break_in_a_handler_runs_the_finally_too():
             finally:
                 w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1}}  # no pass leaves 0; the break in the handler left 1
 
 
 def test_a_break_does_not_run_the_finally_of_a_try_around_its_loop():
-    got = states(
-        """
+    got = states("""
         w = base
         try:
             for i in x:
@@ -377,14 +334,12 @@ def test_a_break_does_not_run_the_finally_of_a_try_around_its_loop():
         finally:
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"between": {0}, "after": {1}}
 
 
 def test_a_finally_that_was_read_is_not_run_by_a_jump_after_its_try():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             try:
@@ -394,14 +349,12 @@ def test_a_finally_that_was_read_is_not_run_by_a_jump_after_its_try():
             w = w.trigger(2)
             break
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 2}}
 
 
 def test_a_jump_in_a_finally_leaves_through_the_ones_outside_it_only():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             try:
@@ -410,14 +363,12 @@ def test_a_jump_in_a_finally_leaves_through_the_ones_outside_it_only():
                 w = w.trigger(1)
                 break
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1}}
 
 
 def test_a_jump_in_a_finally_that_a_jump_runs_does_not_run_it_again():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             try:
@@ -425,14 +376,12 @@ def test_a_jump_in_a_finally_that_a_jump_runs_does_not_run_it_again():
             finally:
                 break
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0}}
 
 
 def test_a_jump_in_nested_finally_bodies_runs_each_once():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             try:
@@ -444,14 +393,12 @@ def test_a_jump_in_nested_finally_bodies_runs_each_once():
             finally:
                 w = w.trigger(2)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 2}}
 
 
 def test_a_jump_through_two_finally_bodies_runs_both_innermost_first():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             try:
@@ -462,14 +409,12 @@ def test_a_jump_through_two_finally_bodies_runs_both_innermost_first():
             finally:
                 w = w.trigger(2)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 2}}
 
 
 def test_a_finally_that_ends_the_path_leaves_nothing_after_the_jump():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             w = w.trigger(1)
@@ -478,14 +423,12 @@ def test_a_finally_that_ends_the_path_leaves_nothing_after_the_jump():
             finally:
                 return
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0}}  # the break never gets out: only the loop that ran no pass
 
 
 def test_a_use_in_finally_has_what_a_handler_that_raises_set():
-    got = states(
-        """
+    got = states("""
         w = base
         try:
             f()
@@ -494,14 +437,12 @@ def test_a_use_in_finally_has_what_a_handler_that_raises_set():
             raise
         finally:
             use("final")
-        """
-    )
+        """)
     assert got == {"final": {0, 1}}
 
 
 def test_a_use_in_finally_has_what_the_else_set():
-    got = states(
-        """
+    got = states("""
         w = base
         try:
             f()
@@ -512,8 +453,7 @@ def test_a_use_in_finally_has_what_the_else_set():
             raise E2
         finally:
             use("final")
-        """
-    )
+        """)
     assert got == {"final": {0, 1}}
 
 
@@ -578,9 +518,7 @@ def test_what_a_body_sets_is_found_once_however_often_the_body_is_read(monkeypat
 
 
 def test_what_a_body_sets_is_found_among_statements_not_expressions(monkeypatch):
-    tree = ast.parse(
-        textwrap.dedent(
-            f"""
+    tree = ast.parse(textwrap.dedent(f"""
             w = base
             try:
                 y = [{", ".join("1" for _ in range(2_000))}]
@@ -588,9 +526,7 @@ def test_what_a_body_sets_is_found_among_statements_not_expressions(monkeypatch)
                 pass
             w = w.trigger(1)
             use("after")
-            """
-        )
-    )
+            """))
     base, setter, use = tree.body[0], tree.body[2], tree.body[3]
     flow = _flow.Flow(base, {id(setter): 1}, {id(use)})
 
@@ -615,8 +551,7 @@ def test_a_body_whose_statements_cost_too_much_to_look_at_is_not_read(monkeypatc
 
 
 def test_a_break_skips_the_else_of_its_loop():
-    got = states(
-        """
+    got = states("""
         w = base
         for i in x:
             w = w.trigger(1)
@@ -624,30 +559,25 @@ def test_a_break_skips_the_else_of_its_loop():
         else:
             w = w.trigger(2)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {1, 2}}  # a pass that breaks leaves 1; no pass runs the else: 2
 
 
 def test_a_with_that_may_swallow_an_exception_may_leave_before_its_body_is_done():
-    got = states(
-        """
+    got = states("""
         w = base
         with contextlib.suppress(E):
             f()
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {0, 1}}
-    got = states(
-        """
+    got = states("""
         w = base
         with open(x):
             w = w.trigger(1)
         use("after")
-        """
-    )
+        """)
     assert got == {"after": {1}}
 
 

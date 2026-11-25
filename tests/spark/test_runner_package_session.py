@@ -193,16 +193,13 @@ def test_past_the_cap_the_dead_letters_land_and_the_output_does_not(
     assert spark.table(OUTPUT).count() == 0
 
 
-WRITES = (
-    JOBS
-    + """
+WRITES = JOBS + """
 
 def writes(spark, context):
     frame = merge_orders(spark, context)
     frame.writeTo(context.output).append()
     return frame
 """
-)
 
 
 def test_a_package_that_writes_is_stopped_and_fails_the_run(
@@ -215,9 +212,7 @@ def test_a_package_that_writes_is_stopped_and_fails_the_run(
     assert not _snapshots(spark, OUTPUT)
 
 
-AROUND = (
-    JOBS
-    + """
+AROUND = JOBS + """
 
 def around(spark, context):
     frame = merge_orders(spark, context)
@@ -228,7 +223,6 @@ def around(spark, context):
     )
     return frame
 """
-)
 
 
 def test_a_commit_made_around_the_runner_fails_the_run(spark, runner_module, tmp_path, monkeypatch):
@@ -241,9 +235,7 @@ def test_a_commit_made_around_the_runner_fails_the_run(spark, runner_module, tmp
     assert "fluid.package.sha256" not in commit["summary"]
 
 
-AT_IMPORT = (
-    JOBS
-    + """
+AT_IMPORT = JOBS + """
 
 from pyspark.sql import SparkSession
 
@@ -253,7 +245,6 @@ SparkSession.getActiveSession().sql(
     "CAST(NULL AS STRING)), CAST(1 AS DECIMAL(18,2)), DATE '2026-11-20'"
 )
 """
-)
 
 
 def test_a_write_the_package_makes_as_it_is_imported_is_stopped(
@@ -324,9 +315,7 @@ def test_the_sql_check_allows_what_spark_parses_as_a_read(spark, runner_module, 
     assert runner_module.sql_write(text) is None
 
 
-MAINTAINED = (
-    JOBS
-    + '''
+MAINTAINED = JOBS + '''
 
 def maintained(spark, context):
     """Table maintenance runs while the package does: a compaction and snapshot expiry."""
@@ -338,7 +327,6 @@ def maintained(spark, context):
     )
     return merge_orders(spark, context)
 '''
-)
 
 
 def test_table_maintenance_during_the_run_is_not_a_write(
@@ -360,14 +348,11 @@ def test_table_maintenance_during_the_run_is_not_a_write(
     assert "replace" in operations  # the compaction ran during the package, and was let be
 
 
-OTHER_SESSION = (
-    JOBS
-    + """
+OTHER_SESSION = JOBS + """
 
 def elsewhere(spark, context):
     return merge_orders(spark.newSession(), context)
 """
-)
 
 
 def test_a_dataframe_of_another_session_is_refused(spark, runner_module, tmp_path, monkeypatch):

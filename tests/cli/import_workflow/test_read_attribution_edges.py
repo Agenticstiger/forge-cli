@@ -351,9 +351,7 @@ def test_a_stream_sink_of_an_unknown_format_that_names_a_topic_is_still_a_write(
 ):
     (tmp_path / "jobs").mkdir()
     (tmp_path / "jobs" / "j.py").write_text(
-        HEAD
-        + textwrap.dedent(
-            """
+        HEAD + textwrap.dedent("""
             import os
 
             FMT = os.environ["SINK_FORMAT"]
@@ -365,8 +363,7 @@ def test_a_stream_sink_of_an_unknown_format_that_names_a_topic_is_still_a_write(
                 .option("checkpointLocation", "/chk/x")
                 .start()
             )
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -393,16 +390,13 @@ def test_a_stream_sink_of_an_unknown_format_with_a_target_option_is_not_taken_fo
 ):
     (tmp_path / "jobs").mkdir()
     (tmp_path / "jobs" / "j.py").write_text(
-        HEAD
-        + textwrap.dedent(
-            f"""
+        HEAD + textwrap.dedent(f"""
             import os
 
             spark.readStream.table("raw.events").writeStream.format(os.environ["F"]).option(
                 "{option}", "x"
             ).start()
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -424,14 +418,11 @@ def test_a_stream_sink_of_an_unknown_format_with_no_target_is_taken_for_a_memory
 ):
     (tmp_path / "jobs").mkdir()
     (tmp_path / "jobs" / "j.py").write_text(
-        HEAD
-        + textwrap.dedent(
-            f"""
+        HEAD + textwrap.dedent(f"""
             import os
 
             spark.readStream.table("raw.events").writeStream.format(os.environ["F"]){options}.start()
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)

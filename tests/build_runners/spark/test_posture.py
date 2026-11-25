@@ -403,7 +403,7 @@ def test_the_caller_policy_grants_the_reads_on_the_cluster():
     actions = aws_identity.caller_actions("emr-ec2")
     for name in ("DescribeCluster", "ListInstanceFleets", "ListInstanceGroups"):
         assert f"elasticmapreduce:{name}" in actions
-    (statement, *_) = aws_identity.caller_document(
+    statement, *_ = aws_identity.caller_document(
         [aws_identity.CallerRun("X", "emr-ec2", "j-ABC", "arn:role", ())],
         account="123456789012",
         region="eu-west-1",

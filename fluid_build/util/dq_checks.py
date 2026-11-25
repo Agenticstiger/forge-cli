@@ -178,7 +178,7 @@ def has_rules(exposes: Sequence[Mapping[str, Any]]) -> bool:
 
 
 def _parts(
-    exposure: Mapping[str, Any]
+    exposure: Mapping[str, Any],
 ) -> Tuple[str, List[Mapping[str, Any]], List[Mapping[str, Any]]]:
     """An expose's id, its named schema columns and its DQ rules."""
     spec = exposure.get("contract")

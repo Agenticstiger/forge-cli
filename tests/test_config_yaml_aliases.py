@@ -550,8 +550,7 @@ def test_anchors_aliases_and_merge_keys_within_the_budget_load_unchanged(checkou
 # first mapping listed wins, the mapping's own keys over all), an inline
 # mapping, a list behind an alias, a merge of a mapping that merges, nested
 # maps, many blocks merging the same anchors, and three levels of nine.
-_MERGES = (
-    """\
+_MERGES = """\
 x-a: &a {timeout: 30, retries: 3, auth: {type: api_key}, tags: [a, b]}
 x-b: &b {timeout: 60, verify: true}
 x-both: &both [*a, *b]
@@ -573,10 +572,7 @@ merge-of-merge:
   <<: [*chained, *b]
   auth: {type: none}
 blocks:
-"""
-    + "".join(f"  b{i}:\n    <<: [*a, *b]\n    own: {i}\n" for i in range(200))
-    + _merge_laughs(3)
-)
+""" + "".join(f"  b{i}:\n    <<: [*a, *b]\n    own: {i}\n" for i in range(200)) + _merge_laughs(3)
 
 
 # ── what a merge key means, whichever PyYAML is installed ────────────────

@@ -53,9 +53,7 @@ TEST_NAME = "fluid_rule"
 MACRO_SENTINEL = "-- managed-by: fluid"
 #: The file the macro is written to, below the project's first macro path.
 MACRO_FILE = "fluid/fluid_rule.sql"
-MACRO = (
-    MACRO_SENTINEL
-    + """
+MACRO = MACRO_SENTINEL + """
 -- Written by `fluid generate dbt-tests`. One generic test for every rule about valid data a
 -- FLUID contract declares (RFC-data-rules.md): each test carries, per adapter type, the query
 -- that counts covered and violating rows, and the predicate that holds when the counts meet
@@ -80,7 +78,6 @@ where not ({{ band }})
 {%- endif %}
 {% endtest %}
 """
-)
 
 _OPERATORS = {
     "mustBe": "=",

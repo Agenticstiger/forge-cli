@@ -7,6 +7,7 @@
 Pattern adapted from `pulumi about -j/--json`.
 Usage: fluid describe --self [--json] | --commands
 """
+
 # ruff: noqa: T201 — this CLI command owns user-facing print() output by design;
 # the canonical migration to console.cprint is tracked separately.
 from __future__ import annotations

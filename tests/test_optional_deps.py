@@ -233,8 +233,7 @@ def test_doctor_shows_the_extra_for_a_missing_optional_runtime(block, cli, top, 
 
 
 def test_doctor_imports_neither_litellm_mcp_nor_openlineage_and_reports_versions(tmp_path):
-    code = textwrap.dedent(
-        """
+    code = textwrap.dedent("""
         import sys
         from fluid_build.cli import main
         for top in ("litellm", "mcp", "openlineage.client"):
@@ -242,8 +241,7 @@ def test_doctor_imports_neither_litellm_mcp_nor_openlineage_and_reports_versions
         main(["doctor", "--verbose"])
         print("IMPORTED=%s" % [t for t in ("litellm", "mcp", "openlineage.client") if t in sys.modules])
         print("NMODS=%d" % len(sys.modules))
-        """
-    )
+        """)
     env = {
         "PATH": "/usr/bin:/bin",
         # the package under test, not whichever copy the interpreter finds first
@@ -303,8 +301,7 @@ def test_mcp_generation_probe_survives_a_missing_sdk(block):
 def test_output_port_server_without_the_sdk_names_the_extra(tmp_path):
     # In a subprocess: importing the package with mcp blocked leaves a stub bound
     # on ``fluid_build.output_ports`` that later in-process tests would patch.
-    code = textwrap.dedent(
-        """
+    code = textwrap.dedent("""
         import sys
         sys.modules["mcp"] = None  # an uninstalled SDK, as the import system sees it
         from fluid_build._optional import MissingOptionalDependency
@@ -313,8 +310,7 @@ def test_output_port_server_without_the_sdk_names_the_extra(tmp_path):
             pkg.OutputPortMcpServer()
         except MissingOptionalDependency as exc:
             print("MSG=" + repr(str(exc)))
-        """
-    )
+        """)
     proc = subprocess.run(
         [sys.executable, "-c", code],
         cwd=tmp_path,

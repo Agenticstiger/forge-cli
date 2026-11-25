@@ -152,7 +152,7 @@ def _forge_args(contract: Dict[str, Any], run_id: str, scheduler_run_id: str) ->
         "FLUID_RELEASE_ID": "v1.4.0",
     }
     stamps = _desired.run_stamps(contract, run_id=run_id, environ=environ, bundle_digest=BUNDLE)
-    (run, *_rest) = _desired.desired_runs(contract, account=ACCOUNT, stamps=stamps)
+    run, *_rest = _desired.desired_runs(contract, account=ACCOUNT, stamps=stamps)
     return run.stamp_args()
 
 

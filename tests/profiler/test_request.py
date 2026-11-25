@@ -355,7 +355,7 @@ def test_each_table_column_and_domain_refusal_has_its_own_code(workspace):
             asked_for.check_tables(request, contract)
         return caught.value.event
 
-    (customers, orders) = asked.tables
+    customers, orders = asked.tables
     ghost = RequestTable("ghost", False, customers.columns)
     assert refuse(Request(None, 16, (ghost,))) == "profile_request_table_not_an_expose"
     column = RequestColumn("area", "category")
@@ -399,7 +399,7 @@ def test_a_listed_column_fluid_profile_does_not_read_is_reported_not_refused(wor
         backend=FakeBackend(),
         request=request,
     )
-    (_, table) = result.tables
+    _, table = result.tables
     assert ("payload", "a nested value has no profile domain") in table.plan.skipped
     assert "payload" not in result.document["tables"]["orders"]["columns"]
 

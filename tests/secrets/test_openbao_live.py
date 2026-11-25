@@ -289,8 +289,7 @@ def test_ship_unwraps_once_for_stage_processes_and_revokes_at_its_end(store, mon
         monkeypatch.delenv(name, raising=False)
     # A stage as ship starts it: a new interpreter with ship's environment, which
     # reads the token from its pipe first, as main() does, then reads the secret.
-    stage = textwrap.dedent(
-        f"""\
+    stage = textwrap.dedent(f"""\
         import os, subprocess, sys
         from fluid_build.secrets._ship_token import take
         take()
@@ -304,8 +303,7 @@ def test_ship_unwraps_once_for_stage_processes_and_revokes_at_its_end(store, mon
         with secret_run("apply"):
             value = resolve_secret("vault://{MOUNT}/{store['path']}#password", host="localhost")
         sys.exit(0 if value.get_secret_value() == {store['v2']!r} else 3)
-        """
-    )
+        """)
     with ship._store_token_for_stages([5, 7]) as token:
         assert token
         env = ship._child_env("live-run", token)
@@ -319,8 +317,7 @@ def test_ship_unwraps_once_for_stage_processes_and_revokes_at_its_end(store, mon
 def test_secrets_check_resolve_reads_no_value(store, operator_token, tmp_path):
     contract = tmp_path / "contract.fluid.yaml"
     contract.write_text(
-        textwrap.dedent(
-            f"""\
+        textwrap.dedent(f"""\
             fluidVersion: "0.7.7"
             kind: DataProduct
             id: ci.secret_check
@@ -338,8 +335,7 @@ def test_secrets_check_resolve_reads_no_value(store, operator_token, tmp_path):
                       database: app
                       user: app
                       secretRef: vault://{MOUNT}/{store['path']}#password
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FLUID_VAULT_",))}

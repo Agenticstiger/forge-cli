@@ -85,12 +85,10 @@ def paths(facts: JobFacts):
 
 
 def test_a_read_whose_path_ends_in_a_run_date_is_the_table_the_rule_gives_it():
-    facts = job(
-        """
+    facts = job("""
 def run(run_date):
     return spark.read.json(f"{LANDING}/orders/dt={run_date}/")
-"""
-    )
+""")
     assert paths(facts) == [("path", "s3://lake/landing/retail/orders")]
     assert facts.notes == []  # it is no longer a table named by a parameter
     assert any("is taken as that table" in remark for remark in facts.remarks)
@@ -128,13 +126,11 @@ def test_a_write_to_a_partition_directory_is_a_write_to_its_table(call):
 
 
 def test_a_path_held_in_a_name_is_rooted_too():
-    facts = job(
-        """
+    facts = job("""
 def run(d):
     where = f"{LANDING}/orders/dt={d}"
     return spark.read.json(where)
-"""
-    )
+""")
     assert paths(facts) == [("path", "s3://lake/landing/retail/orders")]
 
 
@@ -180,25 +176,21 @@ def test_a_path_that_folds_completely_is_not_touched():
 
 
 def test_the_remark_is_made_once_for_a_path_read_twice():
-    facts = job(
-        """
+    facts = job("""
 def run(d):
     a = spark.read.json(f"{LANDING}/orders/dt={d}")
     b = spark.read.json(f"{LANDING}/orders/dt={d}")
-"""
-    )
+""")
     # two lines, two remarks: the line is part of what a person looks for
     assert len(facts.remarks) == 2
     assert len(facts.reads) == 2
 
 
 def test_only_a_path_option_is_rooted_not_any_option():
-    facts = job(
-        """
+    facts = job("""
 def run(d):
     return spark.readStream.format("kafka").option("subscribe", f"{LANDING}/orders/{d}").load()
-"""
-    )
+""")
     assert [r for r in facts.reads if r.kind == "topic" and r.resolved] == []
 
 
@@ -206,13 +198,11 @@ def test_the_remarks_are_bounded(monkeypatch):
     from fluid_build.cli.import_workflow import _spark_io
 
     monkeypatch.setattr(_spark_io, "MAX_NOTES_PER_JOB", 1)
-    facts = job(
-        """
+    facts = job("""
 def run(d):
     a = spark.read.json(f"{LANDING}/orders/dt={d}")
     b = spark.read.json(f"{LANDING}/customers/dt={d}")
-"""
-    )
+""")
     assert len(facts.remarks) == 1 and len(facts.reads) == 2
 
 
