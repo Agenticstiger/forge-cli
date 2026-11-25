@@ -412,6 +412,17 @@ def _links_of(request: Request, relationship: "runner.Relationship") -> List[Req
     ]
 
 
+def _distinct_asks(
+    links: Sequence[RequestRelationship], *picks: Callable[[RequestRelationship], Sequence[Any]]
+) -> List[List[Any]]:
+    """What each of *picks* takes from the links, each value once, in the order listed."""
+    found: List[List[Any]] = [[] for _ in picks]
+    for link in links:
+        for held, pick in zip(found, picks, strict=True):
+            held.extend(value for value in pick(link) if value not in held)
+    return found
+
+
 def relationship_asks(
     request: Request, relationship: "runner.Relationship"
 ) -> Tuple[bool, Tuple[str, ...], Tuple[Tuple[str, str], ...]]:
@@ -422,17 +433,13 @@ def relationship_asks(
     statistics are asked grouped by and *linked* the ``(child column, parent column)`` pairs
     asked, each once, in the order listed.
     """
-    counted = False
-    group_by: List[str] = []
-    linked: List[Tuple[str, str]] = []
-    for each in _links_of(request, relationship):
-        counted = counted or "marginalHistogram/1" in each.statistics
-        group_by.extend(name for name in each.group_by if name not in group_by)
-        linked.extend(
-            pair
-            for pair in ((item.column, item.parent_column) for item in each.linked)
-            if pair not in linked
-        )
+    links = _links_of(request, relationship)
+    counted = any("marginalHistogram/1" in each.statistics for each in links)
+    group_by, linked = _distinct_asks(
+        links,
+        lambda each: each.group_by,
+        lambda each: [(item.column, item.parent_column) for item in each.linked],
+    )
     return counted, tuple(group_by), tuple(linked)
 
 
@@ -445,17 +452,11 @@ def relationship_dates_asks(
     ``(start, end)`` parent lifetimes asked as children per active day (``end`` is ``None`` for a
     lifetime with no end column), each once, in the order listed.
     """
-    dates: List[Tuple[str, str]] = []
-    exposure: List[Tuple[str, Optional[str]]] = []
-    for each in _links_of(request, relationship):
-        dates.extend(
-            pair for pair in ((item.parent, item.child) for item in each.dates) if pair not in dates
-        )
-        exposure.extend(
-            pair
-            for pair in ((item.start, item.end) for item in each.exposure)
-            if pair not in exposure
-        )
+    dates, exposure = _distinct_asks(
+        _links_of(request, relationship),
+        lambda each: [(item.parent, item.child) for item in each.dates],
+        lambda each: [(item.start, item.end) for item in each.exposure],
+    )
     return tuple(dates), tuple(exposure)
 
 
@@ -667,6 +668,20 @@ def _link_not_measured(link: RequestRelationship, *, declared: bool) -> List[Tup
     return found
 
 
+def _binned_why(identifier: str, domain: str, default_ids: Set[str]) -> str:
+    """Why a histogram or quantiles of a column are not in the profile: it gets the other."""
+    other = "quantile/2" if identifier == "marginalHistogram/1" else "marginalHistogram/1"
+    if other not in default_ids:
+        return "it has neither a declared range nor a type that bounds it"
+    if identifier == "marginalHistogram/1":
+        if domain == "timestamp":
+            return _TIMESTAMP_LADDER
+        return "it has no declared range, so it gets quantile/2 on its type's ladder"
+    if domain == "timestamp":
+        return _TIMESTAMP_NEVER_BOTH
+    return "a column gets a histogram or quantiles, never both on one set of bins"
+
+
 def _why(
     identifier: str,
     domain: str,
@@ -691,18 +706,8 @@ def _why(
         return _NO_RECORD_FORMS
     if column in uncovered:
         return uncovered[column]
-    if identifier == "marginalHistogram/1":
-        if "quantile/2" in default_ids:
-            if domain == "timestamp":
-                return _TIMESTAMP_LADDER
-            return "it has no declared range, so it gets quantile/2 on its type's ladder"
-        return "it has neither a declared range nor a type that bounds it"
-    if identifier == "quantile/2":
-        if "marginalHistogram/1" in default_ids:
-            if domain == "timestamp":
-                return _TIMESTAMP_NEVER_BOTH
-            return "a column gets a histogram or quantiles, never both on one set of bins"
-        return "it has neither a declared range nor a type that bounds it"
+    if identifier in ("marginalHistogram/1", "quantile/2"):
+        return _binned_why(identifier, domain, default_ids)
     if identifier == "support/1":
         if "levelHistogram/1" in default_ids:
             return "beside a level histogram it would show which withheld cells hold no record"

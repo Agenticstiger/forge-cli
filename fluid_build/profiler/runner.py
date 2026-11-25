@@ -688,43 +688,40 @@ def profile_expose(
     )
 
 
-def profile_exposes(
+@dataclass(frozen=True)
+class _Planned:
+    """What a profile settles before it reads a record: its plans, blocks and relationships."""
+
+    fact_plans: List["facts.FactPlan"]
+    plans: List[ExposePlan]
+    asked: Dict[str, RequestTable]
+    blocks: Mapping[str, BundleBlock]
+    declared: List[Optional[DeclaredBlock]]
+    uncovered: List[Tuple[Tuple[str, str], ...]]
+    matched: Set[int]
+    relationships: List[Relationship]
+    relationships_left_out: List[Tuple[str, str, str]]
+    held: Dict[str, FrozenSet[str]]
+    unfiltered: Dict[str, Optional[DeclaredBlock]]
+    keys: Dict[str, FrozenSet[str]]
+    fractional_bits: int
+
+
+def _plan_profile(
     contract: Mapping[str, Any],
     exposes: Sequence[ExposeSource],
     *,
     backend: StatisticsBackend,
-    cwd: Optional[Path] = None,
-    rule: disclosure.DisclosureRule = disclosure.ACRO_DEFAULT,
-    producer: Optional[str] = None,
-    fractional_bits: Optional[int] = None,
-    bundles: Optional[Mapping[str, BundleBlock]] = None,
-    request: Optional[Request] = None,
-    row_floor: Optional[int] = None,
-    timings: Optional[StageTimings] = None,
-    strict: bool = False,
-) -> ProfileResult:
-    """Profile each of *exposes* of *contract*, each from its own source, into one document.
+    request: Optional[Request],
+    bundles: Optional[Mapping[str, BundleBlock]],
+    fractional_bits: Optional[int],
+    row_floor: Optional[int],
+    strict: bool,
+) -> _Planned:
+    """Check the call and plan every table, relationship and request ask before a record is read.
 
-    *fractional_bits* is the grid ``mean/1`` is formed on (16 unless given),
-    checked before any record is read; the fidelity block must declare the same
-    (PROFILE-SPEC §7). An expose *bundles* holds a block for also answers that
-    block, on the block's grid (:func:`_declared_block`), and the blocks of one
-    document declare one grid. Every expose's plan and block is checked before any
-    record is read, and each expose's records are read once.
-
-    With a *request* the profile measures what it lists and nothing else
-    (:mod:`fluid_build.profiler.request`); its grid is the profile's. A request of format
-    1-2-0 may also ask rank correlations of column pairs (:mod:`fluid_build.profiler.ranks`;
-    *row_floor*, a count of at least 2, is then written as each one's ``rowFloor``), the
-    columns of a table related in pairs, and a relationship's statistics grouped by a parent
-    column or a child column grouped through the link (:mod:`fluid_build.profiler.grouped`).
-
-    With *timings*, each table's read, measure and check seconds, and the document's write,
-    are added to it; without, nothing is timed.
-
-    With *strict* and a *request*, the profile is refused before any record is read when the
-    contract and the request show an ask cannot be formed (:func:`_refuse_unformable`); an ask
-    only the records leave unanswered is still named under Not measured.
+    Refuses what cannot be profiled (a bad row floor, a request with a bundle, an unformable
+    ask under *strict*) with nothing read.
     """
     if row_floor is not None and (
         isinstance(row_floor, bool) or not 2 <= row_floor <= disclosure.MAX_COUNT
@@ -737,10 +734,10 @@ def profile_exposes(
                 "next": "give --row-floor a count of 2 or more",
             },
         )
+    from fluid_build.profiler import request as asked_for
+
     fact_plans: List[facts.FactPlan] = []
     if request is not None:
-        from fluid_build.profiler import request as asked_for
-
         if bundles:
             raise ProfileError(
                 "profile_request_with_bundle",
@@ -829,6 +826,83 @@ def profile_exposes(
             backend,
             fractional_bits,
         )
+    return _Planned(
+        fact_plans=fact_plans,
+        plans=plans,
+        asked=asked,
+        blocks=blocks,
+        declared=declared,
+        uncovered=uncovered,
+        matched=matched,
+        relationships=relationships,
+        relationships_left_out=relationships_left_out,
+        held=held,
+        unfiltered=unfiltered,
+        keys=keys,
+        fractional_bits=fractional_bits,
+    )
+
+
+def profile_exposes(
+    contract: Mapping[str, Any],
+    exposes: Sequence[ExposeSource],
+    *,
+    backend: StatisticsBackend,
+    cwd: Optional[Path] = None,
+    rule: disclosure.DisclosureRule = disclosure.ACRO_DEFAULT,
+    producer: Optional[str] = None,
+    fractional_bits: Optional[int] = None,
+    bundles: Optional[Mapping[str, BundleBlock]] = None,
+    request: Optional[Request] = None,
+    row_floor: Optional[int] = None,
+    timings: Optional[StageTimings] = None,
+    strict: bool = False,
+) -> ProfileResult:
+    """Profile each of *exposes* of *contract*, each from its own source, into one document.
+
+    *fractional_bits* is the grid ``mean/1`` is formed on (16 unless given),
+    checked before any record is read; the fidelity block must declare the same
+    (PROFILE-SPEC §7). An expose *bundles* holds a block for also answers that
+    block, on the block's grid (:func:`_declared_block`), and the blocks of one
+    document declare one grid. Every expose's plan and block is checked before any
+    record is read, and each expose's records are read once.
+
+    With a *request* the profile measures what it lists and nothing else
+    (:mod:`fluid_build.profiler.request`); its grid is the profile's. A request of format
+    1-2-0 may also ask rank correlations of column pairs (:mod:`fluid_build.profiler.ranks`;
+    *row_floor*, a count of at least 2, is then written as each one's ``rowFloor``), the
+    columns of a table related in pairs, and a relationship's statistics grouped by a parent
+    column or a child column grouped through the link (:mod:`fluid_build.profiler.grouped`).
+
+    With *timings*, each table's read, measure and check seconds, and the document's write,
+    are added to it; without, nothing is timed.
+
+    With *strict* and a *request*, the profile is refused before any record is read when the
+    contract and the request show an ask cannot be formed (:func:`_refuse_unformable`); an ask
+    only the records leave unanswered is still named under Not measured.
+    """
+    from fluid_build.profiler import request as asked_for
+
+    planned = _plan_profile(
+        contract,
+        exposes,
+        backend=backend,
+        request=request,
+        bundles=bundles,
+        fractional_bits=fractional_bits,
+        row_floor=row_floor,
+        strict=strict,
+    )
+    fact_plans, plans, asked, blocks = (
+        planned.fact_plans,
+        planned.plans,
+        planned.asked,
+        planned.blocks,
+    )
+    declared, uncovered, matched = planned.declared, planned.uncovered, planned.matched
+    relationships, held, unfiltered = planned.relationships, planned.held, planned.unfiltered
+    keys, fractional_bits = planned.keys, planned.fractional_bits
+    relationships_left_out = planned.relationships_left_out
     reads: List[sources.SourceColumns] = []
     for exposed, plan in zip(exposes, plans, strict=True):
         with _timed(timings, "read", plan.expose_id):

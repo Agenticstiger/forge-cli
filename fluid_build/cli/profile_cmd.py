@@ -409,6 +409,30 @@ def _refuse_before_reading(args: argparse.Namespace) -> None:
     _refuse_timings_with_release(args)
 
 
+def _read_request(
+    args: argparse.Namespace, request_file: Any, contract_path: Any, backend: Any
+) -> Tuple[Any, Optional[bool]]:
+    """Read ``--request`` and check it against the contract: the request and whether the
+    contract file's digest is the one it names (``None`` with no request)."""
+    if request_file is None:
+        return None, None
+    from fluid_build.cli.security import validate_cli_path
+    from fluid_build.profiler import _stats, runner
+    from fluid_build.profiler import request as asked_for
+
+    try:
+        asked_for.check_flags(bundle=args.bundle, env=args.env, exposes=args.expose_id)
+        asked = asked_for.read_request_file(
+            validate_cli_path(request_file, mode="read", file_type="request"), backend
+        )
+        digest_matched = asked_for.check_contract_file(contract_path, asked, backend)
+        if getattr(args, "strict", False):
+            asked_for.refuse_unformed(asked)
+    except (runner.ProfileError, _stats.StatisticsUnavailable) as exc:
+        raise _as_refusal(exc, args.source) from None
+    return asked, digest_matched
+
+
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Profile the expose and write the document; return the exit code."""
     from fluid_build.cli import _profile_release
@@ -452,19 +476,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
     bundle_dir = _bundle_dir(args.bundle)
     request_file = getattr(args, "request", None)
-    asked = None
-    digest_matched: Optional[bool] = None
-    if request_file is not None:
-        try:
-            asked_for.check_flags(bundle=args.bundle, env=args.env, exposes=args.expose_id)
-            asked = asked_for.read_request_file(
-                validate_cli_path(request_file, mode="read", file_type="request"), backend
-            )
-            digest_matched = asked_for.check_contract_file(contract_path, asked, backend)
-            if getattr(args, "strict", False):
-                asked_for.refuse_unformed(asked)
-        except (runner.ProfileError, _stats.StatisticsUnavailable) as exc:
-            raise _as_refusal(exc, args.source) from None
+    asked, digest_matched = _read_request(args, request_file, contract_path, backend)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     try:
         if asked is not None:
