@@ -892,7 +892,9 @@ jobs:
   # floor (read from pyproject.toml, so the two cannot drift) and runs the
   # suites whose result depends on how sqlglot reads SQL: the shared
   # row-filter parser, the MCP gateway's row filters and its column
-  # projection. Below the floor some of them fail.
+  # projection. Below the floor some of them fail. tests/test_ci_sqlglot_floor.py
+  # holds the list to every test that compiles a query_sql statement or a row
+  # filter in process.
   # ──────────────────────────────────────────────────────────────
   sqlglot-floor:
     name: sqlglot floor (Python 3.12)
@@ -934,9 +936,16 @@ jobs:
         run: |
           python -m pytest -q \
             tests/iac/test_iac_row_filter_predicates.py \
+            tests/output_ports/test_drivers_duckdb.py \
+            tests/output_ports/test_duckdb_logging_gate.py \
             tests/output_ports/test_mcp_authz_row_filters.py \
+            tests/output_ports/test_mcp_row_filter_fence.py \
+            tests/output_ports/test_pii_audit_circuit_token.py \
+            tests/output_ports/test_query_compiler.py \
             tests/output_ports/test_query_rls.py \
-            tests/output_ports/test_restricted_columns_projection.py
+            tests/output_ports/test_quickstart_golden_path.py \
+            tests/output_ports/test_restricted_columns_projection.py \
+            tests/output_ports/test_rls_real_engine_duckdb.py
 
   # ──────────────────────────────────────────────────────────────
   # dbt v2 canary. The `test` and `coverage-and-audit` jobs install
