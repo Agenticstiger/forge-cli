@@ -35,7 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1-3-0 with a date pair, and `--rederive` recomputes both. The help and the report now say that a
   followed relationship out of a versioned table by its natural entity repeats its key by design,
   with the entity-versions precondition, instead of that every followed parent key names one row.
-
 - **`fluid profile` publishes the history of a table with a validity window.** A table whose
   contract declares a slowly changing dimension (one natural entity and a start and an end
   dimension, both DATE or both timestamp columns) gets a `history` in a default profile: the
@@ -50,7 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window's own start and end under `datePairs`: the pair is named under Not measured, since its
   days and the history's version lengths would give each other's withheld cells back. A table
   without a validity window keeps the same bytes.
-
 - **A private release counts children per entity of a versioned table.** With `--privacy-unit`
   and `--follow`, a relationship into a table with a validity window, whose `toColumns` are its
   natural entity, is released as children per entity: the parents are the distinct entity keys of
@@ -61,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with that reason. Records that put one entity's versions in two units are refused with
   `profile_release_entity_units`, naming the table and the columns only. A grouping by a parent
   column needs a column stable per entity, and the release never writes a `history` member.
-
 - **`fluid profile` counts children per entity through a relationship into a versioned table.**
   A relationship whose `toColumns` are exactly the natural entity of a table that declares a
   validity window is counted one parent per entity, not one per version: the parents are the
@@ -72,7 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disagree on any other. Dates and exposure are not formed through such a relationship, and say
   so. A relationship into a window by any other columns stays left out, with its reason, and
   `--strict` refuses an ask of it before any record is read.
-
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
   active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
   histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed
@@ -837,8 +833,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so
   the document moves from format 1-1-0 to 1-3-0 even with no date pair or relationship in it.
-  `fluxsim` 0.10.0 and later read format 1-3-0; 0.9 and older refuse the document. Re-profile
-  after upgrading, and pin the new digest wherever the old one was pinned.
+  `fluxsim` 0.10.0 and later read format 1-3-0; 0.9 and older refuse the document. A table with a
+  validity window also gains a `history`, and its window's own start and end leave `datePairs`.
+  Re-profile after upgrading, and pin the new digest wherever the old one was pinned.
 - **An unset or empty `{{ env.NAME }}` now stops the command.** A contract that relied on a
   variable rendering as nothing (an optional prefix, a path whose variable was never exported) now
   fails naming it: export the variable, or delete the placeholder. That includes a region written
