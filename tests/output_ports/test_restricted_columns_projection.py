@@ -692,7 +692,7 @@ def test_free_form_projection_applies_to_pii_columns_too(con):
 def test_free_form_with_no_declared_readable_column_fails_closed():
     expose = _expose()
     expose["contract"]["schema"] = [{"name": "region"}]
-    with pytest.raises(QueryValidationError, match="no column it may read"):
+    with pytest.raises(QueryValidationError, match="no column they may read"):
         compile_free_form_sql(
             sql="SELECT 1 FROM customers",
             table_reference="customers",

@@ -1764,14 +1764,27 @@ def _identifier(name: str) -> Any:
     return exp.to_identifier(name, quoted=False)
 
 
+def unrestricted_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
+    """The columns ``contract.schema`` declares (:func:`declared_columns`), less
+    ``restricted``, in schema order. Raises :class:`QueryValidationError` when none is
+    left: ``sample`` would otherwise return empty rows, which still count the table's
+    rows, where ``query_sql`` has no column to project."""
+    kept = _kept_names(declared_columns(expose), restricted)
+    if not kept:
+        raise QueryValidationError(
+            "Every column this expose declares is restricted, so sample and query_sql have "
+            "no column they may read."
+        )
+    return kept
+
+
 def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
-    """The columns ``query_sql``'s projection selects on ``expose``: the ones
-    ``contract.schema`` declares (:func:`declared_columns`), less ``restricted``, in
-    schema order. A restricted column is never read, so only the others must be plain
-    identifiers: the projection selects each by its name. Fails closed when a column it
-    selects is not one, or when every declared column is restricted."""
+    """The columns ``query_sql``'s projection selects on ``expose``:
+    :func:`unrestricted_columns`. A restricted column is never read, so only the others
+    must be plain identifiers: the projection selects each by its name. Fails closed when
+    a column it selects is not one, or when every declared column is restricted."""
     readable: List[str] = []
-    for name in _kept_names(declared_columns(expose), restricted):
+    for name in unrestricted_columns(expose, restricted):
         try:
             readable.append(validate_ident(name))
         except ValueError:
@@ -1781,11 +1794,6 @@ def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) 
                 "query_sql reads the exposed table through a projection that names each "
                 "declared column: rename the column, or expose it through a view."
             ) from None
-    if not readable:
-        raise QueryValidationError(
-            "Every column this expose declares is restricted, so query_sql has no column "
-            "it may read."
-        )
     return readable
 
 

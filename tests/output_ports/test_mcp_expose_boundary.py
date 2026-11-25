@@ -170,6 +170,22 @@ def test_sample_does_not_return_an_undeclared_column_named_like_a_declared_one(s
     assert sorted(row["order"] for row in payload["rows"]) == [7, 8, 9]
 
 
+def test_sample_and_query_sql_refuse_an_expose_whose_columns_are_all_restricted(state_for):
+    """Rows with no column would still count the table's rows, so ``sample`` refuses
+    as ``query_sql`` does, before it reads anything."""
+    expose = _expose()
+    expose["policy"] = {
+        "authz": {
+            "columnRestrictions": [{"principal": "*", "columns": _DECLARED, "access": "deny"}]
+        }
+    }
+    state = state_for(expose)
+    with pytest.raises(query_compiler.QueryValidationError, match="no column they may read"):
+        tool_sample(state, {"limit": 10})
+    with pytest.raises(query_compiler.QueryValidationError, match="no column they may read"):
+        tool_query_sql(state, {"sql": "SELECT count(*) AS n FROM customers"}, caller_attributes={})
+
+
 def test_a_filtered_callers_sample_returns_only_the_declared_columns(state_for):
     state = state_for(_expose(row_filters=_EU_ONLY))
     payload = tool_sample(state, {"limit": 10}, caller_attributes={"principal": EU})

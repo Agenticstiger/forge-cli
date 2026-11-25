@@ -50,11 +50,11 @@ from ..query_compiler import (
     ColumnType,
     catalog_columns_sql,
     column_type,
-    declared_columns,
     declared_result_columns,
     row_filter_predicate,
     select_body,
     strip_projection_open,
+    unrestricted_columns,
 )
 from ..query_compiler import (
     RowFilterIdentityMissing as RowFilterIdentityMissing,
@@ -429,7 +429,7 @@ class EngineDriver(ABC):
         it (:func:`...query_compiler.declared_result_columns`), so a column whose name
         differs from a declared one only in case is not returned with it. Restricted
         columns are then left out and PII columns masked (:meth:`project`). An expose
-        that declares no column is refused.
+        that declares no column, or only restricted ones, is refused.
 
         ``caller_attributes`` is the request's verified identity. When the
         contract declares ``policy.authz.rowFilters``,
@@ -447,7 +447,9 @@ class EngineDriver(ABC):
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
         predicate = row_filter_predicate(self.expose, caller_attributes, dialect=descriptor.dialect)
-        declared_columns(self.expose)  # refuses an expose that declares no column
+        # Refuses an expose that declares no column, or only restricted ones: empty rows
+        # would still count the table's rows.
+        unrestricted_columns(self.expose, self._restricted_columns)
         source = descriptor.table_reference
         if predicate is not None:
             # The predicate is the contract's own literal SQL, its columns qualified
