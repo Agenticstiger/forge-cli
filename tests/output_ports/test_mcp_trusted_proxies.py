@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -305,6 +305,27 @@ def _auth_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return audit_root
 
 
+async def _audit_record_of_a_sample(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    headers: Dict[str, str],
+    *,
+    trusted_proxies: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Serve the expose over HTTP with a shared token, call ``sample`` with
+    ``headers`` beside the token, and return the data-access record it wrote."""
+    audit_root = _auth_env(monkeypatch, tmp_path)
+    if trusted_proxies is not None:
+        monkeypatch.setenv("FLUID_MCP_TRUSTED_PROXIES", trusted_proxies)
+    port = _free_port()
+    with _running_http_server(_cn_filtered_server(tmp_path), port):
+        payload = await _sample_over_http(port, {"Authorization": f"Bearer {TOKEN}", **headers})
+    assert payload.get("error") is None, payload
+    records = _audit_records(audit_root)
+    assert records, "a data_access record must be written"
+    return records[0]
+
+
 @pytest.mark.asyncio
 async def test_direct_client_cannot_choose_its_certificate_cn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -312,19 +333,10 @@ async def test_direct_client_cannot_choose_its_certificate_cn(
     """No trusted proxy configured: a client that sets X-Client-CN itself is
     not attributed to that certificate; the audit record shows the real auth
     layer with no certificate identity."""
-    audit_root = _auth_env(monkeypatch, tmp_path)
-    server = _cn_filtered_server(tmp_path)
-    port = _free_port()
-    with _running_http_server(server, port):
-        payload = await _sample_over_http(
-            port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS}
-        )
-    assert payload.get("error") is None, payload
-    records = _audit_records(audit_root)
-    assert records, "a data_access record must be written"
-    assert records[0]["authKind"] == "shared-token"
-    assert "clientCertCn" not in records[0]
-    assert "clientCertFingerprint" not in records[0]
+    record = await _audit_record_of_a_sample(tmp_path, monkeypatch, CERT_HEADERS)
+    assert record["authKind"] == "shared-token"
+    assert "clientCertCn" not in record
+    assert "clientCertFingerprint" not in record
 
 
 @pytest.mark.asyncio
@@ -333,38 +345,22 @@ async def test_forwarded_for_header_cannot_impersonate_a_trusted_proxy(
 ):
     """The trust check reads the TCP peer, not an X-Forwarded-For value the
     client wrote."""
-    audit_root = _auth_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("FLUID_MCP_TRUSTED_PROXIES", "192.0.2.10")
-    server = _cn_filtered_server(tmp_path)
-    port = _free_port()
-    with _running_http_server(server, port):
-        payload = await _sample_over_http(
-            port,
-            {
-                "Authorization": f"Bearer {TOKEN}",
-                "X-Forwarded-For": "192.0.2.10",
-                **CERT_HEADERS,
-            },
-        )
-    assert payload.get("error") is None, payload
-    records = _audit_records(audit_root)
-    assert records and "clientCertCn" not in records[0], records
+    record = await _audit_record_of_a_sample(
+        tmp_path,
+        monkeypatch,
+        {"X-Forwarded-For": "192.0.2.10", **CERT_HEADERS},
+        trusted_proxies="192.0.2.10",
+    )
+    assert "clientCertCn" not in record, record
 
 
 @pytest.mark.asyncio
 async def test_trusted_proxy_certificate_identity_binds_and_is_audited(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    audit_root = _auth_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("FLUID_MCP_TRUSTED_PROXIES", "127.0.0.1,::1")
-    server = _cn_filtered_server(tmp_path)
-    port = _free_port()
-    with _running_http_server(server, port):
-        payload = await _sample_over_http(
-            port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS}
-        )
-    assert payload.get("error") is None, payload
-    record = _audit_records(audit_root)[0]
+    record = await _audit_record_of_a_sample(
+        tmp_path, monkeypatch, CERT_HEADERS, trusted_proxies="127.0.0.1,::1"
+    )
     assert record["authKind"] == "shared-token"
     assert record["clientCertCn"] == "C0001"
     assert record["clientCertFingerprint"] == "ab12cd34"

@@ -167,19 +167,14 @@ class TestSnowflakeDriverMocked:
         string, so a ``%`` in a LIKE pattern (a row filter, a metric filter) is doubled;
         without parameters nothing interpolates it and it is left as written."""
         driver = SnowflakeDriver(expose=_make_expose(), contract={})
-        _connection, cursor = self._patch_connection(driver)
-        cursor.description = [type("Col", (), {"name": "N"})()]
-        cursor.fetchall.return_value = [(1,)]
-        sql = "SELECT COUNT(*) AS N FROM T WHERE (REGION LIKE 'EU%') AND (SEGMENT = :p_0)"
-        driver.execute(sql=sql, params=("retail",))
-        executed_sql, bound = cursor.execute.call_args.args
-        assert "LIKE 'EU%%'" in executed_sql and "%(p_0)s" in executed_sql
-        assert executed_sql % bound == sql.replace(":p_0", "retail")
-        driver.execute(sql="SELECT COUNT(*) AS N FROM T WHERE REGION LIKE 'EU%'", params=())
-        assert cursor.execute.call_args.args == (
-            "SELECT COUNT(*) AS N FROM T WHERE REGION LIKE 'EU%'",
-            None,
-        )
+        cursor = self._patch_connection(driver)[1]
+        filtered = "SELECT COUNT(*) AS N FROM T WHERE (REGION LIKE 'EU%') AND (SEGMENT = :p_0)"
+        driver.execute(sql=filtered, params=("retail",))
+        rendered, bound = cursor.execute.call_args.args
+        assert rendered % bound == filtered.replace(":p_0", "retail")
+        plain = "SELECT COUNT(*) AS N FROM T WHERE REGION LIKE 'EU%'"
+        driver.execute(sql=plain, params=())
+        assert cursor.execute.call_args.args == (plain, None)
 
     def test_execute_blocks_injection_marker_at_driver(self):
         driver = SnowflakeDriver(expose=_make_expose(), contract={})
