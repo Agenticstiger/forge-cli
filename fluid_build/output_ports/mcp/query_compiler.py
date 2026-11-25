@@ -1557,14 +1557,19 @@ def _crosscheck_duckdb_projection(sql: str, exposed_name: str, allowed: Iterable
         import duckdb
     except ImportError:  # pragma: no cover - a duckdb dialect implies duckdb
         return
+    from fluid_build.providers._duckdb_compat import first_row
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+
     refusal = QueryValidationError(
         "sql could not be checked against the columns this expose allows; write one "
         "plain SELECT over the exposed table."
     )
     permitted = {name.casefold() for name in allowed}
-    connection = duckdb.connect(":memory:")
+    # A parse with no execution, on a sandboxed in-memory connection with no file
+    # or network access.
+    connection = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none())
     try:
-        raw = connection.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()
+        raw = first_row(connection.execute("SELECT json_serialize_sql(?)", [sql]))
         document = json.loads(raw[0]) if raw else {}
     except (duckdb.Error, ValueError):
         raise refusal from None
@@ -1648,7 +1653,7 @@ def _project_exposed_table(
     """
     import sqlglot
     from sqlglot import exp
-    from sqlglot.errors import ErrorLevel, SqlglotError
+    from sqlglot.errors import SqlglotError
 
     read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
     unreadable = _unreadable_sql()

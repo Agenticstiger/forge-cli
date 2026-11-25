@@ -27,7 +27,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build.providers._sql_safety import (
     names_refused_duckdb_function,
@@ -47,7 +47,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # ``from ...drivers.base import RowFilterIdentityMissing`` call sites are
 # unchanged.
 from ..query_compiler import (
-    RowFilterIdentityMissing,
+    RowFilterIdentityMissing as RowFilterIdentityMissing,
+)
+from ..query_compiler import (
     compile_row_filter_clauses,
     strip_projection_open,
 )
