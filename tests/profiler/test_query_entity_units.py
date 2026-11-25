@@ -585,3 +585,44 @@ def test_two_parents_that_hold_one_key_do_not_fail_the_run(tmp_path):
     customers.append({"customer_id": 10, "region": "north"})
     result = _profile(tmp_path, _on_unit("many", MANY), customers=customers)
     assert query_rates.RUN_FAILED not in _said(result).values()
+
+
+# ---- the combinations of a population are bounded before any read -----------------------------
+
+
+def _many_queries(count: int, unit: str = UNIT) -> List[_stats.RequestQuery]:
+    return [_on_unit(f"q{at}", _over(unit, f'"v"."n" >= {at + 1}'), unit) for at in range(count)]
+
+
+def test_a_population_past_the_bound_is_cut_at_plan_time_in_request_order():
+    from fluid_build.profiler.consumer_queries import MAX_GROUPS
+
+    queries = _many_queries(40)
+    planned = query_rates.plan_queries(CONTRACT, _request(*queries), FakeBackend().enum_levels)
+    answered = [each.name for each in planned.answerable()]
+    cut = [each for each in planned.plans if each.reason]
+    assert answered == [each.name for each in queries[: len(answered)]]
+    assert cut and [each.name for each in cut] == [each.name for each in queries[len(answered) :]]
+    assert {each.reason for each in cut} == {query_rates.ENTITIES_PAST_BOUND}
+    assert not asked_for.decided_by_records(query_rates.ENTITIES_PAST_BOUND)
+    # the states of the bin factor times two to the units and queries stay inside the child's cap
+    assert 8 * 2 ** (1 + len(answered)) <= MAX_GROUPS < 8 * 2 ** (2 + len(answered))
+
+
+def test_a_request_past_the_bound_is_refused_by_strict_before_any_read(tmp_path):
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, *_many_queries(40), strict=True, gone=True)
+    assert query_rates.ENTITIES_PAST_BOUND in str(refused.value.context)
+
+
+def test_a_bound_population_does_not_change_with_one_record(tmp_path):
+    seen = []
+    for note in ("n", "y"):
+        orders = _orders()
+        orders[0]["note"] = note
+        orders[0]["customer_id"] = None
+        result = _profile(tmp_path, *_many_queries(40), orders=orders)
+        seen.append(sorted(_said(result).items()))
+        assert query_rates.RUN_FAILED not in _said(result).values()
+    assert seen[0] == seen[1]
+    assert len(seen[0]) > 0

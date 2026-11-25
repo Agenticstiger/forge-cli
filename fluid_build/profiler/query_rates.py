@@ -54,7 +54,10 @@ outcome; the entities' set is checked apart from the table's own rows.
    :data:`MOST_PER_UNIT` over one unit, :data:`MOST_SET_PARTS` parts in one table's set check
    (a grouped query adds one per level of its column, and the first adds one more per level),
    :data:`MOST_GROUPED_PER_COLUMN` grouped queries per column, :data:`MOST_GROUP_LEVELS` levels,
-   and :data:`MOST_TEXT_TOKENS` tokens of query and view text in the whole request. The budget is
+   as many units and queries over one table's entities as keep the one statement that counts
+   their combinations (the bin factor's states times two to the units and queries) inside the
+   query process's group and reply limits (:func:`_counts_combinations`; the rest are named
+   :data:`ENTITIES_PAST_BOUND`), and :data:`MOST_TEXT_TOKENS` tokens of query and view text in the whole request. The budget is
    the sum of the tokenizer's own counts and is spent in the order the request lists the
    queries; a decision therefore never depends on the machine, and the queries past the budget
    are named as not checked.
@@ -139,6 +142,7 @@ from fluid_build.profiler.consumer_queries import Checked, Refused, Table
 
 __all__ = [
     "CAN_FAIL",
+    "ENTITIES_PAST_BOUND",
     "ENTITY_ONLY",
     "HISTORY_ENTITY",
     "PER_ENTITY_KEY",
@@ -210,6 +214,9 @@ ENTITY_PARENT_TYPE = (
     "its entity column and the key of its relationship's parent are not read as one type"
 )
 
+ENTITIES_PAST_BOUND = (
+    "not checked: one table's entities hold more units and queries than one set check can count"
+)
 CAN_FAIL = (
     "a condition of its query or its unit's view could raise an error that depends on a row's "
     "value, so fluid profile does not run it: compare columns with constants of their own type, "
@@ -461,6 +468,8 @@ class _Planner:
             if item.get("exposeId")
         }
         self._entity_parts: Dict[Tuple[str, str], int] = {}
+        self._entity_units: Dict[Tuple[str, str], Set[str]] = {}
+        self._entity_queries: Dict[Tuple[str, str], int] = {}
         self._spent = 0
         self._exhausted = False
         self._counted: Set[str] = set()
@@ -882,6 +891,12 @@ class _Planner:
             population = (plan.entity.table, plan.entity.key)
             if self._entity_parts.get(population, 0) + parts > MOST_SET_PARTS:
                 return f"past the {MOST_SET_PARTS} parts one table's set check holds"
+            held = self._entity_units.setdefault(population, set())
+            wider = len(held | {plan.view or ""}) + self._entity_queries.get(population, 0) + 1
+            if not _counts_combinations(plan.entity.parent is not None, wider):
+                return ENTITIES_PAST_BOUND
+            held.add(plan.view or "")
+            self._entity_queries[population] = self._entity_queries.get(population, 0) + 1
             self._per_unit[unit] = self._per_unit.get(unit, 0) + 1
             self._unit_parts.add(unit_part)
             self._entity_parts[population] = self._entity_parts.get(population, 0) + parts
@@ -2203,6 +2218,26 @@ def _populations(
             _PopPlan(n, table, key, members, link, unit.parent if link is not None else None)
         )
     return found
+
+
+def _counts_combinations(parented: bool, parts: int) -> bool:
+    """Whether a population's one ``counts`` statement stays inside the query process's limits.
+
+    It returns one row per combination present, and a combination is the bin factor's state
+    (the children-per-parent bins and "no parent": :data:`_BINS` + 1 of them when the entity
+    column has a parent, else one) and whether each unit and each query holds the entity: at
+    most ``states * 2 ** parts`` rows, public structure only, whatever the records hold. The
+    process refuses a result of more than ``MAX_GROUPS`` rows, which would make one record decide
+    whether the run is answered. A row is at most ``6 * parts + 24`` bytes of JSON (a boolean is
+    at most six, the bin two, the count at most twenty); the bound also keeps the largest
+    allowed reply (at most ``MAX_GROUPS`` rows) under a quarter of ``REPLY_LIMIT``. With the
+    16 parts the group cap allows that is 120 bytes a row, about 12 MB against 64 MiB.
+    """
+    rows = ((_BINS + 1) if parented else 1) << parts
+    return (
+        rows <= consumer_queries.MAX_GROUPS
+        and rows * (6 * parts + 24) * 4 <= consumer_queries.REPLY_LIMIT
+    )
 
 
 def _unused(name: str, taken: Set[str]) -> str:

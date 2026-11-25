@@ -106,6 +106,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from fluid_build.profiler.consumer_queries._child import MAX_GROUPS, REPLY_LIMIT
 from fluid_build.profiler.consumer_queries._types import (
     REFUSAL_CODES,
     Checked,
@@ -124,7 +125,9 @@ from fluid_build.profiler.consumer_queries.runner import (
 )
 
 __all__ = [
+    "MAX_GROUPS",
     "REFUSAL_CODES",
+    "REPLY_LIMIT",
     "STATUSES",
     "Bits",
     "Checked",
