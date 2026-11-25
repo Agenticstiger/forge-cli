@@ -584,7 +584,8 @@ def test_the_refusal_is_the_one_a_release_that_does_not_reach_the_target_does_no
     # The history is fixed when the unit does not reach it, so its versions move nothing.
     _workspace(tmp_path, monkeypatch, rows=_rows(drift=True))
     assert main(_argv(FOLLOW_READINGS_OF_NETWORK)) == 0
-    assert "profile_release_entity_units" not in _out(capsys)
+    # the report's guarantee sentence names the refusal; the refusal itself says this
+    assert "has versions that follow different rows" not in _out(capsys)
 
 
 # -- a parent key that is not an entity still repeats by mistake -----------------------------------------

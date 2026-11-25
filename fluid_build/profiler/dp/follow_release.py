@@ -76,6 +76,8 @@ from fluid_build.profiler.dp.release import (
     DEFAULT_ROW_FLOOR,
     LEVELS,
     LINK,
+    NO_CELL,
+    PAIRS,
     RANK,
     RELATION,
     RULE_NAME,
@@ -98,13 +100,18 @@ from fluid_build.profiler.dp.release import (
     _table_not_released,
     _TableColumns,
     _version,
+    agrees,
     decimal_text,
+    other_table_pairs,
+    pair_cells,
+    place_known,
     place_values,
     public_structures,
     release_parts,
     scale_units,
     selection_share,
     split_budget,
+    table_cells,
 )
 
 __all__ = [
@@ -718,10 +725,7 @@ def plan_follow_release(
                     )
                 ).get(column, {})
                 if entry.get("required") is not True:
-                    child_made, why = None, (
-                        f"{column}: the contract does not declare it required: true, and a "
-                        "record with no value is refused, never counted"
-                    )
+                    child_made = replace(child_made, nullable=True)
             by_made, by_why = _group_structure(
                 contract,
                 backend,
@@ -793,7 +797,11 @@ def plan_follow_release(
             for definition in ("kendallTau/1", "spearmanRho/1")
             if any(each[0] == definition for each in found.rank_pairs)
         )
-        needed = set(each.name for each in released) | set(extra_read.get(table, ()))
+        needed = (
+            set(each.name for each in released)
+            | set(extra_read.get(table, ()))
+            | {name for pair in found.date_pairs for name in pair}
+        )
         read = tuple(column for column in found.expose_plan.columns if column.name in needed)
         asked = found.asked
         in_request = set() if asked is None else {each.name for each in asked.columns}
@@ -824,6 +832,8 @@ def plan_follow_release(
             rank_deltas=deltas,
             clique_method=clique_method,
             reach=m,
+            date_pairs=found.date_pairs,
+            date_required=found.date_required,
         )
         tables.append(TablePlan(table, m, table_plan, asked is not None))
         if asked is not None:
@@ -833,6 +843,8 @@ def plan_follow_release(
                 )
             )
             not_released.extend(found.rank_left_out)
+            not_released.extend(found.date_left_out)
+            not_released.extend(found.clique_left_out)
     # the reached tables first, then the others, in the request's order
     fixed: List[Tuple[str, Tuple[Tuple[str, str], ...]]] = []
     for table in sorted((set(request_tables(request)) | set(extra_read)) - set(tree.order)):
@@ -842,6 +854,7 @@ def plan_follow_release(
         if asked_table is not None:
             wanted |= {each.name for each in asked_table.columns}
             not_released.append((f"table {table}", _FIXED))
+            not_released.extend(other_table_pairs(asked_table, _FIXED))
         domains = tuple(
             (column.name, column.domain) for column in expose_plan.columns if column.name in wanted
         )
@@ -1135,7 +1148,11 @@ def encode_follow_rows(
     placed: Dict[Tuple[str, str], List[Optional[int]]] = {}
     for (table, name), column in plan.structure.items():
         found = exact[table][name]
-        nullable = _released_in(plan, table, name) is None and (table, name) not in _links_of(plan)
+        released_as = _released_in(plan, table, name)
+        counted_as = (table, name) in _links_of(plan)
+        nullable = (released_as is None or released_as.nullable) and (
+            not counted_as or column.nullable
+        )
         at = [index for index, value in enumerate(found) if value is not None]
         if not nullable and len(at) != len(found):
             index = next(i for i, value in enumerate(found) if value is None)
@@ -1145,7 +1162,15 @@ def encode_follow_rows(
                 "one in every row",
                 {"next": "fix the records, or the contract's column type, then release"},
             )
-        cells = place_values(name, column, [found[i] for i in at], backend, plan.fractional_bits)
+        cells = place_values(
+            name,
+            column,
+            [found[i] for i in at],
+            backend,
+            plan.fractional_bits,
+            rows=at,
+            table=table,
+        )
         full: List[Optional[int]] = [None] * len(found)
         for index, cell in zip(at, cells, strict=True):
             full[index] = cell
@@ -1158,18 +1183,11 @@ def encode_follow_rows(
         cells_of: Dict[str, List[int]] = {}
         levels: Dict[str, Sequence[str]] = {}
         for name, column in released.items():
-            found = exact[table][name]
-            for index, value in enumerate(found):
-                if value is None:
-                    raise ReleaseRefused(
-                        "profile_release_null",
-                        f"table {table!r} column {name!r} row {index}: no value, and the "
-                        "release needs one in every row",
-                        {"next": "fix the records, or the contract's column type, then release"},
-                    )
             if column.categorical:
                 levels[name] = column.levels
-            cells_of[name] = place_values(name, column, found, backend, plan.fractional_bits)
+            cells_of[name] = place_known(
+                name, column, exact[table][name], backend, plan.fractional_bits, table=table
+            )
         grid: Dict[str, List[int]] = {}
         if each.plan.rank_pairs:
             encode = backend.encoder(plan.fractional_bits)
@@ -1187,6 +1205,7 @@ def encode_follow_rows(
             contents=rows_bytes,
             levels=levels,
             grid=grid,
+            pairs=pair_cells(each.plan, exact[table], table=table),
         )
     return FollowRows(counts=counts, tables=encoded, contents=contents, keys=keys, placed=placed)
 
@@ -1457,7 +1476,7 @@ def draw_follow(
         mine = [item for item in tables if item.table == each.table and item.kind in _TABLE_KINDS]
         counted = [item for item in mine if item.kind != RANK]
         if counted:
-            values_of.update(_count_values(counted, measured, seed))
+            values_of.update(_count_values(counted, measured, seed, each.plan))
         for item in mine:
             if item.kind == RANK:
                 first, second = item.columns
@@ -1491,7 +1510,7 @@ def draw_follow(
     )
 
 
-_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK)
+_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK, *PAIRS)
 
 
 def measure_counts(
@@ -1510,16 +1529,12 @@ def measure_counts(
     relations = {relation.label: relation for relation in plan.relations}
     links = {link.label: link for link in plan.links}
     for table in tables:
-        if table.kind in (CLIQUE, LEVELS, BINS):
-            encoded = rows.tables[table.table]
-            rows_kept = kept[table.table]
-            cell = [0] * len(rows_kept)
-            for name, size in zip(table.columns, table.sizes, strict=True):
-                index = encoded.cells[name]
-                cell = [value * size + index[i] for value, i in zip(cell, rows_kept, strict=True)]
+        if table.kind in (CLIQUE, LEVELS, BINS, *PAIRS):
+            cells = table_cells(table, rows.tables[table.table], kept[table.table])
             counts = [0] * table.cells
-            for value in cell:
-                counts[value] += 1
+            for value in cells:
+                if value != NO_CELL:  # a row with no value in a column lands in no cell
+                    counts[value] += 1
             found[table.label] = counts
         elif table.kind == RELATION:
             found[table.label] = _relation_counts(plan, relations[table.label], rows, kept, backend)
@@ -1529,32 +1544,47 @@ def measure_counts(
 
 
 def _count_values(
-    counted: Sequence[ReleasedTable], measured: Mapping[str, Sequence[int]], seed: bytes
+    counted: Sequence[ReleasedTable],
+    measured: Mapping[str, Sequence[int]],
+    seed: bytes,
+    plan: ReleasePlan,
 ) -> Dict[str, Tuple[str, ...]]:
-    """The noisy counts of one table's count tables, made to agree, as decimal text."""
-    sigma2 = Fraction(counted[0].scale_units ** 2, 10**12)
+    """The noisy counts of one table's count tables as decimal text.
+
+    The cliques and the histograms of required columns are made to agree; a histogram of a column
+    that may hold a null and the days and the order of a date pair are noised on their own
+    (:func:`~fluid_build.profiler.dp.release.agrees`).
+    """
     count_tables: List[consistency.CountTable] = []
+    found: Dict[str, Tuple[str, ...]] = {}
     for table in counted:
+        sigma2 = Fraction(table.scale_units**2, 10**12)
         source = SeededSource(seed, table.label)
         values = tuple(
             Fraction(count + sample_discrete_gaussian(sigma2, source))
             for count in measured[table.label]
         )
-        count_tables.append(
-            consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
-        )
-    try:
-        forest = consistency.junction_forest(count_tables)
-        agreed = consistency.make_consistent(count_tables)
-        texts = consistency.to_decimal_text(count_tables, agreed, forest)
-    except ValueError as error:
-        raise ReleaseRefused(
-            "profile_release_not_a_forest",
-            f"the tables of the release cannot be made to agree: {error}",
-            {"next": "report it with your forge-cli version"},
-        ) from None
-    _agree(counted, texts)
-    return {table.label: cells for table, cells in zip(counted, texts, strict=True)}
+        if agrees(plan, table):
+            count_tables.append(
+                consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
+            )
+        else:
+            found[table.label] = tuple(_integer_text(value) for value in values)
+    if count_tables:
+        together = [table for table in counted if agrees(plan, table)]
+        try:
+            forest = consistency.junction_forest(count_tables)
+            agreed = consistency.make_consistent(count_tables)
+            texts = consistency.to_decimal_text(count_tables, agreed, forest)
+        except ValueError as error:
+            raise ReleaseRefused(
+                "profile_release_not_a_forest",
+                f"the tables of the release cannot be made to agree: {error}",
+                {"next": "report it with your forge-cli version"},
+            ) from None
+        _agree(together, texts)
+        found.update({table.label: cells for table, cells in zip(together, texts, strict=True)})
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1814,7 +1844,7 @@ def check_follow_record(
             or not isinstance(owner, str)
         ):
             raise _mismatch("a table's columns are not names")
-        if stated.get("kind") in (RANK, RELATION, LINK):
+        if stated.get("kind") in (RANK, RELATION, LINK, *PAIRS):
             continue
         if len(columns) >= 2:
             by_table[owner] = (*by_table.get(owner, ()), tuple(columns))

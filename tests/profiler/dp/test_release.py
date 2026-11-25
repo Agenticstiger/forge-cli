@@ -245,7 +245,7 @@ def test_a_plan_reads_no_record():
     run.keyed_plan(Guard())
 
 
-def test_a_boolean_or_a_nullable_or_an_unlisted_column_is_not_released():
+def test_a_nullable_column_is_released_with_its_known_values_and_joins_no_clique():
     text = contract("orders")
     schema = text["exposes"][0]["contract"]["schema"]
     schema[2] = {"name": "status", "type": "enum('paid','placed','returned','shipped')"}
@@ -259,8 +259,10 @@ def test_a_boolean_or_a_nullable_or_an_unlisted_column_is_not_released():
         unit_key=("customer_id",),
         max_rows_per_unit=3,
     )
-    assert [each.name for each in plan.columns] == ["channel", "amount"]
-    assert "required" in dict(plan.not_released)["levelHistogram/1 of orders.status"]
+    assert [each.name for each in plan.columns] == ["status", "channel", "amount"]
+    assert [each.nullable for each in plan.columns] == [True, False, False]
+    assert [each.name for each in plan.eligible] == ["channel"]
+    assert "levelHistogram/1 of orders.status" not in dict(plan.not_released)
     assert not plan.selects
 
 

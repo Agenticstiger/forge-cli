@@ -45,29 +45,39 @@ _FLAGS = (
 HELP = """\
 With --request FILE, --privacy-unit EXPOSE, --rho R and --release-record PATH the profile
 is a release under differential privacy: the noisy counts of one table, and the noisy rank
-correlations the request asks for, in profile format 1-2-0 (1-4-0 when it holds a rank
-correlation, a clique with a binned column, a clique selection or a unit that follows its
-child rows), which flux-engine grades
+correlations and date pairs the request asks for, in profile format 1-2-0 (1-3-0 when it holds
+a date pair, 1-4-0 when it holds a rank correlation, a clique with a binned column, a clique
+selection or a unit that follows its child rows), which flux-engine grades
 P3. Nothing else of the request is released.
 
 What it releases, from the release table (the privacy unit's expose, or with
 --release-table a child of it through one declared relationship, or with --unit-key the rows
 of the unit's expose that name one entity by COL[,COL]):
-  - a noisy levelHistogram/1 of each required enum column the request lists;
-  - a noisy marginalHistogram/1 of each required number, date or timestamp column the request
+  - a noisy levelHistogram/1 of each enum column the request lists;
+  - a noisy marginalHistogram/1 of each number, date or timestamp column the request
     lists, on the bins the contract's declared range gives (else the type's ladder);
+  - for a column the contract does not declare required, the same histogram over the column's
+    known values: a record with no value lands in no cell, the column has a share of its own and
+    joins no clique, and no null count or share of nulls is released;
+  - for each date pair of two DATE columns the request lists (a table the release holds), a
+    noisy histogram of the days from start to end on the whole public ladder of days, never
+    trimmed, and a noisy order (after, before, same), both over the records where both dates
+    are known, each with a share of its own;
   - noisy cliqueMarginal/1 tables over categorical columns, the cliques chosen with AIM or,
     with --clique-method mst, MST (OpenDP, from the [privacy] extra) when two or more columns
     may join them. A request that lists cliqueColumns lets those released columns join, a
     number or timestamp column by its public bins: such a clique is a cliqueMarginal/2, and
     the table states its cliqueSelection (method, producer and the share spent choosing);
   - a noisy kendallTau/1 or spearmanRho/1 of each pair of released number or timestamp
-    columns a rankCorrelations entry of the request lists, each value formed with the public
+    columns a rankCorrelations entry of the request lists (columns the contract declares
+    required), each value formed with the public
     row floor --row-floor N (default 1000, a count of 2 or more, written as its rowFloor).
 The levels and bins are public: they come from the contract, never from the records. A key
-column, a column that may hold a null and a column with no public levels or bins is not
-released, and neither is a row count, a column metric, a quantile, a mean, a relationship or
-a fact. The report names each requested item that is not released, with the reason.
+column and a column with no public levels or bins are not released, a column that may hold a
+null takes part in no clique and no rank correlation, and a date pair with a timestamp or a key
+column is not formed; neither is a row count, a column metric, a quantile, a mean, a
+relationship or a fact, nor a calendar or a relationship's dates or exposure. The report names
+each requested item that is not released, with the reason.
 
 What it guarantees: zero-concentrated differential privacy with total privacy loss rho = R,
 for one release of one table. A tenth of R chooses the cliques when two or more columns
@@ -104,8 +114,11 @@ reach is treated as fixed: its rows are the same in every neighbouring data set,
 grouped by its column protects the unit's rows and not that table's, and a labelled column of
 it (pii, restricted, ...) that groups a noisy statistic draws a warning, since the engine
 counts such a column as P1. --follow cannot be used with --release-table, --unit-key or
---max-rows-per-unit; each parent key must name one row, and every table the release reads
-needs a --source <exposeId>=<location>.
+--max-rows-per-unit; each followed parent key must name one row, except that a followed
+relationship out of a table with a validity window by its natural entity repeats its key by
+design, and its data precondition is then that an entity's versions follow one parent row (a
+release whose records break it is refused as profile_release_entity_units); and every table the
+release reads needs a --source <exposeId>=<location>.
 
 For which unit: one entity is one row of the unit's expose; with a release table related to
 it, or with a unit key, an entity owns every row that belongs to it, and the stated loss holds
@@ -132,8 +145,9 @@ owner (it names a column and a row): a refusal is not covered by the guarantee.
 What it does not do: it states nothing about a second release of the same records, which
 spends its own loss; it does not make the contract, the request or the levels and bins
 private, since they are public; and it is not a statement that the data is anonymous. A
-record with a null in a released column, or a value outside its levels or bins, refuses the
-release, naming the column and the row and never the value. The report says no count of
+record with a null in a column the contract declares required, or a value outside its levels
+or bins, or a date that is no whole day in a date pair, refuses the release, naming the column
+and the row and never the value. The report says no count of
 rows, entities or dropped rows. A table that has relationships cannot ship on flux-engine
 0.9 until it skips a table the release holds no statistic for.
 
@@ -671,6 +685,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             )
             read_tables = [plan.table]
             named = plan.table
+        if getattr(args, "strict", False):
+            # a date pair the contract shows cannot be formed is a refusal before any record is read
+            unformed = [item for item in plan.not_released if item[0].startswith("date pair ")]
+            if unformed:
+                raise asked_for.refuse_asks(unformed)
         _only_the_read_tables(args.source, contract, read_tables)
         exposes = profile_cmd._expose_sources(contract, read_tables, args.source, args.table)
         out = profile_cmd._out_path(args.out, named, [each.source for each in exposes])
@@ -851,6 +870,8 @@ _KIND = {
     "levels": "level histogram of",
     "bins": "histogram of",
     "rank": "rank correlation",
+    "pairDays": "days of the date pair",
+    "pairOrder": "order of the date pair",
 }
 
 
@@ -869,6 +890,7 @@ def _report(
     Only what is public or part of the release is said: the plan, the budget, each table's
     scale and share, the cliques, the reasons and the files. Never a count of the records.
     """
+    from fluid_build.cli import _profile_follow
     from fluid_build.profiler.dp import release
 
     say(
@@ -926,11 +948,18 @@ def _report(
                 soft_wrap=True,
             )
             continue
+        shown = (
+            " to ".join(table.columns)
+            if table.kind in ("pairDays", "pairOrder")
+            else ", ".join(table.columns)
+        )
         say(
-            f"  {_KIND[table.kind]} {', '.join(table.columns)}: noise scale {table.scale}, "
+            f"  {_KIND[table.kind]} {shown}: noise scale {table.scale}, "
             f"share rho {table.share}, squared L2 sensitivity {plan.sensitivity} for one entity",
             soft_wrap=True,
         )
+    for line in _profile_follow.unknown_values_notes(plan):
+        say(line, soft_wrap=True)
     if ranked:
         say(
             "A rank correlation's value is formed exactly with its row floor, floored onto a "

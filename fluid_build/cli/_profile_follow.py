@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__all__ = ["report"]
+__all__ = ["report", "unknown_values_notes"]
 
 _KIND = {
     "clique": "clique of",
@@ -25,7 +25,34 @@ _KIND = {
     "rank": "rank correlation",
     "relationship": "children per parent,",
     "link": "histogram grouped through a link,",
+    "pairDays": "days of the date pair",
+    "pairOrder": "order of the date pair",
 }
+
+
+def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
+    """What the histograms of columns that may hold a null and of date pairs count, in words.
+
+    Names columns and pairs only: the format holds no noisy null count, so none is released, and a
+    share of nulls is never stated.
+    """
+    place = "" if table is None else f" of exposes[{table}]"
+    notes: List[str] = []
+    nullable = [each.name for each in plan.columns if each.nullable]
+    if nullable:
+        notes.append(
+            f"The histogram of {', '.join(nullable)}{place}, which the contract does not declare "
+            "required, counts the column's known values: a record with no value lands in no cell. "
+            "It joins no clique, and no null count or share of nulls is released."
+        )
+    if plan.date_pairs:
+        notes.append(
+            f"The days and the order of each date pair{place} count the records where both dates "
+            "are known, on the whole public ladder of days: "
+            + "; ".join(f"{start} to {end}" for start, end in plan.date_pairs)
+            + "."
+        )
+    return notes
 
 
 def _words(plan: Any) -> List[str]:
@@ -119,7 +146,9 @@ def report(
     rests += (
         " The guarantee covers data that meets the contract (required columns hold a value, "
         "values lie in their declared levels and ranges, and each followed parent key names one "
-        "row); data that does not is refused, releases nothing, and the refusal is for the data "
+        "row, except that a followed relationship out of a versioned table by its natural entity "
+        "repeats its key by design and then needs an entity's versions to follow one parent row, "
+        "refused as profile_release_entity_units otherwise); data that does not is refused, releases nothing, and the refusal is for the data "
         "owner (it names a table, a column and a row): a refusal is not covered by the "
         "guarantee."
     )
@@ -137,6 +166,8 @@ def report(
             continue
         if table.kind in ("relationship", "link"):
             what = table.label
+        elif table.kind in ("pairDays", "pairOrder"):
+            what = " to ".join(table.columns)
         else:
             what = ", ".join(table.columns)
         say(
@@ -144,6 +175,9 @@ def report(
             f"{table.share}, squared L2 sensitivity {table.sensitivity} for one unit",
             soft_wrap=True,
         )
+    for each in plan.tables:
+        for line in unknown_values_notes(each.plan, each.table):
+            say(line, soft_wrap=True)
     if plan.selects:
         chosen: Dict[str, Any] = dict(drawn.cliques)
         listed = "; ".join(

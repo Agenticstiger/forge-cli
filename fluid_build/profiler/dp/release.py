@@ -9,9 +9,9 @@ reason for every requested item that is not, each column's public levels or bins
 budget. Nothing is read. :func:`encode_rows` then reads the values of the records once and
 refuses what the release cannot hold, naming a column and a row and never a value.
 :func:`draw` bounds what each unit contributes, chooses the cliques, counts, adds noise,
-makes the tables agree and writes the document (profile format 1-2-0, or 1-4-0 when it holds a
-rank correlation, a clique with a binned column or a ``cliqueSelection``; PROFILE-SPEC section 3a
-and 5a). :func:`build_record` and :func:`check_record` are the release record's side: what a
+makes the tables agree and writes the document (profile format 1-2-0, 1-3-0 when it holds a
+date pair, or 1-4-0 when it holds a rank correlation, a clique with a binned column or a
+``cliqueSelection``; PROFILE-SPEC section 3a and 5a). :func:`build_record` and :func:`check_record` are the release record's side: what a
 release needs to be drawn again inside the data owner's boundary.
 
 The noise is drawn from a seeded randomness source recorded inside the data owner's
@@ -25,7 +25,19 @@ columns of the request's ``cliqueColumns``, a number or timestamp column joining
 bins), and the rest is split equally over the parts, each share floored to 12 decimal places so
 the parts never add up to more than the total. :func:`release_parts` lists the parts once, and
 the document, the report and the record all read that list. A part is a count table (a clique, a
-level histogram or a histogram of a binned column) or a rank correlation of a pair of columns.
+level histogram or a histogram of a binned column, or the days or the order of a date pair) or a
+rank correlation of a pair of columns.
+
+A column the contract does not declare required is released like a required one, counting its
+known values only: a record with no value lands in no cell, so a unit still changes at most
+``m_T`` cells by one each. Its table has a share of its own and is noised on its own: it joins no
+clique, no selection and no consistency step (cliques count a record only where every column is
+known, and tables that share a column must agree, so they keep the required columns). A date pair
+the request asks is two such tables over the rows where both dates are known: the days from start
+to end on the whole public ladder :data:`~fluid_build.profiler.dates.DAY_LADDER`, never trimmed,
+and the order over ``after``, ``before`` and ``same``. No null count, no share of nulls and no row
+count is written: the format has no noisy null count, and a share formed from two noisy totals
+would be too noisy to use.
 
 A count table's noise is a discrete Gaussian whose scale is the least ``m / 10**6`` that spends
 no more than its share on a table whose squared L2 sensitivity is
@@ -40,7 +52,8 @@ import importlib.util
 import itertools
 import math
 import re
-from dataclasses import dataclass, field
+from bisect import bisect_right
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, Decimal, localcontext
 from fractions import Fraction
 from typing import (
@@ -57,7 +70,7 @@ from typing import (
 )
 
 from fluid_build.policy._common import iter_exposes
-from fluid_build.profiler import defaults, document, runner, sources
+from fluid_build.profiler import dates, defaults, document, runner, sources
 from fluid_build.profiler._stats import Request, StatisticsBackend
 from fluid_build.profiler.defaults import BOOLEAN_LEVELS, DeclaredRange
 from fluid_build.profiler.dp import bounding, consistency, rank_noise, selection
@@ -73,6 +86,10 @@ __all__ = [
     "DEFAULT_ROW_FLOOR",
     "MECHANISM",
     "LINK",
+    "NO_CELL",
+    "PAIR_DAYS",
+    "PAIR_ORDER",
+    "PAIRS",
     "Part",
     "PublicStructures",
     "RANK",
@@ -91,6 +108,7 @@ __all__ = [
     "decimal_text",
     "draw",
     "encode_rows",
+    "measure_counts",
     "epsilon_at_delta",
     "noise_label",
     "parse_rho",
@@ -301,6 +319,8 @@ class ReleasedColumn:
     edge_texts: Tuple[str, ...] = ()
     #: The exact range its validationRules declare, when its bins are cut over one.
     declared: Optional[DeclaredRange] = None
+    #: The contract does not declare it required: a record may hold no value, which lands in no cell.
+    nullable: bool = False
 
     @property
     def categorical(self) -> bool:
@@ -353,6 +373,12 @@ class ReleasePlan:
     reach: Optional[int] = None
     #: The share a unit that follows its child rows spends choosing this table's cliques.
     selection_rho: Optional[Fraction] = None
+    #: The date pairs released, ``(start, end)``, in the request's order: both DATE columns of
+    #: the table, neither a key.
+    date_pairs: Tuple[Tuple[str, str], ...] = ()
+    #: The columns of those pairs the contract declares required: a record with no value in one
+    #: refuses the release, as in a released column.
+    date_required: FrozenSet[str] = frozenset()
 
     @property
     def categorical(self) -> Tuple[ReleasedColumn, ...]:
@@ -491,6 +517,59 @@ class _TableColumns:
     selects: bool
     rank_pairs: Tuple[Tuple[str, str, str], ...]
     rank_left_out: Tuple[Tuple[str, str], ...]
+    #: The date pairs the table releases, the required ones among their columns, and each pair
+    #: asked that it does not, and each ask to join a clique that it does not hold, with why.
+    date_pairs: Tuple[Tuple[str, str], ...] = ()
+    date_required: FrozenSet[str] = frozenset()
+    date_left_out: Tuple[Tuple[str, str], ...] = ()
+    clique_left_out: Tuple[Tuple[str, str], ...] = ()
+
+
+_NOT_A_DATE = (
+    "a date pair is formed over DATE columns, whose days are whole; a timestamp column's order "
+    "is on the millisecond and its days are whole, which one count cannot hold together"
+)
+
+
+def _date_pairs(
+    asked: Any,
+    table: str,
+    readable: Mapping[str, runner.ColumnPlan],
+    skipped: Mapping[str, str],
+    keys: FrozenSet[str],
+    schema: Mapping[str, Mapping[str, Any]],
+) -> Tuple[Tuple[Tuple[str, str], ...], FrozenSet[str], List[Tuple[str, str]]]:
+    """The date pairs of *asked* the release holds, the required columns among them, and the rest.
+
+    Decided from the contract and the request alone: a pair is released when both its columns are
+    DATE columns that fluid profile reads and that are not keys. Never a value.
+    """
+    kept: List[Tuple[str, str]] = []
+    required: set[str] = set()
+    left_out: List[Tuple[str, str]] = []
+    for pair in asked.date_pairs:
+        what = f"date pair {pair.start} to {pair.end} of {table}"
+        reason: Optional[str] = None
+        for name in (pair.start, pair.end):
+            column = readable.get(name)
+            if column is None:
+                reason = f"{name}: a column fluid profile does not read" + (
+                    f" ({skipped[name]})" if name in skipped else ""
+                )
+            elif name in keys:
+                reason = f"{name}: a key column, whose values name an entity"
+            elif not (column.domain == runner.TIMESTAMP and column.date):
+                reason = f"{name}: {_NOT_A_DATE}"
+            if reason is not None:
+                break
+        if reason is not None:
+            left_out.append((what, reason))
+            continue
+        kept.append((pair.start, pair.end))
+        required.update(
+            name for name in (pair.start, pair.end) if schema.get(name, {}).get("required") is True
+        )
+    return tuple(kept), frozenset(required), left_out
 
 
 def _plan_columns(
@@ -545,26 +624,26 @@ def _plan_columns(
         statistic = (
             "levelHistogram/1" if column.domain == runner.CATEGORY else "marginalHistogram/1"
         )
-        if entry.get("required") is not True:
-            why_not[column.name] = (
-                "the contract does not declare it required: true, and a record with no value "
-                "is refused, never counted"
-            )
-        elif statistic not in ask.statistics:
+        if statistic not in ask.statistics:
             why_not[column.name] = f"the request does not list {statistic} for it"
         else:
             made = known.column(column, entry, backend)
             if isinstance(made, str):
                 why_not[column.name] = made
+            elif entry.get("required") is not True:
+                released.append(replace(made, nullable=True))
             else:
                 released.append(made)
-    if not released and not nothing_ok:
+    pairs, pair_required, pair_left_out = _date_pairs(
+        asked, table, readable, skipped, frozenset(keys), schema
+    )
+    if not released and not pairs and not nothing_ok:
         raise _refuse(
             "profile_release_nothing_to_release",
             f"no requested column of {table!r} can be released: "
             + "; ".join(f"{name}: {reason}" for name, reason in sorted(why_not.items())),
-            "list levelHistogram/1 for a required enum column, or marginalHistogram/1 for a "
-            "required number, date or timestamp column that is not a key",
+            "list levelHistogram/1 for an enum column, or marginalHistogram/1 for a number, date "
+            "or timestamp column that is not a key, or a date pair of two DATE columns",
             read=True,
         )
     for name in keys & set(readable):
@@ -585,7 +664,19 @@ def _plan_columns(
         )
     joining = set(asked.clique_columns)
     eligible = tuple(
-        each for each in released if (each.name in joining if joining else each.categorical)
+        each
+        for each in released
+        if not each.nullable and (each.name in joining if joining else each.categorical)
+    )
+    clique_left_out = tuple(
+        (
+            f"clique column {table}.{each.name}",
+            "the contract does not declare it required, a clique counts a record only where "
+            "every column has a value, and a table that shares a column with another must agree "
+            "with it",
+        )
+        for each in released
+        if each.nullable and each.name in joining
     )
     selects = len(eligible) >= 2
     if selects and len(eligible) > selection.MOST_SELECTION_COLUMNS:
@@ -613,6 +704,10 @@ def _plan_columns(
         selects=selects,
         rank_pairs=rank_pairs,
         rank_left_out=tuple(rank_left_out),
+        date_pairs=pairs,
+        date_required=pair_required,
+        date_left_out=tuple(pair_left_out),
+        clique_left_out=clique_left_out,
     )
 
 
@@ -679,9 +774,13 @@ def plan_release(
     )
     # At most one part per released column and rank pair, so no part gets a share below the least
     # check.
-    split_budget(rho, selects, len(released) + len(rank_pairs))
+    split_budget(rho, selects, len(released) + len(rank_pairs) + 2 * len(found.date_pairs))
 
-    read_names = {each.name for each in released} | set(unit_plan.key_columns)
+    read_names = (
+        {each.name for each in released}
+        | set(unit_plan.key_columns)
+        | {name for pair in found.date_pairs for name in pair}
+    )
     missing_keys = [name for name in unit_plan.key_columns if name not in readable]
     if missing_keys:
         raise _refuse(
@@ -717,6 +816,8 @@ def plan_release(
         not_released=(
             *_not_released(request, table, frozenset(c.name for c in released), why_not, skipped),
             *rank_left_out,
+            *found.date_left_out,
+            *found.clique_left_out,
         ),
         rho=rho,
         selects=selects,
@@ -728,6 +829,8 @@ def plan_release(
         row_floor=floor,
         rank_deltas=deltas,
         clique_method=clique_method,
+        date_pairs=found.date_pairs,
+        date_required=found.date_required,
     )
 
 
@@ -745,9 +848,11 @@ def _rank_pairs(
     """The rank correlations the release holds, and each pair asked that it does not, with why.
 
     A pair is released when both its columns are released number or timestamp columns: their
-    bins are public and a record holds a value in each.
+    bins are public and a record holds a value in each: a column that may hold a null is left
+    out, since a rank correlation is formed over every record.
     """
-    ordered = {each.name for each in released if not each.categorical}
+    ordered = {each.name for each in released if not each.categorical and not each.nullable}
+    nullable = {each.name for each in released if each.nullable}
     kept: List[Tuple[str, str, str]] = []
     left_out: List[Tuple[str, str]] = []
     for ask in asked.rank_correlations:
@@ -760,6 +865,11 @@ def _rank_pairs(
                     continue
                 name = missing[0]
                 reason = why_not.get(name) or skipped.get(name)
+                if reason is None and name in nullable:
+                    reason = (
+                        "the contract does not declare it required, and a rank correlation is "
+                        "formed over every record"
+                    )
                 if reason is None:
                     reason = (
                         "the release holds the rank correlation of released number or timestamp "
@@ -821,6 +931,9 @@ def _not_released(
                     "listed columns appear with their domains only",
                 )
             )
+            found.extend(
+                other_table_pairs(each, f"the release holds the statistics of one table, {table}")
+            )
             continue
         found.extend(_table_not_released(each, table, released, why_not, skipped))
     for link in request.relationships:
@@ -837,6 +950,14 @@ def _not_released(
 
     found.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED, private=True))
     return tuple(found)
+
+
+def other_table_pairs(each: Any, reason: str) -> List[Tuple[str, str]]:
+    """The date pairs of a listed table the release does not hold, each with *reason*."""
+    return [
+        (f"date pair {pair.start} to {pair.end} of {each.expose_id}", reason)
+        for pair in each.date_pairs
+    ]
 
 
 def check_selection_available(plan: ReleasePlan) -> None:
@@ -886,15 +1007,34 @@ class EncodedRows:
     levels: Mapping[str, Sequence[str]] = field(default_factory=dict)
     #: Per column of a rank correlation, each row's value floored onto the grid.
     grid: Mapping[str, Sequence[int]] = field(default_factory=dict)
+    #: Per date pair, the bin of the days from start to end each row falls in, :data:`NO_CELL`
+    #: where either date is null.
+    pairs: Mapping[Tuple[str, str], Sequence[int]] = field(default_factory=dict)
 
 
 _OUTSIDE = "profile_record_outside_declared_domain"
+#: The cell of a row with no value in a column that may hold none: it is counted in no cell.
+NO_CELL = -1
+_MS_PER_DAY = 86_400_000
+_INNER_DAYS = dates.DAY_LADDER[1:-1]
+#: The level of ``order`` (an index into :data:`dates.ORDER_LEVELS`) of each bin of the day ladder.
+_ORDER_OF_BIN = tuple(
+    dates.ORDER_LEVELS.index("before" if left < 0 else "same" if left == 0 else "after")
+    for left in dates.DAY_LADDER[:-1]
+)
 
 
-def _row_error(event: str, column: str, row: int, what: str) -> ReleaseRefused:
+def _row_error(
+    event: str, column: str, row: int, what: str, table: Optional[str] = None
+) -> ReleaseRefused:
+    where = (
+        f"column {column!r} row {row}"
+        if table is None
+        else (f"table {table!r} column {column!r} row {row}")
+    )
     return ReleaseRefused(
         event,
-        f"column {column!r} row {row}: {what}",
+        f"{where}: {what}",
         {
             "next": "fix the records, or the contract's column type, enum levels or "
             "validationRules range, then release"
@@ -908,19 +1048,31 @@ def place_values(
     found: Sequence[Any],
     backend: StatisticsBackend,
     fractional_bits: int,
+    *,
+    rows: Optional[Sequence[int]] = None,
+    table: Optional[str] = None,
 ) -> List[int]:
     """The level or bin each value of *column* falls in, no value being ``None``.
 
     A value outside the levels or the range the column declares refuses, naming the column and
-    the row and never the value.
+    the row and never the value. *rows* are the rows of the table the values are, when they are
+    not all of them (a column that may hold a null is placed over the rows that hold a value).
     """
+
+    def at(index: int) -> int:
+        return index if rows is None else rows[index]
+
     if column.categorical:
         position = {level: place for place, level in enumerate(column.levels)}
         placed = []
         for index, value in enumerate(found):
             if value not in position:
                 raise _row_error(
-                    _OUTSIDE, name, index, "a value outside the levels its type declares"
+                    _OUTSIDE,
+                    name,
+                    at(index),
+                    "a value outside the levels its type declares",
+                    table,
                 )
             placed.append(position[value])
         return placed
@@ -930,10 +1082,99 @@ def place_values(
             raise _row_error(
                 _OUTSIDE,
                 name,
-                index,
+                at(index),
                 "a value outside the range its type or validationRules declare",
+                table,
             )
     return backend.bin_cells(found, column.edges, fractional_bits)
+
+
+def place_known(
+    name: str,
+    column: ReleasedColumn,
+    found: Sequence[Any],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+    *,
+    table: Optional[str] = None,
+) -> List[int]:
+    """The cell of each value of a column that may hold a null: :data:`NO_CELL` where it holds none.
+
+    A column the contract declares required refuses a null (``profile_release_null``), naming the
+    column and the row. Only the values that exist are placed, and a value outside the levels or
+    bins refuses as in :func:`place_values`.
+    """
+    known = [index for index, value in enumerate(found) if value is not None]
+    if len(known) != len(found) and not column.nullable:
+        index = next(i for i, value in enumerate(found) if value is None)
+        raise _row_error(
+            "profile_release_null",
+            name,
+            index,
+            "no value, and the release needs one in every row",
+            table,
+        )
+    placed = place_values(
+        name,
+        column,
+        [found[index] for index in known],
+        backend,
+        fractional_bits,
+        rows=known,
+        table=table,
+    )
+    cells = [NO_CELL] * len(found)
+    for index, cell in zip(known, placed, strict=True):
+        cells[index] = cell
+    return cells
+
+
+def day_bin(days: int) -> int:
+    """The bin of :data:`dates.DAY_LADDER` that *days* falls in; a day beyond an end is in that end."""
+    return bisect_right(_INNER_DAYS, days)
+
+
+def pair_cells(
+    plan: "ReleasePlan",
+    exact: Mapping[str, Sequence[Any]],
+    *,
+    table: Optional[str] = None,
+) -> Dict[Tuple[str, str], List[int]]:
+    """The bin of the days from start to end of each row of each date pair of *plan*.
+
+    *exact* are the values read for each column of the pairs, in the timestamp domain
+    (milliseconds). A row where either date is null has :data:`NO_CELL`. A null in a column the
+    contract declares required refuses (``profile_release_null``), and so does a value that is no
+    whole day (``profile_record_outside_declared_domain``): the days of a pair are whole, and a
+    pair is never left out because of what the records hold. A refusal names the column and the
+    row, never a value.
+    """
+    whole: Dict[str, List[Optional[int]]] = {}
+    for name in dict.fromkeys(name for pair in plan.date_pairs for name in pair):
+        found: List[Optional[int]] = []
+        for index, value in enumerate(exact[name]):
+            if value is None:
+                if name in plan.date_required:
+                    raise _row_error(
+                        "profile_release_null",
+                        name,
+                        index,
+                        "no value, and the release needs one in every row",
+                        table,
+                    )
+                found.append(None)
+            elif value % _MS_PER_DAY:
+                raise _row_error(_OUTSIDE, name, index, "a value that is not a whole day", table)
+            else:
+                found.append(int(value // _MS_PER_DAY))
+        whole[name] = found
+    cells: Dict[Tuple[str, str], List[int]] = {}
+    for start, end in plan.date_pairs:
+        cells[(start, end)] = [
+            NO_CELL if first is None or last is None else day_bin(last - first)
+            for first, last in zip(whole[start], whole[end], strict=True)
+        ]
+    return cells
 
 
 def encode_rows(
@@ -958,18 +1199,10 @@ def encode_rows(
     cells: Dict[str, List[int]] = {}
     levels: Dict[str, Sequence[str]] = {}
     for name, each in released.items():
-        found = exact[name]
-        for index, value in enumerate(found):
-            if value is None:
-                raise _row_error(
-                    "profile_release_null",
-                    name,
-                    index,
-                    "no value, and the release needs one in every row",
-                )
         if each.categorical:
             levels[name] = each.levels
-        cells[name] = place_values(name, each, found, backend, plan.fractional_bits)
+        cells[name] = place_known(name, each, exact[name], backend, plan.fractional_bits)
+    pairs = pair_cells(plan, exact)
     unit = plan.unit
     keyed: List[Optional[bytes]] = [None] * rows
     if unit.mode != ROWS or unit.key_columns:
@@ -1008,11 +1241,17 @@ def encode_rows(
         encode = backend.encoder(plan.fractional_bits)
         for name in dict.fromkeys(n for _, a, b in plan.rank_pairs for n in (a, b)):
             grid[name] = [encode(Fraction(value)) for value in exact[name]]
-    order = [each.name for each in plan.columns]
+    order = list(
+        dict.fromkeys(
+            [*(each.name for each in plan.columns), *(n for p in plan.date_pairs for n in p)]
+        )
+    )
     contents = [
         bounding.encode_values([exact[name][index] for name in order]) for index in range(rows)
     ]
-    return EncodedRows(cells=cells, units=keyed, contents=contents, levels=levels, grid=grid)
+    return EncodedRows(
+        cells=cells, units=keyed, contents=contents, levels=levels, grid=grid, pairs=pairs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1259,10 @@ def encode_rows(
 # ---------------------------------------------------------------------------
 
 CLIQUE, LEVELS, BINS, RANK = "clique", "levels", "bins", "rank"
+#: The two parts of a date pair: the days from start to end on the public ladder, and the order
+#: (``after``, ``before``, ``same``), each a count table over the rows where both dates are known.
+PAIR_DAYS, PAIR_ORDER = "pairDays", "pairOrder"
+PAIRS = (PAIR_DAYS, PAIR_ORDER)
 #: The two kinds a unit that follows its child rows adds: a relationship's children-per-parent
 #: histogram and a statistic grouped through a link.
 RELATION, LINK = "relationship", "link"
@@ -1029,8 +1272,9 @@ RELATION, LINK = "relationship", "link"
 class Part:
     """One noisy statistic of the release, before its scale is chosen.
 
-    ``kind`` is :data:`CLIQUE`, :data:`LEVELS`, :data:`BINS` or :data:`RANK`; ``sizes`` are the
-    cells of each column of a count table (none for a rank correlation, whose ``definition``
+    ``kind`` is :data:`CLIQUE`, :data:`LEVELS`, :data:`BINS`, :data:`PAIR_DAYS`,
+    :data:`PAIR_ORDER` or :data:`RANK`; ``sizes`` are the cells of each column of a count table
+    (the cells of a date pair's days or order; none for a rank correlation, whose ``definition``
     names it and whose ``columns`` are its pair). ``label`` names its noise stream.
     """
 
@@ -1083,7 +1327,7 @@ class ReleasedTable:
             found["table"] = self.table
         if self.kind == RANK:
             found.update({"kind": RANK, "definition": self.definition, "rowFloor": self.row_floor})
-        elif self.kind in (RELATION, LINK):
+        elif self.kind in (RELATION, LINK, *PAIRS):
             found["kind"] = self.kind
         return found
 
@@ -1131,7 +1375,8 @@ def release_parts(plan: ReleasePlan, cliques: Sequence[Sequence[str]]) -> Tuple[
     The document, the report, the budget and the record all read this list. The parts are the
     cliques as given, then a level histogram for each categorical column in none of them, then
     a histogram for each number, date or timestamp column in none of them (the last two in column
-    order), then each rank correlation in the request's order. Each is one equal share.
+    order), then each rank correlation in the request's order, then the days and the order of each
+    date pair in the request's order. Each is one equal share.
     """
     names = _eligible_names(plan)
     position = {name: place for place, name in enumerate(names)}
@@ -1172,7 +1417,34 @@ def release_parts(plan: ReleasePlan, cliques: Sequence[Sequence[str]]) -> Tuple[
         parts.append(
             Part(RANK, f"rank/{definition}/{first}/{second}", (first, second), (), definition)
         )
+    for start, end in plan.date_pairs:
+        parts.append(
+            Part(
+                PAIR_DAYS,
+                f"pair/days/{start}/{end}",
+                (start, end),
+                (len(dates.DAY_LADDER) - 1,),
+            )
+        )
+        parts.append(
+            Part(PAIR_ORDER, f"pair/order/{start}/{end}", (start, end), (len(dates.ORDER_LEVELS),))
+        )
     return tuple(parts)
+
+
+def agrees(plan: ReleasePlan, table: "ReleasedTable") -> bool:
+    """Whether *table* is made to agree with the others: a clique, or the histogram of a required column.
+
+    A histogram of a column that may hold a null counts that column's known values, which are not
+    the records the other tables count, and the days and the order of a date pair count the rows
+    where both dates are known; none is made to agree with another table, and each is noised on
+    its own.
+    """
+    if table.kind in PAIRS:
+        return False
+    if table.kind in (LEVELS, BINS):
+        return not plan.column(table.columns[0]).nullable
+    return True
 
 
 def _describe(
@@ -1311,6 +1583,54 @@ def _agree(tables: Sequence[ReleasedTable], texts: Sequence[Sequence[str]]) -> N
         )
 
 
+def table_cells(table: ReleasedTable, encoded: EncodedRows, kept: Sequence[int]) -> List[int]:
+    """The cell of each kept row in the count table *table*; :data:`NO_CELL` where it lands in none.
+
+    A row lands in no cell of a table when a column of it holds no value (a column that may hold a
+    null) or, for a date pair, when either date is null. A unit therefore still changes at most
+    the cells it changed before, each by at most one.
+    """
+    if table.kind in PAIRS:
+        days = encoded.pairs[(table.columns[0], table.columns[1])]
+        if table.kind == PAIR_DAYS:
+            return [days[i] for i in kept]
+        return [NO_CELL if days[i] == NO_CELL else _ORDER_OF_BIN[days[i]] for i in kept]
+    cell = [0] * len(kept)
+    for name, size in zip(table.columns, table.sizes, strict=True):
+        index = encoded.cells[name]
+        cell = [
+            NO_CELL if value == NO_CELL or index[i] == NO_CELL else value * size + index[i]
+            for value, i in zip(cell, kept, strict=True)
+        ]
+    return cell
+
+
+def measure_counts(
+    plan: ReleasePlan,
+    rows: EncodedRows,
+    kept: Sequence[int],
+    tables: Sequence[ReleasedTable],
+) -> Dict[str, List[int]]:
+    """The exact cells of every count table of the release, by label: what one unit moves by at most
+    the sensitivity each part is charged. Rank correlations are not counts and are left out.
+
+    *kept* are the rows left after the bounding. A row with no cell in a table is not counted in
+    it, and a unit counts at most ``max_rows_per_cell`` rows in one cell.
+    """
+    unit = plan.unit
+    cap = unit.max_rows_per_cell if unit.mode != ROWS else 1
+    found: Dict[str, List[int]] = {}
+    for table in tables:
+        if table.kind == RANK:
+            continue
+        cells = table_cells(table, rows, kept)
+        units = [rows.units[i] for i, cell in zip(kept, cells, strict=True) if cell != NO_CELL]
+        found[table.label] = bounding.capped_counts(
+            units, [cell for cell in cells if cell != NO_CELL], table.cells, cap
+        )
+    return found
+
+
 def draw(
     plan: ReleasePlan,
     rows: EncodedRows,
@@ -1378,46 +1698,49 @@ def draw(
             dict(refused.context),
         ) from None
     counted = [each for each in tables if each.kind != RANK]
-    sigma2 = Fraction(counted[0].scale_units ** 2, 10 ** (2 * _SCALE_PLACES))
-
-    kept_units = [rows.units[i] for i in kept]
+    exact = measure_counts(plan, rows, kept, tables)
     noisy: List[Tuple[Fraction, ...]] = []
-    count_tables: List[consistency.CountTable] = []
+    together: List[consistency.CountTable] = []
     for table in counted:
-        cell = [0] * len(kept)
-        for name, size in zip(table.columns, table.sizes, strict=True):
-            index = rows.cells[name]
-            cell = [value * size + index[i] for value, i in zip(cell, kept, strict=True)]
-        counts = bounding.capped_counts(
-            kept_units, cell, table.cells, unit.max_rows_per_cell if unit.mode != ROWS else 1
-        )
+        sigma2 = Fraction(table.scale_units**2, 10 ** (2 * _SCALE_PLACES))
         source = SeededSource(seed, table.label)
         values = tuple(
-            Fraction(count + sample_discrete_gaussian(sigma2, source)) for count in counts
+            Fraction(count + sample_discrete_gaussian(sigma2, source))
+            for count in exact[table.label]
         )
         noisy.append(values)
-        count_tables.append(
-            consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
-        )
-    try:
-        forest = consistency.junction_forest(count_tables)
-        agreed = consistency.make_consistent(count_tables)
-        texts = consistency.to_decimal_text(count_tables, agreed, forest)
-    except ValueError as error:
-        raise ReleaseRefused(
-            "profile_release_not_a_forest",
-            f"the tables of the release cannot be made to agree: {error}",
-            {"next": "report it with your forge-cli version"},
-        ) from None
-    _agree(counted, texts)
-    values_of = {table.label: cells for table, cells in zip(counted, texts, strict=True)}
+        if agrees(plan, table):
+            together.append(
+                consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
+            )
+    values_of: Dict[str, Tuple[str, ...]] = {}
+    agreed_of: Dict[str, Tuple[Fraction, ...]] = {}
+    if together:
+        try:
+            forest = consistency.junction_forest(together)
+            agreed = consistency.make_consistent(together)
+            texts = consistency.to_decimal_text(together, agreed, forest)
+        except ValueError as error:
+            raise ReleaseRefused(
+                "profile_release_not_a_forest",
+                f"the tables of the release cannot be made to agree: {error}",
+                {"next": "report it with your forge-cli version"},
+            ) from None
+        agreeing = [each for each in counted if agrees(plan, each)]
+        _agree(agreeing, texts)
+        values_of.update({table.label: cells for table, cells in zip(agreeing, texts, strict=True)})
+        agreed_of.update({table.label: each for table, each in zip(agreeing, agreed, strict=True)})
+    for table, values in zip(counted, noisy, strict=True):
+        if table.label not in values_of:
+            values_of[table.label] = tuple(decimal_text(value) for value in values)
+            agreed_of[table.label] = values
     for table in tables:
         if table.kind == RANK:
             first, second = table.columns
             pairs = [(rows.grid[first][i], rows.grid[second][i]) for i in kept]
-            exact = backend.rank_value(table.definition, pairs, table.row_floor)
+            value = backend.rank_value(table.definition, pairs, table.row_floor)
             noised = rank_noise.release_value(
-                exact, table.delta, table.scale_units, SeededSource(seed, table.label)
+                value, table.delta, table.scale_units, SeededSource(seed, table.label)
             )
             values_of[table.label] = (decimal_text(noised),)
 
@@ -1436,7 +1759,7 @@ def draw(
         selection_rho=selection_share(plan),
         share=share,
         noisy=tuple(noisy),
-        consistent=agreed,
+        consistent=tuple(agreed_of[each.label] for each in counted),
     )
 
 
@@ -1471,6 +1794,7 @@ def _table_block(
     }
     cliques: List[Dict[str, Any]] = []
     pairs: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    dated: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
     binned = False
     for table in tables:
         cells = values_of[table.label]
@@ -1518,6 +1842,21 @@ def _table_block(
                 }
             )
             continue
+        if table.kind in PAIRS:
+            statistic: Dict[str, Any] = {
+                "sampleSize": {"min": 0},
+                "disclosure": RULE_NAME,
+                "groups": [{"group": "", "status": "F", "noisyCounts": list(cells)}],
+                "noise": _noise_block(table),
+            }
+            if table.kind == PAIR_DAYS:
+                statistic["definition"] = "marginalHistogram/1"
+                statistic["bins"] = [str(edge) for edge in dates.DAY_LADDER]
+            else:
+                statistic["definition"] = "levelHistogram/1"
+                statistic["levels"] = list(dates.ORDER_LEVELS)
+            dated.setdefault((table.columns[0], table.columns[1]), {})[table.kind] = statistic
+            continue
         column = plan.column(table.columns[0])
         entry: Dict[str, Any] = {
             "definition": "levelHistogram/1" if table.kind == LEVELS else "marginalHistogram/1",
@@ -1543,6 +1882,17 @@ def _table_block(
                 ),
             }
             for (first, second), statistics in pairs.items()
+        ]
+    if dated:
+        released["datePairs"] = [
+            {
+                "start": start,
+                "end": end,
+                "statistics": [dated[(start, end)][PAIR_DAYS]],
+                "order": dated[(start, end)][PAIR_ORDER],
+            }
+            for start, end in plan.date_pairs
+            if (start, end) in dated
         ]
     # A release of format 1-2-0 states no selection, and the loss of choosing the cliques is
     # slack below its total. One that holds a 1-4-0 form, or names MST, states it.
@@ -1571,9 +1921,10 @@ def _document(
         from fluid_build import __version__
 
         producer = document.producer_uri(__version__)
+    needed = document.schema_url_for({plan.table: released})
     schema_url = (
-        document.SCHEMA_URL_1_4_0
-        if document.schema_url_for({plan.table: released}) == document.SCHEMA_URL_1_4_0
+        needed
+        if needed in (document.SCHEMA_URL_1_3_0, document.SCHEMA_URL_1_4_0)
         else SCHEMA_URL_1_2_0
     )
     return {
@@ -1697,7 +2048,7 @@ def check_record(plan: ReleasePlan, record: ReleaseRecord) -> Tuple[Tuple[str, .
         columns = each.get("columns") if isinstance(each, Mapping) else None
         if not isinstance(columns, list) or not all(isinstance(name, str) for name in columns):
             raise _mismatch("a table's columns are not names")
-        if each.get("kind") == RANK:
+        if each.get("kind") in (RANK, *PAIRS):
             continue
         if len(columns) >= 2:
             cliques.append(tuple(columns))

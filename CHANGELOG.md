@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A private release holds nullable columns and date pairs.** With `--privacy-unit`, own rows or
+  `--follow`, a column the contract does not declare `required: true` is released like a required
+  one: its public levels or bins, a noisy histogram with a share of its own, counting the column's
+  known values (a record with no value lands in no cell, so a unit still changes at most `m_T`
+  cells by one each). It joins no clique and no consistency step, and no null count or share of
+  nulls is released. A null in a required column still refuses the release. The same holds for a
+  nullable child column of a statistic grouped through a link. Each date pair of two DATE
+  columns the request asks of a table the release holds gets a noisy histogram of the days from
+  start to end on the whole public ladder, never trimmed, and a noisy order (after, before, same),
+  both over the rows where both dates are known, each a share of the budget charged like every
+  count table of its table. A pair with a timestamp or a key column, a calendar and a
+  relationship's dates and exposure are still named as not released, with their reasons, and
+  `--strict` refuses a date pair the contract shows cannot be formed. The document names format
+  1-3-0 with a date pair, and `--rederive` recomputes both. The help and the report now say that a
+  followed relationship out of a versioned table by its natural entity repeats its key by design,
+  with the entity-versions precondition, instead of that every followed parent key names one row.
+
 - **`fluid profile` publishes the history of a table with a validity window.** A table whose
   contract declares a slowly changing dimension (one natural entity and a start and an end
   dimension, both DATE or both timestamp columns) gets a `history` in a default profile: the
