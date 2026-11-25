@@ -600,14 +600,68 @@ def _policy_at(expose: Mapping[str, Any]) -> str:
     return f"exposes[{expose.get('exposeId') or '?'}].policy"
 
 
+def _first_ref(node: Any, path: str) -> Optional[Tuple[str, Any]]:
+    """``(path, pointer)`` of the first ``$ref`` left in ``node``, or ``None``."""
+    if isinstance(node, Mapping):
+        if "$ref" in node:
+            return path, node["$ref"]
+        for key, value in node.items():
+            found = _first_ref(value, f"{path}.{key}")
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found = _first_ref(value, f"{path}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
+def _refuse_unresolved_refs(expose: Mapping[str, Any]) -> None:
+    """Refuse an expose whose ``policy``, or whose ``contract`` or the column entries of
+    its ``contract.schema``, still holds a ``$ref``. The row filters, readers, column
+    restrictions and declared columns behind the pointer would read as absent, and the
+    expose would be served as though it declared none. forge's loader and ``fluid
+    bundle`` resolve every reference before the gateway reads a contract; a caller that
+    passes an expose of its own must resolve them first."""
+    at = f"exposes[{expose.get('exposeId') or '?'}]"
+    found = _first_ref(expose.get("policy"), f"{at}.policy")
+    contract = expose.get("contract")
+    if found is None and isinstance(contract, Mapping):
+        schema = contract.get("schema")
+        if "$ref" in contract:
+            found = (f"{at}.contract", contract["$ref"])
+        elif isinstance(schema, Mapping) and "$ref" in schema:
+            found = (f"{at}.contract.schema", schema["$ref"])
+        elif isinstance(schema, list):
+            found = next(
+                (
+                    (f"{at}.contract.schema[{index}]", column["$ref"])
+                    for index, column in enumerate(schema)
+                    if isinstance(column, Mapping) and "$ref" in column
+                ),
+                None,
+            )
+    if found is not None:
+        path, pointer = found
+        raise RowFilterUnavailable(
+            f"{path} holds an unresolved $ref ({str(pointer)[:120]!r}), so its row filters, "
+            "readers, column restrictions and declared columns cannot be read. Load the "
+            "contract with forge's loader or fluid bundle, which resolve every reference, "
+            "or resolve it before passing the expose."
+        )
+
+
 def _authz_block(expose: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     """The expose's ``policy.authz``, or ``None`` when it declares none.
 
-    Refuses the old ``policy.rowFilters`` key when it holds anything: no schema allows
-    it, and a contract that still fills it meant its rows to be filtered, so reading
-    it as "no filter" would serve them all. A ``policy`` or ``authz`` that is not a
-    mapping is refused for the same reason.
+    Refuses an expose that still holds an unresolved ``$ref`` where this reads
+    (:func:`_refuse_unresolved_refs`). Refuses the old ``policy.rowFilters`` key when
+    it holds anything: no schema allows it, and a contract that still fills it meant its
+    rows to be filtered, so reading it as "no filter" would serve them all. A ``policy``
+    or ``authz`` that is not a mapping is refused for the same reason.
     """
+    _refuse_unresolved_refs(expose)
     policy = expose.get("policy")
     if policy is None or (isinstance(policy, Mapping) and not policy):
         return None
