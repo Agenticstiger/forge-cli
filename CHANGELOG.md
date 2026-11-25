@@ -375,6 +375,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crosstab*`, `dblink*` and `pgstat*` function, beside the XML functions already refused. Their
   query text can be spelt without the word SELECT (`'SEL' || 'ECT ...'`), so neither the statement
   guard nor the projection saw it.
+- **On Postgres, a row-filtered read is evaluated as a step of its own.** Postgres can merge a
+  subquery into the statement around it and then evaluate the caller's conditions on rows the row
+  filter removes, so a condition that fails on such a row (a cast, a division by zero) could tell
+  the caller the row exists. `query` and `query_sql` now end the filtered projection with
+  `OFFSET 0` on Postgres, which keeps it separate.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is

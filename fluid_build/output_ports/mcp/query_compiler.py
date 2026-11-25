@@ -1535,7 +1535,7 @@ def compile_semantic_query(
         allowed = _allowed_columns(index, restricted)
         inner = f"SELECT {', '.join(allowed)} FROM {table_reference}"
         if row_predicate is not None:
-            inner += f" AS {ROW_FILTER_ALIAS} WHERE {row_predicate}"
+            inner += f" AS {ROW_FILTER_ALIAS} WHERE {row_predicate}{_postgres_fence(dialect)}"
         source = f"({inner}) AS {_PROJECTION_ALIAS}"
 
     sql_lines: List[str] = [
@@ -1578,6 +1578,17 @@ def compile_semantic_query(
         row_cap=limit if group_columns else None,
         row_filter=row_predicate,
         redacted_columns=tuple(redacted_aliases),
+    )
+
+
+def _postgres_fence(dialect: Optional[str]) -> str:
+    """What ends a row-filtered projection on ``dialect``: ``" OFFSET 0"`` on Postgres,
+    else nothing. Postgres flattens a plain subquery into the statement around it and
+    may then evaluate the caller's own conditions on rows the filter removes, so a
+    condition that fails on such a row (a cast, a division) would tell the caller the
+    row exists. ``OFFSET 0`` keeps the filtered projection a separate step there."""
+    return (
+        " OFFSET 0" if _SQLGLOT_DIALECTS.get((dialect or "").strip().lower()) == "postgres" else ""
     )
 
 
@@ -1897,13 +1908,21 @@ def _is_sanctioned_projection(
 ) -> bool:
     """Whether a read of the exposed table is the compiler's projection and nothing else:
     the sole source of a subquery that selects bare allowed columns and, with a row
-    filter, reads the table as :data:`ROW_FILTER_ALIAS` under exactly that WHERE."""
+    filter, reads the table as :data:`ROW_FILTER_ALIAS` under exactly that WHERE (and,
+    on Postgres, the ``OFFSET 0`` that keeps it a separate step)."""
     from sqlglot import exp
 
     select = table.parent.parent if isinstance(table.parent, exp.From) else None
     if not isinstance(select, exp.Select) or not isinstance(select.parent, exp.Subquery):
         return False
-    if any(value for key, value in select.args.items() if key not in _PROJECTION_CLAUSES):
+    fenced = expected_where is not None and read == "postgres"
+    extra = {key for key, value in select.args.items() if value and key not in _PROJECTION_CLAUSES}
+    if extra != ({"offset"} if fenced else set()):
+        return False
+    offset = select.args.get("offset")
+    if fenced and not (
+        isinstance(offset.expression, exp.Literal) and str(offset.expression.this) == "0"
+    ):
         return False
     if not all(
         isinstance(item, exp.Column) and not item.table and item.name.casefold() in allowed_names
@@ -1972,7 +1991,11 @@ def _project_exposed_table(
     _require_plain_sources(tree)
     exposed_name = exposed.name.casefold()
     tables = _refuse_unprojectable_reads(tree, exposed_name)
-    row_filter = "" if predicate is None else f" AS {ROW_FILTER_ALIAS} WHERE {predicate}"
+    row_filter = (
+        ""
+        if predicate is None
+        else f" AS {ROW_FILTER_ALIAS} WHERE {predicate}{_postgres_fence(dialect)}"
+    )
     projection = f"(SELECT {', '.join(allowed)} FROM {table_reference}{row_filter})"
     rewritten = _splice_projection(sql, tables, exposed, projection)
     try:

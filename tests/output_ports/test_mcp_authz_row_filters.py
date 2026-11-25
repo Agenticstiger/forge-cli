@@ -884,3 +884,32 @@ def test_a_restricted_expose_without_a_filter_reads_no_other_relation_either():
             expose=_expose(row_filters=[], readers=[]),
             dialect="postgres",
         )
+
+
+@pytest.mark.parametrize("tool", ["query", "query_sql"])
+def test_the_postgres_projection_is_a_separate_step(tool):
+    """Postgres would otherwise flatten the projection into the caller's statement and
+    could evaluate the caller's conditions on rows the filter removes."""
+
+    def compiled(dialect: str) -> str:
+        if tool == "query":
+            return query_compiler.compile_semantic_query(
+                expose=_expose(),
+                measure="total",
+                dimensions=["segment"],
+                limit=10,
+                table_reference="customers",
+                dialect=dialect,
+                caller_attributes=_as(EU),
+            ).sql
+        return query_compiler.compile_free_form_sql(
+            sql="SELECT id FROM customers WHERE amount > 0",
+            table_reference="customers",
+            limit=10,
+            expose=_expose(),
+            caller_attributes=_as(EU),
+            dialect=dialect,
+        ).sql
+
+    assert "WHERE ((_fluid_rows.region = 'EU')) OFFSET 0) AS " in compiled("postgres")
+    assert "OFFSET 0" not in compiled("duckdb")
