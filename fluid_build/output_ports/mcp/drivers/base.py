@@ -100,7 +100,7 @@ def guard_against_injection_markers(sql: str) -> None:
     if names_refused_postgres_function(sql):
         raise ValueError(
             "Refusing to execute statement that calls a function which reads a relation "
-            "or runs a query given as text"
+            "or runs a query given as text, or that writes a name with Unicode escapes"
         )
     # The one body SELECT the compiler writes itself: the allowed-column projection
     # an expose with column restrictions is read through.

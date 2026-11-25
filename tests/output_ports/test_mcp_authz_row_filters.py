@@ -849,6 +849,18 @@ def test_serve_refuses_a_policy_that_is_not_a_mapping_before_anything_reads_it(t
         ),
         pytest.param("SELECT connectby('customers', 'id', 'id', '1', 0)", id="connectby"),
         pytest.param("SELECT pgstattuple('customers')", id="pgstattuple"),
+        pytest.param(
+            "SELECT pg_stat_get_live_tuples('customers'::regclass)", id="pg-stat-row-count"
+        ),
+        # A refused name spelt with Unicode escapes is the same function to Postgres.
+        pytest.param(
+            "SELECT U&\"ts!005Fstat\" UESCAPE '!'('SEL' || 'ECT region FROM customers')",
+            id="ts-stat-unicode-escaped",
+        ),
+        pytest.param(
+            "SELECT pg_catalog.u&\"ts\\005Fstat\"('SEL' || 'ECT region FROM customers')",
+            id="ts-stat-unicode-escaped-qualified",
+        ),
         # Any relation besides the exposed table: a catalog view holds every row's values.
         pytest.param(
             "SELECT attname, most_common_vals::text FROM pg_stats WHERE tablename = 'customers'",
@@ -872,6 +884,93 @@ def test_query_sql_reads_no_relation_but_the_exposed_table(sql, restricted):
             caller_attributes=_as(EU),
             dialect="postgres",
         )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            "SELECT v.sql FROM duckdb_views AS v, "
+            "(WITH duckdb_views AS (FROM customers) FROM duckdb_views) AS x",
+            id="cte-in-another-subquery",
+        ),
+        pytest.param(
+            "SELECT * FROM (WITH duckdb_views AS (FROM duckdb_views) FROM duckdb_views) AS x",
+            id="cte-body-reads-its-own-name",
+        ),
+        pytest.param(
+            "SELECT * FROM (WITH a AS (FROM duckdb_views), duckdb_views AS (FROM customers) "
+            "FROM a) AS x",
+            id="cte-defined-after-the-read",
+        ),
+        pytest.param(
+            "SELECT * FROM customers AS duckdb_views, LATERAL (FROM duckdb_views) AS x",
+            id="alias-of-another-from-item",
+        ),
+    ],
+)
+def test_a_cte_covers_only_the_reads_in_its_scope(sql):
+    """A name that matches a CTE somewhere else in the statement is still the catalog's
+    relation where that CTE is not in scope."""
+    with pytest.raises(query_compiler.QueryValidationError, match="duckdb_views"):
+        query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=10,
+            expose=_expose(),
+            caller_attributes=_as(EU),
+            dialect="duckdb",
+        )
+
+
+def test_a_cte_in_scope_reads_the_filtered_projection(con):
+    sql = "SELECT id FROM (WITH c AS (FROM customers) FROM (FROM C) AS y) AS x"
+    assert _free_form(con, sql, _as(EU)) == [(1,), (3,)]
+
+
+@pytest.mark.parametrize(
+    ("sql", "refused"),
+    [
+        ('WITH X AS (SELECT id FROM customers) SELECT * FROM "X"', True),
+        ('WITH "X" AS (SELECT id FROM customers) SELECT * FROM X', True),
+        ("WITH x AS (SELECT id FROM customers) SELECT * FROM X", False),
+    ],
+)
+def test_a_cte_name_is_matched_the_way_postgres_folds_it(sql, refused):
+    """Postgres folds an unquoted name to lower case and keeps a quoted one, so ``"X"``
+    and an unquoted ``X`` are different relations there."""
+
+    def project():
+        return query_compiler._project_exposed_table(
+            sql, table_reference="customers", allowed=["id"], dialect="postgres"
+        )
+
+    if refused:
+        with pytest.raises(query_compiler.QueryValidationError, match="sql reads"):
+            project()
+    else:
+        assert "(SELECT id FROM customers) AS customers" in project()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT U&\"ts!005Fstat\" UESCAPE '!'('x') AS s",
+        "SELECT U&'!0041' UESCAPE '!' AS a",
+    ],
+)
+def test_unicode_escapes_are_refused_wherever_the_refused_functions_are(sql):
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+    from fluid_build.providers._sql_safety import validate_sql_expression_allowlist
+
+    with pytest.raises(query_compiler.QueryValidationError, match="Unicode escapes"):
+        query_compiler.compile_free_form_sql(
+            sql=sql, table_reference="customers", limit=10, dialect="postgres"
+        )
+    with pytest.raises(ValueError, match="Unicode escapes"):
+        guard_against_injection_markers(sql)
+    with pytest.raises(ValueError):
+        validate_sql_expression_allowlist(sql.split(None, 1)[1])
 
 
 def test_a_restricted_expose_without_a_filter_reads_no_other_relation_either():

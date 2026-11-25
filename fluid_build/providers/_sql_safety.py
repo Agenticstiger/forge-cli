@@ -67,10 +67,11 @@ def names_refused_duckdb_function(sql: str) -> bool:
 #: ``ts_rewrite`` run a query given as text (``ts_stat('SEL' || 'ECT ... FROM t')``
 #: spells it without the word), ``connectby`` reads a table named in text, and the
 #: ``crosstab``, ``dblink`` and ``pgstat`` families run a query or read a relation by
-#: name. No table node and no column name shows in the text a check here reads, so the
-#: engine reads past any column projection or row filter the caller's statement was
-#: limited to. Refused as a call, in any case, quoted or schema-qualified, on every
-#: dialect; a column that only shares a name is not a call.
+#: name, and the ``pg_stat`` family reports a relation's row counts. No table node and
+#: no column name shows in the text a check here reads, so the engine reads past any
+#: column projection or row filter the caller's statement was limited to. Refused as a
+#: call, in any case, quoted or schema-qualified, on every dialect; a column that only
+#: shares a name is not a call.
 POSTGRES_REFUSED_FUNCTIONS = frozenset(
     {
         "connectby",
@@ -87,13 +88,15 @@ POSTGRES_REFUSED_FUNCTIONS = frozenset(
     }
 )
 #: Families whose every member is refused: ``schema_to_xml*``, ``database_to_xml*``,
-#: ``crosstab*`` (tablefunc), ``dblink*`` and ``pgstat*`` (pgstattuple).
+#: ``crosstab*`` (tablefunc), ``dblink*``, ``pgstat*`` (pgstattuple) and ``pg_stat*``
+#: (the statistics functions, such as ``pg_stat_get_live_tuples``).
 POSTGRES_REFUSED_FUNCTION_PREFIXES = (
     "schema_to_xml",
     "database_to_xml",
     "crosstab",
     "dblink",
     "pgstat",
+    "pg_stat",
 )
 
 _POSTGRES_REFUSED_RE = re.compile(
@@ -105,10 +108,19 @@ _POSTGRES_REFUSED_RE = re.compile(
 )
 
 
+#: A name or a string written with Unicode escapes (Postgres and Trino):
+#: ``U&"ts!005Fstat" UESCAPE '!'`` is the identifier ``ts_stat``, which no check on the
+#: text would find. ``U&`` must touch the quote, so this is every such spelling.
+_UNICODE_ESCAPE_RE = re.compile(r"(?i)\bu&[\"']")
+
+
 def names_refused_postgres_function(sql: str) -> bool:
     """Whether ``sql`` calls one of :data:`POSTGRES_REFUSED_FUNCTIONS` or a member of a
-    :data:`POSTGRES_REFUSED_FUNCTION_PREFIXES` family."""
-    return _POSTGRES_REFUSED_RE.search(sql) is not None
+    :data:`POSTGRES_REFUSED_FUNCTION_PREFIXES` family, or writes a name or a string with
+    Unicode escapes (``U&"..."``, ``U&'...'``), which can spell any of them."""
+    return (
+        _POSTGRES_REFUSED_RE.search(sql) is not None or _UNICODE_ESCAPE_RE.search(sql) is not None
+    )
 
 
 _BLOCKED_EXPR_TOKENS = re.compile(

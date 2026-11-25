@@ -367,14 +367,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   position, wherever the IaC emitters read row filters (`fluid generate iac`, `fluid apply`), and
   so is a `rowFilters` value that is not a list (`{}`, `""`), which used to be read as no filter.
 - **On an expose that restricts columns or filters rows, `query_sql` reads only the exposed
-  table.** A statement may still read its own CTEs, `VALUES` and `UNNEST`; any other relation is
-  refused, since a catalog view such as Postgres's `pg_stats` holds values from every row and
-  column of a table and the projection covers only the table itself. On every expose, `query_sql`,
-  contract expressions and the drivers' statement guard also refuse the Postgres functions that read
-  a relation or run a query given as text: `ts_stat`, `ts_rewrite`, `connectby` and every
-  `crosstab*`, `dblink*` and `pgstat*` function, beside the XML functions already refused. Their
-  query text can be spelt without the word SELECT (`'SEL' || 'ECT ...'`), so neither the statement
-  guard nor the projection saw it.
+  table.** A statement may still read a CTE of its own where that CTE is in scope, `VALUES` and
+  `UNNEST`; any other relation is refused, since a catalog view such as Postgres's `pg_stats` holds
+  values from every row and column of a table and the projection covers only the table itself. On
+  every expose, `query_sql`, contract expressions and the drivers' statement guard also refuse the
+  Postgres functions that read a relation or run a query given as text: `ts_stat`, `ts_rewrite`,
+  `connectby` and every `crosstab*`, `dblink*` and `pgstat*` function, beside the XML functions
+  already refused, and the `pg_stat*` functions, which report a table's row counts. Their query
+  text can be spelt without the word SELECT (`'SEL' || 'ECT ...'`), so neither the statement guard
+  nor the projection saw it. A name or a string written with Unicode escapes (`U&"..."`), which
+  can spell any of these functions, is refused there too.
 - **On Postgres, a row-filtered read is evaluated as a step of its own.** Postgres can merge a
   subquery into the statement around it and then evaluate the caller's conditions on rows the row
   filter removes, so a condition that fails on such a row (a cast, a division by zero) could tell
@@ -580,7 +582,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`query_sql` on an expose that restricts columns or filters rows reads only the exposed
   table.** A statement that joins another table or reads a catalog view there is now refused; read
   the other table through its own expose. On every expose, `query_sql` refuses `ts_stat`,
-  `ts_rewrite`, `connectby` and the `crosstab*`, `dblink*` and `pgstat*` functions.
+  `ts_rewrite`, `connectby`, the `crosstab*`, `dblink*`, `pgstat*` and `pg_stat*` functions, and
+  names or strings written with Unicode escapes (`U&"..."`).
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so
