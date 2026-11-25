@@ -173,9 +173,10 @@ _QUERY_SQL_SCHEMA: Dict[str, Any] = {
                 "it, and a literal or cast of that type (DATE '2024-01-01'). A date "
                 "meets a date, a timestamp a timestamp, a timestamp with a time "
                 "zone its own kind (now()); write a relative date as "
-                "CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE). Exact numbers "
-                "meet when the larger integer part plus the larger scale fits in "
-                "38 digits, and a float meets any number. LIKE patterns are string literals without ESCAPE. It "
+                "CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE). Integers meet "
+                "integers; other exact numbers meet when the larger integer part "
+                "plus the larger scale fits in 38 digits; a float meets any "
+                "number. LIKE patterns are string literals without ESCAPE. It "
                 "computes values only in the outer select list. Refused unless the "
                 "server was started with --allow-sql."
             ),

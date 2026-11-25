@@ -476,10 +476,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     or minus an interval is not typed, since engines differ on whether it is a date or a
     timestamp; cast it, as in `CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)`;
   - exact numbers are compared as DECIMAL. An integer type is DECIMAL(d, 0), with d = 3, 5, 10,
-    19 and 39 for tinyint, smallint, int, bigint and hugeint, and a decimal literal is
-    DECIMAL(its digits, its decimals). Two exact numbers meet only when the larger integer part
-    plus the larger scale is at most 38 digits, and a number of unknown precision (Postgres's
-    unconstrained `numeric`) meets no other exact number. A float meets any number;
+    19 and 39 for tinyint, smallint, int, bigint and hugeint (38 for every integer on
+    Snowflake), and a decimal literal is DECIMAL(its digits, its decimals). Integer types and
+    integer literals of up to 38 digits meet each other at any size, since an engine widens an
+    integer to the larger integer type; DuckDB's UHUGEINT is compared as a decimal, since DuckDB
+    casts it to the signed type it meets. Two other exact numbers meet only when the larger
+    integer part plus the larger scale is at most 38 digits, and a number of unknown precision
+    (Postgres's unconstrained `numeric`) meets no other exact number. A float meets any number.
+    A literal with an exponent is a float on DuckDB, Trino, Athena and BigQuery, whose
+    documentation types it so, and an exact number of its digits elsewhere;
   - a date meets only a date, a timestamp only a timestamp, and a timestamp with a time zone
     only a timestamp with a time zone;
   - each `coalesce`, `IN` and `BETWEEN` operand is held to the same rules. A `VALUES` or
@@ -727,9 +732,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller). Compare a column with a constant of its own type: `DATE '2024-01-01'` or
   `CURRENT_DATE` for a date (not `'2024-01-01'`), `now()` for a timestamp with a time zone,
   and `CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)` for a date relative to today. Keep
-  comparisons of exact numbers within 38 digits; a column of unknown precision, such as
-  Postgres's unconstrained `numeric`, meets another exact number only once the table gives it
-  a precision and scale. Write LIKE patterns
+  comparisons of exact numbers within 38 digits, except between integers, which meet at any
+  size; a column of unknown precision, such as Postgres's unconstrained `numeric`, meets
+  another exact number only once the table gives it a precision and scale. Write LIKE patterns
   as string literals without `ESCAPE` or a backslash, and compute values (casts, arithmetic,
   other functions) in the outer select list. Only listed functions may be called, and the row
   and string generators are no longer listed.

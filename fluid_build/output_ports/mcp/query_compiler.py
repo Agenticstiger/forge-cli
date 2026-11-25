@@ -2336,6 +2336,9 @@ class ColumnType(NamedTuple):
     kind: str
     precision: Optional[int] = None
     scale: Optional[int] = None
+    #: An integer type or an integer literal. Integers meet each other by widening to
+    #: the larger integer type, never through a DECIMAL.
+    integral: bool = False
 
 
 _NULL = ColumnType("null")
@@ -2387,6 +2390,20 @@ _INTEGER_DIGITS = {
     "ubigint": 20,
     **dict.fromkeys(("hugeint", "int128", "uhugeint"), 39),
 }
+# Integer types that do not widen safely: DuckDB casts a UHUGEINT to the signed type
+# it meets, and its largest values do not fit any. It is compared as DECIMAL(39, 0).
+_NOT_WIDENING = frozenset({"uhugeint"})
+# The engines (sqlglot dialects) whose documentation types a numeric literal with an
+# exponent as a float. DuckDB: DOUBLE (checked with typeof). Trino, and Athena on its
+# engine: "Floating-point, fixed-precision numbers can be expressed as numeric literal
+# using scientific notation such as 1.03e1 and are cast as DOUBLE data type"
+# (trino.io/docs/current/language/types.html). BigQuery: "Numeric literals that contain
+# either a decimal point or an exponent marker are presumed to be type double"
+# (cloud.google.com/bigquery/docs/reference/standard-sql/lexical). Elsewhere such a
+# literal is an exact number of its digits.
+_FLOAT_EXPONENT_ENGINES = frozenset({"bigquery", "duckdb", "trino"})
+# The most digits an integer literal has to be an integer of a type every engine has.
+_MAX_INTEGER_LITERAL_DIGITS = 38
 _DECIMAL_WORDS = frozenset({"bigdecimal", "bignumeric", "dec", "decimal", "number", "numeric"})
 # DECIMAL with no precision, per engine. Postgres's ``numeric`` has none: it is unknown.
 _DECIMAL_DEFAULTS = {
@@ -2421,7 +2438,8 @@ def _type_of(
         return ColumnType("complex") if "[" in written else None
     word = match.group(1)
     if word in _INTEGER_DIGITS:
-        return ColumnType("number", 38 if read == "snowflake" else _INTEGER_DIGITS[word], 0)
+        digits = 38 if read == "snowflake" else _INTEGER_DIGITS[word]
+        return ColumnType("number", digits, 0, word not in _NOT_WIDENING)
     if word in _DECIMAL_WORDS:
         return _decimal_type(match, precision, scale, _decimal_default(word, read, defaults))
     if word in ("time", "timestamp"):
@@ -2779,9 +2797,10 @@ def _output_type(item: Any, source: Any, typing: _Typing, depth: int) -> Optiona
 
 
 def _literal_type(literal: Any, read: Optional[str]) -> Optional[ColumnType]:
-    """A string literal is a string. A numeric literal is DECIMAL(its digits, its
-    decimals); one in scientific notation is a float, except on Postgres (and when the
-    engine is not known), where it is an exact number of its digits."""
+    """A string literal is a string. An integer literal of up to 38 digits is an
+    integer, and any other numeric literal DECIMAL(its digits, its decimals). One in
+    scientific notation is a float on the engines whose documentation says so
+    (:data:`_FLOAT_EXPONENT_ENGINES`) and an exact number of its digits elsewhere."""
     if literal.is_string:
         return ColumnType("string")
     text = str(literal.this)
@@ -2791,13 +2810,17 @@ def _literal_type(literal: Any, read: Optional[str]) -> Optional[ColumnType]:
         return None
     if not value.is_finite():
         return None
-    if "e" in text.lower() and read not in (None, "postgres"):
+    scientific = "e" in text.lower()
+    if scientific and read in _FLOAT_EXPONENT_ENGINES:
         return ColumnType("float")
     _sign, digits, exponent = value.as_tuple()
     if not isinstance(exponent, int):
         return None
     if exponent >= 0:
-        return ColumnType("number", len(digits) + exponent, 0)
+        written_as_integer = not scientific and "." not in text
+        whole = len(digits) + exponent
+        integral = written_as_integer and whole <= _MAX_INTEGER_LITERAL_DIGITS
+        return ColumnType("number", whole, 0, integral)
     # At least one integer digit, as engines type ``0.5``: DECIMAL(2,1).
     places = -exponent
     return ColumnType("number", places + max(1, len(digits) - places), places)
@@ -2873,7 +2896,7 @@ def _exact_sum_type(left: ColumnType, right: ColumnType) -> ColumnType:
         return ColumnType("number")
     places = max(left.scale, right.scale)
     whole = max(left.precision - left.scale, right.precision - right.scale)
-    return ColumnType("number", whole + 1 + places, places)
+    return ColumnType("number", whole + 1 + places, places, left.integral and right.integral)
 
 
 def _value_type(side: Any, typing: _Typing, scope_of: Mapping[int, Any]) -> Optional[ColumnType]:
@@ -2969,9 +2992,11 @@ def _common_type(
     * every value has a known scalar type, and all have one kind (a date is compared
       with a date, a timestamp with a timestamp of the same time zone kind);
     * a float may meet any number;
-    * exact numbers need a known precision and scale, and the larger integer part plus
-      the larger scale must fit in 38 digits: an engine casts every value to that
-      DECIMAL, and a value that does not fit fails the cast, a withheld row's too."""
+    * integers (integer types and integer literals) meet each other at any size, by
+      widening;
+    * other exact numbers need a known precision and scale, and the larger integer
+      part plus the larger scale must fit in 38 digits: an engine casts every value to
+      that DECIMAL, and a value that does not fit fails the cast, a withheld row's too."""
     found: List[Tuple[Any, ColumnType]] = []
     for node, found_type in typed:
         if found_type is None or found_type.kind == "complex":
@@ -3003,9 +3028,13 @@ def _common_type(
 def _exact_common_type(
     found: List[Tuple[Any, ColumnType]], read: Optional[str], verb: str
 ) -> ColumnType:
-    """The DECIMAL exact numbers meet as; see :func:`_common_type`."""
+    """The DECIMAL exact numbers meet as; see :func:`_common_type`. Integers alone meet
+    as the widest of them: an engine widens an integer to the larger integer type,
+    which cannot fail."""
     if len(found) == 1:
         return found[0][1]
+    if all(found_type.integral for _, found_type in found):
+        return max((found_type for _, found_type in found), key=lambda t: t.precision or 0)
     sizes: List[Tuple[Any, int, int]] = []
     for node, found_type in found:
         if found_type.precision is None or found_type.scale is None:

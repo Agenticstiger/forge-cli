@@ -431,6 +431,7 @@ _HELD = {
     "price": "DECIMAL(10,2)",
     "fine": "DECIMAL(20,18)",
     "huge": "HUGEINT",
+    "uhuge": "UHUGEINT",
     "ratio": "DOUBLE",
     "created": "DATE",
     "seen": "TIMESTAMP",
@@ -493,6 +494,11 @@ _DUCK = (_HELD, "duckdb")
         pytest.param("ratio > 0.5", *_DUCK, id="float-column"),
         pytest.param("big > 1.5e0", *_DUCK, id="float-literal"),
         pytest.param("huge > CAST(5 AS DOUBLE)", *_DUCK, id="float-cast"),
+        # Integers meet integers by widening, never through a DECIMAL.
+        pytest.param("huge = 5", *_DUCK, id="hugeint-and-an-integer-literal"),
+        pytest.param("huge = id", *_DUCK, id="hugeint-and-an-int-column"),
+        pytest.param(f"huge = {'9' * 38}", *_DUCK, id="hugeint-and-a-38-digit-literal"),
+        pytest.param("id > 1e-30", *_DUCK, id="exponent-literal-is-a-float-on-duckdb"),
         pytest.param("amount > 5.25", *_PG, id="postgres-numeric-10-2"),
         pytest.param("id = amount", *_PG, id="postgres-int-and-numeric"),
         pytest.param("ratio > 1.5e0", *_PG, id="postgres-float-column"),
@@ -540,8 +546,17 @@ def test_comparisons_the_type_rules_allow(where, held, dialect):
         pytest.param("big = 0.5", *_DUCK, "38 digits", id="38-digits-and-a-decimal"),
         pytest.param("big = price", *_DUCK, "38 digits", id="38-digits-and-a-scale-of-2"),
         pytest.param("big = fine", *_DUCK, "38 digits", id="38-digits-and-a-scale-of-18"),
-        pytest.param("huge = 5", *_DUCK, "38 digits", id="hugeint"),
-        pytest.param("huge = id", *_DUCK, "38 digits", id="hugeint-and-an-int-column"),
+        pytest.param("huge = big", *_DUCK, "38 digits", id="hugeint-and-decimal-38-0"),
+        pytest.param("huge = 0.5", *_DUCK, "38 digits", id="hugeint-and-a-decimal"),
+        pytest.param("uhuge = id", *_DUCK, "38 digits", id="uhugeint-and-an-int-column"),
+        pytest.param("uhuge = -5", *_DUCK, "38 digits", id="uhugeint-and-a-negative-integer"),
+        pytest.param(
+            "id = 1e-30",
+            {"id": "NUMBER(38,0)", "region": "TEXT"},
+            "snowflake",
+            "38 digits",
+            id="snowflake-exponent-literal-is-exact",
+        ),
         pytest.param("coalesce(big, 0.5) > 1", *_DUCK, "38 digits", id="coalesce"),
         pytest.param("big IN (1, 0.5)", *_DUCK, "38 digits", id="in-list"),
         pytest.param("big BETWEEN 0.5 AND 1", *_DUCK, "38 digits", id="between"),
@@ -615,16 +630,24 @@ def test_a_relative_date_written_as_a_cast_is_a_date_on_every_engine(dialect):
     [
         ("0.5", "duckdb", ColumnType("number", 2, 1)),
         ("123.450", "duckdb", ColumnType("number", 6, 3)),
-        ("5", "duckdb", ColumnType("number", 1, 0)),
+        ("5", "duckdb", ColumnType("number", 1, 0, True)),
+        ("5.", "duckdb", ColumnType("number", 1, 0)),
+        (f"{'9' * 38}", "duckdb", ColumnType("number", 38, 0, True)),
+        (f"{'9' * 39}", "duckdb", ColumnType("number", 39, 0)),
         ("1.5e0", "duckdb", ColumnType("float")),
+        ("1.5e0", "athena", ColumnType("float")),
+        ("1.5e0", "bigquery", ColumnType("float")),
         ("1e3", "postgres", ColumnType("number", 4, 0)),
+        # Not documented as a float there: an exact number of its digits.
+        ("1e-30", "snowflake", ColumnType("number", 31, 30)),
     ],
 )
 def test_a_numeric_literal_is_typed_by_its_digits(text, dialect, expected):
     import sqlglot
 
-    literal = sqlglot.parse_one(text, read=dialect)
-    assert query_compiler._literal_type(literal, dialect) == expected
+    read = query_compiler._SQLGLOT_DIALECTS[dialect]
+    literal = sqlglot.parse_one(text, read=read)
+    assert query_compiler._literal_type(literal, read) == expected
 
 
 # ---------------------------------------------------------------------
@@ -796,6 +819,7 @@ def _count_catalog_reads(driver: Any, fail: Optional[List[bool]] = None) -> List
 def test_the_table_types_are_read_again_after_a_few_minutes(state_for, monkeypatch):
     from fluid_build.output_ports.mcp.drivers import base
 
+    assert base.PHYSICAL_TYPES_TTL_SECONDS == 300.0
     clock = [1000.0]
     monkeypatch.setattr(base, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     state = state_for(_CSV_SCHEMA)
@@ -935,15 +959,18 @@ _NO_SIZE = (None, None)
         ("NUMERIC", "bigquery", "number", (38, 9)),
         ("BIGNUMERIC", "bigquery", "number", (76, 38)),
         ("decimal", "athena", "number", (38, 0)),
-        ("tinyint", "athena", "number", (3, 0)),
-        ("smallint", "postgres", "number", (5, 0)),
-        ("INTEGER", "duckdb", "number", (10, 0)),
-        ("INTEGER", "snowflake", "number", (38, 0)),
-        ("bigint", "postgres", "number", (19, 0)),
-        ("HUGEINT", "duckdb", "number", (39, 0)),
-        ("INT64", "bigquery", "number", (19, 0)),
-        ("LONG", "databricks", "number", (19, 0)),
-        ("SHORT", "databricks", "number", (5, 0)),
+        ("tinyint", "athena", "integer", (3, 0)),
+        ("smallint", "postgres", "integer", (5, 0)),
+        ("INTEGER", "duckdb", "integer", (10, 0)),
+        ("INTEGER", "snowflake", "integer", (38, 0)),
+        ("bigint", "postgres", "integer", (19, 0)),
+        ("HUGEINT", "duckdb", "integer", (39, 0)),
+        ("UBIGINT", "duckdb", "integer", (20, 0)),
+        # DuckDB casts a UHUGEINT to the signed type it meets: compared as a DECIMAL.
+        ("UHUGEINT", "duckdb", "number", (39, 0)),
+        ("INT64", "bigquery", "integer", (19, 0)),
+        ("LONG", "databricks", "integer", (19, 0)),
+        ("SHORT", "databricks", "integer", (5, 0)),
         ("double precision", "postgres", "float", _NO_SIZE),
         ("FLOAT64", "bigquery", "float", _NO_SIZE),
         ("DATE", "duckdb", "date", _NO_SIZE),
@@ -970,7 +997,13 @@ _NO_SIZE = (None, None)
     ],
 )
 def test_a_catalog_type_is_read_with_its_precision(written, dialect, kind, size):
-    expected = None if kind is None else ColumnType(kind, *size)
+    """``integer`` marks an integer type: DECIMAL(d, 0) that widens to a larger integer."""
+    if kind is None:
+        expected = None
+    elif kind == "integer":
+        expected = ColumnType("number", *size, True)
+    else:
+        expected = ColumnType(kind, *size)
     assert query_compiler.column_type(written, dialect) == expected
 
 
