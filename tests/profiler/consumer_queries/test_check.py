@@ -310,8 +310,10 @@ def test_a_count_star_stays_a_star() -> None:
     "text",
     [
         "SELECT id FROM readings WHERE level > 3.5 AND valid",
-        "WITH w AS (SELECT station, count(*) AS n FROM readings GROUP BY station) "
-        "SELECT station FROM w WHERE n > 1",
+        (
+            "WITH w AS (SELECT station, count(*) AS n FROM readings GROUP BY station) "
+            "SELECT station FROM w WHERE n > 1"
+        ),
         "SELECT r.id FROM readings r JOIN stations s ON r.station = s.station",
         "SELECT region, count(*) FROM stations GROUP BY region ORDER BY region",
         "SELECT id FROM readings UNION SELECT id FROM readings",

@@ -420,6 +420,7 @@ class _Child:
                     process.stdin.close()
                     process.wait(timeout=_LEAVE_SECONDS)
                 except (_Gone, OSError, subprocess.TimeoutExpired):
+                    # It left, broke its pipe or did not leave in time: end() below makes sure.
                     pass
             self.end()
         finally:
@@ -428,6 +429,7 @@ class _Child:
                     try:
                         stream.close()
                     except OSError:
+                        # A pipe the process already broke has nothing left to close.
                         pass
 
 
