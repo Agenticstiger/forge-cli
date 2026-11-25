@@ -377,9 +377,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Postgres functions that read a relation or run a query given as text: `ts_stat`, `ts_rewrite`,
   `connectby` and every `crosstab*`, `dblink*` and `pgstat*` function, beside the XML functions
   already refused, and the `pg_stat*` functions, which report a table's row counts. Their query
-  text can be spelt without the word SELECT (`'SEL' || 'ECT ...'`), so neither the statement guard
-  nor the projection saw it. A name or a string written with Unicode escapes (`U&"..."`), which
-  can spell any of these functions, is refused there too.
+  text can be put together at run time, so neither the statement guard nor the projection saw it.
+  A name or a string written with Unicode escapes (`U&"..."`), which can spell any of these
+  functions, is refused there too.
 - **On Postgres, a row-filtered read is evaluated as a step of its own.** Postgres can merge a
   subquery into the statement around it and then evaluate the caller's conditions on rows the row
   filter removes, so a condition that fails on such a row (a cast, a division by zero) could tell
