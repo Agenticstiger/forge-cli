@@ -36,7 +36,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from ..observability.tracing import traced_stage
 from . import _ci_output
@@ -72,11 +72,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "Exit status: 0 every selected stage passed or was skipped; 1 a stage failed; "
             "2 ship refused its arguments; 3 a stage failed after apply changed something, "
             "so those changes are live; 130 interrupted.\n\n"
-            "Environment variables read when the flag is absent: FLUID_ENV, APPLY_MODE, "
+            "Variables read when the flag is absent: FLUID_ENV, APPLY_MODE, "
             "APPLY_BUILD_ID, ALLOW_DATA_LOSS, NO_VERIFY_DIGEST, PUBLISH_TARGETS, SCHEDULER, "
             "SCHEDULER_DESTINATION, SCHEDULER_ENVIRONMENT_NAME, SCHEDULER_LOCATION, "
             "SCHEDULER_WORKSPACE, SCHEDULE_SYNC_DRY_RUN, VALIDATE_STRICT, VERIFY_STRICT, "
             "GENERATE_EMIT, DIFF_EXIT_ON_DRIFT, DIFF_LAST_APPLIED, PLAN_HTML, POLICY_APPLY_MODE, "
+            "RELEASE_ARTIFACTS, "
             "and RUN_STAGE_<N>_<NAME>: false switches a stage off, even one --stage names "
             "(a run with nothing left says so and exits 0); true switches on 10 or 11 when "
             "--stage is not given.\n\n"
@@ -300,7 +301,7 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         "--ci-output",
         choices=_ci_output.MODES,
         default="auto",
-        help="Log grouping for the CI system, detected unless set.",
+        help="Log grouping: github, gitlab, azure, plain (default: auto-detect).",
     )
     g.add_argument(
         "--report-dir",
@@ -312,6 +313,12 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         default=None,
         metavar="DIR",
         help="Publish a release in DIR (new) when all stages pass (needs 1-4).",
+    )
+    g.add_argument(
+        "--artifacts",
+        default=None,
+        metavar="LOCK",
+        help="Also seal the external files LOCK lists (with --release-dir).",
     )
     g.add_argument(
         "--journal-dir",
@@ -351,6 +358,7 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
     journal_dir = Path(os.path.abspath(journal_flag)) if journal_flag else None
     acknowledged = _acknowledged(args, journal_dir or release_dir)
     opts, selected, not_selected, project_dir = _prepare(args)
+    opts.artifacts = _artifacts_lock(args, release_dir)
     with _working_directory(project_dir):
         anchor = None  # an explicit --journal-dir is the operator's, links and all
         if journal_dir is None and release_dir is not None:
@@ -364,6 +372,23 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return _run_selected(
             args, logger, opts, selected, not_selected, report_dir, release_dir, keep
         )
+
+
+def _artifacts_lock(args: argparse.Namespace, release_dir: Optional[Path]) -> str:
+    """``--artifacts``, else ``$RELEASE_ARTIFACTS`` in a run that seals a release, as an absolute
+    path from where ship was invoked; "" for none.
+
+    The variable is read only beside ``--release-dir``: one set for every job of a pipeline leaves
+    the jobs that seal nothing alone (a GitLab project variable reaches every job). The flag
+    without ``--release-dir`` is refused (``_ship_release.refusal``)."""
+    from . import _release_lock
+
+    flag = getattr(args, "artifacts", None)
+    if flag is not None and not flag.strip():  # `--artifacts "$LOCK"` with LOCK unset
+        raise st.ShipUsageError("--artifacts needs the path of a lock file")
+    value = flag if flag is not None else os.environ.get(_release_lock.LOCK_ENV, "")
+    value = value.strip() if flag is not None or release_dir is not None else ""
+    return os.path.abspath(value) if value else ""
 
 
 def _acknowledged(args: argparse.Namespace, journal_on: Optional[Path]) -> Set[int]:
@@ -577,6 +602,8 @@ class _Context:
     release_dir: Optional[Path] = None  # --release-dir: published when every stage passed
     staging: Optional[Path] = None  # its staging directory, beside it
     keep: Optional["_Journaling"] = None  # the stage journal, when one is kept
+    # --artifacts: the external files the release seals, read when its identity is built
+    external: List[Any] = field(default_factory=list)
     # the store token ship unwrapped for every stage, handed to each through a pipe
     store_token: Optional[str] = field(default=None, repr=False)
 
@@ -1047,15 +1074,21 @@ def _release_identity(
     ctx: _Context, ordered: List[report.StageRecord]
 ) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
     """``(identity, None)``, or ``(None, why it cannot be built)``."""
+    from . import _release_lock
+
     try:
+        # Read again once the stages ran: the files must still be the bytes the lock names.
+        external = _release_lock.load(ctx.opts.artifacts) if ctx.opts.artifacts else []
         identity = release.build_identity(
             ctx.opts,
             Path.cwd(),
             with_plan=_plan_in_release(ordered),
             applied=any(r.number == st.APPLY_STAGE and r.status == report.PASSED for r in ordered),
+            external=external,
         )
     except release.ReleaseError as exc:
         return None, str(exc)
+    ctx.external = list(external)
     return identity, None
 
 
@@ -1122,6 +1155,7 @@ def _close_release(
                 journal=None if ctx.keep is None else ctx.keep.block(),
             ),
             with_plan=_plan_in_release(ordered),
+            external=ctx.external,
         )
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - any failure publishes nothing
         interrupted = isinstance(exc, KeyboardInterrupt)
@@ -1197,6 +1231,8 @@ def _explain(
             f"release: published to {release_dir} once every selected stage passes "
             f"(staged beside it in {release_dir.name}.partial-*)"
         )
+        if opts.artifacts:
+            _out(f"external: the files {opts.artifacts} lists, sealed under external/<name>/")
     if problem:
         _out(f"warning: a real run would stop: {problem}")
     return 0

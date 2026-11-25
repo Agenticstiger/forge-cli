@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid ship --release-dir DIR --artifacts LOCK.yaml` seals external files into the release.**
+  A lock lists the files a product runs that Forge does not build (a Spark package, an Airflow
+  DAG, any other file), each with its sha256 and the repository, commit and optional ref it was
+  built from. Before any stage runs, ship refuses a lock it cannot seal: an unknown field or kind,
+  a path that is absolute, hidden or leads out of the lock's directory (by `..` or a linked
+  directory), a link, or bytes that are not the sha256 named (the message never shows the digest
+  the file has). The release copies each file to `external/<name>/<file>`, hashes the copy again
+  and records the entries in its `identity`, sorted by name and with no path on the machine that
+  ran it, so two clean runs give one identity and changed bytes give a new one.
+  `$RELEASE_ARTIFACTS` names the lock when the flag is absent, read only by a run that seals a
+  release; the flag without `--release-dir` is refused. `fluid runs status --release-dir` names
+  each external file and its source.
+
 ### Fixed
 
 - **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through

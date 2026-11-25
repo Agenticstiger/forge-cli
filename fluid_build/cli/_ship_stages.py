@@ -139,6 +139,9 @@ class ShipOptions:
     # --require-artifacts named custom-scaffold when it was left out: such a run may check
     # the change, never seal a release or publish (check_withheld_requirement).
     scaffold_required_left_out: bool = False
+    # --artifacts LOCK, else $RELEASE_ARTIFACTS when the run seals a release: the external
+    # files it seals, as an absolute path; "" for none. Set by ship (_release_lock).
+    artifacts: str = ""
 
 
 @dataclass
