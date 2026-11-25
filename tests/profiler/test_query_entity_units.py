@@ -491,7 +491,7 @@ def test_a_statement_that_fails_on_the_records_withholds_every_query_of_the_run(
     assert "queries" not in result.document
 
 
-@pytest.mark.parametrize(("counted", "delta"), [(True, -1), (False, 1), (False, -1)])
+@pytest.mark.parametrize(("counted", "delta"), [(True, -1), (True, 1), (False, 1), (False, -1)])
 def test_rows_that_are_not_the_units_records_withhold_the_run(
     tmp_path, monkeypatch, counted, delta
 ):
@@ -516,3 +516,12 @@ def test_nothing_printed_names_a_count_of_records(tmp_path):
     result = _profile(tmp_path, _on_unit("many", MANY))
     lines = "\n".join(query_rates.report_lines(result.queries, 1))
     assert lines == "Queries: 1 of 1 published whole."
+
+
+def test_a_group_that_names_no_parent_withholds_the_run(tmp_path):
+    # An order whose customer is not a customer row forms a group of the unit that is no parent:
+    # the rate's records would then be other than those the set check sees.
+    orders = _orders()
+    orders.append({**orders[0], "order_id": len(orders), "customer_id": CUSTOMERS + 7})
+    result = _profile(tmp_path, _on_unit("many", MANY), orders=orders)
+    assert _said(result) == {"query many": query_rates.RUN_FAILED}

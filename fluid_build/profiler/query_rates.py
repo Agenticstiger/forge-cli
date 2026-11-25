@@ -2420,10 +2420,10 @@ def _population_answer(
         if rows_query is None or rows_query.status != "ok" or rows_query.count is None:
             fail()
             return
-        if counted:
-            exact = rows_unit.count >= in_unit[unit] and rows_query.count >= kept[at]
-        else:
-            exact = rows_unit.count == in_unit[unit] and rows_query.count == kept[at]
+        # The unit's rows and the query's must be exactly the entities counted: a group whose key
+        # is null or names no parent would make the rate's records other than those the set
+        # check sees, so any such group withholds the run.
+        exact = rows_unit.count == in_unit[unit] and rows_query.count == kept[at]
         if not exact:
             fail()
             return
