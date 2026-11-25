@@ -168,7 +168,8 @@ counted on a fixed ladder of whole days, trimmed to the bins from the first hold
 record to the last, and are published only when each of those two bins holds at
 least minimumCell records. One that cannot be formed (a pair with a timestamp
 column, an exposure with no window, days with a small end bin) is named under
-Not measured with its reason. A listed fact, a rule of the contract's
+Not measured with its reason, and --strict refuses, before any record is read, one
+the contract rules out (a pair with a timestamp column). A listed fact, a rule of the contract's
 invariants, is measured on the table's records as the share of the rows it covers
 that satisfy it: two counts (the rows that do not, the rows that do) that pass the
 checks as cells do, and either withheld withholds both (format 1-2-0, the
@@ -325,9 +326,16 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "--strict",
         action="store_true",
         help=(
-            "refuse a --request that asks for a kind of statistic fluid profile does not form "
-            "(a workload, a consumer query; a table's calendar too, for a private release), "
-            "before any record is read; without it each such ask is named under Not measured"
+            "refuse a --request before any record is read when the request or the contract "
+            "alone shows an ask cannot be formed: a workload, a consumer query, a metric, "
+            "statistic, rank correlation, grouping, date pair, calendar, relationship date or "
+            "exposure over a column the profile does not read, a key or a column whose type "
+            "rules it out, a fact whose rule it cannot measure, more entries than a profile "
+            "holds, any ask of a relationship the contract does not declare or the profile does "
+            "not read; with --privacy-unit, instead the kinds a private release does not form "
+            "(a workload, a consumer query, date pairs, a calendar, relationship dates, "
+            "exposure). An ask only the records leave unanswered is named under Not measured, "
+            "as without --strict"
         ),
     )
     p.add_argument(
