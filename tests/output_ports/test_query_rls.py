@@ -39,7 +39,12 @@ from fluid_build.output_ports.mcp.query_compiler import (
 )
 
 _MEASURES = [{"name": "row_count", "agg": "count", "expr": "id"}]
-_SCHEMA = [{"name": "id"}, {"name": "tenant_id"}, {"name": "region"}, {"name": "secret"}]
+_SCHEMA = [
+    {"name": "id", "type": "integer"},
+    {"name": "tenant_id", "type": "string"},
+    {"name": "region", "type": "string"},
+    {"name": "secret", "type": "string"},
+]
 ACME = "group:acme@tenants.example"
 AS_ACME = {"principal": ACME}
 NO_PRINCIPAL = {"model_id": "x", "tenant_id": "acme"}

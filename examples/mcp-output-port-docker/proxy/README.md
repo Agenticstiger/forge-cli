@@ -20,7 +20,7 @@ This directory carries two ready-to-edit templates:
 | **Trusted-proxy allow-list** | A client that reaches the gateway without the proxy and sets the certificate headers itself. | Gateway (`FLUID_MCP_TRUSTED_PROXIES`) |
 | **`agentPolicy.allowedModels` / `allowedUseCases`** | A legitimate client running an unapproved model or use case. | Gateway (per-`tools/call`) |
 | **`policy.authz.rowFilters`** | A legitimate client acting as a different principal, or reading rows its principal may not. | Gateway (row filter on every read of the table) |
-| **Snowflake row-access policy** (compiled via `fluid_build.output_ports.iam_compiler`) | Bypass-the-gateway reads — analyst querying Snowflake directly. | Cloud (warehouse-side) |
+| **Warehouse row filters** (written by `fluid apply` from `policy.authz.rowFilters`) | Bypass-the-gateway reads: an analyst querying the warehouse directly. | Cloud (BigQuery, Lake Formation, Unity Catalog) |
 
 ## Quick start
 

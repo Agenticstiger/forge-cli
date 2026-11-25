@@ -82,6 +82,15 @@ _EXTRA_KEYS = (
 )
 
 
+def _unprivileged_connection() -> Any:
+    """A stub connection whose role check answers: not a superuser, no privileged role."""
+    from unittest.mock import MagicMock
+
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(False, [])]
+    return connection
+
+
 def _group_names() -> List[str]:
     names: List[str] = []
     for group in ENDPOINT_CREDENTIAL_GROUPS:
@@ -432,7 +441,7 @@ def test_the_postgres_output_port_driver_does_not_connect_to_a_dotenv_host(
 
     calls: List[Dict[str, Any]] = []
     fake = types.ModuleType("psycopg")
-    fake.connect = lambda **opts: calls.append(opts) or types.SimpleNamespace()  # type: ignore[attr-defined]
+    fake.connect = lambda **opts: calls.append(opts) or _unprivileged_connection()  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "psycopg", fake)
     monkeypatch.setenv("POSTGRES_PASSWORD", OPERATOR_KEY)
     (tmp_path / ".env").write_text("POSTGRES_HOST=pg.project.test\nPOSTGRES_PORT=6543\n")
