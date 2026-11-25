@@ -9,8 +9,8 @@ COPY pom.xml .
 COPY src src
 RUN mvn --batch-mode --no-transfer-progress package
 
-# flink:1.20.4-scala_2.12-java17
-FROM flink:1.20.4-scala_2.12-java17@sha256:da329fbe16821e8b4749513f4b86eac2172f395c2d5f050017ea8396a7fa98f9
+# flink:1.20.5-scala_2.12-java17
+FROM flink:1.20.5-scala_2.12-java17@sha256:a8c0a2e94f655905ee995dac7b28df30641dbc00f7dee59fe0a8a2331392bab4
 COPY --from=build /build/target/forge-sql-runner.jar /opt/flink/usrlib/forge-sql-runner.jar
 COPY --from=build /build/target/dependency/*.jar /opt/flink/lib/
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
