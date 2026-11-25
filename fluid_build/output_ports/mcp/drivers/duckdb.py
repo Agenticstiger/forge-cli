@@ -123,6 +123,10 @@ class DuckDBDriver(EngineDriver):
                 )
             self._db_file = candidate
         self._connection = None  # lazy
+        # The other exposes of the contract an as-of relationship of this expose reaches,
+        # prepared once (related_table_reference), and why one cannot be read here.
+        self._related: Optional[Dict[str, "DuckDBDriver"]] = None
+        self._related_refused: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # EngineDriver surface
@@ -206,7 +210,7 @@ class DuckDBDriver(EngineDriver):
     # Internals
     # ------------------------------------------------------------------
 
-    def _get_connection(self):
+    def _get_connection(self) -> Any:
         if self._connection is not None:
             return self._connection
         try:
@@ -219,9 +223,13 @@ class DuckDBDriver(EngineDriver):
         from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
         target = str(self._db_file) if self._db_file is not None else ":memory:"
-        # The bound file (if any) and nothing else: a query the MCP port
-        # compiles cannot reach another file, URL or database.
-        allow = DuckDBAllowlist.none().with_paths(self._path)
+        # The bound file (if any), plus the file of each expose an as-of relationship of
+        # this expose reaches, and nothing else: a query the MCP port compiles cannot
+        # reach another file, URL or database.
+        related = self._related_drivers()
+        allow = DuckDBAllowlist.none().with_paths(
+            self._path, *(driver._path for driver in related.values())
+        )
         # DuckDB read-only mode protects against accidental writes
         # even though every advertised tool is SELECT-only. Skip
         # read-only when the target is in-memory because a fresh
@@ -229,10 +237,98 @@ class DuckDBDriver(EngineDriver):
         # below.
         connection = secure_duckdb_connect(target, allow=allow, read_only=target != ":memory:")
         self._configure_connection(connection)
+        for target_id, driver in related.items():
+            if driver._path is None or target_id in self._related_refused:
+                continue
+            try:
+                driver._configure_connection(connection)
+            except Exception as exc:  # noqa: BLE001 - a target that fails is refused later
+                self._related_refused[target_id] = "its file cannot be read in this connection"
+                self.logger.info("duckdb_related_view_failed: %s: %s", target_id, exc)
         self._connection = connection
         return connection
 
-    def _configure_connection(self, connection) -> None:
+    def _related_drivers(self) -> Dict[str, "DuckDBDriver"]:
+        """A driver for each other expose of the contract that an as-of relationship of this
+        expose reaches (relationships that declare ``asOf``; ``to`` names an expose of the
+        contract). Building one validates its binding and ``--readable-paths``; one that
+        fails, lives in another database, or names a table another file already holds is
+        left out and refused with a reason by :meth:`related_table_reference`."""
+        if self._related is not None:
+            return self._related
+        found: Dict[str, "DuckDBDriver"] = {}
+        own_id = self.expose.get("exposeId")
+        semantics = self.expose.get("semantics")
+        relationships = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+        exposes = self.contract.get("exposes") if isinstance(self.contract, Mapping) else None
+        for relationship in relationships if isinstance(relationships, list) else []:
+            if not isinstance(relationship, Mapping) or not relationship.get("asOf"):
+                continue
+            target_id = relationship.get("to")
+            if not isinstance(target_id, str) or target_id == own_id or target_id in found:
+                continue
+            target = next(
+                (
+                    e
+                    for e in (exposes if isinstance(exposes, list) else [])
+                    if isinstance(e, Mapping) and e.get("exposeId") == target_id
+                ),
+                None,
+            )
+            if target is None:
+                continue
+            try:
+                found[target_id] = DuckDBDriver(
+                    expose=target,
+                    contract=self.contract,
+                    logger=self.logger,
+                    connection_options=self.connection_options,
+                    readable_paths=self.readable_paths,
+                )
+            except Exception as exc:  # noqa: BLE001 - refused later, with a reason
+                self._related_refused[target_id] = "its binding cannot be read by this gateway"
+                self.logger.info("duckdb_related_unreadable: %s: %s", target_id, exc)
+        claimed: Dict[str, Tuple[Optional[Path], Optional[Path]]] = {
+            self._table.casefold(): (self._path, self._db_file)
+        }
+        for target_id, driver in list(found.items()):
+            where = (driver._path, driver._db_file)
+            if driver._db_file != self._db_file:
+                self._related_refused[target_id] = "it is stored in another database"
+            elif claimed.setdefault(driver._table.casefold(), where) != where:
+                self._related_refused[target_id] = (
+                    "its table name is already used by another file or database"
+                )
+            if target_id in self._related_refused:
+                del found[target_id]
+        self._related = found
+        return found
+
+    def related_table_reference(self, target: Mapping[str, Any]) -> str:
+        """The target's table in this connection: the same database, readable here, and a
+        table name no other file claims. Its file is made readable (and viewed) when the
+        connection is built."""
+        found = target.get("exposeId")
+        target_id = found if isinstance(found, str) else ""
+        driver: Optional[DuckDBDriver] = None
+        if target_id and target_id == self.expose.get("exposeId"):
+            driver = self
+        elif target_id:
+            driver = self._related_drivers().get(target_id)
+        refused = self._related_refused.get(target_id)
+        if driver is None or refused:
+            raise UnsupportedBindingError(
+                refused or "the expose is not one an as-of relationship of this expose reaches"
+            )
+        if driver.expose.get("binding") != target.get("binding"):
+            raise UnsupportedBindingError("the expose supplied is not the one this gateway reads")
+        self._get_connection()
+        refused = self._related_refused.get(target_id)
+        if refused:
+            raise UnsupportedBindingError(refused)
+        return driver._table
+
+    def _configure_connection(self, connection: Any) -> None:
         """Wire the configured CSV/parquet/json file or attach list
         into the connection so the bound table reference resolves.
 

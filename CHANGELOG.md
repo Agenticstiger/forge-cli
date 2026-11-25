@@ -161,6 +161,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`.hql`, `.ddl`, `.cql`, `.j2`, `.jinja` and `.sh` are text suffixes:** a `$ref` to such a file
   becomes its text. Before, `q.hql` holding `SELECT 'a: b' FROM t` was parsed as YAML and became
   the mapping `{"SELECT 'a": "b' FROM t"}`.
+- **The MCP `query` tool reads a column of the version an as-of relationship reaches.** A
+  dimension or a filter key `<relationship>.<column>` on a `semantics.relationships[]` entry that
+  declares `asOf` reads `column` of the version of the target valid on the row's `asOf` value
+  (`joinType: inner` drops rows that reach none; a row that reaches none reads NULL). The target is
+  read only through its own governed projection: its declared columns that no policy restricts and
+  the rows its `policy.authz.rowFilters` leave the same caller, so a version the caller may not read
+  never bounds a visible one; a caller its filters do not name is refused. A restricted target
+  column cannot be read, filtered on or joined on, and a PII column is redacted under its
+  `<relationship>_<column>` name. It works where the gateway reads the target in the same statement:
+  DuckDB (the same database; the target's file must be inside `--readable-paths`), BigQuery (the
+  same project), Snowflake (the same database and schema), PostgreSQL (the same connection
+  settings and database) and Athena (the same workgroup, region and output location). A target
+  with another `agentPolicy`, on another platform, outside the readable paths or whose table name
+  another file holds is refused, and a relationship that is not a well-formed as-of reading is
+  refused with the reason.
 
 ### Changed
 

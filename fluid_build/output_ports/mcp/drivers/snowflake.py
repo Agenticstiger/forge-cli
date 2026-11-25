@@ -225,6 +225,22 @@ class SnowflakeDriver(EngineDriver):
         self._connection = connection
         return connection
 
+    def _connection_identity(self) -> Optional[Tuple[Any, ...]]:
+        # Exactly what _get_connection connects with: the account, user, warehouse and role
+        # of the environment, the database and schema of the binding, and how it signs in.
+        # A table of another database or schema is not read as the same session reads its own.
+        return (
+            "snowflake",
+            os.environ.get("SNOWFLAKE_ACCOUNT"),
+            os.environ.get("SNOWFLAKE_USER"),
+            os.environ.get("SNOWFLAKE_WAREHOUSE"),
+            os.environ.get("SNOWFLAKE_ROLE"),
+            self._database,
+            self._schema,
+            bool(os.environ.get("SNOWFLAKE_PASSWORD")),
+            os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH"),
+        )
+
     @staticmethod
     def _env(name: str, *, required: bool = True) -> Optional[str]:
         value = os.environ.get(name)

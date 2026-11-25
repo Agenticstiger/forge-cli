@@ -24,10 +24,17 @@ standing up a full server. ``SessionState`` is imported only under
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 from ._expose_utils import _jsonable
-from .query_compiler import compile_free_form_sql, compile_semantic_query
+from .drivers.base import EngineDriver, UnsupportedBindingError
+from .query_compiler import (
+    QueryValidationError,
+    RelatedTable,
+    compile_free_form_sql,
+    compile_semantic_query,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .server import SessionState
@@ -132,6 +139,93 @@ def _resolve_limit(requested: Any, *, cap: int) -> int:
     return min(max(value, 1), cap)
 
 
+_LOG = logging.getLogger("fluid.output_port.mcp.query")
+
+
+def _named_relationships(expose: Mapping[str, Any], args: Mapping[str, Any]) -> List[str]:
+    """The as-of relationships of ``expose`` that ``args`` name: a dimension or a filter key
+    ``<relationship>.<column>`` (exactly one dot) whose prefix is one of its
+    ``semantics.relationships[]`` with a non-empty ``asOf``, in the order named."""
+    semantics = expose.get("semantics")
+    listed = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+    as_of = {
+        r["name"]
+        for r in (listed if isinstance(listed, list) else [])
+        if isinstance(r, Mapping) and isinstance(r.get("name"), str) and r.get("asOf")
+    }
+    dimensions = args.get("dimensions")
+    filters = args.get("filters")
+    names = [*(dimensions if isinstance(dimensions, list) else [])]
+    names += list(filters) if isinstance(filters, Mapping) else []
+    found: List[str] = []
+    for name in names:
+        if isinstance(name, str) and name.count(".") == 1:
+            prefix = name.split(".")[0]
+            if prefix in as_of and prefix not in found:
+                found.append(prefix)
+    return found
+
+
+def _related_tables(
+    state: "SessionState", driver: Any, args: Mapping[str, Any]
+) -> Dict[str, RelatedTable]:
+    """The tables the as-of relationships a ``query`` names reach, each with its own column
+    policy, or nothing when it names none. The target's table is read as THIS driver's
+    connection reads it, and only when its ``agentPolicy`` is the served expose's: the gate
+    this call passed is the served expose's."""
+    expose = state.expose
+    named = _named_relationships(expose, args)
+    if not named:
+        return {}
+    contract = getattr(state, "contract", None)
+    exposes = contract.get("exposes") if isinstance(contract, Mapping) else None
+    served = expose.get("policy")
+    served_policy = (served.get("agentPolicy") if isinstance(served, Mapping) else None) or {}
+    by_name: Dict[str, Mapping[str, Any]] = {}
+    for entry in expose["semantics"]["relationships"]:
+        if isinstance(entry, Mapping):
+            by_name.setdefault(entry["name"], entry)
+    related: Dict[str, RelatedTable] = {}
+    for relationship in named:
+        to = by_name[relationship].get("to")
+
+        def refuse(why: str, *, _name: str = relationship, _to: Any = to) -> QueryValidationError:
+            return QueryValidationError(
+                f"Relationship {_name!r} cannot be read: the table it reaches ({_to!r}) {why}."
+            )
+
+        target = next(
+            (
+                e
+                for e in (exposes if isinstance(exposes, list) else [])
+                if isinstance(e, Mapping) and e.get("exposeId") == to
+            ),
+            None,
+        )
+        if target is None:
+            raise refuse("is not an expose of this contract")
+        policy = target.get("policy")
+        target_policy = (policy.get("agentPolicy") if isinstance(policy, Mapping) else None) or {}
+        if target_policy != served_policy:
+            raise refuse("carries another agentPolicy than the expose being queried")
+        reader = getattr(driver, "related_table_reference", None)
+        try:
+            if not callable(reader):
+                raise UnsupportedBindingError("this driver cannot read another expose")
+            reference = reader(target)
+        except (UnsupportedBindingError, ValueError) as exc:
+            logger = getattr(driver, "logger", None) or _LOG
+            logger.info("related_table_unreadable: %s -> %s: %s", relationship, to, exc)
+            raise refuse("cannot be read in the same statement on this gateway") from None
+        related[relationship] = RelatedTable(
+            expose=target,
+            table_reference=reference,
+            restricted_columns=tuple(sorted(EngineDriver._compute_restricted_columns(target))),
+            redacted_columns=tuple(sorted(EngineDriver._compute_pii_columns(target))),
+        )
+    return related
+
+
 def tool_query(
     state: "SessionState",
     arguments: Mapping[str, Any],
@@ -175,6 +269,9 @@ def tool_query(
         # aliases whose values must be redacted.
         restricted_columns=set(getattr(driver, "_restricted_columns", set())),
         redacted_columns=set(getattr(driver, "_pii_columns", set())),
+        # An as-of relationship the request names: the version of its target the row's
+        # date falls in, read through the target's own governed projection.
+        related=_related_tables(state, driver, args),
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)

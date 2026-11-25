@@ -257,6 +257,18 @@ class AthenaDriver(EngineDriver):
     # Internals
     # ------------------------------------------------------------------
 
+    def _connection_identity(self) -> Optional[Tuple[Any, ...]]:
+        # The client is built from the region and the connection options; a query runs in
+        # a workgroup and writes its result to an output location. A fully qualified table
+        # of the catalog those reach is read by any of them.
+        return (
+            "athena",
+            self._region,
+            self._workgroup,
+            self._output_location,
+            tuple(sorted((str(k), repr(v)) for k, v in (self.connection_options or {}).items())),
+        )
+
     def _get_client(self):
         if self._client is not None:
             return self._client

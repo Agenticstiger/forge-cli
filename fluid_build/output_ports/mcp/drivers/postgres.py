@@ -230,17 +230,8 @@ class PostgresDriver(EngineDriver):
     # Internals
     # ------------------------------------------------------------------
 
-    def _get_connection(self):
-        if self._connection is not None:
-            return self._connection
-        try:
-            import psycopg  # type: ignore[import-not-found]
-        except ImportError as exc:  # pragma: no cover - depends on optional dep
-            raise UnsupportedBindingError(
-                "psycopg is required for PostgresDriver. Install with: "
-                "pip install 'data-product-forge[postgres]'"
-            ) from exc
-
+    def _connect_options(self) -> Dict[str, Any]:
+        """What :meth:`_get_connection` connects with."""
         opts = dict(self.connection_options or {})
         # Layered resolution: explicit connection_options > env vars >
         # binding location hints. Hostname / port / credentials always
@@ -258,7 +249,35 @@ class PostgresDriver(EngineDriver):
         if sslmode and "sslmode" not in opts:
             opts["sslmode"] = sslmode
         # Drop any None values — psycopg complains about them.
-        opts = {k: v for k, v in opts.items() if v is not None}
+        return {k: v for k, v in opts.items() if v is not None}
+
+    def _connection_identity(self) -> Optional[Tuple[Any, ...]]:
+        # Every parameter the connection is made with: the same host, port, database,
+        # role and credentials read the same tables, and a table of the same database
+        # is named by its schema. The binding's database must also be the one connected
+        # to, since the reference carries it.
+        try:
+            opts = self._connect_options()
+        except (TypeError, ValueError):
+            return None
+        return (
+            "postgres",
+            self._database,
+            tuple(sorted((str(k), repr(v)) for k, v in opts.items())),
+        )
+
+    def _get_connection(self):
+        if self._connection is not None:
+            return self._connection
+        try:
+            import psycopg  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - depends on optional dep
+            raise UnsupportedBindingError(
+                "psycopg is required for PostgresDriver. Install with: "
+                "pip install 'data-product-forge[postgres]'"
+            ) from exc
+
+        opts = self._connect_options()
         if self.logger is not None:
             redacted = {k: ("***" if k in {"password", "passfile"} else v) for k, v in opts.items()}
             self.logger.debug("postgres_connect: %s", redacted)

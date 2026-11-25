@@ -169,6 +169,12 @@ class BigQueryDriver(EngineDriver):
             "latency_ms": round((time.monotonic() - started) * 1000, 2),
         }
 
+    def _connection_identity(self) -> Optional[Tuple[Any, ...]]:
+        # The client is built from the project alone (credentials and location come from
+        # the environment, the same for every driver of the process); a fully qualified
+        # table of that project reads through it.
+        return ("bigquery", self._project)
+
     def _get_client(self, bigquery_module):
         if self._client is not None:
             return self._client

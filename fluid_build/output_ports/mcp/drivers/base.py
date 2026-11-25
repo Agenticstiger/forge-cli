@@ -554,6 +554,47 @@ class EngineDriver(ABC):
         return QueryResult(columns=visible_columns, rows=rows, truncated=truncated)
 
     # ------------------------------------------------------------------
+    # Another expose in the same statement
+    # ------------------------------------------------------------------
+
+    def _connection_identity(self) -> Optional[Tuple[Any, ...]]:
+        """What this driver connects with, as a value two drivers can be compared by: equal
+        identities read the same data through the same connection, so a table one names
+        can be read in a statement the other runs. ``None`` when the driver cannot say, and
+        :meth:`related_table_reference` then refuses."""
+        return None
+
+    def related_table_reference(self, target: Mapping[str, Any]) -> str:
+        """``target``'s table reference as THIS driver's connection reads it in the same
+        statement (an as-of relationship's table, joined in a ``query``).
+
+        ``target`` is another expose of the contract. The default builds a sibling driver of
+        the same class for it (no network: only its binding is read) and returns the
+        sibling's table reference when both drivers would connect the same way
+        (:meth:`_connection_identity`); a driver with no identity, a target on another
+        platform or a target another connection reads raises
+        :class:`UnsupportedBindingError`. A driver whose engine reads files or attached
+        databases overrides it."""
+        identity = self._connection_identity()
+        if identity is None:
+            raise UnsupportedBindingError(
+                "this engine does not read another expose in the same statement"
+            )
+        sibling = type(self)(
+            expose=target,
+            contract=self.contract,
+            logger=self.logger,
+            connection_options=self.connection_options,
+            readable_paths=self.readable_paths,
+        )
+        if sibling._connection_identity() != identity:
+            raise UnsupportedBindingError(
+                "the expose is read through another connection than this one, so it cannot "
+                "be read in the same statement"
+            )
+        return sibling.descriptor().table_reference
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
