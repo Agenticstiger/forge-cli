@@ -939,6 +939,7 @@ jobs:
             tests/output_ports/test_drivers_duckdb.py \
             tests/output_ports/test_duckdb_logging_gate.py \
             tests/output_ports/test_mcp_authz_row_filters.py \
+            tests/output_ports/test_mcp_policy_refs.py \
             tests/output_ports/test_mcp_row_filter_fence.py \
             tests/output_ports/test_pii_audit_circuit_token.py \
             tests/output_ports/test_query_compiler.py \
