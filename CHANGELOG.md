@@ -524,10 +524,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     or minus an interval is not typed, since engines differ on whether it is a date or a
     timestamp; cast it, as in `CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)`;
   - exact numbers are compared as DECIMAL. An integer type is DECIMAL(d, 0), with d = 3, 5, 10,
-    19 and 39 for tinyint, smallint, int, bigint and hugeint, and a decimal literal is
-    DECIMAL(its digits, its decimals). Two exact numbers meet only when the larger integer part
-    plus the larger scale is at most 38 digits, and a number of unknown precision (Postgres's
-    unconstrained `numeric`) meets no other exact number. A float meets any number;
+    19 and 39 for tinyint, smallint, int, bigint and hugeint (38 for every integer on
+    Snowflake), and a decimal literal is DECIMAL(its digits, its decimals). Integer types and
+    integer literals of up to 38 digits meet each other at any size, since an engine widens an
+    integer to the larger integer type; DuckDB's UHUGEINT is compared as a decimal, since DuckDB
+    casts it to the signed type it meets. Two other exact numbers meet only when the larger
+    integer part plus the larger scale is at most 38 digits, and a number of unknown precision
+    (Postgres's unconstrained `numeric`) meets no other exact number. A float meets any number.
+    A literal with an exponent is a float on DuckDB, Trino, Athena and BigQuery, whose
+    documentation types it so, and an exact number of its digits elsewhere;
   - a date meets only a date, a timestamp only a timestamp, and a timestamp with a time zone
     only a timestamp with a time zone;
   - each `coalesce`, `IN` and `BETWEEN` operand is held to the same rules. A `VALUES` or
@@ -544,6 +549,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value a subquery computes is refused. A reader no filter narrows is not limited, and the
   `query_sql` tool's description states these limits. A refusal names the function or the
   condition as the caller wrote it where the parser kept its position.
+- **`query_sql` and `sample` read only what the expose declares, for every caller.** On every
+  expose, and for a reader no row filter narrows as well, `query_sql` reads the exposed table
+  through a projection of the columns `contract.schema` declares, and reads no other relation
+  besides `VALUES`, `UNNEST` and, on DuckDB, a `FROM`-first CTE of its own: no other table, view,
+  catalog view (`information_schema` included), table function or file. Every caller may call only
+  the listed functions, since a function can read past the projection through its argument (a
+  view's definition, the server's settings, an object's DDL); the condition limits stay with the
+  callers a row filter narrows. Each projected column is folded to the case the engine gives a
+  bare name and then quoted, so a column named like a reserved word (`order`) or a session value
+  (`current_user`, and `user` on Postgres) is read as itself. A read of the table without an
+  alias takes the caller's own name for it, folded and quoted the same way, so a table named like
+  a reserved word reads too; a quoted name that Postgres or Snowflake reads as another table
+  than the exposed one is refused, and so is a Postgres cast to an object identifier type
+  (`regclass`, `regproc` and the like), which looks a name up in the catalog. `split` and
+  `string_to_array` are listed functions. `sample` keeps, for each declared name, the column the
+  engine reads for it, or the only column of that name in another case, so a quoted mixed-case
+  column is still returned and a column whose name differs from a declared one only in case is
+  not. Like `query_sql`, `sample` refuses an expose whose declared columns are all restricted,
+  since rows without a column would still count the table's rows. `query` is unchanged: it reads
+  only what the contract's semantics name.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -744,6 +769,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names or strings written with Unicode escapes (`U&"..."`). It also refuses `set_config`, the
   pageinspect functions, `pgrowlocks`, `pg_prepared_statement`, `pg_cursor` and the
   `pg_prepared_statements` and `pg_cursors` views.
+- **`query_sql` and `sample` read only the columns `contract.schema` declares, and every
+  `query_sql` caller is held to the function list.** This holds for every caller on every expose,
+  readers no row filter narrows included:
+  - `sample` returns only declared columns. It refuses an expose that declares no column, or
+    whose declared columns are all restricted. The `source-aligned-postgres-duckdb` example now
+    declares the columns it lands, which it used to leave to discovery.
+  - A `query_sql` statement that joins another table or reads a catalog view is refused, and one
+    that names an undeclared column fails on that column.
+  - Readers are now held to the function list too, so a `query_sql` statement that calls a
+    function the list does not name is refused for them: to_json, COLUMNS and hash, for example.
+    So is a Postgres cast to an object identifier type (`regclass`, `regproc` and the like).
+  - A declared column whose name is not a plain identifier (a letter or underscore, then
+    letters, digits and underscores) refuses `query_sql` on that expose for everyone, unless the
+    column is restricted.
+
+  Declare the column, read the other table through its own expose, or compute the value
+  elsewhere.
 - **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
   read the name as a string. Write the column name bare.
 - **A caller a row filter narrows writes `query_sql` conditions as typed comparisons.** The
@@ -752,12 +794,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller). Compare a column with a constant of its own type: `DATE '2024-01-01'` or
   `CURRENT_DATE` for a date (not `'2024-01-01'`), `now()` for a timestamp with a time zone,
   and `CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)` for a date relative to today. Keep
-  comparisons of exact numbers within 38 digits; a column of unknown precision, such as
-  Postgres's unconstrained `numeric`, meets another exact number only once the table gives it
-  a precision and scale. Write LIKE patterns as string
-  literals without `ESCAPE` or a backslash, and compute values (casts, arithmetic, other
-  functions) in the outer select list. Only listed functions may be called, and the row and
-  string generators are no longer listed.
+  comparisons of exact numbers within 38 digits, except between integers, which meet at any
+  size; a column of unknown precision, such as Postgres's unconstrained `numeric`, meets
+  another exact number only once the table gives it a precision and scale. Write LIKE patterns
+  as string literals without `ESCAPE` or a backslash, and compute values (casts, arithmetic,
+  other functions) in the outer select list. Only listed functions may be called, and the row
+  and string generators are no longer listed.
 - **sqlglot 30.1 or newer is required.** 26.16 and older record no identifier positions, so the MCP
   output port refused every row filter on them, and releases before 30.1 refuse some valid
   `query_sql` reads on an expose with row filters (a DuckDB `EXISTS (FROM ...)` subquery, for one).

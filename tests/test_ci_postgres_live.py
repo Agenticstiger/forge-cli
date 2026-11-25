@@ -57,10 +57,18 @@ def test_the_job_names_its_server_runs_the_integration_tests_and_requires_them()
 
 
 def test_a_live_module_fails_where_the_job_requires_it_and_skips_elsewhere(monkeypatch):
+    """A skip raised here would mark this test skipped, not failed, so it is caught
+    and turned into a failure: the job must fail, not skip, without a server."""
     monkeypatch.delenv(DSN_VARIABLE, raising=False)
     monkeypatch.setenv(REQUIRED_VARIABLE, "1")
-    with pytest.raises(pytest.fail.Exception, match=DSN_VARIABLE):
+    try:
         live_postgres()
+    except pytest.fail.Exception as failed:
+        assert DSN_VARIABLE in str(failed)
+    except pytest.skip.Exception:
+        pytest.fail("live_postgres() skipped where the job requires the live tests")
+    else:
+        pytest.fail("live_postgres() returned without a server")
     monkeypatch.delenv(REQUIRED_VARIABLE)
     with pytest.raises(pytest.skip.Exception, match=DSN_VARIABLE):
         live_postgres()

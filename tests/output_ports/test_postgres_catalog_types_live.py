@@ -41,7 +41,7 @@ EU = "group:eu@x.example"
 
 # Column name: (its type, with {schema} for this test's own types; what it reads as).
 _COLUMNS: Dict[str, Tuple[str, Optional[ColumnType]]] = {
-    "id": ("integer", ColumnType("number", 10, 0)),
+    "id": ("integer", ColumnType("number", 10, 0, True)),
     "region": ("text", ColumnType("string")),
     "amount": ("numeric(10,2)", ColumnType("number", 10, 2)),
     "total": ("numeric", ColumnType("number")),
