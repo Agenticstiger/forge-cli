@@ -423,14 +423,8 @@ def compile_enforcement(
     try:
         filters = row_filters_for(exposure, index, dialect="databricks")
     except UnsupportedBindingError as exc:
+        # Every refusal of the shared reader, a predicate its parser cannot read included.
         raise _refusal("row-filter-invalid", f"{where}: {exc}", *exc.remediation) from exc
-    except Exception as exc:  # noqa: BLE001 — the shared reader's parser can raise its own
-        # tokenizer errors on text it cannot read (a backslash-escaped quote, say): refused.
-        raise _refusal(
-            "row-filter-invalid",
-            f"{where}: a row filter predicate could not be read as SQL ({type(exc).__name__}).",
-            "Write each predicate as one boolean expression over the table's columns.",
-        ) from exc
     if not restrictions and not filters:
         return None
 

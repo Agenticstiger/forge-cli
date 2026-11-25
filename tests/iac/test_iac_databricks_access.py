@@ -578,7 +578,7 @@ INJECTIONS = [
     "*",
     "region = 'eu' AND hash(region) = 1",
     "region = ${jndi}",
-    # The shared reader's tokenizer cannot read a backslash-escaped quote: refused, no traceback.
+    # A backslash-escaped quote is not standard SQL: the shared reader refuses it, no traceback.
     "region = 'it\\'s'",
 ]
 

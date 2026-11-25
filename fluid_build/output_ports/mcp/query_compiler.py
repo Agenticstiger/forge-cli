@@ -1046,11 +1046,11 @@ def _resolve_metric(
                 "apply it. Rewrite the contract filter as a plain SQL "
                 "predicate over contract columns."
             ) from None
-        # Defence-in-depth: the filter is the first contract expression to
-        # land in the WHERE next to policy.rowFilters. A deliberately
-        # unbalanced filter like ``1=1) OR (1=1`` passes the char allowlist
-        # but would escape its wrapping parens and — by AND/OR precedence —
-        # neutralize an ANDed RLS clause. Balanced parens close the class.
+        # Defence in depth: the filter is a contract expression ANDed into the
+        # WHERE beside the caller's filters. A deliberately unbalanced filter
+        # like ``1=1) OR (1=1`` passes the char allowlist but would escape its
+        # wrapping parens and, by AND/OR precedence, neutralize a clause ANDed
+        # to it. Balanced parens close the class.
         if not _parens_balanced(metric_filter):
             raise QueryValidationError(
                 f"Metric {metric_name!r} carries a filter with unbalanced "
