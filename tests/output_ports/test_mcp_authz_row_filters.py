@@ -1117,3 +1117,44 @@ def test_the_exposed_table_may_be_named_as_its_binding_names_it(dialect, sql):
         dialect=dialect,
     )
     assert "_fluid_rows.region = 'EU'" in compiled.sql
+
+
+def _bound_to(db_file: Optional[str]) -> Dict[str, Any]:
+    expose = _expose()
+    if db_file is not None:
+        expose["binding"] = {
+            "platform": "local",
+            "format": "duckdb_table",
+            "location": {"dbFile": db_file, "table": "customers"},
+        }
+    return expose
+
+
+@pytest.mark.parametrize(
+    ("db_file", "sql", "refused"),
+    [
+        (None, "SELECT id FROM memory.main.customers", False),
+        ("/data/warehouse.duckdb", "SELECT id FROM warehouse.main.customers", False),
+        ("/data/warehouse.duckdb", "SELECT id FROM memory.main.customers", True),
+        (None, "SELECT id FROM warehouse.main.customers", True),
+    ],
+    ids=["in-memory", "database-file", "memory-for-a-file", "file-for-memory"],
+)
+def test_duckdb_reads_the_exposed_table_under_the_catalog_its_binding_opens(db_file, sql, refused):
+    """DuckDB names the database a binding opens ``memory``, or after the file's stem."""
+
+    def compile_it():
+        return query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=10,
+            expose=_bound_to(db_file),
+            caller_attributes=_as(EU),
+            dialect="duckdb",
+        )
+
+    if refused:
+        with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
+            compile_it()
+    else:
+        assert "_fluid_rows.region = 'EU'" in compile_it().sql

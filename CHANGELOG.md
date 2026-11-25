@@ -412,7 +412,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`query_sql` refuses the exposed table's name under another schema or catalog.** On an expose
   that restricts columns or filters rows, `other.customers` was read as the exposed table, so the
   caller saw its filtered rows under another table's name. A read now names the table unqualified
-  or as the expose binds it (on DuckDB, `main` is the binding's schema).
+  or as the expose binds it. On DuckDB an unqualified binding's schema is `main` and its catalog is
+  the database the binding opens: `memory`, or the database file's name without its extension.
 - **More Postgres functions are refused on every expose: those that read server files, the
   write-ahead log or logical-decoding changes, or touch the session, sequences, locks or other
   sessions.** `query_sql`, contract expressions and the drivers' statement guard refuse

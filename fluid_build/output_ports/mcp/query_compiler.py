@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
@@ -1905,16 +1906,31 @@ def _refuse_unprojectable_reads(tree: Any, exposed_name: str, read: Optional[str
 _DEFAULT_SCHEMA = {"duckdb": "main"}
 
 
-def _refuse_another_schemas_table(tables: List[Any], exposed: Any, read: Optional[str]) -> None:
+def duckdb_catalog(expose: Mapping[str, Any]) -> str:
+    """The catalog DuckDB gives the database a binding opens: the stem of
+    ``binding.location.dbFile`` (``warehouse`` for ``warehouse.duckdb``), or ``memory``
+    when the binding opens none, as the DuckDB driver does."""
+    binding = expose.get("binding") if isinstance(expose, Mapping) else None
+    location = binding.get("location") if isinstance(binding, Mapping) else None
+    db_file = location.get("dbFile") if isinstance(location, Mapping) else None
+    if isinstance(db_file, str) and db_file and db_file != ":memory:":
+        return PurePath(db_file).stem
+    return "memory"
+
+
+def _refuse_another_schemas_table(
+    tables: List[Any], exposed: Any, read: Optional[str], catalog: str = ""
+) -> None:
     """Refuse a read that names the exposed table in another schema or catalog than the
     binding's. The projection would serve the exposed table's rows under that name, so
     the caller would be shown one table's rows labelled as another's. A part the caller
     writes must be the binding's; a part the binding leaves out may be written only as
-    the engine's default (DuckDB's ``main`` schema)."""
+    the engine's default (on DuckDB the ``main`` schema, and ``catalog``, the database
+    the binding opens)."""
     exposed_name = exposed.name.casefold()
     expected = {
         "db": exposed.text("db") or _DEFAULT_SCHEMA.get(read or "", ""),
-        "catalog": exposed.text("catalog"),
+        "catalog": exposed.text("catalog") or (catalog if read == "duckdb" else ""),
     }
     for table in tables:
         if table.name.casefold() != exposed_name:
@@ -2008,6 +2024,7 @@ def _project_exposed_table(
     allowed: List[str],
     dialect: Optional[str],
     predicate: Optional[str] = None,
+    catalog: str = "",
 ) -> str:
     """Rewrite caller SQL so every read of the exposed table goes through a projection
     of the ``allowed`` columns, limited to the rows ``predicate`` selects.
@@ -2053,7 +2070,7 @@ def _project_exposed_table(
     _require_plain_sources(tree)
     exposed_name = exposed.name.casefold()
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
-    _refuse_another_schemas_table(tables, exposed, read)
+    _refuse_another_schemas_table(tables, exposed, read, catalog)
     row_filter = (
         ""
         if predicate is None
@@ -2241,6 +2258,7 @@ def compile_free_form_sql(
             allowed=_allowed_names(_declared_column_names(expose), restricted),
             dialect=dialect,
             predicate=row_predicate,
+            catalog=duckdb_catalog(expose),
         )
     # Append the server-side cap, but only when the caller didn't already supply a
     # trailing ``LIMIT <n>`` (a second one is a syntax error on most engines).
