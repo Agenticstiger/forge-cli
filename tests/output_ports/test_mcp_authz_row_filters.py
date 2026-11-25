@@ -1334,7 +1334,8 @@ def test_having_and_qualify_are_fenced_like_a_where(sql, dialect):
 
 def _typed() -> Dict[str, Any]:
     expose = _expose()
-    types = {"id": "integer", "amount": "integer", "secret": "string", "segment": "varchar(20)"}
+    types = {"id": "integer", "amount": "integer", "segment": "varchar(20)"}
+    types[_COLUMNS[-1]] = "string"  # the column the fixture calls secret
     expose["contract"]["schema"] = [
         {"name": name, **({"type": types[name]} if name in types else {})} for name in _COLUMNS
     ]
