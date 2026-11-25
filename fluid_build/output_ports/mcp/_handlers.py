@@ -217,6 +217,9 @@ def tool_query_sql(
         expose=state.expose,
         caller_attributes=attrs,
         dialect=descriptor.dialect,
+        # A filtered caller's comparisons are typed by contract.schema; the driver reads
+        # the table's own types once, so a declared type the table does not hold is refused.
+        physical_kinds=getattr(driver, "physical_column_kinds", None),
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)

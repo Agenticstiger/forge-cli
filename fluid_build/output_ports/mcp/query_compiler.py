@@ -63,7 +63,7 @@ import functools
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
 from fluid_build.output_ports.mcp.auth import PRINCIPAL_ATTR
@@ -77,6 +77,7 @@ from fluid_build.providers._row_filters import (
 from fluid_build.providers._sql_safety import (
     names_refused_duckdb_function,
     names_refused_postgres_function,
+    quote_string_literal,
     validate_ident,
     validate_sql_expression_allowlist,
 )
@@ -1919,7 +1920,10 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
     """The function classes a statement on an expose with row filters may call, and the
     lower-cased names a call sqlglot leaves unparsed may have: theirs, and
     :data:`_ANONYMOUS_ALLOWED`. Everything else is refused, as Trino's file-based access
-    control refuses a function no rule names."""
+    control refuses a function no rule names. The row and string generators
+    (``generate_series``, ``range``, ``repeat``, ``lpad``, ``rpad``) are not listed: one
+    call can build rows or a string far larger than the result cap bounds, and not every
+    engine stops a statement at the gateway's timeout."""
     from sqlglot import exp
 
     classes: Tuple[type, ...] = (
@@ -1975,7 +1979,6 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.Replace,
         exp.Left,
         exp.Right,
-        exp.Pad,
         exp.StrPosition,
         exp.Initcap,
         exp.SplitPart,
@@ -1987,7 +1990,6 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.SHA2,
         exp.SHA2Digest,
         exp.Hex,
-        exp.Repeat,
         exp.Reverse,
         exp.StartsWith,
         exp.EndsWith,
@@ -2062,7 +2064,6 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.ArrayConcat,
         exp.Explode,
         exp.Unnest,
-        exp.GenerateSeries,
         exp.Struct,
         # a predicate over a subquery, which sqlglot models as a function
         exp.Exists,
@@ -2076,15 +2077,25 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
     return classes, frozenset(names | _ANONYMOUS_ALLOWED)
 
 
-def _refuse_unlisted_functions(tree: Any, read: Optional[str] = None) -> None:
+def _refuse_unlisted_functions(tree: Any, sql: str = "", read: Optional[str] = None) -> None:
     """Refuse a call to a function :func:`_allowed_functions` does not list. A call that
     names a schema is refused unless the schema is ``pg_catalog``: any other could hold a
-    function of an allowed name that reads anything. The deny-list of
-    :func:`names_refused_postgres_function` still applies on every expose."""
+    function of an allowed name that reads anything. A quoted name is compared as written,
+    case included: Postgres resolves ``"LOWER"`` to another function than ``lower``. The
+    refusal names the function as ``sql`` spells it, where the parser kept its position.
+    The deny-list of :func:`names_refused_postgres_function` still applies on every
+    expose."""
     from sqlglot import exp
 
     classes, names = _allowed_functions()
     for func in tree.find_all(exp.Func):
+        written = _written_name(func, sql)
+        quoted = (
+            written is not None
+            and len(written) > 1
+            and written[0] in '"`'
+            and (written[-1] == written[0])
+        )
         if isinstance(func, exp.Anonymous):
             parent = func.parent
             qualifier = (
@@ -2095,14 +2106,30 @@ def _refuse_unlisted_functions(tree: Any, read: Optional[str] = None) -> None:
             plain = qualifier is None or (
                 isinstance(qualifier, exp.Identifier) and qualifier.name.casefold() == "pg_catalog"
             )
-            if not plain or func.name.casefold() not in names:
-                written = func.name if qualifier is None else f"{qualifier.sql()}.{func.name}"
-                raise QueryValidationError(_unlisted_function(written))
-        elif not isinstance(func, classes):
-            raise QueryValidationError(_unlisted_function(func.sql(dialect=read)[:80]))
+            name = written[1:-1] if quoted and written else func.name.casefold()
+            if not plain or name not in names:
+                shown = written or func.name
+                shown = shown if qualifier is None else f"{qualifier.sql()}.{shown}"
+                raise QueryValidationError(_unlisted_function(shown))
+        elif not isinstance(func, classes) or (
+            quoted
+            and written
+            and written[1:-1] not in {name.lower() for name in type(func).sql_names()}
+        ):
+            raise QueryValidationError(_unlisted_function(written or func.sql(dialect=read)[:80]))
     for operator in tree.find_all(exp.Operator):
         # ``OPERATOR(schema.op)`` calls the function behind an operator a schema defines.
         raise QueryValidationError(_unlisted_function(operator.sql(dialect=read)[:80]))
+
+
+def _written_name(node: Any, sql: str) -> Optional[str]:
+    """The text of ``node``'s name in ``sql`` (a function's name as the caller wrote it,
+    quotes included), when the parser kept its position."""
+    meta = getattr(node, "meta", None) or {}
+    start, end = meta.get("start"), meta.get("end")
+    if isinstance(start, int) and isinstance(end, int) and 0 <= start <= end < len(sql):
+        return sql[start : end + 1]
+    return None
 
 
 def _unlisted_function(name: str) -> str:
@@ -2116,9 +2143,9 @@ def _unlisted_function(name: str) -> str:
 @functools.lru_cache(maxsize=1)
 def _condition_nodes() -> Tuple[type, ...]:
     """What a condition may hold on an expose with row filters: comparisons, IN, BETWEEN,
-    IS, LIKE and EXISTS over columns and literals, joined by AND, OR and NOT. None of them
-    fails on a row's value, so a planner that runs one early, on a row the filter
-    removes, tells the caller nothing (Postgres calls such operators leakproof)."""
+    IS, LIKE and EXISTS over columns and constants, joined by AND, OR and NOT, and
+    ``lower``, ``upper`` and ``coalesce`` over typed values. The checks in
+    :func:`_refuse_conditions_that_can_fail` decide how each may be used."""
     from sqlglot import exp
 
     return (
@@ -2139,7 +2166,6 @@ def _condition_nodes() -> Tuple[type, ...]:
         exp.Between,
         exp.Like,
         exp.ILike,
-        exp.Escape,
         exp.Exists,
         exp.Any,
         exp.All,
@@ -2150,31 +2176,367 @@ def _condition_nodes() -> Tuple[type, ...]:
         exp.Boolean,
         exp.Neg,
         exp.Tuple,
+        exp.Lower,
+        exp.Upper,
+        exp.Coalesce,
     )
 
 
-# Declared column types that a comparison would cast row by row when the other side is
-# not a string: a string column compared with a number fails on a value such as 'S1'.
-_STRING_TYPE_RE = re.compile(r"(?i)^(?:n?(?:var)?char|character(?: varying)?|string|str|text)\b")
+# The kind of a declared or engine type, by its first word. A comparison is typed only
+# between values of one scalar kind; ``complex`` values (JSON, VARIANT, arrays, maps,
+# structs) and types outside these lists are never compared.
+_TYPE_KINDS: Tuple[Tuple[str, FrozenSet[str]], ...] = (
+    (
+        "complex",
+        frozenset(
+            {"array", "geography", "geometry", "hstore", "json", "jsonb", "list", "map"}
+            | {"object", "record", "row", "struct", "super", "union", "variant", "xml"}
+        ),
+    ),
+    (
+        "string",
+        frozenset(
+            {"bpchar", "char", "character", "citext", "clob", "nchar", "nvarchar"}
+            | {"nvarchar2", "str", "string", "text", "varchar", "varchar2"}
+        ),
+    ),
+    (
+        "number",
+        frozenset(
+            {"bigint", "bignumeric", "byteint", "dec", "decimal", "double", "float"}
+            | {"float32", "float4", "float64", "float8", "hugeint", "int", "int128", "int16"}
+            | {"int2", "int32", "int4", "int64", "int8", "integer", "mediumint", "money"}
+            | {"number", "numeric", "real", "smallint", "tinyint", "ubigint", "uhugeint"}
+            | {"uinteger", "usmallint", "utinyint"}
+        ),
+    ),
+    ("boolean", frozenset({"bool", "boolean"})),
+    (
+        "temporal",
+        frozenset(
+            {"date", "datetime", "datetime2", "smalldatetime", "time", "timestamp"}
+            | {"timestamp_ltz", "timestamp_ntz", "timestamp_tz", "timestamptz", "timetz"}
+        ),
+    ),
+    ("interval", frozenset({"interval"})),
+    ("binary", frozenset({"binary", "blob", "bytea", "bytes", "varbinary"})),
+    ("uuid", frozenset({"uniqueidentifier", "uuid"})),
+)
+_TYPE_WORD_RE = re.compile(r"[a-z_][a-z0-9_]*")
 
 
-def _declared_column_types(expose: Mapping[str, Any]) -> Dict[str, bool]:
-    """``{column name (case-folded): whether its declared type is a string type}`` for
-    every ``contract.schema`` column that declares a type."""
-    found: Dict[str, bool] = {}
-    for column in (expose.get("contract") or {}).get("schema") or []:
+def _kind_of_type(text: Any) -> Optional[str]:
+    """The kind of a type written as ``text`` (``varchar(20)``, ``NUMBER(38,0)``,
+    ``timestamp with time zone``, ``ARRAY<STRING>``, ``int[]``), or ``None`` when it is not
+    one this module types."""
+    if not isinstance(text, str):
+        return None
+    written = text.strip().lower()
+    if written.endswith("[]"):
+        return "complex"
+    word = _TYPE_WORD_RE.match(written)
+    if word is None:
+        return None
+    for kind, words in _TYPE_KINDS:
+        if word.group(0) in words:
+            return kind
+    return None
+
+
+def kind_of_type(text: Any) -> Optional[str]:
+    """The kind (``string``, ``number``, ``boolean``, ``temporal``, ``interval``,
+    ``binary``, ``uuid`` or ``complex``) of a type an engine's catalog or a contract
+    writes, or ``None`` when the gateway does not type it."""
+    return _kind_of_type(text)
+
+
+def catalog_columns_sql(table_reference: str, dialect: Optional[str]) -> str:
+    """The statement that reads the exposed table's column names and types from the
+    engine's ``information_schema.columns``: dataset-scoped on BigQuery, database-scoped
+    on Snowflake, matched by name without regard to case elsewhere."""
+    from sqlglot import exp
+
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    table = exp.to_table(table_reference, dialect=read)
+    catalog, db = table.args.get("catalog"), table.args.get("db")
+
+    def written(part: Any) -> str:
+        rendered: str = part.sql(dialect=read)
+        return rendered
+
+    if read == "bigquery":
+        scope = ".".join(written(part) for part in (catalog, db) if part is not None)
+        source = f"{scope}.INFORMATION_SCHEMA.COLUMNS" if scope else "INFORMATION_SCHEMA.COLUMNS"
+        filters = [f"table_name = {quote_string_literal(table.name)}"]
+    else:
+        source = "information_schema.columns"
+        if read == "snowflake" and catalog is not None:
+            source = f"{written(catalog)}.information_schema.columns"
+        filters = [f"lower(table_name) = {quote_string_literal(table.name.lower())}"]
+        if db is not None:
+            filters.append(f"lower(table_schema) = {quote_string_literal(db.name.lower())}")
+    return f"SELECT column_name, data_type FROM {source} WHERE {' AND '.join(filters)}"
+
+
+def _declared_column_kinds(expose: Mapping[str, Any]) -> Dict[str, Optional[str]]:
+    """``{column name (case-folded): kind}`` for every ``contract.schema`` column; the kind
+    is ``None`` when the column declares no type, or one this module does not type."""
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    found: Dict[str, Optional[str]] = {}
+    for column in schema if isinstance(schema, list) else []:
         if isinstance(column, Mapping) and isinstance(column.get("name"), str):
-            declared = column.get("type")
-            if isinstance(declared, str) and declared.strip():
-                found[column["name"].casefold()] = bool(_STRING_TYPE_RE.match(declared.strip()))
+            found[column["name"].casefold()] = _kind_of_type(column.get("type"))
     return found
 
 
-def _refuse_a_casting_comparison(node: Any, string_columns: Mapping[str, bool]) -> None:
-    """Refuse a comparison that would cast a string column row by row: a declared string
-    column against anything that is not a string (a number, a date, a boolean, a column
-    of another declared type), however it is parenthesised, and position by position
-    when tuples are compared."""
+def _refuse_types_the_table_does_not_hold(
+    declared: Mapping[str, Optional[str]], physical: Mapping[str, Optional[str]]
+) -> None:
+    """Refuse a filtered caller's statement when a typed ``contract.schema`` column has
+    another kind in the table: the comparisons are typed by the declared kinds, and a
+    column declared as an integer but held as text would be cast on every row."""
+    held = {name.casefold(): kind for name, kind in physical.items()}
+    for name, kind in sorted(declared.items()):
+        if kind is not None and held.get(name) != kind:
+            found = held.get(name)
+            table = (
+                "the table has no such column"
+                if name not in held
+                else f"the table holds it as {found or 'a type the gateway does not type'}"
+            )
+            raise RowFilterUnavailable(
+                f"contract.schema declares {name!r} as a {kind} column, but {table}. The "
+                "gateway types a filtered caller's comparisons by the declared types, so they "
+                "must match the table's; correct contract.schema."
+            )
+
+
+def _kinds_of_columns(
+    tree: Any, declared: Mapping[str, Optional[str]], exposed_name: str
+) -> Tuple[Dict[int, Optional[str]], Dict[int, Any]]:
+    """``({id(column): kind}, {id(select): scope})`` for the statement. A column has a kind
+    only when it resolves, through sqlglot's scopes, to a typed column of the exposed table:
+    directly, through a CTE or derived table that selects it unchanged, or from an outer
+    query. A column of ``VALUES``, ``UNNEST``, a set operation or a computed value has none."""
+    from sqlglot.errors import SqlglotError
+    from sqlglot.optimizer.scope import traverse_scope
+
+    kinds: Dict[int, Optional[str]] = {}
+    try:
+        scopes = list(traverse_scope(tree))
+    except (SqlglotError, RecursionError):
+        return kinds, {}
+    scope_of = {id(scope.expression): scope for scope in scopes}
+    for scope in scopes:
+        # Innermost first: a correlated column is listed by its outer scope too.
+        for column in scope.columns:
+            if id(column) not in kinds:
+                kinds[id(column)] = _name_kind(
+                    scope, column.name, column.table, declared, exposed_name, kinds
+                )
+    return kinds, scope_of
+
+
+def _name_kind(
+    scope: Any,
+    name: str,
+    qualifier: str,
+    declared: Mapping[str, Optional[str]],
+    exposed_name: str,
+    kinds: Mapping[int, Optional[str]],
+    depth: int = 0,
+) -> Optional[str]:
+    """The kind of the column ``qualifier.name`` (or bare ``name``) as ``scope`` reads it."""
+    folded = name.casefold()
+    current = scope
+    while current is not None and depth < 32:
+        sources = {key.casefold(): value for key, value in current.sources.items()}
+        if qualifier:
+            source = sources.get(qualifier.casefold())
+            if source is not None:
+                return _source_kind(source, folded, declared, exposed_name, kinds, depth)
+        else:
+            found = [
+                _source_kind(source, folded, declared, exposed_name, kinds, depth)
+                for source in sources.values()
+                if _source_may_have(source, folded, declared, exposed_name)
+            ]
+            if found:
+                return found[0] if len(set(found)) == 1 else None
+        current = current.parent
+    return None
+
+
+def _star_select(select: Any) -> bool:
+    from sqlglot import exp
+
+    return not select.expressions or any(
+        isinstance(item, exp.Star) or (isinstance(item, exp.Column) and item.is_star)
+        for item in select.expressions
+    )
+
+
+def _alias_columns(source: Any) -> Optional[List[str]]:
+    """The column names, in order, that the alias of a derived table, a CTE, ``VALUES`` or
+    ``UNNEST`` gives its columns (``AS d(a, b)``, ``WITH c(a, b)``), if it gives any."""
+    from sqlglot import exp
+
+    expression = getattr(source, "expression", source)
+    parent = expression.parent
+    holder = parent if isinstance(parent, (exp.Subquery, exp.CTE)) else expression
+    alias = holder.args.get("alias")
+    columns = alias.columns if isinstance(alias, exp.TableAlias) else []
+    return [column.name.casefold() for column in columns] if columns else None
+
+
+def _source_may_have(
+    source: Any, folded: str, declared: Mapping[str, Optional[str]], exposed_name: str
+) -> bool:
+    from sqlglot import exp
+
+    if isinstance(source, exp.Table):
+        return folded in declared if source.name.casefold() == exposed_name else True
+    names = _alias_columns(source)
+    if names is not None:
+        return folded in names
+    expression = source.expression
+    if isinstance(expression, exp.Select):
+        return _star_select(expression) or folded in {
+            name.casefold() for name in expression.named_selects
+        }
+    return True
+
+
+def _source_kind(
+    source: Any,
+    folded: str,
+    declared: Mapping[str, Optional[str]],
+    exposed_name: str,
+    kinds: Mapping[int, Optional[str]],
+    depth: int,
+) -> Optional[str]:
+    from sqlglot import exp
+
+    if isinstance(source, exp.Table):
+        return declared.get(folded) if source.name.casefold() == exposed_name else None
+    expression = source.expression
+    if not isinstance(expression, exp.Select):
+        return None
+    names = _alias_columns(source)
+    if names is not None:
+        # The alias renames the outputs by position: ``AS d(a, b)`` calls the first ``a``.
+        if folded not in names or _star_select(expression):
+            return None
+        position = names.index(folded)
+        if position >= len(expression.expressions):
+            return None
+        item = expression.expressions[position]
+        value = item.this if isinstance(item, exp.Alias) else item
+        if isinstance(value, exp.Column):
+            if id(value) in kinds:
+                return kinds[id(value)]
+            return _name_kind(
+                source, value.name, value.table, declared, exposed_name, kinds, depth + 1
+            )
+        return _constant_kind(value)
+    for item in expression.expressions:
+        if isinstance(item, exp.Star) or (isinstance(item, exp.Column) and item.is_star):
+            continue
+        if item.alias_or_name.casefold() == folded:
+            value = item.this if isinstance(item, exp.Alias) else item
+            if isinstance(value, exp.Column):
+                if id(value) in kinds:
+                    return kinds[id(value)]
+                return _name_kind(
+                    source, value.name, value.table, declared, exposed_name, kinds, depth + 1
+                )
+            return _constant_kind(value)
+    if _star_select(expression):
+        return _name_kind(source, folded, "", declared, exposed_name, kinds, depth + 1)
+    return None
+
+
+def _constant_kind(value: Any) -> Optional[str]:
+    """The kind of a constant, or ``None`` for anything else."""
+    from sqlglot import exp
+
+    value = _unparen(value)
+    if isinstance(value, exp.Null):
+        return "null"
+    if isinstance(value, exp.Literal):
+        return "string" if value.is_string else "number"
+    if isinstance(value, exp.Boolean):
+        return "boolean"
+    if not _is_constant(value):
+        return None
+    if isinstance(value, exp.Neg):
+        return "number" if _constant_kind(value.this) == "number" else None
+    if isinstance(value, (exp.Cast, exp.TryCast)):
+        return _kind_of_type(value.to.sql())
+    if isinstance(value, (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime)):
+        return "temporal"
+    if isinstance(value, exp.Anonymous) and value.name.casefold() == "now":
+        return "temporal"
+    if isinstance(value, exp.Interval):
+        return "interval"
+    if isinstance(value, (exp.Add, exp.Sub)):
+        parts = {_constant_kind(value.this), _constant_kind(value.expression)}
+        if parts in ({"number"}, {"interval"}):
+            return parts.pop()
+        if parts == {"temporal", "interval"}:
+            return "temporal"
+    return None
+
+
+def _value_kind(
+    side: Any, kinds: Mapping[int, Optional[str]], scope_of: Mapping[int, Any]
+) -> Optional[str]:
+    """The kind of one side of a comparison, ``"null"`` for NULL, or ``None`` when the
+    gateway cannot type it."""
+    from sqlglot import exp
+
+    side = _unparen(side)
+    if isinstance(side, exp.Column):
+        return kinds.get(id(side))
+    if isinstance(side, (exp.Lower, exp.Upper)):
+        return "string" if _value_kind(side.this, kinds, scope_of) == "string" else None
+    if isinstance(side, exp.Coalesce):
+        values = [side.this, *side.expressions]
+        if not all(isinstance(_unparen(v), (exp.Column, exp.Literal, exp.Null)) for v in values):
+            return None
+        found = {_value_kind(value, kinds, scope_of) for value in values} - {"null"}
+        return found.pop() if len(found) == 1 else None
+    quantified = isinstance(side, exp.Anonymous) and side.name.casefold() in {"any", "all", "some"}
+    if isinstance(side, (exp.Any, exp.All)) or (quantified and len(side.expressions) == 1):
+        # ``= ANY(ARRAY[...])``; Postgres's ALL(...) and SOME(...) parse as plain calls.
+        inner = _unparen(side.expressions[0] if quantified else side.this)
+        if isinstance(inner, exp.Array):
+            found = {_value_kind(value, kinds, scope_of) for value in inner.expressions}
+            return found.pop() if len(found) == 1 else None
+        return _subquery_kind(inner, kinds, scope_of)
+    return _constant_kind(side)
+
+
+def _subquery_kind(
+    query: Any, kinds: Mapping[int, Optional[str]], scope_of: Mapping[int, Any]
+) -> Optional[str]:
+    """The kind of what a subquery returns: its one output, a typed column or a constant."""
+    from sqlglot import exp
+
+    select = query.this if isinstance(query, exp.Subquery) else query
+    if not isinstance(select, exp.Select) or len(select.expressions) != 1:
+        return None
+    output = select.expressions[0]
+    value = _unparen(output.this if isinstance(output, exp.Alias) else output)
+    if isinstance(value, exp.Column) and not value.is_star:
+        return kinds.get(id(value))
+    return _constant_kind(value)
+
+
+def _comparison_sides(node: Any) -> List[List[Any]]:
+    """The groups of values a comparison relates: its sides, or each position when
+    tuples are compared."""
     from sqlglot import exp
 
     if isinstance(node, exp.In):
@@ -2186,24 +2548,284 @@ def _refuse_a_casting_comparison(node: Any, string_columns: Mapping[str, bool]) 
     sides = [_unparen(side) for side in sides if side is not None]
     tuples = [side for side in sides if isinstance(side, exp.Tuple)]
     if tuples and len(tuples) == len(sides) and len({len(t.expressions) for t in tuples}) == 1:
-        groups = [
+        return [
             [_unparen(t.expressions[i]) for t in tuples] for i in range(len(tuples[0].expressions))
         ]
-    else:
-        groups = [sides]
+    return [sides]
+
+
+def _refuse_an_untyped_comparison(
+    node: Any,
+    kinds: Mapping[int, Optional[str]],
+    scope_of: Mapping[int, Any],
+    kept: Tuple[type, ...],
+    read: Optional[str],
+) -> None:
+    """Refuse a comparison unless every side has a known scalar kind and the kinds match:
+    an engine casts a mismatched value, and a cast of a column's value runs on every row
+    it reads, a withheld one included. Comparisons that read an aggregate or a window
+    function (HAVING, QUALIFY) compare values of the rows the filter keeps."""
+    from sqlglot import exp
+
+    if kept and node.find(*kept) is not None:
+        return
+    groups = _comparison_sides(node)
+    query = node.args.get("query") if isinstance(node, exp.In) else None
+    if query is not None:
+        groups = [[_unparen(node.this), query]]
     for group in groups:
-        kinds = {_value_kind(side, string_columns) for side in group} - {None}
-        columns = [
-            side
-            for side in group
-            if isinstance(side, exp.Column) and _value_kind(side, string_columns) == "string"
-        ]
-        if columns and kinds == {"string", "other"}:
-            raise QueryValidationError(
-                f"sql compares {columns[0].sql()!r}, a string column, with a value of another "
-                "type; on an expose with row filters write the value as a string literal (the "
-                "engine would cast every row's value, and fail on a withheld one)."
+        found = []
+        for side in group:
+            kind = (
+                _subquery_kind(side, kinds, scope_of)
+                if side is query
+                else _value_kind(side, kinds, scope_of)
             )
+            if kind != "null":
+                found.append((side, kind))
+        for side, kind in found:
+            if kind is None or kind == "complex":
+                raise QueryValidationError(
+                    f"sql compares {side.sql(dialect=read)[:80]!r}, which the gateway cannot "
+                    "type as a single scalar value; on an expose with row filters each side "
+                    "of a comparison is a column contract.schema declares with a type, or a "
+                    "literal or cast constant of that type, and both sides have one kind "
+                    "(an engine would otherwise cast values row by row, a withheld row "
+                    "included)."
+                )
+        if len({kind for _, kind in found}) > 1:
+            first, second = found[0][0], found[-1][0]
+            raise QueryValidationError(
+                f"sql compares {first.sql(dialect=read)[:80]!r} with "
+                f"{second.sql(dialect=read)[:80]!r}, values of different types; on an expose "
+                "with row filters both sides of a comparison have one kind: write the "
+                "constant as a literal or cast of the column's type (DATE '2024-01-01', "
+                "CAST('5' AS INTEGER))."
+            )
+
+
+def _refuse_a_non_boolean_operand(
+    node: Any, kinds: Mapping[int, Optional[str]], kept: Tuple[type, ...], read: Optional[str]
+) -> None:
+    """Refuse a condition, or an operand of AND, OR, NOT or IS TRUE / IS FALSE, that is
+    not itself a predicate: an engine would cast the value to a boolean on every row it
+    reads. A predicate is a comparison, IN, BETWEEN, LIKE, IS NULL, EXISTS, a column
+    contract.schema declares as a boolean, or TRUE or FALSE."""
+    from sqlglot import exp
+
+    node = _unparen(node)
+    if isinstance(node, (exp.And, exp.Or)):
+        _refuse_a_non_boolean_operand(node.this, kinds, kept, read)
+        _refuse_a_non_boolean_operand(node.expression, kinds, kept, read)
+        return
+    if isinstance(node, exp.Not):
+        _refuse_a_non_boolean_operand(node.this, kinds, kept, read)
+        return
+    if isinstance(node, exp.Is):
+        if not isinstance(node.expression, exp.Null):
+            _refuse_a_non_boolean_operand(node.this, kinds, kept, read)
+        return
+    predicates = (
+        exp.EQ,
+        exp.NEQ,
+        exp.GT,
+        exp.GTE,
+        exp.LT,
+        exp.LTE,
+        exp.NullSafeEQ,
+        exp.NullSafeNEQ,
+        exp.In,
+        exp.Between,
+        exp.Like,
+        exp.ILike,
+        exp.Escape,
+        exp.Exists,
+        exp.Boolean,
+    )
+    if isinstance(node, predicates):
+        return
+    if isinstance(node, exp.Column) and kinds.get(id(node)) == "boolean":
+        return
+    if kept and isinstance(node, kept):
+        return
+    raise QueryValidationError(
+        f"sql uses {node.sql(dialect=read)[:80]!r} as a condition; on an expose with row "
+        "filters a condition is a comparison, IN, BETWEEN, LIKE, ILIKE, IS NULL, EXISTS, a "
+        "column contract.schema declares as a boolean, or TRUE or FALSE, joined by AND, OR "
+        "and NOT (an engine would cast any other value to a boolean on every row it reads)."
+    )
+
+
+def _refuse_a_like_that_can_fail(
+    node: Any, kinds: Mapping[int, Optional[str]], scope_of: Mapping[int, Any], read: Optional[str]
+) -> None:
+    """Refuse a LIKE or ILIKE an engine could fail on for one row's value: the subject is
+    a string, the pattern a string literal with no backslash, and there is no ESCAPE
+    clause. A literal ``%`` or ``_`` cannot be matched then."""
+    from sqlglot import exp
+
+    pattern = node.expression
+    refused = (
+        isinstance(node.parent, exp.Escape)
+        or _value_kind(node.this, kinds, scope_of) != "string"
+        or not (isinstance(pattern, exp.Literal) and pattern.is_string)
+        or "\\" in str(pattern.this)
+    )
+    if refused:
+        raise QueryValidationError(
+            f"sql matches {node.sql(dialect=read)[:80]!r}; on an expose with row filters LIKE "
+            "and ILIKE take a string value and a string literal pattern, with no ESCAPE clause "
+            "and no backslash in the pattern (an engine can fail on a value that meets an "
+            "escape character), so a literal % or _ cannot be matched."
+        )
+
+
+def _refuse_an_unknown_truth_test(sql: str, read: Optional[str]) -> None:
+    """Refuse ``IS [NOT] UNKNOWN``. sqlglot reads it as ``IS NULL``, but an engine casts
+    the tested value to a boolean on every row it reads."""
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.errors import SqlglotError
+
+    try:
+        tokens = Dialect.get_or_raise(read).tokenize(sql)
+    except SqlglotError:
+        raise _unreadable_sql() from None
+    words = [sql[token.start : token.end + 1].upper() for token in tokens]
+    for index, word in enumerate(words):
+        before = words[max(index - 2, 0) : index]
+        if word == "UNKNOWN" and (before[-1:] == ["IS"] or before == ["IS", "NOT"]):
+            raise QueryValidationError(
+                "sql tests a value with IS UNKNOWN; on an expose with row filters test it with "
+                "IS NULL, or write a comparison (an engine casts the value to a boolean on "
+                "every row it reads)."
+            )
+
+
+def _refuse_untyped_joins(
+    tree: Any,
+    kinds: Mapping[int, Optional[str]],
+    scope_of: Mapping[int, Any],
+    declared: Mapping[str, Optional[str]],
+    exposed_name: str,
+    read: Optional[str],
+) -> None:
+    """Refuse a NATURAL join, and a ``USING`` column whose two sides do not have one known
+    kind: each is a comparison the statement does not spell out."""
+    from sqlglot import exp
+
+    for join in tree.find_all(exp.Join):
+        if str(join.args.get("method") or "").upper() == "NATURAL":
+            raise QueryValidationError(
+                "sql joins with NATURAL; on an expose with row filters name the join columns "
+                "in an ON condition."
+            )
+        using = join.args.get("using") or []
+        if not using:
+            continue
+        scope = scope_of.get(id(join.parent))
+        right_name = join.this.alias_or_name.casefold()
+        sources = {} if scope is None else {k.casefold(): v for k, v in scope.sources.items()}
+        right = sources.get(right_name)
+        left = [source for key, source in sources.items() if key != right_name]
+        for column in using:
+            folded = column.name.casefold()
+            right_kind = (
+                None
+                if right is None
+                else _source_kind(right, folded, declared, exposed_name, kinds, 0)
+            )
+            left_kinds = {
+                _source_kind(source, folded, declared, exposed_name, kinds, 0)
+                for source in left
+                if _source_may_have(source, folded, declared, exposed_name)
+            }
+            if right_kind in (None, "complex") or left_kinds != {right_kind}:
+                raise QueryValidationError(
+                    f"sql joins USING ({column.name}) between values the gateway cannot type "
+                    "as one kind; on an expose with row filters join the exposed table's "
+                    "typed columns in an ON condition."
+                )
+
+
+def _refuse_conditions_that_can_fail(
+    tree: Any,
+    sql: str,
+    declared: Optional[Mapping[str, Optional[str]]] = None,
+    exposed_name: str = "",
+    read: Optional[str] = None,
+) -> None:
+    """Refuse what a planner could evaluate on a row the row filter removes that could
+    raise an error there, so that the error would tell the caller the row exists.
+
+    A planner may merge the filtered projection into the statement and run a WHERE, a
+    JOIN's ON or USING, or a HAVING or QUALIFY term on plain columns before the filter.
+    Each such condition (:func:`_conditions`) is checked:
+
+    * it holds only :func:`_condition_nodes`;
+    * every condition, and every operand of AND, OR, NOT and IS TRUE / IS FALSE, is a
+      predicate (:func:`_refuse_a_non_boolean_operand`);
+    * every comparison relates values of one known scalar kind
+      (:func:`_refuse_an_untyped_comparison`), the kinds coming from the types
+      ``contract.schema`` declares (checked against the table's own by the caller);
+    * LIKE and ILIKE take a string literal pattern with no escape
+      (:func:`_refuse_a_like_that_can_fail`); ``lower``, ``upper`` and ``coalesce`` take
+      typed values;
+    * ``IS UNKNOWN`` and NATURAL joins are refused, and USING columns typed.
+
+    A subquery in a condition is checked as its own statement, and
+    :func:`_refuse_values_a_subquery_computes` covers the values a subquery selects. The
+    outer statement's own select list, its aggregates and window functions see only the
+    rows the filter keeps."""
+    from sqlglot import exp
+
+    declared = declared or {}
+    kinds, scope_of = _kinds_of_columns(tree, declared, exposed_name)
+    _refuse_an_unknown_truth_test(sql, read)
+    _refuse_untyped_joins(tree, kinds, scope_of, declared, exposed_name, read)
+    allowed = _condition_nodes()
+    subqueries = (exp.Subquery, exp.Select, exp.SetOperation)
+    comparisons = (
+        exp.EQ,
+        exp.NEQ,
+        exp.GT,
+        exp.GTE,
+        exp.LT,
+        exp.LTE,
+        exp.NullSafeEQ,
+        exp.NullSafeNEQ,
+        exp.In,
+        exp.Between,
+    )
+    for condition, kept in _conditions(tree):
+        _refuse_a_non_boolean_operand(condition, kinds, kept, read)
+        stops = subqueries + kept
+        for node in condition.walk(prune=lambda n: isinstance(n, stops) or _is_constant(n)):
+            if isinstance(node, stops) or _is_constant(node):
+                continue
+            if isinstance(node, exp.Escape):
+                _refuse_a_like_that_can_fail(node.this, kinds, scope_of, read)
+            if isinstance(node, comparisons):
+                _refuse_an_untyped_comparison(node, kinds, scope_of, kept, read)
+            if isinstance(node, (exp.Like, exp.ILike)):
+                _refuse_a_like_that_can_fail(node, kinds, scope_of, read)
+            if isinstance(node, (exp.Lower, exp.Upper, exp.Coalesce)) and (
+                _value_kind(node, kinds, scope_of) is None
+            ):
+                raise QueryValidationError(
+                    f"sql filters with {node.sql(dialect=read)[:80]!r}; on an expose with row "
+                    "filters lower and upper take a string column or literal, and coalesce "
+                    "columns and literals of one declared type."
+                )
+            if not isinstance(node, allowed) or (
+                isinstance(node, exp.Neg) and not isinstance(node.this, exp.Literal)
+            ):
+                raise QueryValidationError(
+                    f"sql filters with {node.sql(dialect=read)[:80]!r}; on an expose with row "
+                    "filters a condition compares typed columns and constants with =, <>, <, "
+                    "<=, >, >=, IN, BETWEEN, IS NULL, LIKE, ILIKE and EXISTS, joined by AND, OR "
+                    "and NOT (an engine may evaluate it on a row the filter removes, where an "
+                    "error would tell the caller the row exists)."
+                )
 
 
 def _unparen(node: Any) -> Any:
@@ -2212,35 +2834,6 @@ def _unparen(node: Any) -> Any:
     while isinstance(node, exp.Paren):
         node = node.this
     return node
-
-
-def _value_kind(side: Any, string_columns: Mapping[str, bool]) -> Optional[str]:
-    """``"string"``, ``"other"`` or ``None`` (not known) for one side of a comparison. A
-    column has its declared type's kind. A constant is a string when every value in it is
-    a string literal or a cast to a text type, and ``"other"`` otherwise: a number, a
-    date, the current time, arithmetic, an array of numbers."""
-    from sqlglot import exp
-
-    side = _unparen(side)
-    if isinstance(side, exp.Column):
-        known = string_columns.get(side.name.casefold())
-        return None if known is None else ("string" if known else "other")
-    if isinstance(side, exp.Null) or side.find(exp.Column) is not None:
-        return None
-    if isinstance(side, exp.Literal):
-        return "string" if side.is_string else "other"
-    if isinstance(side, (exp.Cast, exp.TryCast)):
-        return "string" if side.to.is_type(*exp.DataType.TEXT_TYPES) else "other"
-    if isinstance(side, (exp.Array, exp.Tuple, exp.Any, exp.All, exp.Anonymous)):
-        values = [
-            value
-            for value in side.find_all(exp.Literal, exp.Cast, exp.TryCast)
-            if not isinstance(value.parent, (exp.Cast, exp.TryCast))
-        ]
-        if values and all(_value_kind(value, string_columns) == "string" for value in values):
-            return "string"
-        return "other"
-    return "other"
 
 
 @functools.lru_cache(maxsize=1)
@@ -2290,52 +2883,6 @@ def _is_constant(node: Any) -> bool:
         }:
             return False
     return True
-
-
-def _refuse_conditions_that_can_fail(
-    tree: Any, string_columns: Optional[Mapping[str, bool]] = None, read: Optional[str] = None
-) -> None:
-    """Refuse what a planner could evaluate on a row the row filter removes and that could
-    fail there, so that an error would tell the caller the row exists.
-
-    A planner may merge the filtered projection into the statement and run a WHERE or a
-    JOIN's ON on rows before the filter. Each condition (:func:`_conditions`) may
-    therefore hold only :func:`_condition_nodes`. A subquery in it is checked as its own
-    statement, and :func:`_refuse_values_a_subquery_computes` covers the values a
-    subquery selects. The outer statement's own select list, its aggregates, HAVING and
-    window functions see only the rows the filter keeps."""
-    from sqlglot import exp
-
-    allowed = _condition_nodes()
-    subqueries = (exp.Subquery, exp.Select, exp.SetOperation)
-    comparisons = (
-        exp.EQ,
-        exp.NEQ,
-        exp.GT,
-        exp.GTE,
-        exp.LT,
-        exp.LTE,
-        exp.NullSafeEQ,
-        exp.NullSafeNEQ,
-        exp.In,
-        exp.Between,
-    )
-    for condition, kept in _conditions(tree):
-        stops = subqueries + kept
-        for node in condition.walk(prune=lambda n: isinstance(n, stops) or _is_constant(n)):
-            if isinstance(node, stops) or _is_constant(node):
-                continue
-            if isinstance(node, comparisons):
-                _refuse_a_casting_comparison(node, string_columns or {})
-            if not isinstance(node, allowed) or (
-                isinstance(node, exp.Neg) and not isinstance(node.this, exp.Literal)
-            ):
-                raise QueryValidationError(
-                    f"sql filters with {node.sql(dialect=read)[:80]!r}; on an expose with row filters a "
-                    "condition compares columns and literals with =, <>, <, >, IN, BETWEEN, IS "
-                    "and LIKE (an engine may evaluate it on a row the filter removes, where "
-                    "anything that can fail would tell the caller the row exists)."
-                )
 
 
 def _conditions(tree: Any) -> List[Tuple[Any, Tuple[type, ...]]]:
@@ -2431,6 +2978,11 @@ def _refuse_another_schemas_table(
         "db": exposed.text("db") or _DEFAULT_SCHEMA.get(read or "", ""),
         "catalog": exposed.text("catalog") or (catalog if read == "duckdb" else ""),
     }
+    accepted = [exposed.name]
+    if expected["db"]:
+        accepted.append(f"{expected['db']}.{exposed.name}")
+        if expected["catalog"]:
+            accepted.append(f"{expected['catalog']}.{expected['db']}.{exposed.name}")
     for table in tables:
         if table.name.casefold() != exposed_name:
             continue
@@ -2439,8 +2991,8 @@ def _refuse_another_schemas_table(
             if written and written.casefold() != value.casefold():
                 raise QueryValidationError(
                     f"sql reads {table.sql(dialect=read)!r}, a table of that name in another "
-                    "schema or catalog than the exposed table's; write the table unqualified "
-                    "or as the expose names it."
+                    "schema or catalog than the exposed table's; name the exposed table as "
+                    f"{' or '.join(accepted)}."
                 )
 
 
@@ -2524,7 +3076,7 @@ def _project_exposed_table(
     dialect: Optional[str],
     predicate: Optional[str] = None,
     catalog: str = "",
-    string_columns: Optional[Mapping[str, bool]] = None,
+    column_kinds: Optional[Mapping[str, Optional[str]]] = None,
 ) -> str:
     """Rewrite caller SQL so every read of the exposed table goes through a projection
     of the ``allowed`` columns, limited to the rows ``predicate`` selects.
@@ -2568,13 +3120,13 @@ def _project_exposed_table(
         raise unreadable
     tree = statements[0]
     _require_plain_sources(tree)
+    exposed_name = exposed.name.casefold()
     if predicate is not None:
         # A filtered caller: only listed functions, and nothing a planner could run on a
-        # row the filter removes that would fail there.
-        _refuse_unlisted_functions(tree, read)
-        _refuse_conditions_that_can_fail(tree, string_columns, read)
+        # row the filter removes that would raise an error there.
+        _refuse_unlisted_functions(tree, sql, read)
+        _refuse_conditions_that_can_fail(tree, sql, column_kinds, exposed_name, read)
         _refuse_values_a_subquery_computes(tree, read)
-    exposed_name = exposed.name.casefold()
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
     _refuse_another_schemas_table(tables, exposed, read, catalog)
     row_filter = (
@@ -2628,6 +3180,7 @@ def compile_free_form_sql(
     expose: Optional[Mapping[str, Any]] = None,
     caller_attributes: Optional[Mapping[str, Any]] = None,
     dialect: Optional[str] = None,
+    physical_kinds: Optional[Callable[[], Mapping[str, Optional[str]]]] = None,
 ) -> CompiledQuery:
     """Compile a caller-supplied SQL ``query_sql`` payload.
 
@@ -2757,6 +3310,12 @@ def compile_free_form_sql(
             "sql cannot be compiled on an expose that restricts columns without the expose "
             "itself: the columns it declares are what the statement is limited to."
         )
+    if expose is not None and row_predicate is not None and physical_kinds is not None:
+        # A filtered caller's comparisons are typed by the declared types: they must be
+        # the table's own. ``physical_kinds`` reads them from the engine's catalog once.
+        declared_kinds = _declared_column_kinds(expose)
+        if any(kind is not None for kind in declared_kinds.values()):
+            _refuse_types_the_table_does_not_hold(declared_kinds, physical_kinds())
     if expose is not None and (restricted or row_predicate is not None):
         candidate = _project_exposed_table(
             candidate,
@@ -2765,7 +3324,7 @@ def compile_free_form_sql(
             dialect=dialect,
             predicate=row_predicate,
             catalog=duckdb_catalog(expose),
-            string_columns=_declared_column_types(expose),
+            column_kinds=_declared_column_kinds(expose),
         )
     # Append the server-side cap, but only when the caller didn't already supply a
     # trailing ``LIMIT <n>`` (a second one is a syntax error on most engines).

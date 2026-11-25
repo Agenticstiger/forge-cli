@@ -38,7 +38,13 @@ def _build(tmp_path: Path):
     expose = {
         "exposeId": "orders",
         "kind": "table",
-        "contract": {"schema": [{"name": "order_id"}, {"name": "tenant_id"}, {"name": "amount"}]},
+        "contract": {
+            "schema": [
+                {"name": "order_id", "type": "integer"},
+                {"name": "tenant_id", "type": "string"},
+                {"name": "amount", "type": "integer"},
+            ]
+        },
         "semantics": {"measures": [{"name": "total_amount", "agg": "sum", "expr": "amount"}]},
         "binding": {
             "platform": "local",

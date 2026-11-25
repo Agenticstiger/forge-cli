@@ -46,6 +46,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # module so ``from ...drivers.base import RowFilterIdentityMissing`` keeps working.
 from ..query_compiler import (
     ROW_FILTER_ALIAS,
+    catalog_columns_sql,
+    kind_of_type,
     row_filter_predicate,
     select_body,
     strip_projection_open,
@@ -225,6 +227,8 @@ class EngineDriver(ABC):
         # marked columns still leaked when the consumer was allowed
         # to see them.
         self._pii_columns: Set[str] = self._compute_pii_columns(expose)
+        # The exposed table's column kinds as the engine holds them, read on first use.
+        self._physical_kinds: Optional[Dict[str, Optional[str]]] = None
 
     # ------------------------------------------------------------------
     # Abstract surface — concrete drivers must override these.
@@ -432,6 +436,33 @@ class EngineDriver(ABC):
         visible_columns, rows = self.project(result.rows, columns=result.columns)
         truncated = len(rows) >= limit
         return SampleResult(columns=visible_columns, rows=rows, truncated=truncated)
+
+    def physical_column_kinds(self) -> Dict[str, Optional[str]]:
+        """``{column name (case-folded): kind}`` of the exposed table as the engine holds
+        it, read once from its catalog (``information_schema.columns``, see
+        :func:`...query_compiler.catalog_columns_sql`) and kept for the driver's life.
+        ``query_sql`` checks a filtered caller's declared types against it. Raises
+        :class:`RowFilterUnavailable` when the catalog cannot be read: a filtered caller's
+        comparisons cannot be typed then. Drivers override this when the engine has a
+        cheaper or more exact source."""
+        if self._physical_kinds is None:
+            descriptor = self.descriptor()
+            try:
+                sql = catalog_columns_sql(descriptor.table_reference, descriptor.dialect)
+                rows = self.execute(sql=sql, params=()).rows
+            except Exception as exc:  # noqa: BLE001 - any engine failure fails closed
+                raise RowFilterUnavailable(
+                    "the gateway could not read the exposed table's column types from the "
+                    "engine's catalog, so it cannot type a filtered caller's comparisons."
+                ) from exc
+            kinds: Dict[str, Optional[str]] = {}
+            for row in rows:
+                fields = {str(key).lower(): value for key, value in row.items()}
+                name = fields.get("column_name")
+                if isinstance(name, str):
+                    kinds[name.casefold()] = kind_of_type(fields.get("data_type"))
+            self._physical_kinds = kinds
+        return dict(self._physical_kinds)
 
     def query(
         self,

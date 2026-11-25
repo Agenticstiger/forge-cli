@@ -59,6 +59,9 @@ _ROWS = [
     (4, "APAC", "retail", 40, "t3", "S4"),
 ]
 _COLUMNS = ("id", "region", "segment", "amount", "tenant_id", "secret")
+# Declared types: a filtered caller's comparisons are typed by them.
+_TYPES = dict.fromkeys(_COLUMNS, "string")
+_TYPES.update(id="integer", segment="varchar(20)", amount="integer")
 
 _FILTERS = [
     {"principal": EU, "where": "region = 'EU'"},
@@ -84,7 +87,7 @@ def _expose(
         metric["filter"] = metric_filter
     return {
         "exposeId": "customers",
-        "contract": {"schema": [{"name": name} for name in _COLUMNS]},
+        "contract": {"schema": [{"name": name, "type": _TYPES[name]} for name in _COLUMNS]},
         "semantics": {
             "measures": [{"name": "total", "agg": "sum", "expr": "amount"}],
             "dimensions": [{"name": "segment", "type": "categorical", "expr": "segment"}],
@@ -1175,7 +1178,7 @@ _CAN_FAIL = [
     pytest.param("SELECT id FROM customers WHERE CAST(segment AS INT) > 0", id="cast"),
     pytest.param("SELECT id FROM customers WHERE amount % 3 = 0", id="modulo"),
     pytest.param("SELECT id FROM customers WHERE amount * 1000 > 0", id="arithmetic"),
-    pytest.param("SELECT id FROM customers WHERE lower(segment) = 'retail'", id="function"),
+    pytest.param("SELECT id FROM customers WHERE sqrt(amount) > 1", id="function"),
     pytest.param(
         "SELECT a.id FROM customers AS a JOIN customers AS b ON a.id = b.amount / 10",
         id="join-condition",
@@ -1188,7 +1191,7 @@ _CAN_FAIL = [
 )
 @pytest.mark.parametrize("sql", _CAN_FAIL)
 def test_a_condition_that_can_fail_is_refused_on_every_engine(sql, dialect):
-    with pytest.raises(query_compiler.QueryValidationError, match="filters with"):
+    with pytest.raises(query_compiler.QueryValidationError, match="on an expose with row filters"):
         _compile_for(sql, dialect=dialect)
 
 
@@ -1212,7 +1215,7 @@ def test_a_condition_that_can_fail_is_refused_on_every_engine(sql, dialect):
     ],
 )
 def test_a_value_a_subquery_computes_is_refused_where_it_could_be_pushed_down(sql):
-    with pytest.raises(query_compiler.QueryValidationError, match="filters with|in a subquery"):
+    with pytest.raises(query_compiler.QueryValidationError, match="on an expose with row filters"):
         query_compiler._project_exposed_table(
             sql,
             table_reference="customers",
@@ -1229,6 +1232,9 @@ _CANNOT_FAIL = [
     "SELECT id FROM customers WHERE NOT EXISTS (FROM customers c WHERE c.id = 99) ORDER BY id",
     "SELECT count(*) AS n FROM customers HAVING count(*) > 0",
     "SELECT id, 100 / amount AS r, CAST(segment AS VARCHAR) AS s FROM customers ORDER BY id",
+    "SELECT id FROM customers WHERE lower(segment) = 'retail' ORDER BY id",
+    "SELECT id FROM customers WHERE upper(region) IN ('EU', 'US') ORDER BY id",
+    "SELECT id FROM customers WHERE coalesce(amount, 0) > 15 ORDER BY id",
 ]
 
 
@@ -1284,16 +1290,15 @@ def test_constants_aggregates_and_windows_are_allowed_in_conditions(dialect, sql
 )
 def test_having_and_qualify_are_fenced_like_a_where(sql, dialect):
     """A HAVING or QUALIFY term over a plain column is a WHERE an optimizer may push down."""
-    with pytest.raises(query_compiler.QueryValidationError, match="filters with"):
+    with pytest.raises(query_compiler.QueryValidationError, match="on an expose with row filters"):
         _compile_for(sql, dialect=dialect)
 
 
 def _typed() -> Dict[str, Any]:
+    """The fixture expose with ``region`` declared without a type."""
     expose = _expose()
-    types = {"id": "integer", "amount": "integer", "segment": "varchar(20)"}
-    types[_COLUMNS[-1]] = "string"  # the column the fixture calls secret
     expose["contract"]["schema"] = [
-        {"name": name, **({"type": types[name]} if name in types else {})} for name in _COLUMNS
+        {"name": name, **({"type": _TYPES[name]} if name != "region" else {})} for name in _COLUMNS
     ]
     return expose
 
@@ -1318,15 +1323,18 @@ def _typed() -> Dict[str, Any]:
         ("SELECT id FROM customers WHERE (secret, id) IN (('5', 1))", False),
         ("SELECT id FROM customers WHERE secret = CAST(5 AS VARCHAR)", False),
         ("SELECT id FROM customers WHERE secret = '5'", False),
-        ("SELECT id FROM customers WHERE amount = 5 AND amount <> '6'", False),
-        ("SELECT id FROM customers WHERE region = 5", False),
+        ("SELECT id FROM customers WHERE amount = 5 AND amount <> '6'", True),
+        ("SELECT id FROM customers WHERE region = 5", True),
     ],
 )
 def test_a_declared_string_column_is_compared_only_with_strings(sql, refused):
-    """The engine would cast every row's value of the string column, and fail on a
-    withheld one. ``region`` declares no type, so nothing is known about it."""
+    """The engine would cast every row's value of a column compared with a value of
+    another type, and fail on a withheld one. ``region`` declares no type, so no
+    comparison on it can be typed."""
     if refused:
-        with pytest.raises(query_compiler.QueryValidationError, match="a string column"):
+        with pytest.raises(
+            query_compiler.QueryValidationError, match="on an expose with row filters"
+        ):
             _compile_for(sql, dialect="snowflake", expose=_typed())
     else:
         _compile_for(sql, dialect="snowflake", expose=_typed())
