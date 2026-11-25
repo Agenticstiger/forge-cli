@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose key is null or names no parent, or the distinct values of the column, and a query over it is checked as a set with whether the entity is in the
   unit and, where the relationship's children-per-parent histogram withholds a bin, that bin;
   any other aggregate, and a table's natural entity, is named before any read, and so are the
-  units and queries over one table's entities past the number one set check can count. A condition that could raise an error depending on a
+  units and queries over one table's entities past the number one set check can count. A sum or average over a decimal of more than 18 digits is refused before any read (its total could overflow depending on the records), and decimals of up to 38 digits now load exactly. A condition that could raise an error depending on a
   row's value is refused before any read with the gateway's own condition fence, and any failure
   that still depends on the records withholds every query of the run with one fixed message, so
   a run says at most that some statement failed, never which. A query is checked as a set with the

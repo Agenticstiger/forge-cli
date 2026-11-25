@@ -626,3 +626,93 @@ def test_a_bound_population_does_not_change_with_one_record(tmp_path):
         assert query_rates.RUN_FAILED not in _said(result).values()
     assert seen[0] == seen[1]
     assert len(seen[0]) > 0
+
+
+# ---- wide decimals load exactly and their sums stay inside the fence --------------------------
+
+
+def _wide_contract(precision: int = 38, scale: int = 0) -> Dict[str, Any]:
+    import copy
+
+    contract = copy.deepcopy(_contract())
+    (orders,) = [each for each in contract["exposes"] if each["exposeId"] == "orders"]
+    orders["contract"]["schema"].append({"name": "big", "type": f"decimal({precision},{scale})"})
+    return contract
+
+
+@pytest.mark.parametrize("digits", [28, 29, 37])
+def test_a_decimal_with_many_digits_loads_exactly(digits):
+    from decimal import Decimal
+
+    text = "9" * digits
+    loaded = query_rates._loaded("DECIMAL(38,0)", [text, "-" + text, None])
+    assert loaded == [Decimal(text), Decimal("-" + text), None]
+    fraction = "9" * (digits - 2) + ".25"
+    assert query_rates._loaded("DECIMAL(38,2)", [fraction]) == [Decimal(fraction)]
+
+
+def test_a_decimal_past_its_precision_or_scale_still_does_not_load():
+    assert query_rates._loaded("DECIMAL(38,0)", ["1" + "0" * 38]) is None
+    assert query_rates._loaded("DECIMAL(38,2)", ["1.255"]) is None
+
+
+@pytest.mark.parametrize("digits", [28, 29, 37])
+def test_a_run_over_a_wide_decimal_column_is_not_failed_by_loading_it(tmp_path, digits):
+    unit = "SELECT customer_id, count(*) AS n, max(big) AS m FROM orders GROUP BY customer_id"
+    rows = _orders()
+    for row in rows:
+        row["big"] = "9" * digits
+    result = _profile(
+        tmp_path,
+        _on_unit("wide", _over(unit, '"v"."n" >= 20'), unit),
+        contract=_wide_contract(),
+        orders=rows,
+    )
+    assert query_rates.RUN_FAILED not in _said(result).values()
+    assert not _said(result)
+
+
+@pytest.mark.parametrize(
+    ("kind", "aggregate"),
+    [
+        ("decimal(38,0)", "sum(big)"),
+        ("decimal(19,2)", "sum(big)"),
+        ("decimal(38,0)", "avg(big)"),
+        ("decimal(30,4)", "avg(big)"),
+    ],
+)
+def test_a_sum_or_average_that_could_overflow_is_refused_before_any_read(tmp_path, kind, aggregate):
+    precision, scale = (int(each) for each in kind[8:-1].split(","))
+    unit = f"SELECT customer_id, {aggregate} AS total FROM orders GROUP BY customer_id"
+    each = _on_unit("wide", _over(unit, '"v"."total" > 0'), unit)
+    planned = query_rates.plan_queries(
+        _wide_contract(precision, scale), _request(each), FakeBackend().enum_levels
+    )
+    assert [plan.reason for plan in planned.plans] == [query_rates.SUM_CAN_OVERFLOW]
+    assert not asked_for.decided_by_records(query_rates.SUM_CAN_OVERFLOW)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, each, contract=_wide_contract(precision, scale), strict=True, gone=True)
+    assert query_rates.SUM_CAN_OVERFLOW in str(refused.value.context)
+
+
+def test_a_sum_of_a_having_that_could_overflow_is_refused_too():
+    unit = (
+        "SELECT customer_id, count(*) AS n FROM orders GROUP BY customer_id " "HAVING sum(big) > 0"
+    )
+    each = _on_unit("wide", _over(unit, '"v"."n" > 0'), unit)
+    planned = query_rates.plan_queries(_wide_contract(), _request(each), FakeBackend().enum_levels)
+    assert [plan.reason for plan in planned.plans] == [query_rates.SUM_CAN_OVERFLOW]
+
+
+@pytest.mark.parametrize(
+    ("kind", "aggregate"),
+    [("decimal(18,2)", "sum(big)"), ("decimal(18,2)", "avg(big)"), ("int", "sum(quantity)")],
+)
+def test_a_sum_that_cannot_overflow_is_still_answered(kind, aggregate):
+    precision, scale = (int(each) for each in kind[8:-1].split(",")) if "(" in kind else (18, 2)
+    unit = f"SELECT customer_id, {aggregate} AS total FROM orders GROUP BY customer_id"
+    each = _on_unit("wide", _over(unit, '"v"."total" > 0'), unit)
+    planned = query_rates.plan_queries(
+        _wide_contract(precision, scale), _request(each), FakeBackend().enum_levels
+    )
+    assert [plan.reason for plan in planned.plans] == [None]

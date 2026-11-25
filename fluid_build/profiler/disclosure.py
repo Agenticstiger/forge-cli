@@ -557,9 +557,9 @@ def round_extreme(
     largest for ``"max"``. The first, finest bucket holding at least ``minimumCell`` records
     gives ``(value, unit)``: the bucket's first millisecond for a minimum, its last day (a
     DATE) or last millisecond (a timestamp) for a maximum, clipped to *floor* and *ceiling*,
-    the range the contract declares, and only when the true extreme lies inside that range. ``None`` when no bucket up to the year holds that many
-    records, or when the bucket lies outside the years 1 to 9999. Whole-number arithmetic on
-    milliseconds throughout.
+    the range the contract declares, and only when the true extreme lies inside that range.
+    ``None`` when no bucket up to the year holds that many records, or when the bucket lies
+    outside the years 1 to 9999. Whole-number arithmetic on milliseconds throughout.
     """
     if not holders:
         return None

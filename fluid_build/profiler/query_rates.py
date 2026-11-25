@@ -57,7 +57,8 @@ outcome; the entities' set is checked apart from the table's own rows.
    as many units and queries over one table's entities as keep the one statement that counts
    their combinations (the bin factor's states times two to the units and queries) inside the
    query process's group and reply limits (:func:`_counts_combinations`; the rest are named
-   :data:`ENTITIES_PAST_BOUND`), and :data:`MOST_TEXT_TOKENS` tokens of query and view text in the whole request. The budget is
+   :data:`ENTITIES_PAST_BOUND`), and :data:`MOST_TEXT_TOKENS` tokens of query and view text in
+   the whole request. The budget is
    the sum of the tokenizer's own counts and is spent in the order the request lists the
    queries; a decision therefore never depends on the machine, and the queries past the budget
    are named as not checked.
@@ -75,8 +76,8 @@ nothing is published for it.
 **Measuring.** The columns the queries and their units read are read even when the request does
 not list them, for the queries only. A *population* is the records a unit counts: the rows of a
 table (one statement per query returns one bit per row, in the order the rows were read, so each
-row's state lines up with the facts' states of the same table), or the rows a view unit keeps, which are the same table's rows, so the unit's
-condition is read as one more state of each row.
+row's state lines up with the facts' states of the same table), or the rows a view unit keeps,
+which are the same table's rows, so the unit's condition is read as one more state of each row.
 
 **Disclosure, as a set.** A query's two cells (``false = k - true`` and ``true``) pass the cell
 checks as a fact's do, and either cell withheld withholds the group. The queries of one
@@ -104,8 +105,10 @@ query or which record.
 
 **What is left.** A query is checked as a set with the table's facts and the other queries and
 units over that table, not with a column's level histogram, ``nullCount`` or row count beside
-it (facts have the same limit); a query and a published histogram cell differ only at the
-rounding precision. The cost is bounded and public: at most :data:`MOST_QUERIES` queries, each
+it (facts have the same limit). A counted entity population is checked apart from the parent
+table's own facts and queries: two sets over the same rows, never crossed with each other, so a
+query over the parent's rows and one over its entities are not differenced together; a query
+and a published histogram cell differ only at the rounding precision. The cost is bounded and public: at most :data:`MOST_QUERIES` queries, each
 statement limited in time and memory, run in a locked process. A request from a source that is
 not trusted belongs in a container.
 
@@ -120,7 +123,7 @@ import itertools
 import re
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, InvalidOperation, localcontext
 from typing import (
     Any,
     Callable,
@@ -159,6 +162,7 @@ __all__ = [
     "RECORD_REASONS",
     "RUN_FAILED",
     "STATEMENT_SECONDS",
+    "SUM_CAN_OVERFLOW",
     "Measured",
     "QueryPlan",
     "QueryPlans",
@@ -214,6 +218,10 @@ ENTITY_PARENT_TYPE = (
     "its entity column and the key of its relationship's parent are not read as one type"
 )
 
+SUM_CAN_OVERFLOW = (
+    "its unit sums or averages a column whose total could exceed what the query process adds "
+    "up exactly: use a column of at most 18 digits, or count, min or max"
+)
 ENTITIES_PAST_BOUND = (
     "not checked: one table's entities hold more units and queries than one set check can count"
 )
@@ -650,6 +658,8 @@ class _Planner:
         outputs, out_key = self._outputs(tree, view, alias, key, columns)
         if out_key is None:
             return ENTITY_ONLY
+        if any(_sum_may_overflow(node, columns) for node in tree.find_all(exp.Sum, exp.Avg)):
+            return SUM_CAN_OVERFLOW
         where = tree.args.get("where")
         if where is not None:
             if any(isinstance(node, exp.AggFunc) for node in where.walk()):
@@ -1101,6 +1111,31 @@ def _aggregate_type(node: Any, alias: str, columns: Mapping[str, str]) -> Option
     return None
 
 
+#: The most digits of a decimal whose sum DuckDB keeps in 64 bits per value: past it a value is a
+#: 128-bit integer and the sum of two can overflow it, an error that depends on the records.
+_EXACT_DECIMAL_DIGITS = 18
+
+
+def _sum_may_overflow(node: Any, columns: Mapping[str, str]) -> bool:
+    """Whether a ``sum`` or ``avg`` over a column could raise an overflow that depends on rows.
+
+    A decimal of more than 18 digits is summed in 128 bits and overflows when a few of its values
+    are large; a whole number overflows the 128-bit sum only when its type's largest value times
+    the most rows the process holds reaches ``2 ** 127``. A column that cannot be typed is left to
+    the caller's own typing, which refuses it.
+    """
+    kind = columns.get(str(getattr(node.this, "name", "")))
+    duck = _duck(kind) if kind is not None else None
+    if duck is None:
+        return False
+    base = duck.split("(")[0]
+    if base == "DECIMAL":
+        return int(re.findall(r"[0-9]+", duck)[0]) > _EXACT_DECIMAL_DIGITS
+    if base in _BOUNDS:
+        return _BOUNDS[base][1] * consumer_queries.MAX_BITS >= 2**127
+    return False
+
+
 def _folded(unit_where: Any, where: Any, names: Mapping[str, str]) -> Any:
     """A view unit's condition and a query's over it, as one condition over the table.
 
@@ -1333,10 +1368,12 @@ def _decimal(duck: str, value: Any) -> Decimal:
         raise ValueError
     number = value if isinstance(value, Decimal) else Decimal(str(value))
     precision, scale = (int(each) for each in re.findall(r"[0-9]+", duck))
-    if not number.is_finite() or number != number.quantize(Decimal(1).scaleb(-scale)):
-        raise ValueError
-    if abs(number) >= Decimal(10) ** (precision - scale):
-        raise ValueError
+    # a context of its own: the default one rounds to 28 digits, and a column is up to 38 wide
+    with localcontext(Context(prec=max(precision, 38) + 2, traps=[InvalidOperation])):
+        if not number.is_finite() or number != number.quantize(Decimal(1).scaleb(-scale)):
+            raise ValueError
+        if abs(number) >= Decimal(1).scaleb(precision - scale):
+            raise ValueError
     return number
 
 
