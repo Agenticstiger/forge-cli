@@ -17,6 +17,7 @@ the station it was taken at.
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 from fractions import Fraction
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -230,11 +231,14 @@ def _workspace(tmp_path, monkeypatch, *, stable=True, rows=None, request=None, c
 
 @pytest.fixture(autouse=True)
 def _no_clique_choice(monkeypatch):
-    """Choose no clique: the releases here are read for their relationships, not their cliques.
+    """Choose no clique where OpenDP is not installed.
 
-    Choosing cliques runs OpenDP (the ``[privacy]`` extra), which the unit lanes do not install,
-    so the choice is fixed to none, as a release with no categorical pair would make it.
+    Choosing cliques runs OpenDP (the ``[privacy]`` extra), which the unit lanes do not install.
+    There the choice is fixed to none, as a release with no categorical pair would make it; the
+    privacy lane, which installs the extra, runs these releases with the real choice.
     """
+    if importlib.util.find_spec("opendp") is not None:
+        return
     from fluid_build.profiler.dp import selection
 
     monkeypatch.setattr(selection, "select_cliques", lambda *args, **kwargs: ())
