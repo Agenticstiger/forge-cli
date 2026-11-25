@@ -1906,10 +1906,11 @@ def _refuse_unprojectable_reads(tree: Any, exposed_name: str, read: Optional[str
 # the same view as ``customers`` there.
 _DEFAULT_SCHEMA = {"duckdb": "main"}
 
-# Functions sqlglot leaves unparsed (``exp.Anonymous``) in some dialect that a statement on
-# an expose with row filters may still call, beside the listed typed ones.
+# Functions sqlglot leaves unparsed (``exp.Anonymous``) in some dialect, or in an older
+# release it still supports (Postgres ``cardinality`` on 30.1), that a statement on an
+# expose with row filters may still call, beside the listed typed ones.
 _ANONYMOUS_ALLOWED = frozenset(
-    {"age", "all", "any", "date_part", "now", "regexp_matches", "some", "strlen"}
+    {"age", "all", "any", "cardinality", "date_part", "now", "regexp_matches", "some", "strlen"}
 )
 
 
