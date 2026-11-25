@@ -25,9 +25,11 @@ the same entities. The unit's records are the entities with at least one row pas
 ``h``, and the population is every entity:
 
 * ``K`` is the child column of a relationship the profile counts: the parents, each a record, with
-  the bin of the children-per-parent histogram each is in. The bins whose cell the histogram
-  withholds are a part of the set check (a published cell is one state, as a column's published
-  histogram is not crossed with a fact), so a query cannot give a withheld cell back;
+  the bin of the children-per-parent histogram each is in, and, beside them, each group of the
+  table's rows whose key is null or names no parent (one record each, in the bin "no parent").
+  The bins whose cell the histogram withholds, and "no parent", are a part of the set check (a
+  published cell is one state, as a column's published histogram is not crossed with a fact), so
+  a query cannot give a withheld cell back;
 * otherwise: the distinct values of ``K`` among the table's rows.
 
 One ``counts`` statement per population gives every combination of "in the unit" and each query's
@@ -1660,9 +1662,11 @@ class _Population:
 #: The bins of the children-per-parent histogram (runner.CHILDREN_EDGES has one edge more).
 _BINS = 7
 #: A bin of the children-per-parent histogram is one state when its cell is published and its own
-#: state when the cell is withheld: the withheld cells are what a query must not give back.
+#: state when the cell is withheld: the withheld cells are what a query must not give back. A
+#: group of the unit that matches no parent (a null or unknown key) is a record of its own, in
+#: the bin ``_BINS``, "no parent", which has a state of its own as well.
 _BIN_PUBLISHED = 3
-_ENTITY_STATES = tuple(range(_BIN_PUBLISHED + 8))
+_ENTITY_STATES = tuple(range(_BIN_PUBLISHED + 9))
 
 
 def _bin_state(bin_index: int, shown: Sequence[bool]) -> int:
@@ -2168,6 +2172,8 @@ class _PopPlan:
     size_sql: str = field(default="", repr=False)
     #: Whether the bin of the entity's children count is one more part of the set.
     binned: bool = False
+    #: Whether two parent rows hold one key, so one group may be the record of several parents.
+    repeated: bool = False
 
 
 def _populations(
@@ -2244,35 +2250,45 @@ def _population_sql(population: _PopPlan, plans: QueryPlans) -> Union[str, Tuple
         unit = first[units[at]].entity
         assert unit is not None
         columns = ", ".join(f'"w".{_ident(name)} AS {_ident(name)}' for name, _ in unit.outputs)
-        extra = f", TRUE AS {_ident(mark)}"
-        if not counted:
-            held = f'"w".{_ident(unit.out_key)}'
-            extra += (
-                f", COALESCE({held}, {_sentinel(duck)}) AS {_ident(kv)}, ({held} IS NULL) AS "
-                f"{_ident(kn)}"
-            )
+        held = f'"w".{_ident(unit.out_key)}'
+        extra = (
+            f", TRUE AS {_ident(mark)}, COALESCE({held}, {_sentinel(duck)}) AS {_ident(kv)}, "
+            f"({held} IS NULL) AS {_ident(kn)}"
+        )
         return f'(SELECT {columns}{extra} FROM ({units[at]}) AS "w") AS "v{at}"'
 
+    column = f"{_ident(table)}.{_ident(key)}"
     if counted:
-        base = f'{_ident(parent)} AS "p"'
-        head = [f'"p".{_ident(population.bin_column)} AS "b"']
+        # The records are the parents and, beside them, each group of the table's rows whose key
+        # is null or names no parent (one record each, in the bin of "no parent"): every group
+        # of every unit is then a record of the population, whatever the unit's condition keeps.
+        parent_column = f'"p".{_ident(parent_key)}'
+        entities = (
+            f'(SELECT "p".{_ident(population.bin_column)} AS "b", '
+            f'COALESCE({parent_column}, {_sentinel(duck)}) AS "kv", ({parent_column} IS NULL) '
+            f'AS "kn", TRUE AS "po" FROM {_ident(parent)} AS "p" UNION ALL '
+            f'SELECT {_BINS} AS "b", COALESCE({column}, {_sentinel(duck)}) AS "kv", '
+            f'({column} IS NULL) AS "kn", FALSE AS "po" FROM {_ident(table)} AS {_ident(table)} '
+            f'LEFT JOIN {_ident(parent)} AS "q" ON "q".{_ident(parent_key)} = {column} '
+            f'WHERE "q".{_ident(parent_key)} IS NULL GROUP BY {column})'
+        )
+        head = ['"e"."b" AS "b"']
     else:
-        column = f"{_ident(table)}.{_ident(key)}"
-        base = (
+        entities = (
             f'(SELECT {column} AS "k", COALESCE({column}, {_sentinel(duck)}) AS "kv", '
             f'({column} IS NULL) AS "kn" FROM {_ident(table)} AS {_ident(table)} '
-            f'GROUP BY {column}) AS "e"'
+            f"GROUP BY {column})"
         )
         head = []
+    base = f'{entities} AS "e"'
     joins: List[str] = []
     selects = list(head)
     for at, text in enumerate(units):
         unit = first[text].entity
         assert unit is not None
+        on = f'"e"."kv" = "v{at}".{_ident(kv)} AND "e"."kn" = "v{at}".{_ident(kn)}'
         if counted:
-            on = f'"p".{_ident(parent_key)} = "v{at}".{_ident(unit.out_key)}'
-        else:
-            on = f'"e"."kv" = "v{at}".{_ident(kv)} AND "e"."kn" = "v{at}".{_ident(kn)}'
+            on += ' AND NOT ("e"."po" AND "e"."kn")'  # a parent with no key matches no group
         joins.append(f"LEFT JOIN {wrapper(at)} ON {on}")
         selects.append(f'COALESCE("v{at}".{_ident(mark)}, FALSE) AS "u{at}"')
     for at, plan in enumerate(members):
@@ -2289,17 +2305,12 @@ def _population_sql(population: _PopPlan, plans: QueryPlans) -> Union[str, Tuple
     checked = _checked_statement(text, tables)
     if isinstance(checked, Refused):
         return f"the statement that counts its entities is refused when checked again: {checked.reason}"
-    size = ""
-    if not counted:
-        column = f"{_ident(table)}.{_ident(key)}"
-        sized = _checked_statement(
-            f'SELECT COUNT(*) FROM (SELECT {column} AS "k" FROM {_ident(table)} AS '
-            f'{_ident(table)} GROUP BY {column}) AS "q"',
-            tables,
+    sized = _checked_statement(f'SELECT COUNT(*) FROM {entities} AS "z"', tables)
+    if isinstance(sized, Refused):
+        return (
+            f"the statement that counts its entities is refused when checked again: {sized.reason}"
         )
-        if isinstance(sized, Refused):
-            return f"the statement that counts its entities is refused when checked again: {sized.reason}"
-        size = sized.text
+    size = sized.text
     return checked.text, size
 
 
@@ -2328,11 +2339,16 @@ def _add_population(
         return
     population.sql, population.size_sql = built
     if link is not None and population.parent is not None:
+        parent, parent_key = population.parent
+        loaded = _loaded(
+            _duck(plans.types_of(parent)[parent_key]) or "", reads[parent].values[parent_key]
+        )
+        held = [value for value in loaded or () if value is not None]
+        population.repeated = loaded is None or len(set(held)) != len(held)
         tables[population.parent[0]].append((population.bin_column, "BIGINT", list(link.bins)))
         population.binned = not all(_shown_of(link))
     statements.append(Statement(f"e{population.n}", population.sql, "counts"))
-    if population.size_sql:
-        statements.append(Statement(f"s{population.n}", population.size_sql, "count"))
+    statements.append(Statement(f"s{population.n}", population.size_sql, "count"))
 
 
 def _shown_of(link: CountedLink) -> Tuple[bool, ...]:
@@ -2363,15 +2379,11 @@ def _population_answer(
         fail()
         return
     counted = population.link is not None and population.parent is not None
-    if counted:
-        assert population.parent is not None
-        size = reads[population.parent[0]].row_count
-    else:
-        sized = by_id.get(f"s{population.n}")
-        if sized is None or sized.status != "ok" or sized.count is None:
-            fail()
-            return
-        size = sized.count
+    sized = by_id.get(f"s{population.n}")
+    if sized is None or sized.status != "ok" or sized.count is None:
+        fail()
+        return
+    size = sized.count
     link = population.link
     units, queries = len(population.units), len(members)
     offset = 1 if counted else 0
@@ -2394,7 +2406,7 @@ def _population_answer(
         if counted:
             assert link is not None
             at = keys[0]
-            if isinstance(at, bool) or not isinstance(at, int) or not 0 <= at < _BINS:
+            if isinstance(at, bool) or not isinstance(at, int) or not 0 <= at <= _BINS:
                 fail()
                 return
             seen.add(at)
@@ -2420,10 +2432,14 @@ def _population_answer(
         if rows_query is None or rows_query.status != "ok" or rows_query.count is None:
             fail()
             return
-        # The unit's rows and the query's must be exactly the entities counted: a group whose key
-        # is null or names no parent would make the rate's records other than those the set
-        # check sees, so any such group withholds the run.
-        exact = rows_unit.count == in_unit[unit] and rows_query.count == kept[at]
+        # Every group of the unit is a record of the population by construction (a parent, or a
+        # group that names no parent), so the unit's rows and the query's are the records counted;
+        # only a parent key that repeats makes one group the record of several parents. A
+        # mismatch is an error of this module's own, not of the records.
+        if population.repeated:
+            exact = rows_unit.count <= in_unit[unit] and rows_query.count <= kept[at]
+        else:
+            exact = rows_unit.count == in_unit[unit] and rows_query.count == kept[at]
         if not exact:
             fail()
             return
@@ -2432,7 +2448,7 @@ def _population_answer(
     states: Set[int] = set()
     if binned:
         assert link is not None
-        states = {_bin_state(at, link.shown) for at in range(_BINS)}
+        states = {_bin_state(at, link.shown) for at in range(_BINS + 1)}
     done.populations.append(
         _Population(
             members_found,

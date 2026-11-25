@@ -518,10 +518,70 @@ def test_nothing_printed_names_a_count_of_records(tmp_path):
     assert lines == "Queries: 1 of 1 published whole."
 
 
-def test_a_group_that_names_no_parent_withholds_the_run(tmp_path):
-    # An order whose customer is not a customer row forms a group of the unit that is no parent:
-    # the rate's records would then be other than those the set check sees.
+def _with_unmatched(orphans: int = 60, nulls: int = 3) -> List[Dict[str, Any]]:
+    """The orders, and some whose customer key is null or names no customer."""
     orders = _orders()
-    orders.append({**orders[0], "order_id": len(orders), "customer_id": CUSTOMERS + 7})
+    for at in range(orphans):
+        orders.append({**orders[0], "order_id": len(orders), "customer_id": CUSTOMERS + 7 + at})
+    for _ in range(nulls):
+        orders.append({**orders[0], "order_id": len(orders), "customer_id": None})
+    return orders
+
+
+def _rounded(count: int) -> int:
+    return round(count / 5) * 5
+
+
+def test_a_group_that_names_no_parent_is_a_record_of_the_unit(tmp_path):
+    # sixty orphan keys and the null key each form a group of the unit: 61 records beside the
+    # 1,200 customers that have an order, none of them with twenty orders
+    result = _profile(tmp_path, _on_unit("many", MANY), orders=_with_unmatched())
+    assert not _said(result)
+    (group,) = _entry(result, "many")["groups"]
+    assert group["status"] == "F"
+    assert group["k"] == _rounded(1200 + 61)
+    assert group["levelCounts"] == [_rounded(1200 + 61 - 200), 200]
+
+
+def test_a_group_that_names_no_parent_is_a_record_when_a_bin_is_withheld(tmp_path):
+    counts = {
+        n: (4 if COUNTS[(n // 3) % 7] == 12 and n % 50 else COUNTS[(n // 3) % 7])
+        for n in range(CUSTOMERS)
+    }
+    orders = _orders(counts)
+    for at in range(60):
+        orders.append({**orders[0], "order_id": len(orders), "customer_id": CUSTOMERS + 7 + at})
     result = _profile(tmp_path, _on_unit("many", MANY), orders=orders)
-    assert _said(result) == {"query many": query_rates.RUN_FAILED}
+    # the withheld bin still withholds the query; nothing fails the run
+    assert query_rates.RUN_FAILED not in _said(result).values()
+
+
+@pytest.mark.parametrize("key", [None, 999_999])
+def test_one_record_with_a_null_or_orphan_key_does_not_decide_whether_the_run_answers(
+    tmp_path, key
+):
+    target = 5
+    unit = (
+        f"SELECT customer_id, count(*) AS n FROM orders WHERE order_id = {target} "
+        "AND quantity >= 50 GROUP BY customer_id"
+    )
+    query = _over(unit, '"v"."n" >= 1')
+    other = _stats.RequestQuery(
+        "other", "SELECT customer_id FROM customers WHERE region = 'north'", table="customers"
+    )
+    seen = []
+    for secret in (10, 70):
+        orders = _orders()
+        orders[target]["customer_id"] = key
+        orders[target]["quantity"] = secret
+        result = _profile(tmp_path, other, _on_unit("oracle", query, unit), orders=orders)
+        assert query_rates.RUN_FAILED not in _said(result).values()
+        seen.append(sorted(each["name"] for each in result.document.get("queries", [])))
+    assert seen[0] == seen[1]
+
+
+def test_two_parents_that_hold_one_key_do_not_fail_the_run(tmp_path):
+    customers = _customers()
+    customers.append({"customer_id": 10, "region": "north"})
+    result = _profile(tmp_path, _on_unit("many", MANY), customers=customers)
+    assert query_rates.RUN_FAILED not in _said(result).values()
