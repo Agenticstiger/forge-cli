@@ -78,7 +78,7 @@ from ._expose_utils import (
     _jsonable,
     _summarise_arguments,
 )
-from .auth import JURISDICTION_ATTR, MTLS_IDENTITY_ATTRS
+from .auth import JURISDICTION_ATTR, MTLS_IDENTITY_ATTRS, PRINCIPAL_ATTR
 from .drivers import EngineDriver, build_driver
 from .policy import OutputPortPolicy
 from .query_compiler import QueryValidationError
@@ -201,10 +201,10 @@ class SessionState:
     driver: Optional[EngineDriver] = None
     model_id: Optional[str] = None
     use_case: Optional[str] = None
-    # All extra clientInfo fields (tenant_id, regions, principal, …)
-    # bound at MCP initialize. Used by ``policy.rowFilters`` to
-    # resolve ``${caller.<attr>}`` placeholders into per-tenant
-    # WHERE clauses at sample/query time.
+    # Fallback caller attributes for handlers called without a per-request
+    # identity (tests, legacy callers). The server always passes the identity
+    # :meth:`OutputPortMcpServer._resolve_request_identity` resolved for the
+    # request, which is what ``policy.authz.rowFilters`` is enforced against.
     caller_attributes: Dict[str, Any] = field(default_factory=dict)
     query_timeout_seconds: float = DEFAULT_QUERY_TIMEOUT_SECONDS
     # Cross-stage correlation id (auto-stamped onto OTel spans + audit
@@ -471,7 +471,7 @@ class OutputPortMcpServer:
             # On HTTP one process serves many concurrent clients
             # over one SessionState; caching the first client's identity
             # bled it onto every later client (wrong agentPolicy
-            # principal + wrong tenant rowFilter). The MCP protocol
+            # model + wrong row-filter principal). The MCP protocol
             # guarantees initialize precedes any tools/call, so the SDK
             # has already received this client's clientInfo + auth attrs
             # by the time we get here.
@@ -764,23 +764,22 @@ class OutputPortMcpServer:
         dict made "crypto wins" hold only for the keys the JWT claim mapping
         happens to produce (the default mapping yields five:
         ``sub`` / ``model`` / ``use_case`` / ``tenant_id`` /
-        ``jurisdiction``). Any ``${caller.<attr>}`` rowFilter outside that set
-        — or, before ``FLUID_MCP_JWT_CLAIM_MAPPING`` was made to merge over the
-        defaults rather than replace them, any custom mapping at all — was
-        then satisfied by the caller's own claim, turning a
-        fail-closed denial into an attacker-chosen RLS predicate, and let a
-        client re-attest ``model`` / ``useCase`` past the agentPolicy gate.
+        ``jurisdiction``). Any attribute outside that set (or, before
+        ``FLUID_MCP_JWT_CLAIM_MAPPING`` was made to merge over the defaults
+        rather than replace them, any custom mapping at all) was then
+        satisfied by the caller's own claim, and a client could re-attest
+        ``model`` / ``useCase`` past the agentPolicy gate.
         So: when the transport stamps ``fluid_auth_kind`` (JWT / mTLS
         actually enforced), ONLY verified attributes bind. Self-attestation
         stays authoritative solely when no auth is configured — the
         pre-existing no-auth behaviour — with one exception below.
 
-        **Certificate attributes are verified-only in every mode.**
-        ``client_cn`` / ``client_fingerprint`` name a client certificate, and
-        only the trusted mTLS proxy can vouch for one. They are dropped from
-        the self-attested tier whatever the auth mode, so with auth off a
-        ``${caller.client_cn}`` rowFilter fails closed instead of selecting
-        the rows of whichever CN the client typed. ``jurisdiction`` has the
+        **Certificate attributes and the principal are verified-only in every
+        mode** (:meth:`_drop_verified_only_attributes`): only the trusted proxy
+        can vouch for a certificate, and the principal decides which rows
+        ``policy.authz.rowFilters`` lets a caller read. With auth off a
+        row-filtered expose therefore refuses every call rather than serve the
+        rows of whichever principal the client typed. ``jurisdiction`` has the
         same rule for its gate (:meth:`_resolve_verified_jurisdiction`).
         """
         model_id: Optional[str] = None
@@ -850,15 +849,7 @@ class OutputPortMcpServer:
                     attrs[key] = value
         except Exception as exc:  # noqa: BLE001
             self.state.logger.debug("output_port_identity_capability_failed: %s", exc)
-        self_attested_certs = sorted(MTLS_IDENTITY_ATTRS.intersection(attrs))
-        for name in self_attested_certs:
-            del attrs[name]
-        if self_attested_certs:
-            self.state.logger.debug(
-                "output_port_identity_self_attested_certificate_ignored: dropped=%s "
-                "(certificate attributes bind only from a trusted proxy)",
-                self_attested_certs,
-            )
+        self._drop_verified_only_attributes(attrs)
         try:
             request = getattr(ctx, "request", None)
             scope = getattr(request, "scope", None) or {}
@@ -869,8 +860,8 @@ class OutputPortMcpServer:
             auth_kind = scope.get("fluid_auth_kind")
             if auth_kind:
                 # Auth enforced: the verified tier REPLACES the self-attested
-                # one. A caller cannot fill a ${caller.*} hole the claim
-                # mapping doesn't cover, nor re-attest model / use_case.
+                # one. A caller cannot fill an attribute the claim mapping
+                # doesn't cover, nor re-attest model / use_case.
                 dropped = sorted(set(attrs) - set(crypto))
                 attrs = dict(crypto)
                 model_id = str(crypto["model"]) if "model" in crypto else None
@@ -899,6 +890,21 @@ class OutputPortMcpServer:
             attrs.setdefault("use_case", use_case)
             attrs.setdefault("useCase", use_case)
         return model_id, use_case, attrs
+
+    def _drop_verified_only_attributes(self, attrs: Dict[str, Any]) -> None:
+        """Remove from the self-attested tier what binds only from a verified channel:
+        the certificate attributes (only the trusted proxy can vouch for a certificate)
+        and the row-filter principal (a client naming its own would pick its rows)."""
+        dropped = sorted((MTLS_IDENTITY_ATTRS | {PRINCIPAL_ATTR}).intersection(attrs))
+        for name in dropped:
+            del attrs[name]
+        if dropped:
+            self.state.logger.debug(
+                "output_port_identity_self_attested_verified_only_ignored: dropped=%s "
+                "(certificate attributes and the principal bind only from a verified "
+                "channel)",
+                dropped,
+            )
 
     def _resolve_verified_jurisdiction(self, request_context: Any) -> Optional[str]:
         """The caller's jurisdiction, and ONLY if a credential carried it.
@@ -1043,8 +1049,8 @@ class OutputPortMcpServer:
         ``caller_attributes`` is the CALLING client's per-request
         identity (resolved by :meth:`_resolve_request_identity`),
         threaded explicitly into the data-tool handlers so each
-        concurrent HTTP client's ``${caller.*}`` rowFilters resolve
-        against ITS OWN identity — not whatever happens to be cached on
+        concurrent HTTP client's ``policy.authz.rowFilters`` resolve
+        against ITS OWN principal, not whatever happens to be cached on
         the shared SessionState.
 
         Each handler is sync today — driver SDKs (snowflake-connector,
@@ -1350,15 +1356,29 @@ def _render_resources(
     return resources
 
 
+def _without_access_policy(expose: Any) -> Any:
+    """``expose`` without ``policy.authz`` (readers, writers, column restrictions, row
+    filters) or the old ``policy.rowFilters``: who may read which rows is policy the
+    gateway enforces on its callers, and the ``describe`` tool does not return it either."""
+    if not isinstance(expose, Mapping) or not isinstance(expose.get("policy"), Mapping):
+        return expose
+    policy = {k: v for k, v in expose["policy"].items() if k not in ("authz", "rowFilters")}
+    return {**expose, "policy": policy}
+
+
 def _read_resource_payload(
     *, uri: str, contract: Mapping[str, Any], expose: Mapping[str, Any]
 ) -> str:
     """Resolve a resource URI to its body. Unknown URIs raise so the
-    SDK turns them into a JSON-RPC error."""
+    SDK turns them into a JSON-RPC error. Neither body carries an expose's
+    access policy (:func:`_without_access_policy`)."""
     if uri.endswith("/contract.yaml"):
-        return yaml.safe_dump(_jsonable(dict(contract)), sort_keys=False)
+        shown = dict(contract)
+        if isinstance(shown.get("exposes"), list):
+            shown["exposes"] = [_without_access_policy(item) for item in shown["exposes"]]
+        return yaml.safe_dump(_jsonable(shown), sort_keys=False)
     if uri.endswith("/expose.json"):
-        return json.dumps(_jsonable(dict(expose)), indent=2, default=str)
+        return json.dumps(_jsonable(_without_access_policy(expose)), indent=2, default=str)
     if uri.endswith("/contract-path"):
         # Best-effort — the server may not have a contract_path bound.
         return uri

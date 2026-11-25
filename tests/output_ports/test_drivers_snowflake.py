@@ -162,6 +162,20 @@ class TestSnowflakeDriverMocked:
         assert result.columns == ("CUSTOMER_ID",)
         assert result.rows == ({"CUSTOMER_ID": "C0001"},)
 
+    def test_a_literal_percent_survives_pyformat_binding(self):
+        """With parameters bound the connector reads the statement as a pyformat
+        string, so a ``%`` in a LIKE pattern (a row filter, a metric filter) is doubled;
+        without parameters nothing interpolates it and it is left as written."""
+        driver = SnowflakeDriver(expose=_make_expose(), contract={})
+        cursor = self._patch_connection(driver)[1]
+        filtered = "SELECT COUNT(*) AS N FROM T WHERE (REGION LIKE 'EU%') AND (SEGMENT = :p_0)"
+        driver.execute(sql=filtered, params=("retail",))
+        rendered, bound = cursor.execute.call_args.args
+        assert rendered % bound == filtered.replace(":p_0", "retail")
+        plain = "SELECT COUNT(*) AS N FROM T WHERE REGION LIKE 'EU%'"
+        driver.execute(sql=plain, params=())
+        assert cursor.execute.call_args.args == (plain, None)
+
     def test_execute_blocks_injection_marker_at_driver(self):
         driver = SnowflakeDriver(expose=_make_expose(), contract={})
         self._patch_connection(driver)

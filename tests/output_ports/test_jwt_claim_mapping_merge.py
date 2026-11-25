@@ -11,8 +11,7 @@ one extra claim silently dropped every default mapping — ``sub``, ``model``,
 What that costs is not cosmetic. ``model`` and ``use_case`` are the inputs to
 the agentPolicy gate: without them, ``decide()`` sees ``None`` for both, so a
 contract's ``allowedModels`` / ``deniedUseCases`` stop being enforceable as
-intended. ``sub`` and ``tenant_id`` are what ``${caller.*}`` row filters
-interpolate, so row-level security silently widens.
+intended. ``sub`` attributes each call on the audit trail.
 
 The trigger is the realistic one. An operator enabling a caller-jurisdiction
 claim writes exactly one mapping and, by doing so, turns off two other controls
@@ -57,8 +56,8 @@ def test_defaults_survive_a_custom_mapping(monkeypatch: pytest.MonkeyPatch) -> N
     missing = DEFAULTS - set(mappings)
     assert not missing, (
         f"setting one custom claim mapping dropped the defaults {sorted(missing)}. "
-        "model and use_case feed the agentPolicy gate; sub and tenant_id feed "
-        "${caller.*} row filters — all four go silently inert."
+        "model and use_case feed the agentPolicy gate and sub the audit trail; "
+        "they go silently inert."
     )
     assert mappings["https://fluid/jurisdiction"] == "jurisdiction"
 

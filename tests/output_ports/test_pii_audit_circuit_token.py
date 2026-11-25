@@ -210,73 +210,72 @@ def test_token_budget_denies_when_request_would_exceed_daily_cap():
     assert "token-budget-exceeded" in (reason or "")
 
 
-def test_row_filter_compiles_to_parameterised_where_with_caller_attrs():
-    """Per-tenant row filters resolve ${caller.<attr>} into bound
-    parameters, not string interpolation. Catches the regression
-    where a future contract author writes ``${caller.tenant_id}``
-    expecting it to be a parameter and accidentally gets a literal
-    SQL injection."""
-    from fluid_build.output_ports.mcp.drivers.base import EngineDriver
+def test_row_filter_resolves_to_the_callers_qualified_predicate():
+    """``policy.authz.rowFilters`` resolves to the predicate of the filter naming the
+    caller's verified principal, its columns qualified with the projection alias.
+    The predicate is the contract's own literal SQL and binds no parameter, so no
+    caller value ever reaches it."""
+    from fluid_build.output_ports.mcp.query_compiler import row_filter_predicate
 
     expose = {
         "exposeId": "demo",
+        "contract": {"schema": [{"name": "tenant_id"}, {"name": "region"}]},
         "policy": {
-            "rowFilters": [
-                {"column": "tenant_id", "equals": "${caller.tenant_id}"},
-                {"column": "region", "in": "${caller.regions}"},
-            ]
+            "authz": {
+                "rowFilters": [
+                    {"principal": "tenant:acme", "where": "tenant_id = 'acme'"},
+                    {"principal": "group:us", "where": "region IN ('us', 'eu')"},
+                ]
+            }
         },
     }
-    where, params = EngineDriver.compile_row_filter_predicate(
-        expose,
-        caller_attributes={"tenant_id": "acme", "regions": ["us", "eu"]},
+    assert row_filter_predicate(expose, {"principal": "group:us"}) == (
+        "((_fluid_rows.region IN ('us', 'eu')))"
     )
-    assert where.startswith(" WHERE ")
-    assert '"tenant_id" = :p_0' in where
-    assert '"region" IN (:p_1, :p_2)' in where
-    assert params == ["acme", "us", "eu"]
 
 
-def test_row_filter_fail_closed_when_caller_attribute_missing():
-    """Missing caller attribute must raise ``RowFilterIdentityMissing``
-    so the gateway never serves rows under an undefined identity."""
-    from fluid_build.output_ports.mcp.drivers.base import (
-        EngineDriver,
-        RowFilterIdentityMissing,
-    )
+def test_row_filter_fail_closed_when_the_principal_is_missing():
+    """A request with no principal a filter names must raise
+    ``RowFilterIdentityMissing`` so the gateway never serves rows under an
+    undefined identity."""
+    from fluid_build.output_ports.mcp.drivers.base import RowFilterIdentityMissing
+    from fluid_build.output_ports.mcp.query_compiler import row_filter_predicate
 
     expose = {
         "exposeId": "demo",
-        "policy": {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]},
+        "contract": {"schema": [{"name": "tenant_id"}]},
+        "policy": {
+            "authz": {"rowFilters": [{"principal": "tenant:acme", "where": "tenant_id = 'acme'"}]}
+        },
     }
-    with pytest.raises(RowFilterIdentityMissing, match="tenant_id"):
-        EngineDriver.compile_row_filter_predicate(
-            expose, caller_attributes={"model_id": "claude-haiku"}
-        )
+    with pytest.raises(RowFilterIdentityMissing, match="principal"):
+        row_filter_predicate(expose, {"model_id": "claude-haiku", "tenant_id": "acme"})
 
 
 def test_row_filter_no_op_when_no_filters_configured():
-    """Empty / absent rowFilters → no WHERE clause, no params."""
-    from fluid_build.output_ports.mcp.drivers.base import EngineDriver
+    """Empty / absent rowFilters → no predicate."""
+    from fluid_build.output_ports.mcp.query_compiler import row_filter_predicate
 
-    where, params = EngineDriver.compile_row_filter_predicate(
-        {"exposeId": "demo"}, caller_attributes={"tenant_id": "anything"}
-    )
-    assert where == ""
-    assert params == []
+    assert row_filter_predicate({"exposeId": "demo"}, {"principal": "anything"}) is None
 
 
-def test_row_filter_rejects_invalid_identifier_via_sql_safety():
-    """Column names get routed through validate_ident — an
-    injection-shaped column name in the contract fails fast."""
-    from fluid_build.output_ports.mcp.drivers.base import EngineDriver
+def test_row_filter_rejects_an_injection_shaped_predicate():
+    """A predicate is parsed, not trusted: a statement separator in the contract
+    fails fast instead of reaching the engine."""
+    from fluid_build.output_ports.mcp.drivers.base import RowFilterUnavailable
+    from fluid_build.output_ports.mcp.query_compiler import row_filter_predicate
 
     expose = {
         "exposeId": "demo",
-        "policy": {"rowFilters": [{"column": "tenant_id; DROP TABLE", "equals": "x"}]},
+        "contract": {"schema": [{"name": "tenant_id"}]},
+        "policy": {
+            "authz": {
+                "rowFilters": [{"principal": "tenant:x", "where": "tenant_id = 'x'; DROP TABLE t"}]
+            }
+        },
     }
-    with pytest.raises(Exception):
-        EngineDriver.compile_row_filter_predicate(expose, caller_attributes={"tenant_id": "x"})
+    with pytest.raises(RowFilterUnavailable):
+        row_filter_predicate(expose, {"principal": "tenant:x"})
 
 
 def test_rate_limit_redis_backend_falls_back_open_when_unavailable(

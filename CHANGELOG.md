@@ -181,6 +181,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `snowflake_table` resource, and forge does not emit those changes yet, so a fresh workspace
   failed `tofu validate` on any Snowflake table with columns. The provider now resolves to
   2.23.x.
+- **The Postgres driver's query timeout applies.** It was set with `SET LOCAL statement_timeout`
+  on an autocommit connection, where it lasted for no statement; inside each request's own
+  transaction it now holds until the request ends.
+- **A `%` in a contract expression no longer breaks a filtered `query` on Snowflake or
+  Postgres.** With a caller's filter bound as a parameter, the connector reads the statement as a
+  pyformat string, so a `LIKE 'EU%'` in a row filter or a metric filter made every such call fail.
+  The drivers now double a literal `%` whenever parameters are bound.
 - **`fluid profile --request` names every ask it does not form.** A profile request can ask for a
   table's date pairs and calendar, a workload, a relationship's dates and exposure, and the
   consumers' queries. The request was read whole and the asks it did not form were dropped without a
@@ -336,24 +343,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The MCP output port enforces the row filters a contract declares under
+  `policy.authz.rowFilters`.** The gateway read row filters from `policy.rowFilters`, a key no
+  contract schema allows, and ignored `exposes[].policy.authz.rowFilters`, so `sample`, `query` and
+  `query_sql` served every row of an expose whose row-level security was declared the schema's way.
+  Each read now goes through `(SELECT <allowed columns> FROM <table> AS _fluid_rows WHERE
+  <predicate>)` wherever the table is read: on `query_sql` a subquery, a CTE, a set operation's
+  branch and a second reference to the table each see only the caller's rows, and the predicate's
+  columns are qualified with `_fluid_rows`, so they never resolve to a column of the caller's own
+  statement. A caller reads the union of the filters that name its principals, as BigQuery combines
+  row access policies, and a principal in `policy.authz.readers` that no filter names reads every
+  row. Every filter is parsed by the same code the IaC emitters write platform policies from, then
+  checked as the engine reads it: a predicate BigQuery or Spark would read differently (a
+  double-quoted name is a string there, even beside the same name unquoted) is refused on those
+  engines, and so is a predicate holding the text `:p_` (the gateway's bind markers are rewritten
+  wherever they appear) or the word UNION, INTERSECT or EXCEPT (its statement guard reads string
+  literals too). The statement returned to the caller shows `(<row filter>)` in place of the
+  predicate, which is policy the `describe` tool does not return either. It fails closed. A request
+  with no principal a filter or reader names is refused (`RowFilterIdentityMissing`), every call on
+  an expose whose filter cannot be applied is refused (`RowFilterUnavailable`), and
+  `fluid mcp output-port serve` refuses to start an expose whose row filters every call would
+  refuse, checked as the binding's engine reads them, or when no request could carry a principal:
+  over stdio, over HTTP without auth or with a shared token, and with JWT auth when no claim is
+  mapped to `principal`. The principal binds only from a verified credential; a
+  client that states its own is ignored in every auth mode.
+- **The IaC row-filter check refuses a predicate with a subquery, a clause besides its WHERE, or a
+  bind placeholder.** `EXISTS (SELECT ...)`, `HAVING`, `QUALIFY`, `WINDOW` and `?` / `:name` /
+  `@name` / `@@name` placeholders passed the check into the platform's row access policy or data
+  cells filter, and an unterminated quote escaped as a parser error. Each is now refused with the
+  filter's position, wherever the IaC emitters read row filters (`fluid generate iac`,
+  `fluid apply`), and so is a `rowFilters` value that is not a list (`{}`, `""`), which used to be
+  read as no filter.
+- **On an expose that restricts columns or filters rows, `query_sql` reads only the exposed
+  table.** A statement may still read a CTE of its own where that CTE is in scope, `VALUES` and
+  `UNNEST`; any other relation is refused, since a catalog view such as Postgres's `pg_stats` holds
+  values from every row and column of a table and the projection covers only the table itself. On
+  every expose, `query_sql`, contract expressions and the drivers' statement guard also refuse the
+  Postgres functions that read a relation or run a query given as text: `ts_stat`, `ts_rewrite`,
+  `connectby` and every `crosstab*`, `dblink*` and `pgstat*` function, beside the XML functions
+  already refused, and the `pg_stat*` functions, which report a table's row counts. Their query
+  text can be put together at run time, so neither the statement guard nor the projection saw it.
+  A name or a string written with Unicode escapes (`U&"..."`), which can spell any of these
+  functions, is refused there too.
+- **On Postgres, a row-filtered read is evaluated as a step of its own.** Postgres can merge a
+  subquery into the statement around it and then evaluate the caller's conditions on rows the row
+  filter removes, so a condition that fails on such a row (a cast, a division by zero) could tell
+  the caller the row exists. `query` and `query_sql` now end the filtered projection with
+  `OFFSET 0` on Postgres, which keeps it separate.
+- **The MCP output port's resources no longer serve an expose's access policy.** The `expose.json`
+  and `contract.yaml` resources returned `policy.authz` (readers, writers, column restrictions and
+  row-filter predicates), which the `describe` tool and the statement shown to the caller leave
+  out. Both now omit `policy.authz` and the old `policy.rowFilters`.
+- **`query_sql` checks its whole statement after the leading `SELECT`.** Text written against the
+  keyword, with no space after it, was left out of the keyword and character checks that read the
+  rest of the statement, and out of the drivers' statement guard. Both now read everything after the
+  keyword.
+- **The Postgres driver runs each request in a read-only transaction of its own and rolls it
+  back.** The shared connection ran in autocommit, where its read-only flag applied to no
+  statement, so a request could change a session setting that every later request on the
+  connection then ran under. A setting a statement changes is now undone when its request ends,
+  and every request is read-only.
+- **`query_sql`, contract expressions and the drivers' statement guard refuse more Postgres
+  functions, on every expose.** `set_config` changes the session later requests run in; the
+  pageinspect functions read raw pages, filtered rows included; `pgrowlocks` reports locked rows;
+  and `pg_prepared_statement` and `pg_cursor` show other requests' statements on the shared
+  connection. The `pg_prepared_statements` and `pg_cursors` views are refused by name.
+- **The IaC emitters check each row filter as the platform's engine reads it.** BigQuery and
+  Databricks read a double-quoted name as a string, so a filter written that way compared two
+  strings and its policy kept every row. `fluid generate iac` and `fluid apply` now refuse such a
+  filter for BigQuery and Unity Catalog, and check Lake Formation filters as Athena reads them,
+  with the same check the MCP output port makes.
+- **`query_sql` refuses the exposed table's name under another schema or catalog.** On an expose
+  that restricts columns or filters rows, `other.customers` was read as the exposed table, so the
+  caller saw its filtered rows under another table's name. A read now names the table unqualified
+  or as the expose binds it (on DuckDB, `main` is the binding's schema).
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
   not part of the relation an expression sees, however the expression is written. The name check
   stays as the early, readable refusal, and it now reads `"..."` as a quoted identifier on every
-  engine except BigQuery and Spark, where it is a string. `policy.rowFilters` are applied inside the
+  engine except BigQuery and Spark, where it is a string. Row filters are applied inside the
   projection, so a row filter may still name a restricted column. On an expose that restricts
   columns or filters rows, an expression that contains a subquery is refused. Two things a contract
   author may notice: on such an expose an expression can only use columns declared in
   `contract.schema` (an undeclared column is no longer projected), and an expose whose schema
   declares no readable column is refused by `query`. Exposes without restrictions keep the same
   statement as before, except that every term of the `WHERE` is now parenthesised.
-- **`query` applies a row filter to every row an expression can see, and refuses a row filter it
-  cannot read.** Each term of the `WHERE` is parenthesised, so a measure, dimension or metric-filter
-  expression containing `OR` can no longer widen the `policy.rowFilters` ANDed to it. A
-  `policy.rowFilters[]` entry that is not an object, has no string `column`, has an operator other
-  than `equals` / `in`, or names two operators is now refused with a validation error on `sample`,
-  `query` and `query_sql`; it used to be skipped.
+- **`query` applies a row filter to every row an expression can see.** Each term of the `WHERE` is
+  parenthesised, so a measure, dimension or metric-filter expression containing `OR` can no longer
+  widen a predicate ANDed to it.
 - **`query` refuses an expression that would read a redacted column without naming it.** On an
   expose with columns marked `sensitivity: pii` / `phi` / `sensitive`, a measure, dimension,
   metric-filter or filter expression may not use `COLUMNS(...)`, `IDENTIFIER(...)`, a `*` that
@@ -523,6 +601,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- **The MCP output port no longer reads `policy.rowFilters`.** No contract schema allows the key,
+  and the gateway now refuses an expose that still carries it, on every call and at `serve`, rather
+  than serve it as though it had no row filter. Move each filter to
+  `exposes[].policy.authz.rowFilters` as `{principal, where}`: a filter that took its value from
+  `${caller.<attr>}` becomes one filter per principal with the value written into the predicate
+  (`tenant_id = 'acme'` for `tenant:acme`). Serve such an expose over HTTP with JWT auth and map
+  the claim that carries a caller's principal: `FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal`.
+  On an expose with row filters the query tools read only the columns `contract.schema` declares,
+  as they already did on an expose with column restrictions.
+- **`query_sql` on an expose that restricts columns or filters rows reads only the exposed
+  table.** A statement that joins another table or reads a catalog view there is now refused; read
+  the other table through its own expose. On every expose, `query_sql` refuses `ts_stat`,
+  `ts_rewrite`, `connectby`, the `crosstab*`, `dblink*`, `pgstat*` and `pg_stat*` functions, and
+  names or strings written with Unicode escapes (`U&"..."`). It also refuses `set_config`, the
+  pageinspect functions, `pgrowlocks`, `pg_prepared_statement`, `pg_cursor` and the
+  `pg_prepared_statements` and `pg_cursors` views.
+- **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
+  read the name as a string. Write the column name bare.
+- **sqlglot 26.20 or newer is required.** Older releases record no identifier positions, so the MCP
+  output port refused every row filter on them.
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so

@@ -3393,7 +3393,7 @@ def lf_row_filters(
     binding that names no Glue-catalog table (a Redshift or Kinesis format, or no
     ``location.database``), where :func:`_emit_lakeformation` writes nothing at all.
     """
-    filters = row_filters_for(exposure, index)
+    filters = row_filters_for(exposure, index, dialect="athena")
     if not filters:
         return {}
     where = f"exposes[{exposure.get('exposeId') or index}].policy.authz.rowFilters"

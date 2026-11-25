@@ -64,7 +64,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
-from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
+from fluid_build.output_ports.mcp.auth import PRINCIPAL_ATTR
+from fluid_build.providers._row_filters import (
+    RowFilter,
+    RowFilterError,
+    check_engine_reading,
+    parse_predicate,
+    parse_row_filters,
+)
 from fluid_build.providers._sql_safety import (
     names_refused_duckdb_function,
     names_refused_postgres_function,
@@ -100,12 +107,30 @@ class QueryValidationError(ValueError):
 
 
 class RowFilterIdentityMissing(RuntimeError):
-    """Raised when a ``rowFilters[]`` entry references a caller attribute
-    that is not present (fail-closed deny so the gateway never serves rows
-    under an undefined identity)."""
+    """The expose filters rows by principal (``policy.authz.rowFilters``) and the
+    request carries no verified principal that a row filter or the expose's
+    ``policy.authz.readers`` names.
+
+    The gateway then cannot tell which rows the caller may read, so the request is
+    refused (fail closed): an unknown caller is served neither a filtered
+    principal's rows nor a reader's every row. A ``RuntimeError``, not a
+    :class:`QueryValidationError`, so the wire carries only its name and the detail
+    stays in the operator log."""
 
 
-_CALLER_PLACEHOLDER = re.compile(r"\$\{caller\.([A-Za-z_][A-Za-z0-9_]*)\}")
+class RowFilterUnavailable(RuntimeError):
+    """The expose's row filters cannot be applied as declared, so the request is
+    refused rather than served unfiltered.
+
+    Raised for a malformed ``policy.authz.rowFilters`` entry (no principal, a
+    predicate that is not one boolean expression, a column the schema does not
+    declare, a principal filtered twice), malformed ``policy.authz.readers``, a
+    predicate this engine would read differently from the contract, and the old
+    ``policy.rowFilters`` key. The cause is the contract, which the caller cannot
+    change, and the detail names predicates and principals, so like
+    :class:`RowFilterIdentityMissing` it is not a :class:`QueryValidationError`:
+    the wire carries only its name."""
+
 
 _RESTRICTED_NAME_CACHE: Dict[str, "re.Pattern[str]"] = {}
 
@@ -417,10 +442,10 @@ def _allowed_names(declared: Iterable[str], restricted: Iterable[str]) -> List[s
         allowed.append(name)
     if not allowed:
         raise QueryValidationError(
-            "This expose restricts columns, but contract.schema declares no readable "
-            "column to project, so the governed query path cannot evaluate an "
-            "expression without risking a restricted one. Declare the readable "
-            "columns in contract.schema."
+            "This expose restricts columns or filters rows, but contract.schema declares "
+            "no readable column to project, so the governed query path cannot evaluate "
+            "an expression over the policy's projection. Declare the readable columns in "
+            "contract.schema."
         )
     return allowed
 
@@ -443,6 +468,20 @@ _PROJECTION_OPEN_RE = re.compile(
 )
 
 
+# A statement's leading ``SELECT`` keyword, after any opening parentheses. The keyword
+# ends at its word boundary, not at the first space: in ``SELECT(...)`` or
+# ``SELECT"name"`` the body starts right after it.
+_LEADING_SELECT_RE = re.compile(r"(?i)\(*select\b")
+
+
+def select_body(sql: str) -> Optional[str]:
+    """``sql`` after its leading ``SELECT`` keyword (and any opening parentheses before
+    it), or ``None`` when it does not start with one. The checks that read a statement's
+    body read this, so nothing written against the keyword is left out of them."""
+    match = _LEADING_SELECT_RE.match(sql)
+    return None if match is None else sql[match.end() :]
+
+
 def strip_projection_open(sql_body: str) -> str:
     """Remove the compiler's own projection ``(SELECT <columns> FROM`` opening from a
     rendered statement body, so a driver's body-keyword guard sees only the rest.
@@ -451,7 +490,7 @@ def strip_projection_open(sql_body: str) -> str:
     still scanned in full: only the opening goes, so a ``SELECT`` anywhere else in the
     statement (a union branch, a scalar subquery over another column list) is still
     refused. The shape removed is the one :func:`compile_semantic_query` and
-    :func:`compile_free_form_sql` render for an expose that restricts columns.
+    :func:`compile_free_form_sql` render for an expose that restricts columns or rows.
     """
     return _PROJECTION_OPEN_RE.sub("(", sql_body)
 
@@ -529,173 +568,258 @@ _VALUE_REVEALING_AGGS = frozenset({"min", "max", "median", "percentile"})
 _PARAM_PLACEHOLDER_RE = re.compile(r":p_(\d+)\b")
 
 
-def _missing_attr_hint(attr: str) -> str:
-    """Operator hint for a missing certificate attribute. ``client_cn`` /
-    ``client_fingerprint`` come only from a proxy listed in
-    ``FLUID_MCP_TRUSTED_PROXIES``; without that hint an operator who has not
-    yet listed their proxy sees a bare denial."""
-    if attr not in MTLS_IDENTITY_ATTRS:
-        return ""
-    return (
-        f". caller.{attr} is set only from the X-Client-CN / X-Client-Fingerprint "
-        "headers of a request whose TCP peer is listed in FLUID_MCP_TRUSTED_PROXIES; "
-        "the gateway log names the peer when it ignores them"
-    )
+#: The alias the exposed table carries inside a row-filtered read, and the qualifier
+#: every column of a row-filter predicate is given. Qualified, a predicate column can
+#: only be the exposed table's own: a column the table lacks is an engine error, never
+#: a same-named column of the caller's statement (a ``LATERAL`` neighbour, an outer
+#: query) that the filter would compare instead.
+ROW_FILTER_ALIAS = "_fluid_rows"
+
+#: What the statement shown to a caller carries in place of its row-filter predicate.
+ROW_FILTER_SHOWN = "(<row filter>)"
+
+# How :func:`parse_predicate` frames a predicate; its spans count from here.
+_PREDICATE_FRAME = "SELECT 1 FROM t WHERE "
+
+# The compiler's own bind markers. ``render_sql_for_dialect`` and the drivers rewrite
+# them wherever they appear, a string literal included, so a predicate that holds the
+# text would reach the engine changed (``code <> 'x:p_1'`` would compare with another
+# value and serve the row it was written to withhold).
+_BIND_MARKER_TEXT_RE = re.compile(r"(?i):p_")
+
+# Words the driver's statement guard refuses anywhere in a statement, a string literal
+# included, and the expression allowlist does not: a predicate holding one would be
+# refused on every read, so it is refused here, where the reason can be named.
+_GUARDED_WORD_RE = re.compile(r"(?i)\b(?:union|intersect|except)\b")
 
 
-def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]) -> Any:
-    """Replace ``${caller.<attr>}`` tokens in ``value`` with values from
-    ``caller_attributes``. Lists / tuples recurse; non-string scalars pass
-    through. Raises :class:`RowFilterIdentityMissing` when an attribute is
-    absent so a misconfigured contract can never accidentally widen access."""
+def _policy_at(expose: Mapping[str, Any]) -> str:
+    return f"exposes[{expose.get('exposeId') or '?'}].policy"
+
+
+def _authz_block(expose: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    """The expose's ``policy.authz``, or ``None`` when it declares none.
+
+    Refuses the old ``policy.rowFilters`` key when it holds anything: no schema allows
+    it, and a contract that still fills it meant its rows to be filtered, so reading
+    it as "no filter" would serve them all. A ``policy`` or ``authz`` that is not a
+    mapping is refused for the same reason.
+    """
+    policy = expose.get("policy")
+    if policy is None or (isinstance(policy, Mapping) and not policy):
+        return None
+    at = _policy_at(expose)
+    if not isinstance(policy, Mapping):
+        raise RowFilterUnavailable(f"{at} is not a mapping, so its row filters cannot be read.")
+    if policy.get("rowFilters"):
+        raise RowFilterUnavailable(
+            f"{at}.rowFilters is not a contract field. Row filters are declared under "
+            f"{at}.authz.rowFilters, each naming a principal and a where predicate; an "
+            "expose that still carries the old key is refused rather than served unfiltered."
+        )
+    authz = policy.get("authz")
+    if authz is None or (isinstance(authz, Mapping) and not authz):
+        return None
+    if not isinstance(authz, Mapping):
+        raise RowFilterUnavailable(
+            f"{at}.authz is not a mapping, so its row filters cannot be read."
+        )
+    return authz
+
+
+def declares_row_filters(expose: Mapping[str, Any]) -> bool:
+    """Whether ``expose`` declares ``policy.authz.rowFilters`` entries.
+
+    Raises :class:`RowFilterUnavailable` for the old ``policy.rowFilters`` key and for
+    a ``policy`` or ``authz`` that is not a mapping, as every read path does."""
+    authz = _authz_block(expose)
+    return bool(authz.get("rowFilters")) if authz is not None else False
+
+
+def _schema_column_names(expose: Mapping[str, Any]) -> Set[str]:
+    """``contract.schema[].name`` as written, for checking a predicate's columns. A
+    name that is not a string declares no column."""
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    if not isinstance(schema, list):
+        return set()
+    names = (column.get("name") for column in schema if isinstance(column, Mapping))
+    return {name for name in names if isinstance(name, str)}
+
+
+def _principal_names(values: Iterable[Any]) -> FrozenSet[str]:
+    """The non-blank strings among ``values``, trimmed."""
+    return frozenset(item.strip() for item in values if isinstance(item, str) and item.strip())
+
+
+def _verified_principals(caller_attributes: Optional[Mapping[str, Any]]) -> FrozenSet[str]:
+    """The principals in the caller's :data:`~fluid_build.output_ports.mcp.auth.PRINCIPAL_ATTR`:
+    one string or a list of them. Any other value names none."""
+    attrs = caller_attributes if isinstance(caller_attributes, Mapping) else {}
+    value = attrs.get(PRINCIPAL_ATTR)
     if isinstance(value, str):
-        match = _CALLER_PLACEHOLDER.fullmatch(value)
-        if match is None:
-            return value
-        attr = match.group(1)
-        if attr not in caller_attributes:
-            raise RowFilterIdentityMissing(
-                f"rowFilter references caller.{attr} but caller_attributes "
-                f"only carry: {sorted(caller_attributes)}{_missing_attr_hint(attr)}"
-            )
-        return caller_attributes[attr]
-    if isinstance(value, (list, tuple)):
-        return [_resolve_caller_placeholder(v, caller_attributes) for v in value]
-    return value
+        return _principal_names([value])
+    return _principal_names(value) if isinstance(value, (list, tuple)) else frozenset()
 
 
-def row_filter_caller_attributes(expose: Mapping[str, Any]) -> FrozenSet[str]:
-    """The ``${caller.<attr>}`` names ``expose.policy.rowFilters[]`` reads,
-    walking ``equals`` and ``in`` values the same way
-    :func:`compile_row_filter_clauses` resolves them. Lets the CLI refuse at
-    startup a configuration in which a required attribute can never bind."""
-    found: Set[str] = set()
-
-    def _walk(value: Any) -> None:
-        if isinstance(value, str):
-            match = _CALLER_PLACEHOLDER.fullmatch(value)
-            if match is not None:
-                found.add(match.group(1))
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                _walk(item)
-
-    for entry in (expose.get("policy") or {}).get("rowFilters") or []:
-        if isinstance(entry, Mapping):
-            for operator in ("equals", "in"):
-                if operator in entry:
-                    _walk(entry[operator])
-    return frozenset(found)
+def _declared_readers(authz: Mapping[str, Any], at: str) -> FrozenSet[str]:
+    """``policy.authz.readers``; anything but a list of principals is refused."""
+    raw = authz.get("readers")
+    if raw is not None and not isinstance(raw, list):
+        raise RowFilterUnavailable(f"{at}.authz.readers must be a list of principals.")
+    return _principal_names(raw or ())
 
 
-def _quote_filter_identifier(column: str, dialect: Optional[str]) -> str:
-    """Quote a (already ``validate_ident``-checked) row-filter column for the
-    target ``dialect``.
+def _qualified_predicate(row_filter: RowFilter, at: str, read: Optional[str]) -> str:
+    """``row_filter.where`` as this engine runs it: every column qualified with
+    :data:`ROW_FILTER_ALIAS`, after checking the engine reads it as declared.
 
-    BigQuery's standard SQL reads ANSI double-quotes as a STRING LITERAL, so
-    ``WHERE "tenant_id" = @p_0`` compiles to ``WHERE 'tenant_id' = <val>`` —
-    always false → an RLS-protected BigQuery expose returns ZERO rows. BigQuery
-    quotes identifiers with backticks instead. Every other dialect we target
-    (duckdb / snowflake / postgres / athena) treats double-quotes as an
-    identifier quote, so the default (``dialect is None`` or anything non-BQ)
-    keeps the ANSI form for back-compat.
+    :func:`parse_row_filters` checks the predicate as standard SQL, the reading the
+    IaC emitters write platform policies from. ``read`` is the engine's sqlglot
+    dialect; a predicate it reads with other columns is refused (on BigQuery and Spark
+    ``"region" <> 'x'`` compares two strings and selects every row), as is one it
+    cannot parse, one that reaches a column through a qualifier, and SQL the gateway
+    refuses in every contract expression (a statement keyword, a refused function).
+    The qualifiers are spliced into the contract's own text, at each column's source
+    span, so the predicate reaches the engine as written; the result is parsed again
+    and must name the same columns, each through :data:`ROW_FILTER_ALIAS`.
     """
-    if dialect == "bigquery":
-        return f"`{column}`"
-    return f'"{column}"'
+    from sqlglot import exp
+
+    try:
+        validate_sql_expression_allowlist(row_filter.where)
+    except ValueError:
+        raise RowFilterUnavailable(
+            f"{at}.where uses SQL the gateway does not run in a contract expression: a "
+            "statement keyword (inside a string literal too), a refused function or a "
+            "character outside its allowlist."
+        ) from None
+    if _GUARDED_WORD_RE.search(row_filter.where):
+        raise RowFilterUnavailable(
+            f"{at}.where holds UNION, INTERSECT or EXCEPT, which the gateway's statement "
+            "guard refuses anywhere in a statement, inside a string literal too."
+        )
+    if _BIND_MARKER_TEXT_RE.search(row_filter.where):
+        raise RowFilterUnavailable(
+            f"{at}.where holds the text ':p_', which the gateway rewrites as a bind "
+            "marker wherever it appears, inside a string literal too."
+        )
+    # As for every contract expression on a policy-bearing expose: a subquery opening
+    # (``(FROM``, ``(TABLE``, ``(VALUES``, ...) would read a relation by itself.
+    if _SUBQUERY_OPEN_RE.search(_strip_string_literals(row_filter.where, read)):
+        raise RowFilterUnavailable(
+            f"{at}.where contains a subquery; a row filter is one boolean expression over "
+            "the expose's own columns."
+        )
+    try:
+        tree = parse_predicate(row_filter.where, at, dialect=read)
+    except RowFilterError as exc:
+        raise RowFilterUnavailable(f"{exc} (as this engine reads it)") from exc
+    # The check the IaC emitters make before they write a predicate into a policy.
+    try:
+        check_engine_reading(row_filter.where, at, read)
+    except RowFilterError as exc:
+        raise RowFilterUnavailable(str(exc)) from exc
+    columns = list(tree.args["where"].find_all(exp.Column))
+    offsets: List[int] = []
+    for column in columns:
+        if any(column.args.get(part) for part in ("table", "db", "catalog")):
+            raise RowFilterUnavailable(
+                f"{at}.where names a column through a qualifier; a row filter reads the "
+                "expose's own columns, so write them unqualified."
+            )
+        name = column.this
+        start = name.meta.get("start") if isinstance(name, exp.Identifier) else None
+        if not isinstance(start, int) or start < len(_PREDICATE_FRAME):
+            raise RowFilterUnavailable(f"{at}.where could not be qualified for this engine.")
+        offsets.append(start - len(_PREDICATE_FRAME))
+    qualified = row_filter.where
+    for offset in sorted(offsets, reverse=True):
+        qualified = f"{qualified[:offset]}{ROW_FILTER_ALIAS}.{qualified[offset:]}"
+    try:
+        check = parse_predicate(qualified, at, dialect=read)
+    except RowFilterError:
+        check = None
+    names = [] if check is None else list(check.args["where"].find_all(exp.Column))
+    if (
+        check is None
+        or sorted(c.name for c in names) != sorted(c.name for c in columns)
+        or any(
+            c.table != ROW_FILTER_ALIAS or c.args.get("db") or c.args.get("catalog") for c in names
+        )
+    ):
+        raise RowFilterUnavailable(f"{at}.where could not be qualified for this engine.")
+    return qualified
 
 
-def compile_row_filter_clauses(
+def row_filter_predicate(
     expose: Mapping[str, Any],
-    caller_attributes: Mapping[str, Any],
+    caller_attributes: Optional[Mapping[str, Any]],
     *,
-    offset: int = 0,
     dialect: Optional[str] = None,
-) -> Tuple[List[str], List[Any]]:
-    """Compile ``expose.policy.rowFilters[]`` into AND-able WHERE clauses +
-    bound params, with placeholders ``:p_{offset}``, ``:p_{offset+1}``, …
+) -> Optional[str]:
+    """The predicate that limits a caller to its rows, or ``None`` for every row.
 
-    Centralises row-level security so EVERY read path enforces it: ``sample``
-    (via :meth:`...drivers.base.EngineDriver.compile_row_filter_predicate`,
-    ``offset=0``), the semantic ``query`` (merged into its WHERE at
-    ``offset=len(existing_params)``), and the free-form ``query_sql`` path
-    (which now rejects rather than wraps — see :func:`compile_free_form_sql`).
-    The ``offset`` is what lets these merge into a statement that already has
-    ``:p_<n>`` placeholders without colliding.
+    ``exposes[].policy.authz.rowFilters[]`` (fluid-schema 0.7.6) lets each filter's
+    principal read only the rows its ``where`` selects, and a reader no filter names
+    read every row. Resolved for the caller's verified principals
+    (:data:`~fluid_build.output_ports.mcp.auth.PRINCIPAL_ATTR`, one or a list):
 
-    ``dialect`` selects the identifier-quoting style for the filter column:
-    backticks for ``"bigquery"`` (BQ reads ANSI double-quotes as a string
-    literal, which silently turns the predicate always-false → zero rows),
-    ANSI double-quotes for every other dialect. ``None`` (default) keeps the
-    ANSI form for back-compat with callers that don't know their dialect.
+    * no row filter declared: ``None``;
+    * a principal of the caller is in ``policy.authz.readers`` and no filter names
+      it: ``None``, every row;
+    * otherwise the union of the predicates of the filters that name the caller's
+      principals, as BigQuery combines the row access policies naming one principal:
+      ``((p1) OR (p2))``, each column qualified with :data:`ROW_FILTER_ALIAS`;
+    * no filter and no reader names a principal of the caller, or it has none:
+      :class:`RowFilterIdentityMissing`. The gateway cannot tell an unfiltered
+      reader from a filtered principal it does not know, so it serves neither.
 
-    Fail-closed: a ``${caller.<attr>}`` referencing a missing attribute, or an
-    ``in:`` filter resolving to an empty/non-list value, raises
-    :class:`RowFilterIdentityMissing` — the gateway prefers no rows to wrong
-    rows. Column identifiers route through ``validate_ident``; filter values are
-    always bound parameters, never interpolated.
-
-    An entry the compiler cannot read (not an object, no string ``column``, no
-    ``equals`` / ``in`` operator, an operator it does not know, or two operators)
-    raises :class:`QueryValidationError` instead of being skipped. A skipped entry
-    would silently widen the rows served, and every read path, ``sample`` included,
-    runs through here.
+    Every filter is parsed by :mod:`fluid_build.providers._row_filters`, the parse the
+    IaC emitters write platform policies from, and checked against ``dialect`` (the
+    driver's dialect token). A filter that cannot be applied raises
+    :class:`RowFilterUnavailable`, which every caller sees whichever filter it is, as
+    does the old ``policy.rowFilters`` key. The predicate binds no parameter: every
+    value in it is the contract's own literal.
     """
-    policy = expose.get("policy") or {}
-    filters = policy.get("rowFilters") or []
-    if not isinstance(filters, (list, tuple)):
-        raise QueryValidationError(_row_filter_refusal("policy.rowFilters", "is not a list"))
-    clauses: List[str] = []
-    params: List[Any] = []
-    for position, entry in enumerate(filters):
-        where = f"policy.rowFilters[{position}]"
-        if not isinstance(entry, Mapping):
-            raise QueryValidationError(_row_filter_refusal(where, "is not an object"))
-        column_raw = entry.get("column")
-        if not isinstance(column_raw, str) or not column_raw:
-            raise QueryValidationError(_row_filter_refusal(where, "has no string 'column'"))
-        operators = [name for name in _ROW_FILTER_OPERATORS if name in entry]
-        if len(operators) != 1:
-            raise QueryValidationError(
-                _row_filter_refusal(
-                    where,
-                    (
-                        "has no 'equals' or 'in' operator"
-                        if not operators
-                        else "names more than one operator"
-                    ),
-                )
-            )
-        column = _quote_filter_identifier(validate_ident(column_raw), dialect)
-        if operators[0] == "equals":
-            value = _resolve_caller_placeholder(entry["equals"], caller_attributes)
-            clauses.append(f"{column} = :p_{offset + len(params)}")
-            params.append(value)
-        else:
-            raw_list = _resolve_caller_placeholder(entry["in"], caller_attributes)
-            if not isinstance(raw_list, (list, tuple)) or not raw_list:
-                raise RowFilterIdentityMissing(
-                    f"row filter on column={column!r} expects a non-empty "
-                    "list (got empty / non-list value); fail-closed deny."
-                )
-            placeholders = ", ".join(f":p_{offset + len(params) + i}" for i in range(len(raw_list)))
-            clauses.append(f"{column} IN ({placeholders})")
-            params.extend(raw_list)
-    return clauses, params
-
-
-# The operators a ``policy.rowFilters[]`` entry may carry, one per entry.
-_ROW_FILTER_OPERATORS = ("equals", "in")
-
-
-def _row_filter_refusal(where: str, problem: str) -> str:
-    """The message for a row filter that cannot be applied. An entry the compiler
-    cannot read is refused rather than skipped: skipping it would serve the rows the
-    filter was written to withhold. Only contract-declared names appear."""
-    return (
-        f"{where} {problem}, so the row filter cannot be applied and the request is refused. "
-        "Each entry needs a string 'column' and exactly one operator, 'equals' or 'in'."
-    )
+    authz = _authz_block(expose)
+    raw = None if authz is None else authz.get("rowFilters")
+    if authz is None or raw is None:
+        return None
+    at = _policy_at(expose)
+    try:
+        filters = parse_row_filters(
+            raw, declared=_schema_column_names(expose), where_at=f"{at}.authz.rowFilters"
+        )
+    except RowFilterError as exc:
+        raise RowFilterUnavailable(str(exc)) from exc
+    if not filters:
+        return None
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    predicates = {
+        row_filter.principal: _qualified_predicate(
+            row_filter, f"{at}.authz.rowFilters[{position}]", read
+        )
+        for position, row_filter in enumerate(filters)
+    }
+    unfiltered_readers = _declared_readers(authz, at) - set(predicates)
+    principals = _verified_principals(caller_attributes)
+    if principals & unfiltered_readers:
+        return None
+    mine = [
+        predicates[row_filter.principal]
+        for row_filter in filters
+        if row_filter.principal in principals
+    ]
+    if not mine:
+        raise RowFilterIdentityMissing(
+            f"{at}.authz.rowFilters limits rows by principal, and this request carries no "
+            "verified principal that a row filter or policy.authz.readers names (it "
+            f"carries {sorted(principals) or 'none'}). A principal binds only from a "
+            "verified credential: map the JWT claim that carries it with "
+            "FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal."
+        )
+    return "(" + " OR ".join(f"({predicate})" for predicate in mine) + ")"
 
 
 @dataclass(frozen=True)
@@ -735,6 +859,12 @@ class CompiledQuery:
     50 was labelled a complete answer.
     """
 
+    row_filter: Optional[str] = None
+    """The row-filter predicate :func:`row_filter_predicate` resolved for the caller and
+    the statement applies, or ``None``. It is the contract's policy text, so the
+    statement the caller is shown carries ``(<row filter>)`` in its place (see
+    :meth:`shown_sql`)."""
+
     redacted_columns: Tuple[str, ...] = ()
     """Projection aliases whose VALUES must be replaced with
     :attr:`...drivers.base.EngineDriver.PII_TOKEN` before the rows leave
@@ -747,6 +877,14 @@ class CompiledQuery:
     only layer that knows the alias→expression mapping, so it resolves
     the alias set here and the driver applies it.
     """
+
+    def shown_sql(self) -> str:
+        """:attr:`sql` as the caller may see it: the row-filter predicate, which is
+        policy the ``describe`` tool does not return either, replaced by
+        ``(<row filter>)``."""
+        if not self.row_filter:
+            return self.sql
+        return self.sql.replace(self.row_filter, ROW_FILTER_SHOWN)
 
     def render_sql_for_dialect(self, dialect: str) -> str:
         """Re-render the SQL with the given dialect's placeholder
@@ -908,11 +1046,11 @@ def _resolve_metric(
                 "apply it. Rewrite the contract filter as a plain SQL "
                 "predicate over contract columns."
             ) from None
-        # Defence-in-depth: the filter is the first contract expression to
-        # land in the WHERE next to policy.rowFilters. A deliberately
-        # unbalanced filter like ``1=1) OR (1=1`` passes the char allowlist
-        # but would escape its wrapping parens and — by AND/OR precedence —
-        # neutralize an ANDed RLS clause. Balanced parens close the class.
+        # Defence in depth: the filter is a contract expression ANDed into the
+        # WHERE beside the caller's filters. A deliberately unbalanced filter
+        # like ``1=1) OR (1=1`` passes the char allowlist but would escape its
+        # wrapping parens and, by AND/OR precedence, neutralize a clause ANDed
+        # to it. Balanced parens close the class.
         if not _parens_balanced(metric_filter):
             raise QueryValidationError(
                 f"Metric {metric_name!r} carries a filter with unbalanced "
@@ -1166,11 +1304,19 @@ def compile_semantic_query(
     "no limit" — every consumer-side query gets a hard cap so a curious
     agent can't run a full-table scan by accident.
 
-    ``dialect`` is the driver's dialect token (``descriptor().dialect``);
-    it only selects the identifier-quoting style for any merged
-    ``policy.rowFilters[]`` column (backticks on BigQuery, ANSI
-    double-quotes elsewhere — see :func:`compile_row_filter_clauses`).
-    ``None`` keeps the ANSI form.
+    ``dialect`` is the driver's dialect token (``descriptor().dialect``). It
+    decides how a quoted name in an expression is read, and which engine a
+    row-filter predicate is checked against (:func:`row_filter_predicate`).
+
+    ``caller_attributes`` is the request's verified identity. When the expose
+    declares ``policy.authz.rowFilters``, :func:`row_filter_predicate` resolves the
+    rows the caller's principals may read, and the statement reads
+    ``(SELECT <allowed columns> FROM <table> AS _fluid_rows WHERE <predicate>)``
+    instead of the table: nothing in the outer statement (a measure, a dimension,
+    a metric filter, a caller filter) can see a row the predicate removed. A
+    caller no filter or reader names, a malformed filter, or the old
+    ``policy.rowFilters`` key is refused before anything is compiled
+    (:class:`RowFilterIdentityMissing`, :class:`RowFilterUnavailable`).
 
     ``restricted_columns`` are the columns denied by
     ``expose.policy.authz.columnRestrictions`` /
@@ -1204,13 +1350,17 @@ def compile_semantic_query(
     ``sum(salary)``) are unaffected.
 
     Every term of the WHERE is parenthesised, so a measure-, dimension- or
-    filter-expression with an ``OR`` in it cannot widen the row filter ANDed to it.
+    filter-expression with an ``OR`` in it cannot widen a predicate ANDed to it.
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
     if not isinstance(table_reference, str) or not table_reference.strip():
         raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
+
+    # Row-level security first: a caller the policy does not name, or a filter that
+    # cannot be applied, is refused before the payload is looked at.
+    row_predicate = row_filter_predicate(expose, caller_attributes, dialect=dialect)
 
     restricted = _clean_column_names(restricted_columns)
     redacted = _clean_column_names(redacted_columns)
@@ -1235,13 +1385,18 @@ def compile_semantic_query(
         measure_name, measure_definition, metric_filter = _resolve_metric(metric, index)
 
     # Expressions are free SQL, so naming a restricted column is only the FRIENDLY
-    # refusal. The boundary is structural: with restrictions, every expression below
-    # is evaluated over a projection that does not contain them (``source`` below),
-    # so a spelling this scan does not recognise still fails at the engine. A
-    # subquery would name the base table directly and skip that projection (and the
-    # row filter), so it is refused outright on a policy-bearing expose.
-    row_filters_declared = bool((expose.get("policy") or {}).get("rowFilters"))
-    guard_subqueries = bool(restricted) or row_filters_declared or bool(redacted)
+    # refusal. The boundary is structural: with restrictions or a row filter, every
+    # expression below is evaluated over a projection that does not contain the
+    # restricted columns or the filtered rows (``source`` below), so a spelling this
+    # scan does not recognise still fails at the engine. A subquery would name the
+    # base table directly and skip that projection, so it is refused outright on a
+    # policy-bearing expose, whoever the caller is.
+    guard_subqueries = (
+        bool(restricted)
+        or bool(redacted)
+        or row_predicate is not None
+        or declares_row_filters(expose)
+    )
 
     def _check_expression(expression: str, subject: str, *, allow_count_star: bool = False) -> None:
         _reject_restricted_reference(expression, restricted, subject=subject, dialect=dialect)
@@ -1332,7 +1487,7 @@ def compile_semantic_query(
     if metric_filter is not None:
         # Contract-declared metric predicate (already allowlist-validated in
         # ``_resolve_metric``). Parenthesized so it ANDs safely with the
-        # caller's dimension filters and any policy rowFilters below.
+        # caller's dimension filters below.
         where_clauses.append(f"({metric_filter})")
     for filter_key, filter_value in (filters or {}).items():
         if not isinstance(filter_key, str):
@@ -1371,40 +1526,24 @@ def compile_semantic_query(
         where_clauses.append(f"(({dimension_expr}) = :p_{placeholder_index})")
         params.append(filter_value)
 
-    # Row-level security: merge policy.rowFilters[] into the WHERE so the
-    # semantic ``query`` tool enforces the SAME tenant isolation as ``sample``.
-    # Previously query() executed the compiled statement with no row filter, so
-    # a multi-tenant rowFilter (e.g. tenant_id = ${caller.tenant_id}) was
-    # silently bypassed on the query/query_sql tools. Placeholders continue from
-    # the filter params (offset) so they never collide.
-    rf_clauses, rf_params = compile_row_filter_clauses(
-        expose, caller_attributes or {}, offset=len(params), dialect=dialect
-    )
-    params.extend(rf_params)
-
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
         raise QueryValidationError("limit must be an integer in [1, 1_000_000]")
 
-    # Every term is parenthesised, so ``AND`` joins whole predicates however a term is
-    # written. The row filter is policy: it must not be one disjunct of a caller-shaped
-    # ``a OR b AND tenant = ...``.
-    rf_clauses = [f"({clause})" for clause in rf_clauses]
-
-    # With restrictions the expressions read ``(SELECT <allowed columns> FROM <table>)``
+    # With restrictions or a row filter the expressions read
+    # ``(SELECT <allowed columns> FROM <table> AS _fluid_rows WHERE <predicate>)``
     # rather than the table: a restricted column is not in that relation, so no
     # spelling of it (quoted, selected by pattern, or as part of the whole row) can
-    # reach it. The row filter is applied INSIDE the projection. It is policy rather
-    # than caller input, so it may name a column the agent is denied, and nothing in
-    # the outer statement can see rows it removed.
+    # reach it, and no row the predicate removed is in it either. The predicate is
+    # policy rather than caller input, so it may name a column the agent is denied,
+    # and nothing in the outer statement (whose WHERE terms are each parenthesised)
+    # can see or widen what it removed.
     source = table_reference
-    if restricted:
+    if restricted or row_predicate is not None:
         allowed = _allowed_columns(index, restricted)
         inner = f"SELECT {', '.join(allowed)} FROM {table_reference}"
-        if rf_clauses:
-            inner += " WHERE " + " AND ".join(rf_clauses)
+        if row_predicate is not None:
+            inner += f" AS {ROW_FILTER_ALIAS} WHERE {row_predicate}{_postgres_fence(dialect)}"
         source = f"({inner}) AS {_PROJECTION_ALIAS}"
-    else:
-        where_clauses.extend(rf_clauses)
 
     sql_lines: List[str] = [
         "SELECT " + ", ".join(select_parts),
@@ -1444,7 +1583,19 @@ def compile_semantic_query(
         # aggregate is exactly one row whatever the cap says, so reporting
         # it as truncatable would be a different lie.
         row_cap=limit if group_columns else None,
+        row_filter=row_predicate,
         redacted_columns=tuple(redacted_aliases),
+    )
+
+
+def _postgres_fence(dialect: Optional[str]) -> str:
+    """What ends a row-filtered projection on ``dialect``: ``" OFFSET 0"`` on Postgres,
+    else nothing. Postgres flattens a plain subquery into the statement around it and
+    may then evaluate the caller's own conditions on rows the filter removes, so a
+    condition that fails on such a row (a cast, a division) would tell the caller the
+    row exists. ``OFFSET 0`` keeps the filtered projection a separate step there."""
+    return (
+        " OFFSET 0" if _SQLGLOT_DIALECTS.get((dialect or "").strip().lower()) == "postgres" else ""
     )
 
 
@@ -1471,6 +1622,12 @@ def _validate_rendered_statement(sql: str) -> None:
 # a file scan). None of these is a catalog table, and one that names the bound file
 # would read it without the projection.
 _FILE_LIKE_TABLE_RE = re.compile(r"[./\\*:]")
+
+# The clauses the compiler's projection sets: its columns, its FROM (``from_`` in
+# current sqlglot, ``from`` before) and, with a row filter, its WHERE. Anything else on
+# a projection the re-parse finds (a join, a GROUP BY, a QUALIFY, a sample) was not
+# written by the compiler.
+_PROJECTION_CLAUSES = frozenset({"expressions", "from", "from_", "where"})
 
 
 def _declared_column_names(expose: Mapping[str, Any]) -> List[str]:
@@ -1500,7 +1657,7 @@ def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
         raise _unreadable_sql() from None
     if any(token.token_type == TokenType.TABLE for token in tokens):
         raise QueryValidationError(
-            "sql may not use the TABLE keyword on an expose that restricts columns; "
+            "sql may not use the TABLE keyword on an expose that restricts columns or rows; "
             "select from the exposed table by name."
         )
 
@@ -1537,27 +1694,113 @@ def _require_plain_sources(tree: Any) -> None:
         if not _is_plain_source(node.this, allow_lateral=isinstance(node, (exp.From, exp.Join))):
             raise QueryValidationError(
                 "sql may only read from tables named in the usual way, subqueries, UNNEST "
-                "and VALUES on an expose that restricts columns; query the exposed table "
-                "directly."
+                "and VALUES on an expose that restricts columns or rows; query the exposed "
+                "table directly."
             )
 
 
-def _crosscheck_duckdb_projection(sql: str, exposed_name: str, allowed: Iterable[str]) -> None:
+def _without_locations(value: Any) -> Any:
+    """A ``json_serialize_sql`` tree without its source positions, so two parses of one
+    expression at different offsets compare equal."""
+    if isinstance(value, dict):
+        return {
+            key: _without_locations(child)
+            for key, child in value.items()
+            if key not in ("query_location", "query_location_length")
+        }
+    if isinstance(value, list):
+        return [_without_locations(child) for child in value]
+    return value
+
+
+def _duckdb_document(connection: Any, sql: str) -> Dict[str, Any]:
+    """DuckDB's own parse of ``sql`` (``json_serialize_sql``; nothing is executed)."""
+    import json
+
+    from fluid_build.providers._duckdb_compat import first_row
+
+    raw = first_row(connection.execute("SELECT json_serialize_sql(?)", [sql]))
+    document = json.loads(raw[0]) if raw else {}
+    return document if isinstance(document, dict) else {}
+
+
+def _duckdb_predicate_where(connection: Any, predicate: str) -> Any:
+    """The WHERE DuckDB parses ``predicate`` into on its own, without positions, or
+    ``None`` when it does not parse."""
+    alone = _duckdb_document(connection, f"SELECT 1 FROM t AS {ROW_FILTER_ALIAS} WHERE {predicate}")
+    statements = alone.get("statements") or [{}]
+    where = (statements[0].get("node") or {}).get("where_clause")
+    return None if alone.get("error") or not where else _without_locations(where)
+
+
+def _json_objects(document: Any) -> List[Dict[str, Any]]:
+    """Every object in a ``json_serialize_sql`` document."""
+    objects: List[Dict[str, Any]] = []
+    pending = [document]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            objects.append(value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return objects
+
+
+def _is_bare_duckdb_projection(
+    node: Dict[str, Any], permitted: Set[str], expected_where: Any
+) -> bool:
+    """Whether a SELECT_NODE is the compiler's projection: bare permitted columns from
+    one table, under ``expected_where`` (the table read as :data:`ROW_FILTER_ALIAS`) or
+    under no WHERE when there is no row filter, and nothing else."""
+    source = node["from_table"]
+    where = node.get("where_clause")
+    if expected_where is None:
+        filtered = not where
+    else:
+        filtered = (
+            bool(where)
+            and _without_locations(where) == expected_where
+            and str(source.get("alias") or "").casefold() == ROW_FILTER_ALIAS
+        )
+    return (
+        filtered
+        and not node.get("modifiers")
+        and not node.get("group_expressions")
+        and not node.get("group_sets")
+        and not node.get("having")
+        and not node.get("qualify")
+        and not node.get("sample")
+        and not source.get("sample")
+        and not source.get("at_clause")
+        and not (node.get("cte_map") or {}).get("map")
+        and bool(node.get("select_list"))
+        and all(
+            item.get("class") == "COLUMN_REF"
+            and len(item.get("column_names") or []) == 1
+            and str(item["column_names"][0]).casefold() in permitted
+            for item in node["select_list"]
+        )
+    )
+
+
+def _crosscheck_duckdb_projection(
+    sql: str, exposed_name: str, allowed: Iterable[str], predicate: Optional[str] = None
+) -> None:
     """Have DuckDB's own parser confirm the rewritten statement.
 
     The rewrite is checked with sqlglot, and sqlglot is not the engine: the two can
     read one statement differently. DuckDB serialises the statement it will run
     (``json_serialize_sql``, a parse with no execution), and every read of the exposed
     table in that tree must be the only source of a projection of bare allowed
-    columns. A statement DuckDB cannot serialise is refused.
+    columns. With a row filter (``predicate``) that projection reads the table as
+    :data:`ROW_FILTER_ALIAS` and its WHERE is the predicate, as DuckDB parses it on
+    its own, and nothing else. A statement DuckDB cannot serialise is refused.
     """
-    import json
-
     try:
         import duckdb
     except ImportError:  # pragma: no cover - a duckdb dialect implies duckdb
         return
-    from fluid_build.providers._duckdb_compat import first_row
     from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
     refusal = QueryValidationError(
@@ -1569,26 +1812,19 @@ def _crosscheck_duckdb_projection(sql: str, exposed_name: str, allowed: Iterable
     # or network access.
     connection = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none())
     try:
-        raw = first_row(connection.execute("SELECT json_serialize_sql(?)", [sql]))
-        document = json.loads(raw[0]) if raw else {}
+        document = _duckdb_document(connection, sql)
+        expected_where = (
+            None if predicate is None else _duckdb_predicate_where(connection, predicate)
+        )
     except (duckdb.Error, ValueError):
         raise refusal from None
     finally:
         connection.close()
     if document.get("error") or not document.get("statements"):
         raise refusal
-    nodes: List[Dict[str, Any]] = []
-
-    def _collect(value: Any) -> None:
-        if isinstance(value, dict):
-            nodes.append(value)
-            for child in value.values():
-                _collect(child)
-        elif isinstance(value, list):
-            for child in value:
-                _collect(child)
-
-    _collect(document)
+    if predicate is not None and expected_where is None:
+        raise refusal
+    nodes = _json_objects(document)
 
     def _reads_exposed(node: Any) -> bool:
         return (
@@ -1597,37 +1833,172 @@ def _crosscheck_duckdb_projection(sql: str, exposed_name: str, allowed: Iterable
             and str(node.get("table_name") or "").casefold() == exposed_name
         )
 
-    def _bare_projection(node: Dict[str, Any]) -> bool:
-        source = node["from_table"]
-        return (
-            not node.get("modifiers")
-            and not node.get("where_clause")
-            and not node.get("group_expressions")
-            and not node.get("group_sets")
-            and not node.get("having")
-            and not node.get("qualify")
-            and not node.get("sample")
-            and not source.get("sample")
-            and not source.get("at_clause")
-            and not (node.get("cte_map") or {}).get("map")
-            and bool(node.get("select_list"))
-            and all(
-                item.get("class") == "COLUMN_REF"
-                and len(item.get("column_names") or []) == 1
-                and str(item["column_names"][0]).casefold() in permitted
-                for item in node["select_list"]
-            )
-        )
-
     sanctioned = {
         id(node["from_table"])
         for node in nodes
         if node.get("type") == "SELECT_NODE"
         and _reads_exposed(node.get("from_table"))
-        and _bare_projection(node)
+        and _is_bare_duckdb_projection(node, permitted, expected_where)
     }
     if any(_reads_exposed(node) and id(node) not in sanctioned for node in nodes):
         raise refusal
+
+
+def _names_outside_ctes(tree: Any, read: Optional[str]) -> List[str]:
+    """The names of the tables ``tree`` reads that are not a CTE where they are read.
+
+    Resolved with sqlglot's scopes after folding unquoted names the way ``read`` does: a
+    CTE is visible in the query that defines it and the queries nested in it, and to the
+    CTEs after it, but not in its own body unless the query is recursive. Only a CTE
+    counts, never another FROM item's alias, which an engine does not read as a table,
+    and a table no scope reaches is a table, so an unexpected shape is refused."""
+    from sqlglot import exp
+    from sqlglot.errors import SqlglotError
+    from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+    from sqlglot.optimizer.scope import Scope, traverse_scope
+
+    resolved: Set[int] = set()
+    try:
+        normalized = normalize_identifiers(tree.copy(), dialect=read)
+        for scope in traverse_scope(normalized):
+            for table in scope.tables:
+                source = scope.cte_sources.get(table.name)
+                if not table.db and isinstance(source, Scope) and source.is_cte:
+                    resolved.add(id(table))
+    except (SqlglotError, RecursionError):
+        normalized = tree
+    return [table.name for table in normalized.find_all(exp.Table) if id(table) not in resolved]
+
+
+def _refuse_unprojectable_reads(tree: Any, exposed_name: str, read: Optional[str]) -> List[Any]:
+    """The statement's tables, after refusing what the projection cannot cover: a CTE
+    named like the exposed table, a table function or a file path as a table, and any
+    relation besides the exposed table and the CTEs in scope where they are read."""
+    from sqlglot import exp
+
+    for cte in tree.find_all(exp.CTE):
+        if cte.alias_or_name.casefold() == exposed_name:
+            raise QueryValidationError(
+                f"sql defines a CTE named {cte.alias_or_name!r}, the name of the exposed "
+                "table; use another name."
+            )
+    tables = list(tree.find_all(exp.Table))
+    for table in tables:
+        if not isinstance(table.this, exp.Identifier) or _FILE_LIKE_TABLE_RE.search(table.name):
+            raise QueryValidationError(
+                "sql may not read from a table function or a file path on an expose that "
+                "restricts columns or rows; query the exposed table directly."
+            )
+    # Any other relation is outside the projection: a catalog view such as Postgres's
+    # ``pg_stats`` holds values of every row and column of the table.
+    for name in _names_outside_ctes(tree, read):
+        if name.casefold() != exposed_name:
+            raise QueryValidationError(
+                f"sql reads {name!r}; on an expose that restricts columns or rows a "
+                "statement reads only the exposed table, its own CTEs, VALUES and UNNEST."
+            )
+    return tables
+
+
+# The schema an unqualified DuckDB binding's table lives in, so ``main.customers`` names
+# the same view as ``customers`` there.
+_DEFAULT_SCHEMA = {"duckdb": "main"}
+
+
+def _refuse_another_schemas_table(tables: List[Any], exposed: Any, read: Optional[str]) -> None:
+    """Refuse a read that names the exposed table in another schema or catalog than the
+    binding's. The projection would serve the exposed table's rows under that name, so
+    the caller would be shown one table's rows labelled as another's. A part the caller
+    writes must be the binding's; a part the binding leaves out may be written only as
+    the engine's default (DuckDB's ``main`` schema)."""
+    exposed_name = exposed.name.casefold()
+    expected = {
+        "db": exposed.text("db") or _DEFAULT_SCHEMA.get(read or "", ""),
+        "catalog": exposed.text("catalog"),
+    }
+    for table in tables:
+        if table.name.casefold() != exposed_name:
+            continue
+        for part, value in expected.items():
+            written = table.text(part)
+            if written and written.casefold() != value.casefold():
+                raise QueryValidationError(
+                    f"sql reads {table.sql(dialect=read)!r}, a table of that name in another "
+                    "schema or catalog than the exposed table's; write the table unqualified "
+                    "or as the expose names it."
+                )
+
+
+def _splice_projection(sql: str, tables: List[Any], exposed: Any, projection: str) -> str:
+    """``sql`` with ``projection`` written over the source span of every read of the
+    exposed table, so everything else in the statement reaches the engine exactly as
+    written (sqlglot cannot print every engine function it can parse)."""
+    exposed_name = exposed.name.casefold()
+    splices: List[Tuple[int, int, str]] = []
+    for table in tables:
+        if table.name.casefold() != exposed_name:
+            continue
+        spans = [part.meta for part in table.parts]
+        if any("start" not in span or "end" not in span for span in spans):
+            raise _unreadable_sql()
+        replacement = projection if table.args.get("alias") else f"{projection} AS {exposed.name}"
+        splices.append((min(m["start"] for m in spans), max(m["end"] for m in spans), replacement))
+    rewritten = sql
+    for begin, finish, replacement in sorted(splices, reverse=True):
+        rewritten = rewritten[:begin] + replacement + rewritten[finish + 1 :]
+    return rewritten
+
+
+def _expected_projection_where(predicate: Optional[str], read: Optional[str]) -> Optional[str]:
+    """The WHERE a filtered projection must carry, as sqlglot prints it, or ``None``."""
+    if predicate is None:
+        return None
+    import sqlglot
+    from sqlglot.errors import SqlglotError
+
+    try:
+        tree = sqlglot.parse_one(
+            f"SELECT 1 FROM t AS {ROW_FILTER_ALIAS} WHERE {predicate}", read=read
+        )
+        return str(tree.args["where"].this.sql(dialect=read))
+    except (SqlglotError, KeyError, AttributeError):
+        raise _unreadable_sql() from None
+
+
+def _is_sanctioned_projection(
+    table: Any, allowed_names: Set[str], expected_where: Optional[str], read: Optional[str]
+) -> bool:
+    """Whether a read of the exposed table is the compiler's projection and nothing else:
+    the sole source of a subquery that selects bare allowed columns and, with a row
+    filter, reads the table as :data:`ROW_FILTER_ALIAS` under exactly that WHERE (and,
+    on Postgres, the ``OFFSET 0`` that keeps it a separate step)."""
+    from sqlglot import exp
+
+    select = table.parent.parent if isinstance(table.parent, exp.From) else None
+    if not isinstance(select, exp.Select) or not isinstance(select.parent, exp.Subquery):
+        return False
+    fenced = expected_where is not None and read == "postgres"
+    extra = {key for key, value in select.args.items() if value and key not in _PROJECTION_CLAUSES}
+    if extra != ({"offset"} if fenced else set()):
+        return False
+    offset = select.args.get("offset")
+    if fenced and not (
+        isinstance(offset.expression, exp.Literal) and str(offset.expression.this) == "0"
+    ):
+        return False
+    if not all(
+        isinstance(item, exp.Column) and not item.table and item.name.casefold() in allowed_names
+        for item in select.expressions
+    ):
+        return False
+    where = select.args.get("where")
+    if expected_where is None:
+        return where is None
+    return (
+        where is not None
+        and where.this.sql(dialect=read) == expected_where
+        and table.alias.casefold() == ROW_FILTER_ALIAS
+    )
 
 
 def _project_exposed_table(
@@ -1636,18 +2007,30 @@ def _project_exposed_table(
     table_reference: str,
     allowed: List[str],
     dialect: Optional[str],
+    predicate: Optional[str] = None,
 ) -> str:
     """Rewrite caller SQL so every read of the exposed table goes through a projection
-    of the ``allowed`` columns.
+    of the ``allowed`` columns, limited to the rows ``predicate`` selects.
 
     Each reference to the table, wherever it sits (the outer ``FROM``, a join, a
-    self-join, a subquery, a CTE body), becomes
-    ``(SELECT <allowed columns> FROM <table_reference>) AS <the caller's alias>``. A
-    restricted column is then not part of any relation the statement can see, whether
-    it is written as a name, a quoted name, ``COLUMNS(...)``, ``*``, ``alias.*`` or the
-    whole row. A table function or a file path as a table is refused, because it
-    would read the data without the projection. The rewritten statement is parsed
-    again and checked, so a printing quirk cannot leave a bare reference behind.
+    self-join, a subquery, a CTE body, a set operation's branch), becomes
+    ``(SELECT <allowed columns> FROM <table_reference>) AS <the caller's alias>``, or
+    with a row filter (:func:`row_filter_predicate`)
+    ``(SELECT <allowed columns> FROM <table_reference> AS _fluid_rows WHERE
+    <predicate>) AS <the caller's alias>``. A restricted column is then not part of
+    any relation the statement can see, whether it is written as a name, a quoted
+    name, ``COLUMNS(...)``, ``*``, ``alias.*`` or the whole row, and neither is a row
+    the predicate removed, however many times or in whatever form the statement
+    reads the table. A table function or a file path as a table is refused, because
+    it would read the data without the projection. The rewritten statement is parsed
+    again and checked, so a printing quirk cannot leave a bare reference behind or
+    change the predicate.
+
+    This is the shape of Apache Superset's sqlglot-based row-level security
+    (``RLSAsSubqueryTransformer``, Apache-2.0), with two differences: the projection
+    is spliced into the caller's own text instead of printed by sqlglot, which cannot
+    print every engine function it parses, and it selects only the allowed columns
+    instead of ``*``.
 
     ``sqlglot`` is imported here, not at module scope, to keep it off the cold path.
     """
@@ -1669,62 +2052,28 @@ def _project_exposed_table(
     tree = statements[0]
     _require_plain_sources(tree)
     exposed_name = exposed.name.casefold()
-    allowed_names = {name.casefold() for name in allowed}
-
-    for cte in tree.find_all(exp.CTE):
-        if cte.alias_or_name.casefold() == exposed_name:
-            raise QueryValidationError(
-                f"sql defines a CTE named {cte.alias_or_name!r}, the name of the exposed "
-                "table; use another name."
-            )
-    tables = list(tree.find_all(exp.Table))
-    for table in tables:
-        if not isinstance(table.this, exp.Identifier) or _FILE_LIKE_TABLE_RE.search(table.name):
-            raise QueryValidationError(
-                "sql may not read from a table function or a file path on an expose that "
-                "restricts columns; query the exposed table directly."
-            )
-    # Splice the projection into the caller's own text, at the source span of each
-    # reference, so everything else in the statement reaches the engine exactly as
-    # written (sqlglot cannot print every engine function it can parse).
-    projection = f"(SELECT {', '.join(allowed)} FROM {table_reference})"
-    splices: List[Tuple[int, int, str]] = []
-    for table in tables:
-        if table.name.casefold() != exposed_name:
-            continue
-        spans = [part.meta for part in table.parts]
-        if any("start" not in span or "end" not in span for span in spans):
-            raise unreadable
-        replacement = projection if table.args.get("alias") else f"{projection} AS {exposed.name}"
-        splices.append((min(m["start"] for m in spans), max(m["end"] for m in spans), replacement))
-    rewritten = sql
-    for begin, finish, replacement in sorted(splices, reverse=True):
-        rewritten = rewritten[:begin] + replacement + rewritten[finish + 1 :]
+    tables = _refuse_unprojectable_reads(tree, exposed_name, read)
+    _refuse_another_schemas_table(tables, exposed, read)
+    row_filter = (
+        ""
+        if predicate is None
+        else f" AS {ROW_FILTER_ALIAS} WHERE {predicate}{_postgres_fence(dialect)}"
+    )
+    projection = f"(SELECT {', '.join(allowed)} FROM {table_reference}{row_filter})"
+    rewritten = _splice_projection(sql, tables, exposed, projection)
     try:
         checked = sqlglot.parse_one(rewritten, read=read)
     except SqlglotError:
         raise unreadable from None
     _require_plain_sources(checked)
-
+    expected_where = _expected_projection_where(predicate, read)
+    allowed_names = {name.casefold() for name in allowed}
     for table in checked.find_all(exp.Table):
-        if table.name.casefold() != exposed_name:
-            continue
-        select = table.parent.parent if isinstance(table.parent, exp.From) else None
         # The only place the exposed table may appear is as the sole source of a
-        # projection that selects bare allowed columns and nothing else.
-        if (
-            not isinstance(select, exp.Select)
-            or not isinstance(select.parent, exp.Subquery)
-            or any(
-                select.args.get(key)
-                for key in ("where", "joins", "group", "having", "order", "limit", "distinct")
-            )
-            or not all(
-                isinstance(item, exp.Column)
-                and not item.table
-                and item.name.casefold() in allowed_names
-                for item in select.expressions
-            )
+        # projection that selects bare allowed columns, filtered by the predicate and
+        # nothing else.
+        if table.name.casefold() == exposed_name and not _is_sanctioned_projection(
+            table, allowed_names, expected_where, read
         ):
             raise QueryValidationError(
                 "sql reads the exposed table in a form that cannot be limited to the columns "
@@ -1733,7 +2082,7 @@ def _project_exposed_table(
     if any(marker in rewritten for marker in (";", "--", "/*", "*/")):
         raise ValueError("Rewritten statement contains a forbidden marker")
     if read == "duckdb":
-        _crosscheck_duckdb_projection(rewritten, exposed_name, allowed)
+        _crosscheck_duckdb_projection(rewritten, exposed_name, allowed, predicate)
     return rewritten
 
 
@@ -1759,10 +2108,11 @@ def compile_free_form_sql(
 ) -> CompiledQuery:
     """Compile a caller-supplied SQL ``query_sql`` payload.
 
-    ``dialect`` is the driver's dialect token. It only decides whether ``"..."`` in the
+    ``dialect`` is the driver's dialect token. It decides whether ``"..."`` in the
     caller's text is a string literal (BigQuery, Spark) or a quoted identifier (every
-    other engine), for the restricted-column scan below. ``None`` reads it as an
-    identifier, the stricter choice.
+    other engine), for the restricted-column scan below, and which engine a row-filter
+    predicate is checked against. ``None`` reads ``"..."`` as an identifier, the
+    stricter choice.
 
     Phase-1 rules — deliberately strict:
 
@@ -1782,31 +2132,27 @@ def compile_free_form_sql(
       defends against the alias bypass — ``SELECT email AS not_email``
       would otherwise sneak masked values past the result-set masking
       step in :class:`fluid_build.output_ports.mcp.drivers.base.EngineDriver`.
-      This is column-level deny only; row-level security is the next bullet.
-    * **Row-level security — FAIL CLOSED.** When
-      ``expose.policy.rowFilters[]`` is declared (i.e.
-      :func:`compile_row_filter_clauses` returns a non-empty clause
-      list), free-form ``query_sql`` is REJECTED with a
-      :class:`QueryValidationError`. RLS cannot be safely enforced on
-      arbitrary caller SQL: wrapping it as
-      ``SELECT * FROM (<caller_sql>) WHERE <rowfilter>`` is bypassable —
-      the caller controls the subquery's projection, so
-      ``SELECT 't1' AS tenant_id, secret FROM other`` spoofs the filter
-      column and reads across tenants. (It also trips every driver's
-      ``guard_against_injection_markers`` body-SELECT check, so the
-      wrap erred anyway.) Callers that need row-filtered access on an
-      RLS-protected expose must use the semantic ``query`` tool, where
-      the WHERE is merged into a compiler-controlled statement. A
-      missing ``${caller.*}`` attribute still raises
-      :class:`RowFilterIdentityMissing` (fail-closed) before the
-      rejection check completes.
+      This is column-level deny only; row-level security is the next bullets.
+    * **Row-level security.** When ``expose`` declares
+      ``policy.authz.rowFilters``, :func:`row_filter_predicate` resolves the rows
+      ``caller_attributes`` (the request's verified identity) may read, and every
+      read of the exposed table is rewritten to
+      ``(SELECT <allowed columns> FROM <table> AS _fluid_rows WHERE <predicate>)``.
+      The filter is applied where the table is read, not around the caller's
+      statement: wrapping it as ``SELECT * FROM (<caller_sql>) WHERE <filter>``
+      lets the caller's projection spoof the filter column (``SELECT 't1' AS
+      tenant_id, secret FROM other``), while a subquery, a CTE, a set operation's
+      branch or a second reference to the table each read the filtered projection
+      here. It fails closed: a caller no filter or reader names raises
+      :class:`RowFilterIdentityMissing`, and a filter that cannot be applied (or
+      the old ``policy.rowFilters`` key) :class:`RowFilterUnavailable`.
     * **Column restrictions.** When ``restricted_columns`` is non-empty, ``expose``
       is required (it declares the columns to project; without it the call is
       refused). Every read of the exposed table is then rewritten to a projection
-      of the allowed columns. The statement may not use the ``TABLE`` keyword,
-      and every source in it must be a plain table, a subquery, ``UNNEST`` or
-      ``VALUES``; on DuckDB the engine's own parser checks the rewritten
-      statement too.
+      of the allowed columns, filtered as above when a row filter applies. The
+      statement may not use the ``TABLE`` keyword, and every source in it must be a
+      plain table, a subquery, ``UNNEST`` or ``VALUES``; on DuckDB the engine's own
+      parser checks the rewritten statement too, the row filter included.
     * ``FROM`` references are NOT rewritten otherwise — the caller must
       reference the bound table by its fully-qualified name from the contract.
       Phase-2 may add an AST-level rewrite so consumers can reference the expose
@@ -1817,16 +2163,14 @@ def compile_free_form_sql(
     candidate = sql.strip()
     if not candidate:
         raise QueryValidationError("sql must be a non-empty string")
-    if not candidate.lower().lstrip("(").startswith("select"):
+    # ``_sql_safety`` blocks the SELECT keyword in expression mode, so it reads the body
+    # after the leading SELECT: everything after the keyword's word boundary, a name or
+    # a parenthesis written against the keyword included. A SELECT with no body is
+    # malformed and rejected outright.
+    body = select_body(candidate)
+    if body is None:
         raise QueryValidationError("Only SELECT statements are allowed in --allow-sql mode")
-    # ``_sql_safety`` blocks the SELECT keyword in expression mode, so
-    # we hand it only the body after the leading SELECT. Splitting on
-    # *any* whitespace (``str.split(None, 1)``) defends against the
-    # tab/newline bypass that would skip validation when only ASCII
-    # spaces are checked. A SELECT with no body (a single-token
-    # ``SELECT``) is malformed and rejected outright.
-    parts = candidate.split(None, 1)
-    if len(parts) < 2:
+    if not body.strip():
         raise QueryValidationError("sql must contain a SELECT body")
     if names_refused_duckdb_function(candidate):
         raise QueryValidationError(
@@ -1838,18 +2182,24 @@ def compile_free_form_sql(
         )
     if names_refused_postgres_function(candidate):
         raise QueryValidationError(
-            "sql may not call a function that returns a whole table, schema, database or "
-            "query result as XML (table_to_xml, query_to_xml, cursor_to_xml, "
-            "schema_to_xml, database_to_xml and their variants). Select the columns of the "
-            "exposed table directly."
+            "sql may not call a function that reads a relation or runs a query given as "
+            "text, or that changes the session (table_to_xml, query_to_xml, cursor_to_xml, "
+            "schema_to_xml, database_to_xml, ts_stat, ts_rewrite, connectby, crosstab, "
+            "dblink, pgstattuple, pg_stat_*, pgrowlocks, get_raw_page and the other "
+            "pageinspect functions, pg_cursor, pg_prepared_statement, set_config and their "
+            "variants), name the pg_cursors or pg_prepared_statements views, or write a name "
+            'or a string with Unicode escapes (U&"..."). Select the columns of the exposed '
+            "table directly."
         )
-    body = parts[1]
     validate_sql_expression_allowlist(body)
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
         raise QueryValidationError("limit must be an integer in [1, 1_000_000]")
     if not isinstance(table_reference, str) or not table_reference.strip():
         raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
+    # Row-level security first: a caller the policy does not name, or a filter that
+    # cannot be applied, is refused before the statement is looked at further.
+    row_predicate = row_filter_predicate(expose or {}, caller_attributes, dialect=dialect)
     # Column-mask enforcement — see the ``restricted_columns`` bullet
     # in the docstring above. Strip quoted string literals first so
     # ``WHERE label = 'email'`` doesn't false-positive when ``email``
@@ -1868,50 +2218,30 @@ def compile_free_form_sql(
                     f"rules as the sample / query tools — aliasing the "
                     f"column does not bypass them."
                 )
-    # Row-level security: FAIL CLOSED. RLS cannot be safely enforced on
-    # arbitrary caller SQL. The old wrapper —
-    #   SELECT * FROM (<caller_sql>) AS _fluid_rls WHERE <rowfilter> LIMIT n
-    # was bypassable two ways: (a) the caller controls the subquery's
-    # projection, so `SELECT 't1' AS tenant_id, secret FROM other` spoofs the
-    # filter column → cross-tenant read; (b) the inner SELECT trips every
-    # driver's guard_against_injection_markers body-keyword check, so it erred
-    # anyway. When the expose declares policy.rowFilters[], reject the
-    # free-form path outright and steer the caller to the semantic `query`
-    # tool, where the WHERE is merged into a compiler-controlled statement.
-    # (compile_row_filter_clauses still resolves ${caller.*} first, so a
-    # missing attribute fails closed via RowFilterIdentityMissing before we
-    # reach the rejection.)
-    rf_clauses, _rf_params = compile_row_filter_clauses(
-        expose or {}, caller_attributes or {}, offset=0
-    )
-    if rf_clauses:
-        raise QueryValidationError(
-            "Free-form query_sql is not permitted on an expose that declares "
-            "row filters (policy.rowFilters): row-level security cannot be "
-            "enforced on arbitrary SQL — use the semantic 'query' tool instead."
-        )
-    # Column restrictions are enforced by structure, not only by the name scan above:
-    # every read of the exposed table is rewritten to a projection of the allowed
-    # columns, so a spelling the scan cannot see (``COLUMNS('..')``, ``*``, ``t.*``,
-    # the whole row, a quoted name) has no restricted column to reach. Callers that
-    # pass no ``expose`` have no declared columns to project, so they are refused (the
-    # MCP ``query_sql`` handler always passes one).
+    # Column restrictions and row filters are enforced by structure, not only by the
+    # name scan above: every read of the exposed table is rewritten to a projection of
+    # the allowed columns, limited to the caller's rows, so a spelling the scan cannot
+    # see (``COLUMNS('..')``, ``*``, ``t.*``, the whole row, a quoted name) has no
+    # restricted column to reach, and no form of the statement (a subquery, a CTE, a
+    # set operation, a second reference) a filtered row. Callers that pass no
+    # ``expose`` have no declared columns to project, so they are refused when
+    # columns are restricted (the MCP ``query_sql`` handler always passes one).
     restricted = _clean_column_names(restricted_columns)
     if restricted and expose is None:
         raise QueryValidationError(
             "sql cannot be compiled on an expose that restricts columns without the expose "
             "itself: the columns it declares are what the statement is limited to."
         )
-    if restricted and expose is not None:
+    if expose is not None and (restricted or row_predicate is not None):
         candidate = _project_exposed_table(
             candidate,
             table_reference=table_reference,
             allowed=_allowed_names(_declared_column_names(expose), restricted),
             dialect=dialect,
+            predicate=row_predicate,
         )
-    # No row filters: append the server-side cap, but only when the caller
-    # didn't already supply a trailing ``LIMIT <n>`` (a second one is a syntax
-    # error on most engines).
+    # Append the server-side cap, but only when the caller didn't already supply a
+    # trailing ``LIMIT <n>`` (a second one is a syntax error on most engines).
     trailing = _TRAILING_LIMIT_RE.search(candidate)
     if trailing is not None:
         final_sql = candidate
@@ -1922,4 +2252,6 @@ def compile_free_form_sql(
     # ``row_cap`` lets the driver report ``truncated`` honestly on the
     # free-form path too: an arbitrary caller SELECT that comes back
     # holding exactly ``row_cap`` rows has almost certainly been clipped.
-    return CompiledQuery(sql=final_sql, params=[], columns=[], row_cap=row_cap)
+    return CompiledQuery(
+        sql=final_sql, params=[], columns=[], row_cap=row_cap, row_filter=row_predicate
+    )
