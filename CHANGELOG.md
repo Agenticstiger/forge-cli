@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each member goes through the same disclosure checks as every other statistic, and a table that
   cannot form one is named under Not measured. The document names format 1-3-0. A request or a
   private release writes no history.
+
+- **`fluid profile` counts children per entity through a relationship into a versioned table.**
+  A relationship whose `toColumns` are exactly the natural entity of a table that declares a
+  validity window is counted one parent per entity, not one per version: the parents are the
+  table's distinct non-null entity keys, and the children per parent, their structural classes
+  and the parents with no child are read per entity. A grouping of those counts by a parent
+  column, and a child column grouped through the link by a parent column, are formed only for a
+  column a `dependency` from the natural entity makes stable, because an entity's versions may
+  disagree on any other. Dates and exposure are not formed through such a relationship, and say
+  so. A relationship into a window by any other columns stays left out, with its reason, and
+  `--strict` refuses an ask of it before any record is read.
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
   active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
   histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed

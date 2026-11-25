@@ -1178,7 +1178,10 @@ def _is_childless(stage: DateStage, sides: _Sides) -> bool:
     ):
         return False
     children = Counter(key for key in sides.child_keys if None not in key)
-    return all(None not in key and children.get(key, 0) > 0 for key in sides.parent_keys)
+    parents = sides.parent_keys
+    if sides.relationship.entity:  # a row with no key names no entity, so it is no parent
+        parents = [key for key in parents if None not in key]
+    return all(None not in key and children.get(key, 0) > 0 for key in parents)
 
 
 def relationship_extras(
