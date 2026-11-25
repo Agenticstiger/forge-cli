@@ -76,5 +76,19 @@ exposes:
       location:
         path: ./out/orders.parquet
     contract:
-      schema: []
+      # The MCP output port reads only the columns an expose declares, so the
+      # landed columns of public.orders are declared here.
+      schema:
+        - name: id
+          type: bigint
+          required: true
+        - name: customer
+          type: string
+          required: true
+        - name: amount
+          type: decimal(12,2)
+          required: true
+        - name: placed_at
+          type: timestamp
+          required: true
       schemaPolicy: discover_and_freeze

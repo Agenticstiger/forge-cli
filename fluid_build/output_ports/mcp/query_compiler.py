@@ -446,16 +446,22 @@ def _allowed_columns(index: "_SemanticIndex", restricted: Iterable[str]) -> List
     return _allowed_names(list(index.columns), restricted)
 
 
-def _allowed_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
+def _kept_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
+    """``declared`` less ``restricted`` and repeats, compared without regard to case,
+    in order."""
     denied = {name.casefold() for name in restricted}
-    allowed: List[str] = []
+    kept: List[str] = []
     seen: Set[str] = set()
     for name in declared:
         folded = name.casefold()
-        if folded in denied or folded in seen:
-            continue
-        seen.add(folded)
-        allowed.append(name)
+        if folded not in denied and folded not in seen:
+            seen.add(folded)
+            kept.append(name)
+    return kept
+
+
+def _allowed_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
+    allowed = _kept_names(declared, restricted)
     if not allowed:
         raise QueryValidationError(
             "This expose restricts columns or filters rows, but contract.schema declares "
@@ -505,8 +511,9 @@ def strip_projection_open(sql_body: str) -> str:
     The remainder (table reference, row-filter predicate, alias, outer clauses) is
     still scanned in full: only the opening goes, so a ``SELECT`` anywhere else in the
     statement (a union branch, a scalar subquery over another column list) is still
-    refused. The shape removed is the one :func:`compile_semantic_query` and
-    :func:`compile_free_form_sql` render for an expose that restricts columns or rows.
+    refused. The shape removed is the one :func:`compile_semantic_query` renders
+    for an expose that restricts columns or rows, and :func:`compile_free_form_sql` for
+    every expose.
     """
     return _PROJECTION_OPEN_RE.sub("(", sql_body)
 
@@ -1702,12 +1709,121 @@ _FILE_LIKE_TABLE_RE = re.compile(r"[./\\*:]")
 _PROJECTION_CLAUSES = frozenset({"expressions", "from", "from_", "where"})
 
 
-def _declared_column_names(expose: Mapping[str, Any]) -> List[str]:
-    names: List[str] = []
-    for column in (expose.get("contract") or {}).get("schema") or []:
-        if isinstance(column, Mapping) and isinstance(column.get("name"), str):
-            names.append(validate_ident(column["name"]))
+def declared_columns(expose: Mapping[str, Any]) -> List[str]:
+    """The column names ``contract.schema`` declares on ``expose``, as written, in schema
+    order. ``sample`` and ``query_sql`` read only these, for every caller, so a column
+    added to the table later stays unreadable until the contract declares it. Raises
+    :class:`QueryValidationError` when the contract declares none."""
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    names = [
+        column["name"]
+        for column in (schema if isinstance(schema, list) else [])
+        if isinstance(column, Mapping) and isinstance(column.get("name"), str)
+    ]
+    if not names:
+        raise QueryValidationError(
+            "This expose declares no column in contract.schema, so sample and query_sql "
+            "have nothing they may read: they read only the columns the contract declares. "
+            "Declare the expose's columns in contract.schema."
+        )
     return names
+
+
+def declared_result_columns(
+    expose: Mapping[str, Any], columns: Iterable[Any], dialect: Optional[str]
+) -> List[str]:
+    """The columns of a ``SELECT *`` result that ``contract.schema`` declares, in the
+    result's order. For each declared name it is the column the engine reads for that
+    bare name (folded the way the engine folds an unquoted name); failing that, the one
+    column whose name matches without regard to case, so a quoted mixed-case column is
+    still read. A table can hold two columns whose names differ only in case (Postgres,
+    Snowflake): one that is not the declared name's column is never returned, and when
+    neither is, the read is refused."""
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    names = [str(column) for column in columns]
+    chosen: Set[str] = set()
+    for declared in declared_columns(expose):
+        candidates = [name for name in names if name.casefold() == declared.casefold()]
+        engine_name = _resolved_name(_identifier(declared), read) if read else declared
+        exact = [name for name in candidates if name == engine_name]
+        if exact or len(candidates) == 1:
+            chosen.add((exact or candidates)[0])
+        elif candidates:
+            raise QueryValidationError(
+                f"The table holds several columns named {declared!r} in different cases, and "
+                "none is the one the engine reads for that name; sample cannot tell which one "
+                "contract.schema declares. Expose the column through a view."
+            )
+    return [name for name in names if name in chosen]
+
+
+def _identifier(name: str) -> Any:
+    from sqlglot import exp
+
+    return exp.to_identifier(name, quoted=False)
+
+
+def unrestricted_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
+    """The columns ``contract.schema`` declares (:func:`declared_columns`), less
+    ``restricted``, in schema order. Raises :class:`QueryValidationError` when none is
+    left: ``sample`` would otherwise return empty rows, which still count the table's
+    rows, where ``query_sql`` has no column to project."""
+    kept = _kept_names(declared_columns(expose), restricted)
+    if not kept:
+        raise QueryValidationError(
+            "Every column this expose declares is restricted, so sample and query_sql have "
+            "no column they may read."
+        )
+    return kept
+
+
+def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
+    """The columns ``query_sql``'s projection selects on ``expose``:
+    :func:`unrestricted_columns`. A restricted column is never read, so only the others
+    must be plain identifiers: the projection selects each by its name. Fails closed when
+    a column it selects is not one, or when every declared column is restricted."""
+    readable: List[str] = []
+    for name in unrestricted_columns(expose, restricted):
+        try:
+            readable.append(validate_ident(name))
+        except ValueError:
+            raise QueryValidationError(
+                f"contract.schema declares the column {name!r}, which is not a plain "
+                "identifier (a letter or underscore, then letters, digits and underscores). "
+                "query_sql reads the exposed table through a projection that names each "
+                "declared column: rename the column, or expose it through a view."
+            ) from None
+    return readable
+
+
+def _engine_identifier(identifier: Any, read: Optional[str]) -> str:
+    """``identifier`` quoted, naming what the engine reads it as: an unquoted name is
+    folded first, the way :func:`_projected_name` folds a bare name, and a quoted name
+    is kept as written."""
+    if identifier.quoted:
+        written: str = identifier.sql(dialect=read)
+        return written
+    return _projected_name(identifier.name, read) if read is not None else identifier.name
+
+
+def _projected_name(name: str, read: Optional[str]) -> str:
+    """``name`` as a projection selects it on the sqlglot dialect ``read``: folded to
+    the case the engine gives an unquoted name, then quoted. It reads the column the
+    bare name reads, also when the engine reserves the word (``order``, or ``user``,
+    which Postgres reads as the current role). Bare when the engine is unknown."""
+    if read is None:
+        return name
+    from sqlglot import exp
+    from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
+
+    dialect = Dialect.get_or_raise(read)
+    if dialect.normalization_strategy is NormalizationStrategy.LOWERCASE:
+        name = name.lower()
+    elif dialect.normalization_strategy is NormalizationStrategy.UPPERCASE:
+        name = name.upper()
+    rendered: str = exp.to_identifier(name, quoted=True).sql(dialect=dialect)
+    return rendered
 
 
 def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
@@ -1729,8 +1845,7 @@ def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
         raise _unreadable_sql() from None
     if any(token.token_type == TokenType.TABLE for token in tokens):
         raise QueryValidationError(
-            "sql may not use the TABLE keyword on an expose that restricts columns or rows; "
-            "select from the exposed table by name."
+            "sql may not use the TABLE keyword; select from the exposed table by name."
         )
 
 
@@ -1766,8 +1881,7 @@ def _require_plain_sources(tree: Any) -> None:
         if not _is_plain_source(node.this, allow_lateral=isinstance(node, (exp.From, exp.Join))):
             raise QueryValidationError(
                 "sql may only read from tables named in the usual way, subqueries, UNNEST "
-                "and VALUES on an expose that restricts columns or rows; query the exposed "
-                "table directly."
+                "and VALUES; query the exposed table directly."
             )
 
 
@@ -1958,16 +2072,16 @@ def _refuse_unprojectable_reads(tree: Any, exposed_name: str, read: Optional[str
     for table in tables:
         if not isinstance(table.this, exp.Identifier) or _FILE_LIKE_TABLE_RE.search(table.name):
             raise QueryValidationError(
-                "sql may not read from a table function or a file path on an expose that "
-                "restricts columns or rows; query the exposed table directly."
+                "sql may not read from a table function or a file path; query the exposed "
+                "table directly."
             )
     # Any other relation is outside the projection: a catalog view such as Postgres's
     # ``pg_stats`` holds values of every row and column of the table.
     for name in _names_outside_ctes(tree, read):
         if name.casefold() != exposed_name:
             raise QueryValidationError(
-                f"sql reads {name!r}; on an expose that restricts columns or rows a "
-                "statement reads only the exposed table, its own CTEs, VALUES and UNNEST."
+                f"sql reads {name!r}; a statement reads only the exposed table, VALUES, "
+                "UNNEST and a CTE of its own (on DuckDB, written FROM-first)."
             )
     return tables
 
@@ -2051,6 +2165,8 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.StrPosition,
         exp.Initcap,
         exp.SplitPart,
+        exp.Split,
+        exp.StringToArray,
         exp.RegexpLike,
         exp.RegexpReplace,
         exp.RegexpExtract,
@@ -2191,6 +2307,22 @@ def _refuse_unlisted_functions(tree: Any, sql: str = "", read: Optional[str] = N
         raise QueryValidationError(_unlisted_function(operator.sql(dialect=read)[:80]))
 
 
+def _refuse_catalog_lookup_casts(tree: Any, read: Optional[str]) -> None:
+    """Refuse a Postgres cast to an object identifier type (``regclass``, ``regproc``,
+    ``regrole`` and the like): it looks a name up in the catalog, so it tells whether
+    another relation, function or role exists."""
+    from sqlglot import exp
+
+    if read != "postgres":
+        return
+    for cast in tree.find_all(exp.Cast, exp.TryCast):
+        if cast.to.sql(dialect=read).casefold().startswith("reg"):
+            raise QueryValidationError(
+                f"sql casts to {cast.to.sql(dialect=read)}, which looks a name up in the "
+                "catalog; query_sql reads only the exposed table."
+            )
+
+
 def _written_name(node: Any, sql: str) -> Optional[str]:
     """The text of ``node``'s name in ``sql`` (a function's name as the caller wrote it,
     quotes included), when the parser kept its position."""
@@ -2203,9 +2335,9 @@ def _written_name(node: Any, sql: str) -> Optional[str]:
 
 def _unlisted_function(name: str) -> str:
     return (
-        f"sql calls {name}, which a statement on an expose with row filters may not call: it "
-        "may use aggregates, window functions, and the common conditional, math, string, "
-        "date, conversion, JSON and array functions."
+        f"sql calls {name}, which query_sql may not call: a statement may use aggregates, "
+        "window functions, and the common conditional, math, string, date, conversion, JSON "
+        "and array functions."
     )
 
 
@@ -2264,6 +2396,9 @@ class ColumnType(NamedTuple):
     kind: str
     precision: Optional[int] = None
     scale: Optional[int] = None
+    #: An integer type or an integer literal. Integers meet each other by widening to
+    #: the larger integer type, never through a DECIMAL.
+    integral: bool = False
 
 
 _NULL = ColumnType("null")
@@ -2315,6 +2450,20 @@ _INTEGER_DIGITS = {
     "ubigint": 20,
     **dict.fromkeys(("hugeint", "int128", "uhugeint"), 39),
 }
+# Integer types that do not widen safely: DuckDB casts a UHUGEINT to the signed type
+# it meets, and its largest values do not fit any. It is compared as DECIMAL(39, 0).
+_NOT_WIDENING = frozenset({"uhugeint"})
+# The engines (sqlglot dialects) whose documentation types a numeric literal with an
+# exponent as a float. DuckDB: DOUBLE (checked with typeof). Trino, and Athena on its
+# engine: "Floating-point, fixed-precision numbers can be expressed as numeric literal
+# using scientific notation such as 1.03e1 and are cast as DOUBLE data type"
+# (trino.io/docs/current/language/types.html). BigQuery: "Numeric literals that contain
+# either a decimal point or an exponent marker are presumed to be type double"
+# (cloud.google.com/bigquery/docs/reference/standard-sql/lexical). Elsewhere such a
+# literal is an exact number of its digits.
+_FLOAT_EXPONENT_ENGINES = frozenset({"bigquery", "duckdb", "trino"})
+# The most digits an integer literal has to be an integer of a type every engine has.
+_MAX_INTEGER_LITERAL_DIGITS = 38
 _DECIMAL_WORDS = frozenset({"bigdecimal", "bignumeric", "dec", "decimal", "number", "numeric"})
 # DECIMAL with no precision, per engine. Postgres's ``numeric`` has none: it is unknown.
 _DECIMAL_DEFAULTS = {
@@ -2349,7 +2498,8 @@ def _type_of(
         return ColumnType("complex") if "[" in written else None
     word = match.group(1)
     if word in _INTEGER_DIGITS:
-        return ColumnType("number", 38 if read == "snowflake" else _INTEGER_DIGITS[word], 0)
+        digits = 38 if read == "snowflake" else _INTEGER_DIGITS[word]
+        return ColumnType("number", digits, 0, word not in _NOT_WIDENING)
     if word in _DECIMAL_WORDS:
         return _decimal_type(match, precision, scale, _decimal_default(word, read, defaults))
     if word in ("time", "timestamp"):
@@ -2707,9 +2857,10 @@ def _output_type(item: Any, source: Any, typing: _Typing, depth: int) -> Optiona
 
 
 def _literal_type(literal: Any, read: Optional[str]) -> Optional[ColumnType]:
-    """A string literal is a string. A numeric literal is DECIMAL(its digits, its
-    decimals); one in scientific notation is a float, except on Postgres (and when the
-    engine is not known), where it is an exact number of its digits."""
+    """A string literal is a string. An integer literal of up to 38 digits is an
+    integer, and any other numeric literal DECIMAL(its digits, its decimals). One in
+    scientific notation is a float on the engines whose documentation says so
+    (:data:`_FLOAT_EXPONENT_ENGINES`) and an exact number of its digits elsewhere."""
     if literal.is_string:
         return ColumnType("string")
     text = str(literal.this)
@@ -2719,13 +2870,17 @@ def _literal_type(literal: Any, read: Optional[str]) -> Optional[ColumnType]:
         return None
     if not value.is_finite():
         return None
-    if "e" in text.lower() and read not in (None, "postgres"):
+    scientific = "e" in text.lower()
+    if scientific and read in _FLOAT_EXPONENT_ENGINES:
         return ColumnType("float")
     _sign, digits, exponent = value.as_tuple()
     if not isinstance(exponent, int):
         return None
     if exponent >= 0:
-        return ColumnType("number", len(digits) + exponent, 0)
+        written_as_integer = not scientific and "." not in text
+        whole = len(digits) + exponent
+        integral = written_as_integer and whole <= _MAX_INTEGER_LITERAL_DIGITS
+        return ColumnType("number", whole, 0, integral)
     # At least one integer digit, as engines type ``0.5``: DECIMAL(2,1).
     places = -exponent
     return ColumnType("number", places + max(1, len(digits) - places), places)
@@ -2801,7 +2956,7 @@ def _exact_sum_type(left: ColumnType, right: ColumnType) -> ColumnType:
         return ColumnType("number")
     places = max(left.scale, right.scale)
     whole = max(left.precision - left.scale, right.precision - right.scale)
-    return ColumnType("number", whole + 1 + places, places)
+    return ColumnType("number", whole + 1 + places, places, left.integral and right.integral)
 
 
 def _value_type(side: Any, typing: _Typing, scope_of: Mapping[int, Any]) -> Optional[ColumnType]:
@@ -2897,9 +3052,11 @@ def _common_type(
     * every value has a known scalar type, and all have one kind (a date is compared
       with a date, a timestamp with a timestamp of the same time zone kind);
     * a float may meet any number;
-    * exact numbers need a known precision and scale, and the larger integer part plus
-      the larger scale must fit in 38 digits: an engine casts every value to that
-      DECIMAL, and a value that does not fit fails the cast, a withheld row's too."""
+    * integers (integer types and integer literals) meet each other at any size, by
+      widening;
+    * other exact numbers need a known precision and scale, and the larger integer
+      part plus the larger scale must fit in 38 digits: an engine casts every value to
+      that DECIMAL, and a value that does not fit fails the cast, a withheld row's too."""
     found: List[Tuple[Any, ColumnType]] = []
     for node, found_type in typed:
         if found_type is None or found_type.kind == "complex":
@@ -2931,9 +3088,13 @@ def _common_type(
 def _exact_common_type(
     found: List[Tuple[Any, ColumnType]], read: Optional[str], verb: str
 ) -> ColumnType:
-    """The DECIMAL exact numbers meet as; see :func:`_common_type`."""
+    """The DECIMAL exact numbers meet as; see :func:`_common_type`. Integers alone meet
+    as the widest of them: an engine widens an integer to the larger integer type,
+    which cannot fail."""
     if len(found) == 1:
         return found[0][1]
+    if all(found_type.integral for _, found_type in found):
+        return max((found_type for _, found_type in found), key=lambda t: t.precision or 0)
     sizes: List[Tuple[Any, int, int]] = []
     for node, found_type in found:
         if found_type.precision is None or found_type.scale is None:
@@ -3431,6 +3592,12 @@ def _refuse_another_schemas_table(
     for table in tables:
         if table.name.casefold() != exposed_name:
             continue
+        if _resolved_name(table.this, read) != _resolved_name(exposed.this, read):
+            raise QueryValidationError(
+                f"sql reads {table.sql(dialect=read)!r}, which the engine reads as another "
+                "table than the exposed one (it keeps the case of a quoted name); name the "
+                f"exposed table as {' or '.join(accepted)}."
+            )
         for part, value in expected.items():
             written = table.text(part)
             if written and written.casefold() != value.casefold():
@@ -3439,6 +3606,23 @@ def _refuse_another_schemas_table(
                     "schema or catalog than the exposed table's; name the exposed table as "
                     f"{' or '.join(accepted)}."
                 )
+
+
+def _resolved_name(identifier: Any, read: Optional[str]) -> str:
+    """The name an engine that folds unquoted names (Postgres, Snowflake) reads for
+    ``identifier``: a quoted name as written, an unquoted one folded. Elsewhere names
+    are compared without regard to case."""
+    from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
+
+    name: str = identifier.name
+    if read is None:
+        return name.casefold()
+    strategy = Dialect.get_or_raise(read).normalization_strategy
+    if strategy not in (NormalizationStrategy.LOWERCASE, NormalizationStrategy.UPPERCASE):
+        return name.casefold()
+    if identifier.quoted:
+        return name
+    return name.lower() if strategy is NormalizationStrategy.LOWERCASE else name.upper()
 
 
 def _accepted_spellings(name: str, db: str, catalog: str) -> List[str]:
@@ -3452,10 +3636,14 @@ def _accepted_spellings(name: str, db: str, catalog: str) -> List[str]:
     return spellings
 
 
-def _splice_projection(sql: str, tables: List[Any], exposed: Any, projection: str) -> str:
+def _splice_projection(
+    sql: str, tables: List[Any], exposed: Any, projection: str, read: Optional[str] = None
+) -> str:
     """``sql`` with ``projection`` written over the source span of every read of the
     exposed table, so everything else in the statement reaches the engine exactly as
-    written (sqlglot cannot print every engine function it can parse)."""
+    written (sqlglot cannot print every engine function it can parse). A read without
+    an alias gets the caller's name for the table as one, quoted, so a table named like
+    a reserved word (``public.order``) still reads."""
     exposed_name = exposed.name.casefold()
     splices: List[Tuple[int, int, str]] = []
     for table in tables:
@@ -3464,7 +3652,11 @@ def _splice_projection(sql: str, tables: List[Any], exposed: Any, projection: st
         spans = [part.meta for part in table.parts]
         if any("start" not in span or "end" not in span for span in spans):
             raise _unreadable_sql()
-        replacement = projection if table.args.get("alias") else f"{projection} AS {exposed.name}"
+        replacement = (
+            projection
+            if table.args.get("alias")
+            else f"{projection} AS {_engine_identifier(table.this, read)}"
+        )
         splices.append((min(m["start"] for m in spans), max(m["end"] for m in spans), replacement))
     rewritten = sql
     for begin, finish, replacement in sorted(splices, reverse=True):
@@ -3577,10 +3769,14 @@ def _project_exposed_table(
     tree = statements[0]
     _require_plain_sources(tree)
     exposed_name = exposed.name.casefold()
+    # Every caller: only listed functions. Some engine functions read past the
+    # projection, naming another relation or the server's state by an argument (a
+    # view's definition, the server's settings, an object's DDL).
+    _refuse_unlisted_functions(tree, sql, read)
+    _refuse_catalog_lookup_casts(tree, read)
     if predicate is not None:
-        # A filtered caller: only listed functions, and nothing a planner could run on a
-        # row the filter removes that would raise an error there.
-        _refuse_unlisted_functions(tree, sql, read)
+        # A filtered caller: nothing a planner could run on a row the filter removes
+        # that would raise an error there.
         _refuse_conditions_that_can_fail(tree, sql, column_types, exposed_name, read)
         _refuse_values_a_subquery_computes(tree, read)
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
@@ -3590,8 +3786,9 @@ def _project_exposed_table(
         if predicate is None
         else f" AS {ROW_FILTER_ALIAS} WHERE {predicate}{_postgres_fence(dialect)}"
     )
-    projection = f"(SELECT {', '.join(allowed)} FROM {table_reference}{row_filter})"
-    rewritten = _splice_projection(sql, tables, exposed, projection)
+    columns = ", ".join(_projected_name(name, read) for name in allowed)
+    projection = f"(SELECT {columns} FROM {table_reference}{row_filter})"
+    rewritten = _splice_projection(sql, tables, exposed, projection, read)
     try:
         checked = sqlglot.parse_one(rewritten, read=read)
     except SqlglotError:
@@ -3678,17 +3875,21 @@ def compile_free_form_sql(
       here. It fails closed: a caller no filter or reader names raises
       :class:`RowFilterIdentityMissing`, and a filter that cannot be applied (or
       the old ``policy.rowFilters`` key) :class:`RowFilterUnavailable`.
+    * **The expose is the boundary.** When ``expose`` is passed (the MCP ``query_sql``
+      handler always passes it), every read of the exposed table is rewritten to a
+      projection of the columns ``contract.schema`` declares (:func:`readable_columns`),
+      for every caller: a reader no filter narrows reads every row of that projection,
+      and a filtered caller the rows above. The statement reads nothing else: only the
+      exposed table, ``VALUES``, ``UNNEST`` and a CTE of its own (on DuckDB, written
+      FROM-first), so no other table, view,
+      catalog view, table function or file. It may not use the ``TABLE`` keyword, and
+      on DuckDB the engine's own parser checks the rewritten statement too, the row
+      filter included. Without an ``expose`` only the checks above apply.
     * **Column restrictions.** When ``restricted_columns`` is non-empty, ``expose``
       is required (it declares the columns to project; without it the call is
-      refused). Every read of the exposed table is then rewritten to a projection
-      of the allowed columns, filtered as above when a row filter applies. The
-      statement may not use the ``TABLE`` keyword, and every source in it must be a
-      plain table, a subquery, ``UNNEST`` or ``VALUES``; on DuckDB the engine's own
-      parser checks the rewritten statement too, the row filter included.
-    * ``FROM`` references are NOT rewritten otherwise — the caller must
-      reference the bound table by its fully-qualified name from the contract.
-      Phase-2 may add an AST-level rewrite so consumers can reference the expose
-      by exposeId rather than the underlying binding.
+      refused), and the restricted columns are left out of the projection.
+    * The caller names the exposed table as the binding names it: bare, or with the
+      binding's schema and catalog.
     """
     if not isinstance(sql, str):
         raise QueryValidationError("sql must be a string")
@@ -3752,14 +3953,16 @@ def compile_free_form_sql(
                     f"rules as the sample / query tools — aliasing the "
                     f"column does not bypass them."
                 )
-    # Column restrictions and row filters are enforced by structure, not only by the
-    # name scan above: every read of the exposed table is rewritten to a projection of
-    # the allowed columns, limited to the caller's rows, so a spelling the scan cannot
-    # see (``COLUMNS('..')``, ``*``, ``t.*``, the whole row, a quoted name) has no
-    # restricted column to reach, and no form of the statement (a subquery, a CTE, a
-    # set operation, a second reference) a filtered row. Callers that pass no
-    # ``expose`` have no declared columns to project, so they are refused when
-    # columns are restricted (the MCP ``query_sql`` handler always passes one).
+    # The expose is enforced by structure, not only by the name scan above: every read
+    # of the exposed table is rewritten to a projection of the declared columns, less
+    # the restricted ones, limited to the caller's rows when a row filter applies. A
+    # column the contract does not declare or restricts is then in no relation the
+    # statement can see, whatever its spelling (``COLUMNS('..')``, ``*``, ``t.*``, the
+    # whole row, a quoted name), no form of the statement (a subquery, a CTE, a set
+    # operation, a second reference) reaches a filtered row, and the statement reads no
+    # other relation. Callers that pass no ``expose`` have no declared columns to
+    # project, so they are refused when columns are restricted (the MCP ``query_sql``
+    # handler always passes one).
     restricted = _clean_column_names(restricted_columns)
     if restricted and expose is None:
         raise QueryValidationError(
@@ -3771,11 +3974,11 @@ def compile_free_form_sql(
         if expose is None or row_predicate is None
         else _column_types(expose, dialect, physical_types)
     )
-    if expose is not None and (restricted or row_predicate is not None):
+    if expose is not None:
         candidate = _project_exposed_table(
             candidate,
             table_reference=table_reference,
-            allowed=_allowed_names(_declared_column_names(expose), restricted),
+            allowed=readable_columns(expose, restricted),
             dialect=dialect,
             predicate=row_predicate,
             catalog=duckdb_catalog(expose),

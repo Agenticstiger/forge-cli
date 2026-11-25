@@ -50,9 +50,11 @@ from ..query_compiler import (
     ColumnType,
     catalog_columns_sql,
     column_type,
+    declared_result_columns,
     row_filter_predicate,
     select_body,
     strip_projection_open,
+    unrestricted_columns,
 )
 from ..query_compiler import (
     RowFilterIdentityMissing as RowFilterIdentityMissing,
@@ -417,8 +419,17 @@ class EngineDriver(ABC):
         limit: int,
         caller_attributes: Optional[Mapping[str, Any]] = None,
     ) -> SampleResult:
-        """Default ``sample`` implementation — ``SELECT * FROM <table>
-        [AS _fluid_rows WHERE <row filter>] LIMIT n``.
+        """Default ``sample`` implementation: ``SELECT * FROM <table>
+        [AS _fluid_rows WHERE <row filter>] LIMIT n``, keeping only the columns
+        ``contract.schema`` declares (:func:`...query_compiler.declared_columns`).
+
+        A column the contract does not declare is dropped before the rows leave the
+        driver, so a column added to the table later stays unreadable until the
+        contract declares it. Each declared name keeps the column the engine reads for
+        it (:func:`...query_compiler.declared_result_columns`), so a column whose name
+        differs from a declared one only in case is not returned with it. Restricted
+        columns are then left out and PII columns masked (:meth:`project`). An expose
+        that declares no column, or only restricted ones, is refused.
 
         ``caller_attributes`` is the request's verified identity. When the
         contract declares ``policy.authz.rowFilters``,
@@ -436,13 +447,18 @@ class EngineDriver(ABC):
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
         predicate = row_filter_predicate(self.expose, caller_attributes, dialect=descriptor.dialect)
+        # Refuses an expose that declares no column, or only restricted ones: empty rows
+        # would still count the table's rows.
+        unrestricted_columns(self.expose, self._restricted_columns)
         source = descriptor.table_reference
         if predicate is not None:
             # The predicate is the contract's own literal SQL, its columns qualified
             # with ROW_FILTER_ALIAS; it binds no parameter.
             source = f"{source} AS {ROW_FILTER_ALIAS} WHERE {predicate}"
         result = self.execute(sql=f"SELECT * FROM {source} LIMIT {limit}", params=())
-        visible_columns, rows = self.project(result.rows, columns=result.columns)
+        kept = declared_result_columns(self.expose, result.columns, descriptor.dialect)
+        declared_rows = [{column: row[column] for column in kept} for row in result.rows]
+        visible_columns, rows = self.project(declared_rows, columns=kept)
         truncated = len(rows) >= limit
         return SampleResult(columns=visible_columns, rows=rows, truncated=truncated)
 

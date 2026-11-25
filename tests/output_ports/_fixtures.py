@@ -120,6 +120,19 @@ def write_customer_csv(path: Path) -> Path:
     return path
 
 
+def csv_session_factory(
+    directory: Path, header: Any, rows: Any, *, table: str = "customers"
+) -> Any:
+    """Write ``header`` and ``rows`` as ``<directory>/<table>.csv`` and return
+    ``expose -> SessionState`` stand-in over a DuckDB driver reading it as ``table``."""
+    path = directory / f"{table}.csv"
+    path.write_text(
+        ",".join(header) + "\n" + "".join(",".join(map(str, row)) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return lambda expose: duckdb_csv_session(path, expose, table=table)
+
+
 def duckdb_csv_session(
     csv_path: Path, expose: Dict[str, Any], *, table: str, file_format: str = "csv"
 ) -> Any:

@@ -212,6 +212,8 @@ class TestDuckdbDriverLiteral:
         from tests.output_ports._fixtures import make_expose
 
         expose = make_expose(
+            # sample reads the declared columns, so declare the CSV's own.
+            columns=[{"name": "id", "type": "INTEGER"}, {"name": "name", "type": "STRING"}],
             binding={
                 "platform": "local",
                 "format": "csv",

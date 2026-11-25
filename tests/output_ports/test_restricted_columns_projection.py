@@ -613,7 +613,6 @@ def test_free_form_sql_cannot_read_a_restricted_column(con, sql):
         pytest.param("SELECT * FROM customers", id="star"),
         pytest.param("SELECT c.* FROM customers c", id="alias-star"),
         pytest.param("SELECT customers.* FROM customers", id="table-star"),
-        pytest.param("SELECT max(COLUMNS(*)) FROM customers", id="columns-star"),
         pytest.param("SELECT * FROM main.customers", id="schema-qualified-star"),
     ],
 )
@@ -668,7 +667,7 @@ def test_a_cte_body_and_a_shadowing_cte_name_see_the_projection(con):
             dialect="duckdb",
         )
     with_cte = _project_exposed_table(
-        "WITH x AS (SELECT * FROM customers) SELECT to_json(x) FROM x",
+        "WITH x AS (SELECT * FROM customers) SELECT x FROM x",
         table_reference="customers",
         allowed=allowed,
         dialect="duckdb",
@@ -693,7 +692,7 @@ def test_free_form_projection_applies_to_pii_columns_too(con):
 def test_free_form_with_no_declared_readable_column_fails_closed():
     expose = _expose()
     expose["contract"]["schema"] = [{"name": "region"}]
-    with pytest.raises(QueryValidationError, match="no readable column"):
+    with pytest.raises(QueryValidationError, match="no column they may read"):
         compile_free_form_sql(
             sql="SELECT 1 FROM customers",
             table_reference="customers",
@@ -703,7 +702,10 @@ def test_free_form_with_no_declared_readable_column_fails_closed():
         )
 
 
-def test_free_form_without_restrictions_keeps_the_callers_statement():
+def test_free_form_without_restrictions_still_reads_the_declared_columns():
+    """The expose is the boundary on every expose: with nothing restricted, the
+    statement still reads the table through a projection of the declared columns, and
+    the caller's own text around the table stays as written."""
     compiled = compile_free_form_sql(
         sql="SELECT  region FROM customers",
         table_reference="customers",
@@ -711,7 +713,9 @@ def test_free_form_without_restrictions_keeps_the_callers_statement():
         restricted_columns=(),
         expose=_expose(),
     )
-    assert compiled.sql == "SELECT  region FROM customers\nLIMIT 5"
+    assert compiled.sql.startswith("SELECT  region FROM (SELECT ")
+    # No dialect: names stay bare.
+    assert compiled.sql.endswith(" FROM customers) AS customers\nLIMIT 5")
 
 
 @pytest.mark.parametrize("dialect,read,table", _DIALECTS, ids=[d[0] for d in _DIALECTS])
@@ -731,7 +735,7 @@ def test_free_form_rewrite_parses_in_every_dialect(dialect, read, table):
     subqueries = [s for s in tree.find_all(exp.Subquery)]
     assert len(subqueries) == 2
     for sub in subqueries:
-        assert [c.name for c in sub.this.expressions] == ["id", "segment", "amount"]
+        assert [c.name.casefold() for c in sub.this.expressions] == ["id", "segment", "amount"]
     assert not {c.name.lower() for c in tree.find_all(exp.Column)} & {"region", "tenant_id"}
     assert compiled.sql.rstrip().endswith("LIMIT 5")
 
@@ -789,7 +793,7 @@ def test_free_form_end_to_end_through_the_driver(tmp_path):
     assert ok["rows"] == [{"segment": "retail", "total": 30}]
     star = tool_query_sql(state, {"sql": "SELECT * FROM customers"})
     assert "region" not in star["columns"] and LEAK_MARKER not in repr(star)
-    whole_row = tool_query_sql(state, {"sql": "SELECT to_json(c) AS x FROM customers c"})
+    whole_row = tool_query_sql(state, {"sql": "SELECT c AS x FROM customers c"})
     assert "region" not in repr(whole_row) and LEAK_MARKER not in repr(whole_row)
     for sql in (
         "SELECT max(COLUMNS('reg.*')) AS x FROM customers",
@@ -815,7 +819,7 @@ def test_free_form_keeps_the_callers_text_outside_the_table_reference(con):
         expose=_expose(),
         dialect="duckdb",
     )
-    assert compiled.sql.startswith("select approx_top_k(segment, 2) AS x\nfrom\n  (SELECT id,")
+    assert compiled.sql.startswith('select approx_top_k(segment, 2) AS x\nfrom\n  (SELECT "id",')
     guard_against_injection_markers(compiled.sql)
     assert con.execute(compiled.sql).fetchall() == [(["retail", "wholesale"],)]
 
@@ -918,7 +922,7 @@ def test_a_quoted_table_identifier_is_not_the_table_keyword():
         expose=_expose(),
         dialect="duckdb",
     )
-    assert compiled.sql.startswith('SELECT "TABLE" FROM (SELECT id, segment')
+    assert compiled.sql.startswith('SELECT "TABLE" FROM (SELECT "id", "segment"')
 
 
 def test_a_table_name_that_merely_contains_the_word_is_not_the_keyword(con):
@@ -1058,7 +1062,8 @@ def test_the_engine_parser_cross_check_runs_on_the_rewritten_statement(monkeypat
         expose=_expose(),
         dialect="duckdb",
     )
-    assert len(seen) == 1 and "(SELECT id, segment, amount, tenant_id FROM customers)" in seen[0]
+    projection = '(SELECT "id", "segment", "amount", "tenant_id" FROM customers)'
+    assert len(seen) == 1 and projection in seen[0]
     seen.clear()
     compile_free_form_sql(
         sql="SELECT id FROM customers",

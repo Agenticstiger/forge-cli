@@ -59,6 +59,11 @@ _PROJECTION = (
     "(SELECT id, tenant_id, region, secret FROM db.t AS _fluid_rows "
     "WHERE ((_fluid_rows.tenant_id = 'acme')))"
 )
+# query_sql on a known engine selects each declared column folded and quoted.
+_QUOTED_PROJECTION = (
+    '(SELECT "id", "tenant_id", "region", "secret" FROM db.t AS _fluid_rows '
+    "WHERE ((_fluid_rows.tenant_id = 'acme')))"
+)
 
 
 def _semantic(expose: Dict[str, Any] = TENANT_EXPOSE, attrs: Any = AS_ACME, **kwargs: Any):
@@ -191,7 +196,8 @@ class TestHandlerWiring:
         driver = _CapturingDriver()
         payload = tool(_fake_state(TENANT_EXPOSE, AS_ACME, driver), arguments)
         assert driver.captured is not None
-        assert _PROJECTION in driver.captured.sql
+        projection = _QUOTED_PROJECTION if tool is tool_query_sql else _PROJECTION
+        assert projection in driver.captured.sql
         # The caller is shown the statement with its predicate, policy, left out.
         assert "'acme'" not in payload["compiled"]["sql"]
         assert "(<row filter>)" in payload["compiled"]["sql"]
