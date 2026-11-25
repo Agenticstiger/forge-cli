@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`fluid profile` answers a profile request's consumer queries with their rates.** A query that
   keeps some of its unit's records and changes none (a `SELECT` of columns from its unit, a table
-  or a view's rows, with at most one `WHERE`) gets a `queries` entry: one level histogram over
+  or a view that itself only keeps some rows of one table, with at most one `WHERE`) gets a `queries` entry: one level histogram over
   `false` and `true`, where `k` is the records of the unit and the `true` count the rows the query
   returns, per level of its `groupBy` column when it has one (format 1-3-0). The text is checked
   and then run only as a tree built again and checked again, in the locked process; the count of
@@ -29,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before any record is read, so `--strict` refuses the rest, and each query not answered is named
   under Not measured with its reason. The queries of one unit are checked as a set, together with
   the facts of the same table, so two queries that differ by a few records give none back; a
-  private release publishes no query rate. The report adds `Queries: N of M published whole`.
+  private release publishes no query rate. A view unit counts its table's records and its
+  condition is one more factor of that table's set check; a view that joins, aggregates or
+  reshapes rows is named before any read. The report adds `Queries: N of M published whole`.
 
 
 - **`fluid profile` can check a consumer query and run it in a locked process.** A query a profile

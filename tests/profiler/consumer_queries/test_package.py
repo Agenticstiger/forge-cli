@@ -45,9 +45,8 @@ def test_the_two_parts_are_listed() -> None:
 
 
 def test_a_new_module_of_the_package_has_the_attribution_line() -> None:
-    from pathlib import Path
-
     import ast
+    from pathlib import Path
 
     root = Path(package.__file__).parent
     for name in ("_allow", "_bounds", "_order", "check", "_child", "runner"):

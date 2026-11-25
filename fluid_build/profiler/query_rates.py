@@ -7,7 +7,10 @@ A request query ``{name, sql, unit, groupBy}`` (PROFILE-REQUEST-SPEC section 6) 
 a ``queries`` entry of the same name (PROFILE-SPEC section 5): one ``levelHistogram/1`` over
 ``["false", "true"]``, where ``k`` is the number of records of the unit and the ``true`` count the
 number of rows the query returns, per level of the ``groupBy`` column when it has one. The
-unit is a table of the request (its rows) or a view (the rows of the unit's SQL).
+unit is a table of the request (its rows) or a view that keeps some of one table's rows
+(``SELECT <columns> FROM <table> [WHERE <condition>]``): the records counted are then the table's,
+and the view's condition is one more factor of that table's set check. Any other view (a join,
+an aggregate, a reshaping) is named before any read.
 
 **What is answered is decided before any record is read** (:func:`plan_queries`), so that
 ``--strict`` refuses the rest. A query is answered when
@@ -18,8 +21,8 @@ unit is a table of the request (its rows) or a view (the rows of the unit's SQL)
    holds only columns, from exactly the unit relation (the table; for a view, the one ``WITH``
    entry whose body is the unit's SQL), with at most one ``WHERE``, and nothing else (no join,
    ``DISTINCT``, ``GROUP BY``, ``HAVING``, ``QUALIFY``, ``ORDER BY``, ``LIMIT``, ``OFFSET``,
-   window, aggregate, set operation or subquery in the ``WHERE``). The unit's view itself may
-   be any query the checker accepts, aggregating and joining ones included;
+   window, aggregate, set operation or subquery in the ``WHERE``). A view unit must itself be
+   such a filter of one request table (:data:`NOT_A_FILTER_VIEW`);
 3. its ``groupBy``, when it has one, names a column of a table unit's records that the query
    also returns under its own name and whose type declares its levels (an ``enum(...)`` or a
    boolean): the groups are those levels, whatever the records hold;
@@ -46,8 +49,8 @@ nothing is published for it.
 **Measuring.** The columns the queries and their units read are read even when the request does
 not list them, for the queries only. A *population* is the records a unit counts: the rows of a
 table (one statement per query returns one bit per row, in the order the rows were read, so each
-row's state lines up with the facts' states of the same table), or the rows of one view (one
-statement returns the count of every combination of the queries' outcomes).
+row's state lines up with the facts' states of the same table), or the rows a view unit keeps, which are the same table's rows, so the unit's
+condition is read as one more state of each row.
 
 **Disclosure, as a set.** A query's two cells (``false = k - true`` and ``true``) pass the cell
 checks as a fact's do, and either cell withheld withholds the group. The queries of one
@@ -104,6 +107,7 @@ __all__ = [
     "MOST_QUERIES",
     "MOST_SET_PARTS",
     "MOST_TEXT_TOKENS",
+    "NOT_A_FILTER_VIEW",
     "NOT_A_LEVEL",
     "NOT_LOADED",
     "OUT_OF_MEMORY",
@@ -158,6 +162,10 @@ RECORD_REASONS = frozenset(
     }
 )
 
+NOT_A_FILTER_VIEW = (
+    "a unit that aggregates, joins or reshapes rows is not one fluid profile can check with "
+    "its table: name the table, or a view that keeps some of one table's rows"
+)
 _KEPT = "fluid profile answers a query that keeps some of its unit's records: "
 _LEVELS = ["false", "true"]
 #: A record's outcome under a query: the query does not return it, or returns it.
@@ -217,7 +225,9 @@ class QueryPlan:
     name: str
     reason: Optional[str] = None
     table: Optional[str] = None
-    #: The canonical text of the unit's view, for a unit given as SQL.
+    #: The canonical text of the unit's view, for a unit given as SQL. The view keeps some of
+    #: ``table``'s rows: the records counted are the table's, the view's condition one more
+    #: factor of the table's set check.
     view: Optional[str] = None
     #: The canonical text of the query (run only inside the count that checks the rows).
     text: str = field(default="", repr=False)
@@ -225,12 +235,19 @@ class QueryPlan:
     levels: Tuple[str, ...] = ()
     #: The ``(exposeId, column)`` pairs the query and its unit read.
     reads: Tuple[Tuple[str, str], ...] = ()
-    #: The checked ``WHERE`` condition, qualifiers still the query's own (``None``: no condition).
+    #: The checked ``WHERE`` condition over the table's columns, a view unit's condition and the
+    #: query's together (``None``: no condition).
     where: Any = field(default=None, compare=False, repr=False)
+    #: A view unit's own condition over the table's columns (``None``: it keeps every row).
+    unit_where: Any = field(default=None, compare=False, repr=False)
     alias: str = ""
     #: The statements built from the checked tree, as the checker wrote them again.
     bits_sql: str = field(default="", repr=False)
     verify_sql: str = field(default="", repr=False)
+    #: A view unit: the statement that reads which rows its condition keeps, and the one that
+    #: counts the rows of its checked text.
+    unit_bits_sql: str = field(default="", repr=False)
+    unit_verify_sql: str = field(default="", repr=False)
 
     @property
     def unit(self) -> Tuple[str, str]:
@@ -290,7 +307,6 @@ def plan_queries(
     rows = {table: _row_column(columns) for table, columns in schema.items()}
     planner = _Planner(schema, rows, enum_levels)
     plans = tuple(planner.plan(index, each) for index, each in enumerate(request.queries))
-    plans = _statements_of_views(plans, schema)
     return QueryPlans(plans, schema, rows)
 
 
@@ -356,6 +372,7 @@ class _Planner:
         self._per_unit: Dict[Tuple[str, str], int] = {}
         self._parts: Dict[str, int] = {}
         self._grouped: Dict[Tuple[str, str], int] = {}
+        self._unit_parts: Set[Tuple[str, str]] = set()
 
     # -- one query ---------------------------------------------------------------------------
 
@@ -370,11 +387,17 @@ class _Planner:
         if isinstance(checked, Refused):
             return blank.refused(f"the check refuses the query: {checked.reason}")
         view: Optional[Checked] = None
+        table = query.table
+        unit_where: Any = None
         if query.unit_sql is not None:
             found = self._view(query.unit_sql)
             if isinstance(found, Refused):
                 return blank.refused(f"the check refuses the unit's view: {found.reason}")
             view = found
+            kept = _filter_view(view, self._schema)
+            if kept is None:
+                return blank.refused(NOT_A_FILTER_VIEW)
+            table, unit_where, names = kept
         elif query.table not in self._schema:
             return blank.refused("its unit's table is not one the request lists")
         try:
@@ -383,7 +406,15 @@ class _Planner:
             )
         except _NotKept as found_not_kept:
             return blank.refused(_KEPT + str(found_not_kept))
-        reads = tuple(sorted(set(checked.columns)))
+        if view is not None:
+            where = _folded(unit_where, where, names)
+            if where is False:
+                return blank.refused(_KEPT + "it reads a column its unit's view does not return")
+            # the statements that count the view's rows and the query's rows read what they name
+            reads = _reads_of(where, table or "", self._schema, (*checked.columns, *view.columns))
+            alias = table or ""
+        else:
+            reads = tuple(sorted(set(checked.columns)))
         levels: Tuple[str, ...] = ()
         if query.group_by is not None:
             grouped = self._group(query, checked, query.table or "")
@@ -396,13 +427,14 @@ class _Planner:
         plan = QueryPlan(
             index,
             query.name,
-            table=query.table,
+            table=table,
             view=None if view is None else view.text,
             text=checked.text,
             group_by=query.group_by,
             levels=levels,
             reads=reads,
             where=where,
+            unit_where=unit_where,
             alias=alias,
         )
         why = self._room(plan)
@@ -487,6 +519,9 @@ class _Planner:
             return f"past the {MOST_PER_UNIT} queries over one unit that fluid profile answers"
         table = plan.table
         parts = 1
+        unit_part = (table or "", plan.view or "")
+        if plan.view is not None and unit_part not in self._unit_parts:
+            parts += 1  # the view's own condition is one more factor of the table's set
         if plan.group_by is not None and table is not None:
             column = (table, plan.group_by)
             if self._grouped.get(column, 0) >= MOST_GROUPED_PER_COLUMN:
@@ -498,6 +533,8 @@ class _Planner:
         if table is not None and self._parts.get(table, 0) + parts > MOST_SET_PARTS:
             return f"past the {MOST_SET_PARTS} parts one table's set check holds"
         self._per_unit[unit] = self._per_unit.get(unit, 0) + 1
+        if plan.view is not None:
+            self._unit_parts.add(unit_part)
         if table is not None:
             self._parts[table] = self._parts.get(table, 0) + parts
             if plan.group_by is not None:
@@ -514,18 +551,43 @@ class _Planner:
                 f"the statement that counts its rows is refused when checked again: {verify.reason}"
             )
         found: Dict[str, Any] = {"verify_sql": verify.text}
-        if plan.table is not None:
-            row = self._rows[plan.table]
-            tables = {**self._schema, plan.table: _with_row(self._schema[plan.table], row)}
-            condition = _condition(plan.where, plan.alias, plan.table)
-            bits = _checked_statement(
-                f"SELECT COALESCE(({condition}), FALSE) FROM {_ident(plan.table)} AS "
-                f"{_ident(plan.table)} ORDER BY {_ident(plan.table)}.{_ident(row)}",
+        table = str(plan.table)
+        row = self._rows[table]
+        tables = {**self._schema, table: _with_row(self._schema[table], row)}
+
+        def outcomes(where: Any) -> Union[str, Checked]:
+            condition = _condition(where, plan.alias, table)
+            built = _checked_statement(
+                f"SELECT COALESCE(({condition}), FALSE) FROM {_ident(table)} AS "
+                f"{_ident(table)} ORDER BY {_ident(table)}.{_ident(row)}",
                 tables,
             )
-            if isinstance(bits, Refused):
-                return f"the statement that reads its outcomes is refused when checked again: {bits.reason}"
-            found["bits_sql"] = bits.text
+            if isinstance(built, Refused):
+                return (
+                    "the statement that reads its outcomes is refused when checked again: "
+                    + built.reason
+                )
+            return built
+
+        bits = outcomes(plan.where)
+        if isinstance(bits, str):
+            return bits
+        found["bits_sql"] = bits.text
+        if plan.view is not None:
+            counted = _checked_statement(
+                f"SELECT count(*) FROM ({plan.view}) AS {_ident('q')}", self._schema
+            )
+            if isinstance(counted, Refused):
+                return (
+                    "the statement that counts its unit's rows is refused when checked again: "
+                    + counted.reason
+                )
+            found["unit_verify_sql"] = counted.text
+            if plan.unit_where is not None:
+                unit_bits = outcomes(plan.unit_where)
+                if isinstance(unit_bits, str):
+                    return unit_bits
+                found["unit_bits_sql"] = unit_bits.text
         return found
 
 
@@ -556,46 +618,81 @@ def _condition(where: Any, alias: str, qualifier: str) -> str:
     return str(rebuilt.sql(dialect="duckdb", comments=False))
 
 
-def _statements_of_views(
-    plans: Sequence[QueryPlan], schema: Mapping[str, Table]
-) -> Tuple[QueryPlan, ...]:
-    """Check, for each view, the one statement that counts its rows by their outcomes."""
-    refused: Dict[int, str] = {}
-    for view, members in _by_view(plans).items():
-        built = view_statement(view, members, schema)
-        if isinstance(built, str):
-            refused.update({each.index: built for each in members})
-    return tuple(
-        each.refused(refused[each.index]) if each.index in refused else each for each in plans
-    )
+def _filter_view(
+    view: Checked, schema: Mapping[str, Table]
+) -> Optional[Tuple[str, Any, Dict[str, str]]]:
+    """A view that keeps some rows of one request table, as ``(table, condition, names)``.
 
-
-def _by_view(plans: Sequence[QueryPlan]) -> Dict[str, List[QueryPlan]]:
-    found: Dict[str, List[QueryPlan]] = {}
-    for each in plans:
-        if each.reason is None and each.view is not None:
-            found.setdefault(each.view, []).append(each)
-    return found
-
-
-def view_statement(
-    view: str, members: Sequence[QueryPlan], schema: Mapping[str, Table]
-) -> Union[str, Checked]:
-    """The statement that counts a view's rows under every combination of *members*' outcomes.
-
-    One ``GROUP BY`` over each query's condition (as a boolean, a missing one is true), built from
-    the checked trees and checked again. Returns the checked statement or why it is refused.
+    The view is ``SELECT <columns> FROM <table> [WHERE <condition>]`` and nothing else
+    (:func:`_kept`'s shape, over a table). *names* maps each column name the view returns to the
+    table's column it is. ``None`` for any other view: one that joins, aggregates or reshapes
+    rows, which is not a filter of its table.
     """
-    flags = ", ".join(
-        f"COALESCE(({_condition(each.where, each.alias, 'u')}), FALSE)" for each in members
-    )
-    keys = ", ".join(str(position) for position in range(1, len(members) + 1))
-    built = _checked_statement(
-        f"SELECT {flags}, count(*) FROM ({view}) AS {_ident('u')} GROUP BY {keys}", schema
-    )
-    if isinstance(built, Refused):
-        return f"the statement that counts the unit's view is refused when checked again: {built.reason}"
-    return built
+    from sqlglot import exp
+
+    tree = view.tree
+    from_ = tree.args.get("from_") if isinstance(tree, exp.Select) else None
+    source = from_.this if isinstance(from_, exp.From) else None
+    if not isinstance(source, exp.Table) or str(source.name) not in schema:
+        return None
+    table = str(source.name)
+    try:
+        condition, _ = _kept(view, table=table, view=None)
+    except _NotKept:
+        return None
+    names: Dict[str, str] = {}
+    for item in tree.args.get("expressions") or []:
+        column = item.this if isinstance(item, exp.Alias) else item
+        if not isinstance(column, exp.Column):
+            return None
+        written = str(item.alias) if isinstance(item, exp.Alias) else str(column.name)
+        if written in names:
+            return None
+        names[written] = str(column.name)
+    return table, condition, names
+
+
+def _folded(unit_where: Any, where: Any, names: Mapping[str, str]) -> Any:
+    """A view unit's condition and a query's over it, as one condition over the table.
+
+    The query reads the view's columns, each rewritten to the table column it is. ``False`` when
+    the query reads a column the view does not return; ``None`` when neither has a condition.
+    """
+    from sqlglot import exp
+
+    parts: List[Any] = []
+    if unit_where is not None:
+        parts.append(exp.Paren(this=unit_where.copy()))
+    if where is not None:
+        rewritten = where.copy()
+        for column in list(rewritten.find_all(exp.Column)):
+            base = names.get(str(column.name))
+            if base is None:
+                return False
+            column.set("this", exp.to_identifier(base, quoted=True))
+        parts.append(exp.Paren(this=rewritten))
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else exp.And(this=parts[0], expression=parts[1])
+
+
+def _reads_of(
+    where: Any,
+    table: str,
+    schema: Mapping[str, Table],
+    named: Sequence[Tuple[str, str]],
+) -> Tuple[Tuple[str, str], ...]:
+    """The columns of *table* a view unit's statements read: the condition's and those *named*.
+
+    One column of it when they read none, so the table is always read.
+    """
+    from sqlglot import exp
+
+    found = {str(each.name) for each in where.find_all(exp.Column)} if where is not None else set()
+    found |= {column for name, column in named if name == table}
+    if not found:
+        found = set(schema[table].column_names[:1])
+    return tuple((table, name) for name in sorted(found))
 
 
 # -- the shape of a query that keeps some of its unit's records ---------------------------------
@@ -856,9 +953,16 @@ class _Member:
     """One answered query over a table: each record's outcome, and its groups."""
 
     plan: QueryPlan
+    #: The table's rows.
     n: int
+    #: Each row's outcome under the query (a view unit's condition and the query's together).
     outcomes: bytes
     true: int
+    #: The records the query's unit counts: the table's rows, or the rows a view unit keeps.
+    size: int = 0
+    #: Each row's outcome under a view unit's own condition (``None``: a table, or a view that
+    #: keeps every row).
+    unit: Optional[bytes] = None
     #: The level index of each record's grouping value (``None``: no group), grouped queries only.
     assigned: Optional[List[Optional[int]]] = None
     #: ``(records, records the query returns)`` of each level, grouped queries only.
@@ -873,14 +977,6 @@ class _Own:
     verdicts: List[Optional[disclosure.Verdict]]
 
 
-@dataclass
-class _ViewPopulation:
-    members: List[QueryPlan]
-    cells: Dict[Combination, int]
-    n: int
-    trues: List[int]
-
-
 class Measured:
     """The answers of one run, and what the set checks and the document need of them."""
 
@@ -888,7 +984,6 @@ class Measured:
         self.plans = plans
         self.failed: Dict[int, str] = {}
         self.tables: Dict[str, List[_Member]] = {}
-        self.views: Dict[str, _ViewPopulation] = {}
         self._own: Dict[int, _Own] = {}
         self._members: Dict[int, _Member] = {}
         self._population: Dict[int, int] = {}
@@ -905,34 +1000,11 @@ class Measured:
             for each in members:
                 self._members[each.plan.index] = each
                 if each.sizes is None:
-                    cells = [[each.n - each.true, each.true]]
+                    cells = [[each.size - each.true, each.true]]
                 else:
                     cells = [[k - true, true] for k, true in each.sizes]
                 self._own[each.plan.index] = _Own([_cell_verdict(pair, rule) for pair in cells])
-                self._population[each.plan.index] = each.n
-        for view in self.views.values():
-            for position, plan in enumerate(view.members):
-                pair = [view.n - view.trues[position], view.trues[position]]
-                self._own[plan.index] = _Own([_cell_verdict(pair, rule)])
-                self._population[plan.index] = view.n
-
-    # -- views: one set per view -------------------------------------------------------------
-
-    def check_views(self, rule: disclosure.DisclosureRule) -> None:
-        for view in self.views.values():
-            members = view.members
-            passed = [
-                at for at, plan in enumerate(members) if self._own[plan.index].verdicts[0] is None
-            ]
-
-            def factors(order: Sequence[int]) -> disclosure.Factors:
-                return [((at,), frozenset({(_OUT,), (_IN,)})) for at in order]
-
-            withheld = disclosure.suppress_differencing(
-                view.cells, passed, rule, factors, _OUTCOMES
-            )
-            for at in withheld:
-                self._own[members[at].index].verdicts[0] = _SET_VERDICT
+                self._population[each.plan.index] = each.size
 
     # -- a table: its queries and its facts in one set --------------------------------------
 
@@ -1051,14 +1123,7 @@ class Measured:
         return {"name": plan.name, "statistics": [statistic]}, result
 
     def _true_of(self, plan: QueryPlan) -> int:
-        member = self._members.get(plan.index)
-        if member is not None:
-            return member.true
-        for view in self.views.values():
-            for position, each in enumerate(view.members):
-                if each.index == plan.index:
-                    return view.trues[position]
-        raise KeyError(plan.index)
+        return self._members[plan.index].true
 
 
 #: What a set check withholds a group with: the code facts the set withholds are written with.
@@ -1104,6 +1169,8 @@ class _Layout:
         self.query_of: Dict[int, Tuple[int, int]] = {}
         self._fact_at: Dict[str, int] = {}
         self._single: List[Tuple[int, int]] = []
+        #: A view unit's own condition (its position) with the positions of its queries.
+        self._units: Dict[str, Tuple[int, List[int]]] = {}
         #: For each grouped column: its parts, with the conceptual rule of which combinations occur.
         self._columns: List[_Column] = []
         for name in facts:
@@ -1117,15 +1184,29 @@ class _Layout:
             verdicts = own[each.plan.index].verdicts
             if each.plan.group_by is None:
                 if verdicts[0] is None:
+                    held = self._unit_of(each)
                     at = len(self.states)
                     self.states.append(each.outcomes)
                     self.query_of[at] = (each.plan.index, 0)
-                    self._single.append((at, each.plan.index))
+                    if held is None:
+                        self._single.append((at, each.plan.index))
+                    else:
+                        held.append(at)
             elif any(verdict is None for verdict in verdicts):
                 by_column.setdefault(each.plan.group_by, []).append(each)
         for column, grouped in by_column.items():
             self._columns.append(self._add_column(column, grouped, own))
         self.width = len(self.states)
+
+    def _unit_of(self, member: _Member) -> Optional[List[int]]:
+        """The positions of the queries over *member*'s view unit, which gets a position once."""
+        if member.unit is None or member.plan.view is None:
+            return None
+        key = member.plan.view
+        if key not in self._units:
+            self._units[key] = (len(self.states), [])
+            self.states.append(member.unit)
+        return self._units[key][1]
 
     def _add_column(
         self, column: str, grouped: Sequence[_Member], own: Mapping[int, _Own]
@@ -1171,6 +1252,12 @@ class _Layout:
         for at, _ in self._single:
             if at in shown:
                 found.append(((at,), frozenset({(_OUT,), (_IN,)})))
+        for unit_at, queries in self._units.values():
+            if unit_at in shown:
+                kept = [unit_at, *(at for at in queries if at in shown)]
+                found.append((tuple(kept), _inside(len(kept) - 1)))
+            else:
+                found.extend(((at,), frozenset({(_OUT,), (_IN,)})) for at in queries if at in shown)
         for column in self._columns:
             kept = [at for at in column.positions if at in shown]
             if kept:
@@ -1182,7 +1269,22 @@ class _Layout:
         more: Set[int] = set()
         for column in self._columns:
             more |= column.dependants(dead)
+        for unit_at, queries in self._units.values():
+            if unit_at in dead:
+                more |= set(queries)
+            elif all(at in dead for at in queries):
+                more.add(unit_at)
         return more - dead
+
+
+def _inside(queries: int) -> FrozenSet[Combination]:
+    """The combinations of a view unit's condition and the conditions of *queries* over it.
+
+    A record the unit's condition does not keep is kept by none of the queries over it.
+    """
+    outside = (_OUT,) * (queries + 1)
+    inside = {(_IN, *each) for each in itertools.product(_OUTCOMES, repeat=queries)}
+    return frozenset({outside, *inside})
 
 
 @dataclass
@@ -1258,19 +1360,9 @@ def measure(
     live = [each for each in live if each.index not in done.failed]
     assigned = _assign(live, reads, backend, done)
     live = [each for each in live if each.index not in done.failed]
-    built: Dict[str, Checked] = {}
-    for view, members in _by_view(live).items():
-        statement = view_statement(view, members, plans.schema)
-        if isinstance(statement, str):
-            for each in members:
-                done.failed[each.index] = REFUSED_BY_PROCESS
-        else:
-            built[view] = statement
-    live = [each for each in live if each.index not in done.failed]
     if not live:
         return done
-    wanted = _by_view(live)
-    tables, statements = _send(live, wanted, built, plans, loaded, reads)
+    tables, statements = _send(live, plans, loaded, reads)
     try:
         run = consumer_queries.run_in_child(
             tables, statements, seconds=STATEMENT_SECONDS, memory=MEMORY_BYTES
@@ -1281,12 +1373,8 @@ def measure(
         return done
     by_id = {each.id: each for each in run.results}
     for plan in live:
-        if plan.view is None:
-            _table_answer(plan, by_id, reads, assigned.get(plan.index), done)
-    for number, (view, members) in enumerate(wanted.items()):
-        _view_answer(view, members, by_id, f"v{number}", done)
+        _table_answer(plan, by_id, reads, assigned.get(plan.index), done)
     done.check_cells(rule)
-    done.check_views(rule)
     return done
 
 
@@ -1334,8 +1422,6 @@ def _assign(
 
 def _send(
     live: Sequence[QueryPlan],
-    wanted: Mapping[str, List[QueryPlan]],
-    built: Mapping[str, Checked],
     plans: QueryPlans,
     loaded: Mapping[Tuple[str, str], List[Any]],
     reads: Mapping[str, Any],
@@ -1344,12 +1430,9 @@ def _send(
     from fluid_build.profiler.consumer_queries import Statement
 
     needed: Dict[str, Dict[str, None]] = {}
-    rowed: Set[str] = set()
     for plan in live:
         for table, column in plan.reads:
             needed.setdefault(table, {})[column] = None
-        if plan.view is None and plan.table is not None:
-            rowed.add(plan.table)
     tables: Dict[str, List[Tuple[str, str, Sequence[Any]]]] = {}
     for table, columns in needed.items():
         entries: List[Tuple[str, str, Sequence[Any]]] = [
@@ -1360,18 +1443,16 @@ def _send(
             )
             for column in columns
         ]
-        if table in rowed:
-            entries.append(
-                (plans.row_columns[table], "BIGINT", list(range(reads[table].row_count)))
-            )
+        entries.append((plans.row_columns[table], "BIGINT", list(range(reads[table].row_count))))
         tables[table] = entries
     statements: List[Any] = []
     for plan in live:
         statements.append(Statement(f"c{plan.index}", plan.verify_sql, "count"))
-        if plan.view is None:
-            statements.append(Statement(f"b{plan.index}", plan.bits_sql, "bits"))
-    for number, view in enumerate(wanted):
-        statements.append(Statement(f"v{number}", built[view].text, "counts"))
+        statements.append(Statement(f"b{plan.index}", plan.bits_sql, "bits"))
+        if plan.view is not None:
+            statements.append(Statement(f"k{plan.index}", plan.unit_verify_sql, "count"))
+            if plan.unit_bits_sql:
+                statements.append(Statement(f"u{plan.index}", plan.unit_bits_sql, "bits"))
     return tables, statements
 
 
@@ -1409,6 +1490,30 @@ def _table_answer(
     if len(flags) != n or count.count != true:
         done.failed[plan.index] = ROWS_NOT_RECORDS
         return
+    size = n
+    unit: Optional[bytes] = None
+    if plan.view is not None:
+        kept = by_id.get(f"k{plan.index}")
+        if kept is None or kept.status != "ok":
+            done.failed[plan.index] = _reason_of(kept) if kept is not None else PROCESS_STOPPED
+            return
+        size = kept.count or 0
+        if plan.unit_where is not None:
+            held = by_id.get(f"u{plan.index}")
+            if held is None or held.status != "ok" or held.bits is None:
+                done.failed[plan.index] = _reason_of(held) if held is not None else PROCESS_STOPPED
+                return
+            unit_flags = held.bits.to_list()
+            unit = bytes(_IN if each else _OUT for each in unit_flags)
+            if len(unit_flags) != n or unit.count(_IN) != size:
+                done.failed[plan.index] = ROWS_NOT_RECORDS
+                return
+        elif size != n:
+            done.failed[plan.index] = ROWS_NOT_RECORDS
+            return
+        if any(each == _IN and not held_in for each, held_in in _pairs(outcomes, unit)):
+            done.failed[plan.index] = ROWS_NOT_RECORDS
+            return
     sizes: Optional[List[Tuple[int, int]]] = None
     if assigned is not None:
         records = [0] * len(plan.levels)
@@ -1418,52 +1523,12 @@ def _table_answer(
                 records[group] += 1
                 returned[group] += 1 if outcome == _IN else 0
         sizes = list(zip(records, returned, strict=True))
-    member = _Member(plan, n, outcomes, true, assigned, sizes)
+    member = _Member(plan, n, outcomes, true, size, unit, assigned, sizes)
     done.tables.setdefault(str(plan.table), []).append(member)
 
 
-def _view_answer(
-    view: str,
-    members: Sequence[QueryPlan],
-    by_id: Mapping[str, Any],
-    identifier: str,
-    done: Measured,
-) -> None:
-    result = by_id.get(identifier)
-    if result is None or result.status != "ok" or result.groups is None:
-        reason = _reason_of(result) if result is not None else PROCESS_STOPPED
-        for plan in members:
-            done.failed[plan.index] = reason
-        return
-    cells: Dict[Combination, int] = {}
-    trues = [0] * len(members)
-    for row in result.groups:
-        flags, total = row[:-1], int(row[-1])
-        key = tuple(_IN if flag else _OUT for flag in flags)
-        cells[key] = cells.get(key, 0) + total
-        for at, outcome in enumerate(key):
-            if outcome == _IN:
-                trues[at] += total
-    bad = False
-    for at, plan in enumerate(members):
-        count = by_id.get(f"c{plan.index}")
-        if count is None or count.status != "ok":
-            done.failed[plan.index] = _reason_of(count) if count is not None else PROCESS_STOPPED
-            bad = True
-        elif count.count != trues[at]:
-            done.failed[plan.index] = ROWS_NOT_RECORDS
-            bad = True
-    if bad:
-        keep = [(at, plan) for at, plan in enumerate(members) if plan.index not in done.failed]
-        if not keep:
-            return
-        # the combinations of the queries that stay are those summed over the ones that went
-        positions = [at for at, _ in keep]
-        merged: Dict[Combination, int] = {}
-        for key, total in cells.items():
-            small = tuple(key[at] for at in positions)
-            merged[small] = merged.get(small, 0) + total
-        cells = merged
-        members = [plan for _, plan in keep]
-        trues = [trues[at] for at in positions]
-    done.views[view] = _ViewPopulation(list(members), cells, sum(cells.values()), trues)
+def _pairs(outcomes: bytes, unit: Optional[bytes]) -> List[Tuple[int, bool]]:
+    """Each row's outcome under a query with whether its view unit keeps the row."""
+    if unit is None:
+        return [(each, True) for each in outcomes]
+    return [(each, held == _IN) for each, held in zip(outcomes, unit, strict=True)]

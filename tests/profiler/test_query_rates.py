@@ -216,10 +216,99 @@ def test_a_view_unit_that_filters_counts_the_views_rows(tmp_path):
     assert (group["k"], group["levelCounts"]) == (100, [50, 50])
 
 
-def test_a_view_unit_that_aggregates_counts_the_views_rows(tmp_path):
-    result = _profile(tmp_path, _on_view("heavy", HEAVY_QUERY, HEAVY_VIEW))
-    (group,) = _entry(result, "heavy")["groups"]
-    assert (group["k"], group["levelCounts"]) == (100, [50, 50])
+NOT_A_FILTER = (
+    "a unit that aggregates, joins or reshapes rows is not one fluid profile can check with "
+    "its table: name the table, or a view that keeps some of one table's rows"
+)
+JOIN_VIEW = "SELECT a.station_id FROM station AS a JOIN station AS b ON b.altitude = 7777"
+UNFILTERED_VIEWS = [
+    ("aggregate", HEAVY_VIEW, "n"),
+    ("join", JOIN_VIEW, "station_id"),
+    ("distinct", "SELECT DISTINCT region FROM station", "region"),
+    ("computed", "SELECT altitude + 1 AS up FROM station", "up"),
+    (
+        "limit",
+        "SELECT * FROM station ORDER BY station_id, region, active, altitude LIMIT 5",
+        "station_id",
+    ),
+    (
+        "subquery",
+        "SELECT * FROM station WHERE station_id IN (SELECT station_id FROM station)",
+        "station_id",
+    ),
+]
+
+
+def _over(view: str, where: str = "TRUE", column: str = "station_id") -> str:
+    return (
+        f'WITH "v" AS ({view}) SELECT "v"."{column}" AS "{column}" FROM "v" AS "v" '
+        f"WHERE {where}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "view", "column"), UNFILTERED_VIEWS, ids=[each[0] for each in UNFILTERED_VIEWS]
+)
+def test_a_view_unit_that_is_not_a_filter_of_one_table_is_refused_before_any_read(
+    tmp_path, label, view, column
+):
+    query = _on_view("odd", _over(view, f'"v"."{column}" IS NOT NULL', column), view)
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, query, strict=True, sources=_gone(tmp_path, query))
+    assert refused.value.event == "profile_request_not_formed"
+    assert NOT_A_FILTER in str(refused.value.context)
+    assert view not in str(refused.value.context)
+
+
+def _padded_views(count: int):
+    found = []
+    for pad in range(count):
+        ids = ", ".join(f"'s{299 - each:03d}'" for each in range(pad)) or "'none'"
+        view = f"SELECT * FROM station WHERE altitude <> 7777 AND station_id NOT IN ({ids})"
+        found.append(_on_view(f"pad{pad}", _over(view, '"v"."station_id" < \'s150\''), view))
+    return found
+
+
+@pytest.mark.parametrize("small", [1, 2, 3, 4])
+def test_filter_views_that_exclude_a_few_known_records_give_no_small_cell_back(tmp_path, small):
+    stations = _stations()
+    for each in range(small):
+        stations[each]["altitude"] = 7777
+    result = _profile(tmp_path, *_padded_views(5), stations=stations)
+    # the table's own queries of the same shape are withheld by the table's set check, and
+    # a view unit is one more factor of that set: no size of a view is published either
+    assert "queries" not in result.document or all(
+        group["status"] != "F"
+        for entry in result.document["queries"]
+        for group in entry["statistics"][0]["groups"]
+    )
+
+
+def test_a_filter_view_and_a_table_query_that_differ_by_one_record_are_both_withheld(tmp_path):
+    view = "SELECT * FROM station WHERE altitude <> 7777"
+    stations = _stations()
+    stations[0]["altitude"] = 7777
+    result = _profile(
+        tmp_path,
+        _on_view("unit", _over(view, '"v"."station_id" < \'s150\''), view),
+        _on_table(
+            "plain",
+            "SELECT station_id FROM station WHERE altitude <> 7777 AND station_id <> 's299'",
+        ),
+        stations=stations,
+    )
+    for name in ("unit", "plain"):
+        (group,) = _entry(result, name)["groups"]
+        assert group["status"] != "F"
+
+
+def test_a_view_unit_that_joins_cannot_read_a_records_attribute_through_its_size(tmp_path):
+    query = _on_view("size", _over(JOIN_VIEW), JOIN_VIEW)
+    with pytest.raises(ProfileError):
+        _profile(tmp_path, query, strict=True, sources=_gone(tmp_path, query))
+    result = _profile(tmp_path, query)
+    assert _said(result)["query size"] == NOT_A_FILTER
+    assert "queries" not in result.document
 
 
 def test_the_engines_reader_accepts_the_document_and_the_rate_is_the_true_rate(tmp_path):
@@ -240,7 +329,7 @@ def test_the_engines_reader_accepts_the_document_and_the_rate_is_the_true_rate(t
         "grouped", "SELECT station_id, region FROM station WHERE active", group_by="region"
     )
     assert rates(grouped) == {"grouped": [0.5, 0.5, 0.5]}
-    assert rates(_on_view("heavy", HEAVY_QUERY, HEAVY_VIEW)) == {"heavy": [0.5]}
+    assert rates(_on_view("low", NORTH_VIEW_QUERY, NORTH_VIEW)) == {"low": [0.5]}
 
 
 def test_the_set_of_queries_is_kept_in_the_order_of_the_request(tmp_path):
@@ -644,11 +733,11 @@ def test_a_value_that_is_no_level_of_the_grouping_column_names_the_query_and_not
 
 
 def test_a_view_that_is_not_the_text_of_the_unit_is_refused_before_any_read(tmp_path):
-    other = "SELECT station_id, count(*) AS n FROM reading GROUP BY station_id HAVING count(*) > 1"
-    query = _on_view("heavy", HEAVY_QUERY, other)
+    other = "SELECT * FROM station WHERE region = 'SOUTH'"
+    query = _on_view("low", NORTH_VIEW_QUERY, other)
     with pytest.raises(ProfileError) as refused:
         _profile(tmp_path, query, strict=True, sources=_gone(tmp_path, query))
-    assert "query heavy" in str(refused.value.context)
+    assert "query low" in str(refused.value.context)
     assert "is not the unit's view" in str(refused.value.context)
 
 
