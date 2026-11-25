@@ -291,3 +291,126 @@ def test_postgres_runs_each_request_in_a_read_only_transaction_it_rolls_back():
         "SELECT id FROM t",
         "ROLLBACK",
     ]
+
+
+def _connecting(monkeypatch, role_row, *, filtered):
+    """A PostgresDriver whose psycopg connects to a fake server; the role query answers
+    ``role_row`` (``rolsuper``, the privileged roles it is a member of)."""
+    import sys
+    import types
+
+    cursor = MagicMock()
+    cursor.__enter__ = lambda self: self
+    cursor.__exit__ = lambda self, *a: None
+    cursor.fetchall.return_value = [role_row]
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setitem(
+        sys.modules, "psycopg", types.SimpleNamespace(connect=lambda **_: connection)
+    )
+    expose = _pg_expose()
+    if filtered:
+        expose["policy"] = {
+            "authz": {"rowFilters": [{"principal": "group:eu@x.example", "where": "id > 0"}]}
+        }
+    return PostgresDriver(expose=expose, contract={}), connection
+
+
+@pytest.mark.parametrize(
+    ("role_row", "named"),
+    [
+        ((True, []), "superuser"),
+        ((False, ["pg_read_server_files"]), "pg_read_server_files"),
+        ((False, ["pg_read_all_data"]), "pg_read_all_data"),
+        ((False, ["pg_read_all_settings", "pg_read_all_stats"]), "pg_read_all_settings"),
+    ],
+    ids=["superuser", "reads-server-files", "reads-all-data", "reads-all-settings-and-stats"],
+)
+def test_postgres_refuses_to_serve_row_filters_as_a_privileged_role(monkeypatch, role_row, named):
+    """Such a role can read a table's files and the write-ahead log, past any filter."""
+    from fluid_build.output_ports.mcp.query_compiler import RowFilterUnavailable
+
+    driver, connection = _connecting(monkeypatch, role_row, filtered=True)
+    with pytest.raises(RowFilterUnavailable, match=named):
+        driver._get_connection()
+    connection.close.assert_called_once()
+    assert driver._connection is None
+
+
+def test_the_privileged_roles_are_pinned():
+    """A role dropped from this tuple would serve row filters it can read past."""
+    from fluid_build.output_ports.mcp.drivers.postgres import PRIVILEGED_ROLES
+
+    assert PRIVILEGED_ROLES == (
+        "pg_execute_server_program",
+        "pg_monitor",
+        "pg_read_all_data",
+        "pg_read_all_settings",
+        "pg_read_all_stats",
+        "pg_read_server_files",
+        "pg_write_server_files",
+    )
+
+
+def test_the_role_query_names_its_catalog_objects_by_schema():
+    """No schema on the search path can put its own pg_roles or pg_has_role first."""
+    import re
+
+    from fluid_build.output_ports.mcp.drivers.postgres import _PRIVILEGE_QUERY
+
+    assert re.findall(r"[\w.]*pg_roles\b", _PRIVILEGE_QUERY) == ["pg_catalog.pg_roles"] * 2
+    assert re.findall(r"[\w.]*pg_has_role\b", _PRIVILEGE_QUERY) == ["pg_catalog.pg_has_role"]
+
+
+def test_postgres_serves_row_filters_as_a_role_that_reads_only_tables(monkeypatch):
+    driver, connection = _connecting(monkeypatch, (False, []), filtered=True)
+    assert driver._get_connection() is connection
+
+
+def test_postgres_warns_about_a_privileged_role_on_an_expose_without_row_filters(
+    monkeypatch, caplog
+):
+    driver, connection = _connecting(monkeypatch, (False, ["pg_monitor"]), filtered=False)
+    with caplog.at_level("WARNING"):
+        assert driver._get_connection() is connection
+    assert "postgres_privileged_role" in caplog.text and "pg_monitor" in caplog.text
+
+
+def test_postgres_checks_the_role_again_after_a_check_that_failed(monkeypatch):
+    """A connection counts only once its role check has passed: a check that failed for
+    any reason (a timeout here) runs again on the next request."""
+    import sys
+    import types
+
+    from fluid_build.output_ports.mcp.query_compiler import RowFilterUnavailable
+
+    answers = [RuntimeError("canceling statement due to statement timeout"), [(True, [])]]
+    connections = []
+
+    def connect(**_):
+        cursor = MagicMock()
+        cursor.__enter__ = lambda self: self
+        cursor.__exit__ = lambda self, *a: None
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            cursor.execute.side_effect = answer
+        else:
+            cursor.fetchall.return_value = answer
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
+    expose = _pg_expose()
+    expose["policy"] = {
+        "authz": {"rowFilters": [{"principal": "group:a@x.example", "where": "id > 0"}]}
+    }
+    driver = PostgresDriver(expose=expose, contract={})
+    with pytest.raises(RuntimeError, match="statement timeout"):
+        driver._get_connection()
+    assert driver._connection is None
+    with pytest.raises(RowFilterUnavailable, match="superuser"):
+        driver._get_connection()
+    assert driver._connection is None
+    assert len(connections) == 2 and all(c.close.called for c in connections)

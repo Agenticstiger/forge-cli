@@ -29,7 +29,7 @@ statement guard, so the filter has to hold in the SQL itself.
 from __future__ import annotations
 
 import logging
-from types import SimpleNamespace
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 import pytest
@@ -58,6 +58,9 @@ _ROWS = [
     (4, "APAC", "retail", 40, "t3", "S4"),
 ]
 _COLUMNS = ("id", "region", "segment", "amount", "tenant_id", "secret")
+# Declared types: a filtered caller's comparisons are typed by them.
+_TYPES = dict.fromkeys(_COLUMNS, "string")
+_TYPES.update(id="integer", segment="varchar(20)", amount="integer")
 
 _FILTERS = [
     {"principal": EU, "where": "region = 'EU'"},
@@ -83,7 +86,7 @@ def _expose(
         metric["filter"] = metric_filter
     return {
         "exposeId": "customers",
-        "contract": {"schema": [{"name": name} for name in _COLUMNS]},
+        "contract": {"schema": [{"name": name, "type": _TYPES[name]} for name in _COLUMNS]},
         "semantics": {
             "measures": [{"name": "total", "agg": "sum", "expr": "amount"}],
             "dimensions": [{"name": "segment", "type": "categorical", "expr": "segment"}],
@@ -115,30 +118,13 @@ def con():
 @pytest.fixture()
 def state_for(tmp_path):
     """A ``SessionState`` stand-in over a DuckDB driver reading a CSV of ``_ROWS``."""
-    from fluid_build.output_ports.mcp.drivers import build_driver
+    from ._fixtures import duckdb_csv_session
 
     csv = tmp_path / "customers.csv"
     csv.write_text(
         ",".join(_COLUMNS) + "\n" + "".join(",".join(map(str, row)) + "\n" for row in _ROWS)
     )
-
-    def _make(expose: Dict[str, Any]) -> SimpleNamespace:
-        expose = dict(expose)
-        expose["binding"] = {
-            "platform": "local",
-            "format": "csv",
-            "location": {"path": str(csv), "table": "customers"},
-        }
-        driver = build_driver(expose=expose, contract={"exposes": [expose]})
-        return SimpleNamespace(
-            expose=expose,
-            caller_attributes={},
-            policy=SimpleNamespace(max_sample_rows=100),
-            query_timeout_seconds=None,
-            get_driver=lambda: driver,
-        )
-
-    return _make
+    return lambda expose: duckdb_csv_session(csv, expose, table="customers")
 
 
 def _refusal(call: Callable[[], Any]) -> str:
@@ -183,6 +169,28 @@ def _free_form(con, sql: str, attrs: Dict[str, Any], **expose_kwargs: Any) -> Li
     )
     assert not compiled.params
     return sorted(con.execute(compiled.sql).fetchall())
+
+
+def _compile_for(
+    sql: str,
+    caller: str = EU,
+    dialect: str = "duckdb",
+    *,
+    expose: Optional[Dict[str, Any]] = None,
+    table_reference: str = "customers",
+    **kwargs: Any,
+):
+    """Compile ``sql`` as ``query_sql`` does for ``caller``, on the fixture expose unless
+    another is given."""
+    return query_compiler.compile_free_form_sql(
+        sql=sql,
+        table_reference=table_reference,
+        limit=10,
+        expose=_expose() if expose is None else expose,
+        caller_attributes=_as(caller),
+        dialect=dialect,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -448,14 +456,7 @@ def test_a_predicate_column_the_table_lacks_never_reads_an_outer_one(con):
 )
 def test_query_sql_refuses_a_source_the_filter_cannot_cover(sql):
     with pytest.raises(query_compiler.QueryValidationError):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect="duckdb",
-        )
+        _compile_for(sql)
 
 
 def test_every_read_of_the_exposed_table_carries_the_filter():
@@ -484,15 +485,7 @@ def test_every_read_of_the_exposed_table_carries_the_filter():
 
 def test_an_unfiltered_reader_keeps_the_callers_statement():
     sql = "SELECT id FROM customers"
-    compiled = query_compiler.compile_free_form_sql(
-        sql=sql,
-        table_reference="customers",
-        limit=10,
-        expose=_expose(),
-        caller_attributes=_as(EVERYONE),
-        dialect="duckdb",
-    )
-    assert compiled.sql.startswith(sql)
+    assert _compile_for(sql, EVERYONE).sql.startswith(sql)
 
 
 def test_the_engine_parser_refuses_a_projection_whose_filter_was_changed():
@@ -874,15 +867,7 @@ def test_serve_refuses_a_policy_that_is_not_a_mapping_before_anything_reads_it(t
 @pytest.mark.parametrize("restricted", [(), ("secret",)], ids=["filtered", "filtered-restricted"])
 def test_query_sql_reads_no_relation_but_the_exposed_table(sql, restricted):
     with pytest.raises(query_compiler.QueryValidationError):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            restricted_columns=restricted,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect="postgres",
-        )
+        _compile_for(sql, dialect="postgres", restricted_columns=restricted)
 
 
 @pytest.mark.parametrize(
@@ -912,14 +897,7 @@ def test_a_cte_covers_only_the_reads_in_its_scope(sql):
     """A name that matches a CTE somewhere else in the statement is still the catalog's
     relation where that CTE is not in scope."""
     with pytest.raises(query_compiler.QueryValidationError, match="duckdb_views"):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference="customers",
-            limit=10,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect="duckdb",
-        )
+        _compile_for(sql)
 
 
 def test_a_cte_in_scope_reads_the_filtered_projection(con):
@@ -1088,14 +1066,7 @@ _BINDINGS = {"duckdb": "customers", "postgres": "logistics.public.customers"}
 def test_a_table_of_the_exposed_name_in_another_schema_is_refused(dialect, sql):
     """It would be served the exposed table's filtered rows under another table's name."""
     with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
-        query_compiler.compile_free_form_sql(
-            sql=sql,
-            table_reference=_BINDINGS[dialect],
-            limit=10,
-            expose=_expose(),
-            caller_attributes=_as(EU),
-            dialect=dialect,
-        )
+        _compile_for(sql, dialect=dialect, table_reference=_BINDINGS[dialect])
 
 
 @pytest.mark.parametrize(
@@ -1108,12 +1079,297 @@ def test_a_table_of_the_exposed_name_in_another_schema_is_refused(dialect, sql):
     ],
 )
 def test_the_exposed_table_may_be_named_as_its_binding_names_it(dialect, sql):
-    compiled = query_compiler.compile_free_form_sql(
-        sql=sql,
-        table_reference=_BINDINGS[dialect],
-        limit=10,
-        expose=_expose(),
-        caller_attributes=_as(EU),
-        dialect=dialect,
-    )
+    compiled = _compile_for(sql, dialect=dialect, table_reference=_BINDINGS[dialect])
     assert "_fluid_rows.region = 'EU'" in compiled.sql
+
+
+def _bound_to(db_file: Optional[str]) -> Dict[str, Any]:
+    expose = _expose()
+    if db_file is not None:
+        expose["binding"] = {
+            "platform": "local",
+            "format": "duckdb_table",
+            "location": {"dbFile": db_file, "table": "customers"},
+        }
+    return expose
+
+
+@pytest.mark.parametrize(
+    ("db_file", "sql", "refused"),
+    [
+        (None, "SELECT id FROM memory.main.customers", False),
+        ("/data/warehouse.duckdb", "SELECT id FROM warehouse.main.customers", False),
+        ("/data/warehouse.duckdb", "SELECT id FROM memory.main.customers", True),
+        (None, "SELECT id FROM warehouse.main.customers", True),
+    ],
+    ids=["in-memory", "database-file", "memory-for-a-file", "file-for-memory"],
+)
+def test_duckdb_reads_the_exposed_table_under_the_catalog_its_binding_opens(db_file, sql, refused):
+    """DuckDB names the database a binding opens ``memory``, or after the file's stem."""
+    if refused:
+        with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
+            _compile_for(sql, expose=_bound_to(db_file))
+    else:
+        assert "_fluid_rows.region = 'EU'" in _compile_for(sql, expose=_bound_to(db_file)).sql
+
+
+# ---------------------------------------------------------------------
+# A filtered caller calls only listed functions
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql", "named"),
+    [
+        ("postgres", "SELECT my_lookup(region) FROM customers", "my_lookup"),
+        ("postgres", "SELECT public.lower(region) FROM customers", "public.lower"),
+        ("duckdb", "SELECT hash(region) FROM customers", "hash"),
+        ("postgres", "SELECT pg_backend_pid() FROM customers", "pg_backend_pid"),
+    ],
+)
+def test_a_filtered_caller_may_call_only_listed_functions(dialect, sql, named):
+    with pytest.raises(query_compiler.QueryValidationError, match=f"calls {named},"):
+        _compile_for(sql, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        ("postgres", "SELECT pg_catalog.lower(region) FROM customers"),
+        ("postgres", "SELECT lower(segment), count(*), sum(amount) FROM customers GROUP BY 1"),
+        ("duckdb", "SELECT row_number() OVER (ORDER BY id) AS n, upper(segment) FROM customers"),
+        ("duckdb", "SELECT date_part('year', now()) AS y, CAST(amount AS DOUBLE) FROM customers"),
+        ("postgres", "SELECT coalesce(segment, '-'), round(amount / 3.0, 1) FROM customers"),
+    ],
+)
+def test_a_filtered_caller_may_call_the_listed_functions(dialect, sql):
+    assert "_fluid_rows.region = 'EU'" in _compile_for(sql, dialect=dialect).sql
+
+
+def test_an_unfiltered_reader_is_not_limited_to_the_listed_functions():
+    """A reader no filter narrows reads every row, so no row is withheld from it."""
+    assert "my_lookup" in _compile_for("SELECT my_lookup(region) FROM customers", EVERYONE).sql
+
+
+# ---------------------------------------------------------------------
+# Nothing that could fail on a withheld row runs where a planner could run it early
+# ---------------------------------------------------------------------
+
+_CAN_FAIL = [
+    pytest.param("SELECT id FROM customers WHERE 1 / (amount - 20) > 0", id="division"),
+    pytest.param("SELECT id FROM customers WHERE CAST(segment AS INT) > 0", id="cast"),
+    pytest.param("SELECT id FROM customers WHERE amount % 3 = 0", id="modulo"),
+    pytest.param("SELECT id FROM customers WHERE amount * 1000 > 0", id="arithmetic"),
+    pytest.param("SELECT id FROM customers WHERE sqrt(amount) > 1", id="function"),
+    pytest.param(
+        "SELECT a.id FROM customers AS a JOIN customers AS b ON a.id = b.amount / 10",
+        id="join-condition",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "dialect", ["duckdb", "postgres", "snowflake", "bigquery", "athena", "databricks"]
+)
+@pytest.mark.parametrize("sql", _CAN_FAIL)
+def test_a_condition_that_can_fail_is_refused_on_every_engine(sql, dialect):
+    with pytest.raises(query_compiler.QueryValidationError, match="on an expose with row filters"):
+        _compile_for(sql, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The keyword checks refuse a nested SELECT on every engine, so query_sql cannot
+        # write these today; the fence is the second layer, checked here directly.
+        pytest.param(
+            "SELECT id FROM customers WHERE EXISTS (FROM customers c WHERE 1 / c.amount > 0)",
+            id="subquery-condition",
+        ),
+        pytest.param(
+            "SELECT r FROM (FROM customers SELECT 100 / amount AS r) AS x WHERE r > 1",
+            id="derived-value",
+        ),
+        pytest.param(
+            "WITH c AS (FROM customers SELECT CAST(segment AS INT) AS s) FROM c WHERE s > 0",
+            id="cte-value",
+        ),
+    ],
+)
+def test_a_value_a_subquery_computes_is_refused_where_it_could_be_pushed_down(sql):
+    with pytest.raises(query_compiler.QueryValidationError, match="on an expose with row filters"):
+        query_compiler._project_exposed_table(
+            sql,
+            table_reference="customers",
+            allowed=list(_COLUMNS),
+            dialect="duckdb",
+            predicate="((_fluid_rows.region = 'EU'))",
+        )
+
+
+_CANNOT_FAIL = [
+    "SELECT id FROM customers WHERE amount > 15 ORDER BY id",
+    "SELECT id FROM customers WHERE segment IN ('retail', 'x') AND amount BETWEEN 0 AND 100",
+    "SELECT id FROM customers WHERE segment LIKE 'ret%' OR tenant_id IS NULL ORDER BY id",
+    "SELECT id FROM customers WHERE NOT EXISTS (FROM customers c WHERE c.id = 99) ORDER BY id",
+    "SELECT count(*) AS n FROM customers HAVING count(*) > 0",
+    "SELECT id, 100 / amount AS r, CAST(segment AS VARCHAR) AS s FROM customers ORDER BY id",
+    "SELECT id FROM customers WHERE lower(segment) = 'retail' ORDER BY id",
+    "SELECT id FROM customers WHERE upper(region) IN ('EU', 'US') ORDER BY id",
+    "SELECT id FROM customers WHERE coalesce(amount, 0) > 15 ORDER BY id",
+]
+
+
+def test_a_withheld_row_that_would_make_a_condition_fail_changes_nothing(con):
+    """With a withheld row whose values would make the refused conditions fail, every
+    condition a filtered caller may write gives the same rows as without it."""
+    with_trap = duckdb.connect()
+    with_trap.execute(
+        "CREATE TABLE customers (id INTEGER, region VARCHAR, segment VARCHAR, amount INTEGER, "
+        "tenant_id VARCHAR, secret VARCHAR)"
+    )
+    with_trap.executemany(
+        "INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)",
+        [*_ROWS, (5, "US", "not-a-number", 0, "t9", "S5")],
+    )
+    try:
+        for sql in _CANNOT_FAIL:
+            assert _free_form(with_trap, sql, _as(EU)) == _free_form(con, sql, _as(EU)), sql
+    finally:
+        with_trap.close()
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        ("postgres", "SELECT id FROM customers WHERE amount >= 5::bigint"),
+        ("postgres", "SELECT id FROM customers WHERE amount > CAST('5' AS INT)"),
+        ("postgres", "SELECT id FROM customers WHERE id = ANY(ARRAY[1, 3])"),
+        ("postgres", "SELECT id FROM customers WHERE segment <> ALL(ARRAY['x'])"),
+        ("duckdb", "SELECT id FROM customers WHERE now() - INTERVAL '1 day' < now()"),
+        ("duckdb", "SELECT segment, count(*) FROM customers GROUP BY segment HAVING count(*) > 1"),
+        (
+            "duckdb",
+            "SELECT id FROM customers QUALIFY row_number() OVER (PARTITION BY segment ORDER BY id) = 1",
+        ),
+        ("duckdb", "SELECT count(*) FILTER (WHERE CAST(amount AS INT) > 5) FROM customers"),
+    ],
+)
+def test_constants_aggregates_and_windows_are_allowed_in_conditions(dialect, sql):
+    """A constant has the same value on every row, and an aggregate or a window function
+    in HAVING or QUALIFY, or an aggregate's FILTER, is a value of the kept rows."""
+    assert "_fluid_rows.region = 'EU'" in _compile_for(sql, dialect=dialect).sql
+
+
+@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery", "databricks"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT segment FROM customers GROUP BY segment HAVING CAST(segment AS INT) = 1",
+        "SELECT id FROM customers QUALIFY CAST(segment AS INT) = row_number() OVER (ORDER BY id)",
+    ],
+    ids=["having", "qualify"],
+)
+def test_having_and_qualify_are_fenced_like_a_where(sql, dialect):
+    """A HAVING or QUALIFY term over a plain column is a WHERE an optimizer may push down."""
+    with pytest.raises(query_compiler.QueryValidationError, match="on an expose with row filters"):
+        _compile_for(sql, dialect=dialect)
+
+
+def _typed() -> Dict[str, Any]:
+    """The fixture expose with ``region`` declared without a type."""
+    expose = _expose()
+    expose["contract"]["schema"] = [
+        {"name": name, **({"type": _TYPES[name]} if name != "region" else {})} for name in _COLUMNS
+    ]
+    return expose
+
+
+@pytest.mark.parametrize(
+    ("sql", "refused"),
+    [
+        ("SELECT id FROM customers WHERE secret = 5", True),
+        ("SELECT id FROM customers WHERE segment IN (1, 2)", True),
+        ("SELECT id FROM customers WHERE secret BETWEEN 1 AND 5", True),
+        ("SELECT id FROM customers WHERE secret = 5::bigint", True),
+        ("SELECT id FROM customers AS a, customers AS b WHERE a.secret = b.amount", True),
+        ("SELECT id FROM customers WHERE secret = (5)", True),
+        ("SELECT id FROM customers WHERE secret = 1 + 1", True),
+        ("SELECT id FROM customers WHERE secret = CURRENT_DATE", True),
+        ("SELECT id FROM customers WHERE secret BETWEEN (1) AND (9)", True),
+        ("SELECT id FROM customers WHERE secret = ANY(ARRAY[1, 2])", True),
+        ("SELECT id FROM customers WHERE (secret, id) IN ((5, 1))", True),
+        ("SELECT id FROM customers WHERE secret = (amount)", True),
+        ("SELECT secret FROM customers GROUP BY secret HAVING secret = (1)", True),
+        ("SELECT id FROM customers WHERE secret = ANY(ARRAY['a', 'b'])", False),
+        ("SELECT id FROM customers WHERE (secret, id) IN (('5', 1))", False),
+        ("SELECT id FROM customers WHERE secret = CAST(5 AS VARCHAR)", False),
+        ("SELECT id FROM customers WHERE secret = '5'", False),
+        ("SELECT id FROM customers WHERE amount = 5 AND amount <> '6'", True),
+        ("SELECT id FROM customers WHERE region = 5", True),
+    ],
+)
+def test_a_declared_string_column_is_compared_only_with_strings(sql, refused):
+    """The engine would cast every row's value of a column compared with a value of
+    another type, and fail on a withheld one. ``region`` declares no type, so no
+    comparison on it can be typed."""
+    if refused:
+        with pytest.raises(
+            query_compiler.QueryValidationError, match="on an expose with row filters"
+        ):
+            _compile_for(sql, dialect="snowflake", expose=_typed())
+    else:
+        _compile_for(sql, dialect="snowflake", expose=_typed())
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        (
+            "postgres",
+            "SELECT to_date(segment, 'YYYY'), random(), cardinality(ARRAY[1]) FROM customers",
+        ),
+        ("bigquery", "SELECT SAFE_DIVIDE(amount, 2), ARRAY_LENGTH([1]) FROM customers"),
+        ("snowflake", "SELECT TO_NUMBER(segment), PARSE_JSON(segment) FROM customers"),
+        (
+            "databricks",
+            "SELECT to_date(segment), date_add(segment, 1), size(array(1)) FROM customers",
+        ),
+        ("duckdb", "SELECT strlen(segment), quarter(DATE '2024-01-01'), typeof(id) FROM customers"),
+    ],
+)
+def test_the_common_functions_of_each_engine_are_listed(dialect, sql):
+    assert "_fluid_rows.region = 'EU'" in _compile_for(sql, dialect=dialect).sql
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql", "named"),
+    [
+        ("postgres", "SELECT current_user FROM customers", "CURRENT_USER"),
+        ("postgres", "SELECT x.pg_catalog.age(region) FROM customers", "x.pg_catalog.age"),
+        (
+            "postgres",
+            "SELECT amount OPERATOR(public.+) 1 FROM customers",
+            "amount OPERATOR(public.+)",
+        ),
+    ],
+)
+def test_a_refusal_names_what_the_caller_wrote(dialect, sql, named):
+    with pytest.raises(query_compiler.QueryValidationError, match=rf"calls {re.escape(named)}"):
+        _compile_for(sql, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    ("sql", "refused"),
+    [
+        ("SELECT id FROM data.main.customers", False),
+        ('SELECT id FROM "data.v1".main.customers', True),
+    ],
+)
+def test_duckdb_names_a_database_file_up_to_its_first_dot(sql, refused):
+    expose = _bound_to("/data/data.v1.duckdb")
+    if refused:
+        with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
+            _compile_for(sql, expose=expose)
+    else:
+        _compile_for(sql, expose=expose)

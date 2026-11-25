@@ -310,13 +310,10 @@ PII/PHI row redaction (via column `sensitivity` markers), and
 read) automatically on every read. When you connect to a fluid data product
 through that gateway, the contract is the policy.
 
-Outside the gateway, the **`fluid_build.output_ports.iam_compiler`** module
-emits Snowflake row-access policies + Postgres `CREATE POLICY` statements from
-the contract's `agentPolicy`, as defence in depth, so a direct warehouse query
-(an analyst with their own Snowflake role) is also gated by the contract. Its
-row filters still come from the old `policy.rowFilters` key, which the gateway
-refuses; `fluid apply` writes `policy.authz.rowFilters` into BigQuery, Lake
-Formation and Unity Catalog.
+Outside the gateway, `fluid apply` writes `policy.authz.rowFilters` into the
+warehouse as defence in depth (BigQuery row access policies, Lake Formation data
+cells filters, Unity Catalog row filters), so a direct warehouse query (an
+analyst with their own credentials) is also gated by the contract.
 
 Defence layers ranked from outer to inner: mTLS proxy (production-only) →
 bearer token (`FLUID_MCP_AUTH_TOKEN`) → agentPolicy.allowedModels →

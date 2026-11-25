@@ -160,8 +160,22 @@ _QUERY_SQL_SCHEMA: Dict[str, Any] = {
                 "the body, rejects references to restricted/PII columns, and, "
                 "when the contract declares row filters (policy.authz.rowFilters), "
                 "reads the table only through the rows your verified principal "
-                "may read, wherever the statement reads it. Refused unless the "
-                "server was started with --allow-sql."
+                "may read, wherever the statement reads it. A caller the row "
+                "filters narrow may call only common aggregate, window, "
+                "conditional, math, string, date, conversion, JSON and array "
+                "functions, and writes WHERE, ON, USING, HAVING and QUALIFY "
+                "conditions as comparisons (=, <>, <, <=, >, >=, IN, BETWEEN, "
+                "IS NULL, LIKE, ILIKE, EXISTS) between values of one type: a "
+                "column, typed as the table holds it, and a literal or cast of "
+                "that type (DATE '2024-01-01'). A date meets a date, a timestamp "
+                "a timestamp, a timestamp with a time zone its own kind (now()); "
+                "write a relative date as CAST(CURRENT_DATE - INTERVAL '7' DAY AS "
+                "DATE); "
+                "exact numbers meet when the larger integer part plus the larger "
+                "scale fits in 38 digits, and a float meets any number. LIKE "
+                "patterns are string literals without ESCAPE. It computes values "
+                "only in the outer select list. Refused unless the server was "
+                "started with --allow-sql."
             ),
         },
         "limit": _LIMIT_PROP,
@@ -203,7 +217,9 @@ OUTPUT_PORT_TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
         description=(
             "Run caller-supplied SELECT SQL against the bound expose. "
             "Available only when the server is started with --allow-sql. "
-            "Refuses any statement that references a restricted column."
+            "Refuses any statement that references a restricted column; on an "
+            "expose with row filters, a narrowed caller's functions and "
+            "conditions are limited (see the sql argument)."
         ),
         requires_sql_allowlist=True,
         input_schema=_QUERY_SQL_SCHEMA,

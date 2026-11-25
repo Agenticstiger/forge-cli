@@ -1333,7 +1333,7 @@ def _xml_dump_statements():
 @pytest.mark.parametrize("dialect", ["postgres", None])
 @pytest.mark.parametrize("sql", _xml_dump_statements())
 def test_query_sql_refuses_a_function_that_dumps_a_table_as_xml(sql, dialect):
-    with pytest.raises(QueryValidationError, match="reads a relation or runs a query"):
+    with pytest.raises(QueryValidationError, match="reads a relation"):
         compile_free_form_sql(
             sql=sql, table_reference="public.customers", limit=10, dialect=dialect
         )
@@ -1346,7 +1346,7 @@ def test_query_sql_refuses_the_xml_dump_inside_a_larger_statement(name):
         f"SELECT length({name}('public.customers', true, false, '')::text) AS n",
         f"SELECT id FROM public.customers WHERE {name}('x', true, false, '') IS NOT NULL",
     ):
-        with pytest.raises(QueryValidationError, match="reads a relation or runs a query"):
+        with pytest.raises(QueryValidationError, match="reads a relation"):
             compile_free_form_sql(sql=sql, table_reference="public.customers", limit=10)
 
 
@@ -1475,6 +1475,26 @@ def test_a_name_or_star_against_the_keyword_still_compiles(sql):
         pytest.param("SELECT pg_prepared_statement()", id="prepared-statement-function"),
         pytest.param("SELECT name, statement FROM pg_prepared_statements", id="prepared-view"),
         pytest.param("SELECT name FROM pg_cursors", id="cursor-view"),
+        pytest.param(
+            "SELECT pg_read_binary_file(pg_relation_filepath('public.customers'))",
+            id="table-file",
+        ),
+        pytest.param("SELECT * FROM pg_get_wal_block_info('0/0', '0/FFFF')", id="wal"),
+        pytest.param("SELECT pg_logical_slot_peek_changes('s', NULL, NULL)", id="decoding"),
+        pytest.param("SELECT lo_get(16384)", id="large-object"),
+        pytest.param("SELECT pg_ls_dir('base')", id="server-directory"),
+        pytest.param("SELECT current_setting('TimeZone')", id="read-setting"),
+        pytest.param("SELECT nextval('customers_id_seq')", id="sequence"),
+        pytest.param("SELECT pg_advisory_lock(1)", id="advisory-lock"),
+        pytest.param("SELECT pg_sleep(5)", id="sleep"),
+        pytest.param("SELECT pg_terminate_backend(1)", id="other-session"),
+        pytest.param("SELECT pg_try_advisory_lock(1)", id="try-advisory-lock"),
+        pytest.param("SELECT currval('customers_id_seq')", id="current-sequence"),
+        pytest.param("SELECT lastval()", id="last-sequence"),
+        pytest.param("SELECT pg_notify('c', 'm')", id="notify"),
+        pytest.param("SELECT pg_switch_wal()", id="switch-wal"),
+        pytest.param("SELECT pg_drop_replication_slot('s')", id="replication-slot"),
+        pytest.param("SELECT loread(1, 2)", id="large-object-read"),
     ],
 )
 def test_query_sql_refuses_what_reads_raw_pages_other_requests_or_the_session(sql):
@@ -1489,3 +1509,11 @@ def test_query_sql_refuses_what_reads_raw_pages_other_requests_or_the_session(sq
         guard_against_injection_markers(sql)
     with pytest.raises(ValueError):
         validate_sql_expression_allowlist(sql.split(None, 1)[1])
+
+
+def test_a_name_that_only_starts_like_a_refused_function_is_not_refused():
+    """A CTE written ``lo_x(a)`` is not a call to a large-object function."""
+    from fluid_build.providers._sql_safety import names_refused_postgres_function
+
+    assert not names_refused_postgres_function("WITH lo_x(a) AS (SELECT 1) SELECT a FROM lo_x")
+    assert names_refused_postgres_function("SELECT lo_get(16384)")

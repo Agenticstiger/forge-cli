@@ -35,6 +35,7 @@ Borrowed-not-built per /borrow-before-build:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -44,17 +45,45 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.providers._sql_safety import validate_ident
 
+from ..query_compiler import declares_row_filters
 from .base import (
     DriverDescriptor,
     EngineDriver,
     QueryResult,
+    RowFilterUnavailable,
     UnsupportedBindingError,
     get_binding,
     guard_against_injection_markers,
 )
 
+_LOG = logging.getLogger(__name__)
+
 # Rewrite ``:p_<index>`` (compiler form) → ``%(p_<index>)s`` (psycopg form).
 _PARAM_REWRITE = re.compile(r":p_(\d+)\b")
+
+#: The predefined Postgres roles that reach past the tables an expose names: they read or
+#: write server files, run programs on the server, read every table, or read every
+#: session's activity, statistics and settings. A superuser can do all of it. Their
+#: functions and views read a table's own files, the write-ahead log and other tables,
+#: so the rows a row filter withholds. Membership counts directly or through another role.
+PRIVILEGED_ROLES = (
+    "pg_execute_server_program",
+    "pg_monitor",
+    "pg_read_all_data",
+    "pg_read_all_settings",
+    "pg_read_all_stats",
+    "pg_read_server_files",
+    "pg_write_server_files",
+)
+# Every catalog name is qualified with pg_catalog, so no schema on the search path can put
+# its own pg_roles or pg_has_role in front of them.
+_PRIVILEGE_QUERY = (
+    "SELECT r.rolsuper, ARRAY(SELECT p.rolname::text FROM pg_catalog.pg_roles AS p "
+    "WHERE p.rolname IN ("
+    + ", ".join(f"'{role}'" for role in PRIVILEGED_ROLES)
+    + ") AND pg_catalog.pg_has_role(current_user, p.oid, 'MEMBER') ORDER BY p.rolname) "
+    "FROM pg_catalog.pg_roles AS r WHERE r.rolname = current_user"
+)
 
 
 class PostgresDriver(EngineDriver):
@@ -233,9 +262,41 @@ class PostgresDriver(EngineDriver):
         if self.logger is not None:
             redacted = {k: ("***" if k in {"password", "passfile"} else v) for k, v in opts.items()}
             self.logger.debug("postgres_connect: %s", redacted)
-        self._connection = psycopg.connect(**opts)
-        # Transactions psycopg starts are read-only (execute runs each request in one):
-        # the gateway never writes.
-        self._connection.read_only = True
-        self._connection.autocommit = True
-        return self._connection
+        connection = psycopg.connect(**opts)
+        try:
+            # Transactions psycopg starts are read-only (execute runs each request in
+            # one): the gateway never writes.
+            connection.read_only = True
+            connection.autocommit = True
+            self._check_the_role(connection)
+        except BaseException:
+            # Kept only once the role check has passed: a check that failed for any
+            # reason (a timeout, a refused role) runs again on the next request.
+            with contextlib.suppress(Exception):
+                connection.close()
+            raise
+        self._connection = connection
+        return connection
+
+    def _check_the_role(self, connection: Any) -> None:
+        """Refuse to serve an expose with row filters as a role that reaches past the
+        tables (a superuser or a member of :data:`PRIVILEGED_ROLES`), and warn on any
+        other expose: no check on a statement stops a function such a role may call."""
+        with connection.transaction(force_rollback=True), connection.cursor() as cursor:
+            cursor.execute(_PRIVILEGE_QUERY)
+            rows = cursor.fetchall()
+        superuser, memberships = rows[0] if rows else (False, [])
+        held = (["superuser"] if superuser else []) + [str(r) for r in memberships or []]
+        if not held:
+            return
+        if declares_row_filters(self.expose):
+            raise RowFilterUnavailable(
+                f"the gateway connects to Postgres as a role that is {', '.join(held)}. Such a "
+                "role can read a table's files and the write-ahead log, so the rows a row "
+                "filter withholds; connect as a role that can read only the exposed tables."
+            )
+        (self.logger or _LOG).warning(
+            "postgres_privileged_role: the gateway connects as a role that is %s; connect as "
+            "a role that can read only the exposed tables.",
+            ", ".join(held),
+        )
