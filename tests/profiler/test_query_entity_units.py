@@ -797,3 +797,28 @@ def test_one_table_is_grouped_by_one_entity_column_per_run():
         contract, _request(_on_unit("many", MANY), second), FakeBackend().enum_levels
     )
     assert [plan.reason for plan in planned.plans] == [None, query_rates.COUNTED_ANOTHER_WAY]
+
+
+def test_an_entity_unit_keyed_into_a_versioned_table_is_refused_before_any_read(tmp_path):
+    # Children of a versioned table are counted one entity at a time, not one row at a time, so a
+    # unit grouping by a key into it would count other records than the histogram it is checked with.
+    contract = _contract()
+    customers = contract["exposes"][0]
+    customers["contract"]["schema"] += [
+        {"name": "valid_from", "type": "date"},
+        {"name": "valid_to", "type": "date"},
+    ]
+    customers["semantics"] = {
+        "entities": [{"name": "customer", "type": "natural", "expr": "customer_id"}],
+        "dimensions": [
+            {
+                "name": "valid_from",
+                "type": "time",
+                "typeParams": {"validityParams": {"isStart": True}},
+            },
+            {"name": "valid_to", "type": "time", "typeParams": {"validityParams": {"isEnd": True}}},
+        ],
+    }
+    rows = [{**row, "valid_from": "2024-01-01", "valid_to": None} for row in _customers()]
+    result = _profile(tmp_path, _on_unit("many", MANY), contract=contract, customers=rows)
+    assert _said(result) == {"query many": query_rates.VERSIONED_PARENT}

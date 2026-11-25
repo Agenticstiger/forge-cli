@@ -246,6 +246,11 @@ ENTITY_KEY_TYPE = (
 ENTITY_PARENT_TYPE = (
     "its entity column and the key of its relationship's parent are not read as one type"
 )
+VERSIONED_PARENT = (
+    "its entity column is the key of a relationship into a versioned table, whose children the "
+    "profile counts one entity at a time, not one row at a time, so fluid profile does not "
+    "answer a unit that groups by it"
+)
 
 SUM_CAN_OVERFLOW = (
     "its unit sums or averages a column whose total could exceed what the query process adds "
@@ -758,6 +763,10 @@ class _Planner:
         target, to_columns = links[0].get("to"), _names(links[0].get("toColumns"))
         if len(to_columns) != 1 or not isinstance(target, str):
             return ENTITY_ONLY
+        from fluid_build.data_rules._model import declares_validity_window
+
+        if declares_validity_window(self._exposes.get(target, {})):
+            return VERSIONED_PARENT
         return (target, to_columns[0]) if target in self._schema else None
 
     def _entity_key(self, table: str, key: str, parent: Optional[Tuple[str, str]]) -> Optional[str]:
