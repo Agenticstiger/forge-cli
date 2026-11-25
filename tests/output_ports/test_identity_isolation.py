@@ -17,8 +17,8 @@ client's identity onto that shared state:
 The consequence: every *later* client was evaluated under the FIRST
 client's principal. A denied model slipped through (or an allowed one
 was denied) because the agentPolicy gate read the wrong ``model_id``;
-and a tenant saw another tenant's rows because ``${caller.tenant_id}``
-rowFilters resolved against the wrong ``caller_attributes``.
+and a tenant saw another tenant's rows because row filters resolved against
+the wrong ``caller_attributes``.
 
 The fix replaces the cache with
 :meth:`OutputPortMcpServer._resolve_request_identity`, which reads the
@@ -66,13 +66,22 @@ _EXPOSE_MODEL_GATE: Dict[str, Any] = {
     "policy": {"agentPolicy": {"allowedModels": ["good-model"]}},
 }
 
-# An expose whose rowFilter resolves ``${caller.tenant_id}`` — used to
-# prove caller_attributes isolate per request all the way into the
-# compiled SQL the driver would execute.
+# An expose whose ``policy.authz.rowFilters`` give each tenant principal its own
+# rows — used to prove caller_attributes isolate per request all the way into
+# the compiled SQL the driver would execute.
 _TENANT_EXPOSE: Dict[str, Any] = {
     "exposeId": "demo",
+    "contract": {"schema": [{"name": "id"}, {"name": "tenant_id"}]},
     "semantics": {"measures": [{"name": "row_count", "agg": "count", "expr": "id"}]},
-    "policy": {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]},
+    "policy": {
+        "authz": {
+            "rowFilters": [
+                {"principal": "tenant:acme", "where": "tenant_id = 'acme'"},
+                {"principal": "tenant:globex", "where": "tenant_id = 'globex'"},
+                {"principal": "tenant:stale", "where": "tenant_id = 'STALE-SHARED-TENANT'"},
+            ]
+        }
+    },
 }
 
 
@@ -305,7 +314,7 @@ def _fake_state(expose: Mapping[str, Any], driver: _CapturingDriver) -> SimpleNa
     """
     return SimpleNamespace(
         expose=expose,
-        caller_attributes={"tenant_id": "STALE-SHARED-TENANT"},
+        caller_attributes={"principal": "tenant:stale"},
         policy=SimpleNamespace(max_sample_rows=100),
         query_timeout_seconds=None,
         get_driver=lambda: driver,
@@ -322,12 +331,11 @@ def test_caller_attributes_threaded_into_handler_per_request() -> None:
     tool_query(
         state,
         {"measure": "row_count", "limit": 10},
-        caller_attributes={"tenant_id": "acme"},
+        caller_attributes={"principal": "tenant:acme"},
     )
     assert driver_a.captured is not None
-    assert '"tenant_id" = :p_0' in driver_a.captured.sql
-    assert "acme" in driver_a.captured.params
-    assert "STALE-SHARED-TENANT" not in driver_a.captured.params
+    assert "_fluid_rows.tenant_id = 'acme'" in driver_a.captured.sql
+    assert "STALE-SHARED-TENANT" not in driver_a.captured.sql
 
     # Request B — tenant globex, SAME shared state object (the
     # concurrent-clients-over-one-state scenario).
@@ -336,13 +344,13 @@ def test_caller_attributes_threaded_into_handler_per_request() -> None:
     tool_query(
         state,
         {"measure": "row_count", "limit": 10},
-        caller_attributes={"tenant_id": "globex"},
+        caller_attributes={"principal": "tenant:globex"},
     )
     assert driver_b.captured is not None
-    assert "globex" in driver_b.captured.params
+    assert "_fluid_rows.tenant_id = 'globex'" in driver_b.captured.sql
     # The first request's tenant must NOT bleed into the second.
-    assert "acme" not in driver_b.captured.params
-    assert "STALE-SHARED-TENANT" not in driver_b.captured.params
+    assert "'acme'" not in driver_b.captured.sql
+    assert "STALE-SHARED-TENANT" not in driver_b.captured.sql
 
 
 # ---------------------------------------------------------------------
@@ -424,23 +432,23 @@ async def test_interleaved_requests_each_gated_under_own_identity() -> None:
 # ---------------------------------------------------------------------
 
 
-def test_compiler_binds_distinct_tenant_params() -> None:
+def test_compiler_compiles_distinct_tenant_predicates() -> None:
     acme = compile_semantic_query(
         expose=_TENANT_EXPOSE,
         measure="row_count",
         limit=100,
-        caller_attributes={"tenant_id": "acme"},
+        caller_attributes={"principal": "tenant:acme"},
         table_reference="db.t",
     )
     globex = compile_semantic_query(
         expose=_TENANT_EXPOSE,
         measure="row_count",
         limit=100,
-        caller_attributes={"tenant_id": "globex"},
+        caller_attributes={"principal": "tenant:globex"},
         table_reference="db.t",
     )
-    assert acme.params == ["acme"]
-    assert globex.params == ["globex"]
+    assert "_fluid_rows.tenant_id = 'acme'" in acme.sql and "'globex'" not in acme.sql
+    assert "_fluid_rows.tenant_id = 'globex'" in globex.sql and "'acme'" not in globex.sql
 
 
 # ---------------------------------------------------------------------
@@ -451,10 +459,9 @@ def test_compiler_binds_distinct_tenant_params() -> None:
 #    (a) The verified and self-attested attribute dicts were flattened
 #        together, so "crypto wins" held only for the keys the JWT claim
 #        mapping happened to produce (the default mapping yields four).
-#        A ${caller.<attr>} rowFilter outside that set — or ANY custom
+#        An attribute outside that set — or ANY custom
 #        FLUID_MCP_JWT_CLAIM_MAPPING, which replaces rather than merges
-#        the defaults — was satisfied by the caller's own claim, turning
-#        a fail-closed denial into an attacker-chosen RLS predicate.
+#        the defaults — was satisfied by the caller's own claim.
 #    (b) model / use_case were promoted from self-attestation whenever
 #        the mapping didn't produce them, letting a client walk past the
 #        agentPolicy gate under a valid token.
@@ -481,10 +488,9 @@ def _enforced_ctx(
     return SimpleNamespace(session=session, request=SimpleNamespace(scope=scope))
 
 
-def test_self_attested_attr_cannot_fill_an_unmapped_rowfilter_placeholder() -> None:
-    """A ${caller.region} rowFilter must NOT be satisfiable by the
-    caller's own attestation when a JWT is enforced but its claim
-    mapping never produced ``region`` — it must fail closed instead."""
+def test_self_attested_attr_cannot_fill_an_unmapped_attribute() -> None:
+    """An attribute the claim mapping never produced (``region``) must NOT be
+    satisfiable by the caller's own attestation when a JWT is enforced."""
     server = _make_server(_TENANT_EXPOSE)
 
     _m, _u, attrs = server._resolve_request_identity(

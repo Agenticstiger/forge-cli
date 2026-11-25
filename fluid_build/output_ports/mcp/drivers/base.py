@@ -39,19 +39,21 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
     from ..query_compiler import CompiledQuery
 
-# Row-level-security primitives live in query_compiler (the lower layer that
-# also compiles the semantic ``query`` / free-form ``query_sql`` WHERE) so a
-# single offset-aware builder enforces ``policy.rowFilters[]`` on EVERY read
-# path — ``sample`` here, plus ``query`` / ``query_sql`` at compile time.
-# Imported (and thus re-exported from this module) so ``sample`` and existing
-# ``from ...drivers.base import RowFilterIdentityMissing`` call sites are
-# unchanged.
+# Row-level security lives in query_compiler (the lower layer that also compiles
+# the semantic ``query`` / free-form ``query_sql`` statements), so one resolver
+# enforces ``policy.authz.rowFilters`` on EVERY read path: ``sample`` here, plus
+# ``query`` / ``query_sql`` at compile time. The refusals are re-exported from this
+# module so ``from ...drivers.base import RowFilterIdentityMissing`` keeps working.
+from ..query_compiler import (
+    ROW_FILTER_ALIAS,
+    row_filter_predicate,
+    strip_projection_open,
+)
 from ..query_compiler import (
     RowFilterIdentityMissing as RowFilterIdentityMissing,
 )
 from ..query_compiler import (
-    compile_row_filter_clauses,
-    strip_projection_open,
+    RowFilterUnavailable as RowFilterUnavailable,
 )
 
 
@@ -393,61 +395,6 @@ class EngineDriver(ABC):
                 out[column] = value
         return out
 
-    @staticmethod
-    def compile_row_filter_predicate(
-        expose: Mapping[str, Any],
-        *,
-        caller_attributes: Mapping[str, Any],
-        dialect: Optional[str] = None,
-    ) -> tuple[str, list[Any]]:
-        """Compile ``expose.policy.rowFilters[]`` into a parameterised
-        SQL ``WHERE`` predicate the driver appends to ``sample`` /
-        ``query`` reads.
-
-        Schema shape (NEW in v0.7.4):
-
-        .. code:: yaml
-
-            policy:
-              rowFilters:
-                - column: tenant_id
-                  equals: ${caller.tenant_id}
-                - column: region
-                  in: ${caller.regions}
-
-        Each filter resolves ``${caller.<attr>}`` placeholders from
-        ``caller_attributes`` (populated by the gateway from the
-        MCP ``clientInfo`` extra fields, e.g.
-        ``Implementation(model=..., useCase=..., tenantId=...,
-        regions=[...])``). Unresolved placeholders → fail-closed
-        deny by raising ``RowFilterIdentityMissing``: the gateway
-        prefers no rows to wrong rows.
-
-        ``dialect`` is the driver's dialect token
-        (``descriptor().dialect``); it selects the identifier-quoting
-        style for the filter column (backticks on BigQuery, ANSI
-        double-quotes elsewhere). BigQuery reads ANSI double-quotes as
-        a STRING LITERAL, so without this the predicate compiles to
-        ``WHERE 'tenant_id' = <val>`` — always false → a row-filtered
-        BigQuery ``sample`` returns ZERO rows. ``None`` keeps the ANSI
-        form for back-compat.
-
-        Returns ``("WHERE <pred>", [param, ...])`` (empty string +
-        empty list when no filters configured). The driver appends
-        the WHERE clause to its FROM and binds the params in its
-        normal placeholder rewrite.
-        """
-        # Delegates to the shared, offset-aware builder in query_compiler so
-        # sample / query / query_sql all enforce identical row filters. sample
-        # builds its own ``SELECT * FROM <table>`` so it owns placeholder index
-        # 0 (offset=0) and just needs the leading WHERE.
-        clauses, params = compile_row_filter_clauses(
-            expose, caller_attributes, offset=0, dialect=dialect
-        )
-        if not clauses:
-            return "", []
-        return " WHERE " + " AND ".join(clauses), params
-
     def sample(
         self,
         *,
@@ -455,41 +402,30 @@ class EngineDriver(ABC):
         caller_attributes: Optional[Mapping[str, Any]] = None,
     ) -> SampleResult:
         """Default ``sample`` implementation — ``SELECT * FROM <table>
-        [WHERE <row_filter>] LIMIT n``.
+        [AS _fluid_rows WHERE <row filter>] LIMIT n``.
 
-        ``caller_attributes`` is the (optional) mapping the gateway
-        passes from ``clientInfo`` extra fields; when the contract
-        declares ``policy.rowFilters[]``, those filters are compiled
-        into a parameterised WHERE clause bound to those attributes.
-        Missing attributes referenced by a row filter raise
-        :class:`RowFilterIdentityMissing` (fail-closed deny). When
-        no row filters are configured, the kwarg is ignored.
+        ``caller_attributes`` is the request's verified identity. When the
+        contract declares ``policy.authz.rowFilters``,
+        :func:`...query_compiler.row_filter_predicate` resolves the rows the
+        caller's principals may read and the read is limited to them. A
+        caller no filter or reader names raises
+        :class:`RowFilterIdentityMissing`, and a filter that cannot be
+        applied :class:`RowFilterUnavailable`: no row is returned unfiltered.
 
         Drivers can override if the engine has a cheaper sampling
         primitive (BigQuery's ``TABLESAMPLE``, Snowflake's
-        ``SAMPLE``).
+        ``SAMPLE``), as long as they apply the same predicate.
         """
         if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
-        where_clause, where_params = self.compile_row_filter_predicate(
-            self.expose,
-            caller_attributes=caller_attributes or {},
-            dialect=descriptor.dialect,
-        )
-        sql = f"SELECT * FROM {descriptor.table_reference}{where_clause} LIMIT {limit}"
-        # The row-filter WHERE carries portable ``:p_<index>`` placeholders; render
-        # them to the driver's native form BEFORE execute (the ``query`` path renders
-        # via CompiledQuery, but ``sample`` built the SQL by hand and previously
-        # skipped this — so sample+rowFilters raised a parser error on every real
-        # engine, e.g. DuckDB ``syntax error at ":"``). A no-rowFilters sample has no
-        # placeholders, so this is a no-op there.
-        from ..query_compiler import CompiledQuery
-
-        rendered = CompiledQuery(sql=sql, params=list(where_params)).render_sql_for_dialect(
-            descriptor.dialect
-        )
-        result = self.execute(sql=rendered, params=tuple(where_params))
+        predicate = row_filter_predicate(self.expose, caller_attributes, dialect=descriptor.dialect)
+        source = descriptor.table_reference
+        if predicate is not None:
+            # The predicate is the contract's own literal SQL, its columns qualified
+            # with ROW_FILTER_ALIAS; it binds no parameter.
+            source = f"{source} AS {ROW_FILTER_ALIAS} WHERE {predicate}"
+        result = self.execute(sql=f"SELECT * FROM {source} LIMIT {limit}", params=())
         visible_columns, rows = self.project(result.rows, columns=result.columns)
         truncated = len(rows) >= limit
         return SampleResult(columns=visible_columns, rows=rows, truncated=truncated)

@@ -17,8 +17,9 @@ Each emitter writes the filters in its platform's own terms:
   wildcard's exclusions), and the principal's ``SELECT`` is granted on the filter
   instead of on the table.
 
-The filters are parsed by :mod:`fluid_build.providers._row_filters`, a parse any other
-consumer of the filters can share. The predicate is one SQL boolean expression over the
+The filters are parsed by :mod:`fluid_build.providers._row_filters`, the parse the MCP
+output-port gateway applies them with too, so a platform's policy and the gateway
+enforce the same filter. The predicate is one SQL boolean expression over the
 expose's columns, parsed (sqlglot) rather than trusted: a statement separator, a
 comment, a subquery, a clause besides the WHERE, a bind placeholder or a column the
 schema does not declare is refused, so the text written into the platform's policy is

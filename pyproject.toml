@@ -80,8 +80,9 @@ dependencies = [
   # deployment needs shared limits.)
   # Borrowed SQL parser (MIT). Real consumers: fluid_build/providers/_row_filters.py
   # (parses and validates a row-filter predicate before the IaC emitters write it
-  # into a platform policy; without sqlglot every row filter is refused, so keep
-  # this in the base install), iac/providers/databricks_access.py,
+  # into a platform policy and before the MCP gateway applies it; without sqlglot
+  # every row filter is refused, so keep this in the base install),
+  # output_ports/mcp/query_compiler.py, iac/providers/databricks_access.py,
   # forge/core/validators.py and the from_ddl parser. (providers/_sql_safety.py
   # does not use it.)
   # Borrowed-not-built per /borrow-before-build: https://github.com/tobymao/sqlglot

@@ -78,7 +78,7 @@ from ._expose_utils import (
     _jsonable,
     _summarise_arguments,
 )
-from .auth import JURISDICTION_ATTR, MTLS_IDENTITY_ATTRS
+from .auth import JURISDICTION_ATTR, MTLS_IDENTITY_ATTRS, PRINCIPAL_ATTR
 from .drivers import EngineDriver, build_driver
 from .policy import OutputPortPolicy
 from .query_compiler import QueryValidationError
@@ -201,10 +201,10 @@ class SessionState:
     driver: Optional[EngineDriver] = None
     model_id: Optional[str] = None
     use_case: Optional[str] = None
-    # All extra clientInfo fields (tenant_id, regions, principal, …)
-    # bound at MCP initialize. Used by ``policy.rowFilters`` to
-    # resolve ``${caller.<attr>}`` placeholders into per-tenant
-    # WHERE clauses at sample/query time.
+    # Fallback caller attributes for handlers called without a per-request
+    # identity (tests, legacy callers). The server always passes the identity
+    # :meth:`OutputPortMcpServer._resolve_request_identity` resolved for the
+    # request, which is what ``policy.authz.rowFilters`` is enforced against.
     caller_attributes: Dict[str, Any] = field(default_factory=dict)
     query_timeout_seconds: float = DEFAULT_QUERY_TIMEOUT_SECONDS
     # Cross-stage correlation id (auto-stamped onto OTel spans + audit
@@ -471,7 +471,7 @@ class OutputPortMcpServer:
             # On HTTP one process serves many concurrent clients
             # over one SessionState; caching the first client's identity
             # bled it onto every later client (wrong agentPolicy
-            # principal + wrong tenant rowFilter). The MCP protocol
+            # model + wrong row-filter principal). The MCP protocol
             # guarantees initialize precedes any tools/call, so the SDK
             # has already received this client's clientInfo + auth attrs
             # by the time we get here.
@@ -764,24 +764,27 @@ class OutputPortMcpServer:
         dict made "crypto wins" hold only for the keys the JWT claim mapping
         happens to produce (the default mapping yields five:
         ``sub`` / ``model`` / ``use_case`` / ``tenant_id`` /
-        ``jurisdiction``). Any ``${caller.<attr>}`` rowFilter outside that set
-        — or, before ``FLUID_MCP_JWT_CLAIM_MAPPING`` was made to merge over the
-        defaults rather than replace them, any custom mapping at all — was
-        then satisfied by the caller's own claim, turning a
-        fail-closed denial into an attacker-chosen RLS predicate, and let a
-        client re-attest ``model`` / ``useCase`` past the agentPolicy gate.
+        ``jurisdiction``). Any attribute outside that set — or, before
+        ``FLUID_MCP_JWT_CLAIM_MAPPING`` was made to merge over the defaults
+        rather than replace them, any custom mapping at all — was then
+        satisfied by the caller's own claim, and a client could re-attest
+        ``model`` / ``useCase`` past the agentPolicy gate.
         So: when the transport stamps ``fluid_auth_kind`` (JWT / mTLS
         actually enforced), ONLY verified attributes bind. Self-attestation
         stays authoritative solely when no auth is configured — the
         pre-existing no-auth behaviour — with one exception below.
 
-        **Certificate attributes are verified-only in every mode.**
-        ``client_cn`` / ``client_fingerprint`` name a client certificate, and
-        only the trusted mTLS proxy can vouch for one. They are dropped from
-        the self-attested tier whatever the auth mode, so with auth off a
-        ``${caller.client_cn}`` rowFilter fails closed instead of selecting
-        the rows of whichever CN the client typed. ``jurisdiction`` has the
-        same rule for its gate (:meth:`_resolve_verified_jurisdiction`).
+        **Certificate attributes and the principal are verified-only in every
+        mode.** ``client_cn`` / ``client_fingerprint``
+        name a client certificate, and only the trusted mTLS proxy can vouch
+        for one, so the audit trail never attributes a call to a certificate
+        the client merely named. ``principal`` decides which rows
+        ``policy.authz.rowFilters`` lets a caller read: a client naming its
+        own would pick its filter, or a reader's every row. All three are
+        dropped from the self-attested tier whatever the auth mode, so with
+        auth off a row-filtered expose refuses every call rather than serve
+        the rows of whichever principal the client typed. ``jurisdiction``
+        has the same rule for its gate (:meth:`_resolve_verified_jurisdiction`).
         """
         model_id: Optional[str] = None
         use_case: Optional[str] = None
@@ -859,6 +862,13 @@ class OutputPortMcpServer:
                 "(certificate attributes bind only from a trusted proxy)",
                 self_attested_certs,
             )
+        if PRINCIPAL_ATTR in attrs:
+            del attrs[PRINCIPAL_ATTR]
+            self.state.logger.debug(
+                "output_port_identity_self_attested_principal_ignored: the principal "
+                "binds only from a verified credential (FLUID_MCP_JWT_CLAIM_MAPPING="
+                "<claim>=principal)"
+            )
         try:
             request = getattr(ctx, "request", None)
             scope = getattr(request, "scope", None) or {}
@@ -869,8 +879,8 @@ class OutputPortMcpServer:
             auth_kind = scope.get("fluid_auth_kind")
             if auth_kind:
                 # Auth enforced: the verified tier REPLACES the self-attested
-                # one. A caller cannot fill a ${caller.*} hole the claim
-                # mapping doesn't cover, nor re-attest model / use_case.
+                # one. A caller cannot fill an attribute the claim mapping
+                # doesn't cover, nor re-attest model / use_case.
                 dropped = sorted(set(attrs) - set(crypto))
                 attrs = dict(crypto)
                 model_id = str(crypto["model"]) if "model" in crypto else None
@@ -1043,8 +1053,8 @@ class OutputPortMcpServer:
         ``caller_attributes`` is the CALLING client's per-request
         identity (resolved by :meth:`_resolve_request_identity`),
         threaded explicitly into the data-tool handlers so each
-        concurrent HTTP client's ``${caller.*}`` rowFilters resolve
-        against ITS OWN identity — not whatever happens to be cached on
+        concurrent HTTP client's ``policy.authz.rowFilters`` resolve
+        against ITS OWN principal — not whatever happens to be cached on
         the shared SessionState.
 
         Each handler is sync today — driver SDKs (snowflake-connector,

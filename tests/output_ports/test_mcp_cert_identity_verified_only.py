@@ -1,15 +1,17 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""``${caller.client_cn}`` / ``${caller.client_fingerprint}`` bind only from a
-verified certificate.
+"""``client_cn`` / ``client_fingerprint`` and the row-filter ``principal`` bind
+only from a verified credential.
 
-Those two attributes name a client certificate. The only party that can vouch
-for one is the mTLS-terminating proxy listed in ``FLUID_MCP_TRUSTED_PROXIES``,
-and the gateway reads that proxy's headers only on an authenticated request.
-So, like ``jurisdiction``, they are verified-only: a value the client supplies
-about itself never binds them, whatever the auth mode, and a gateway that could
-never honour them refuses to start instead of serving every call a denial.
+The first two name a client certificate. The only party that can vouch for one is
+the mTLS-terminating proxy listed in ``FLUID_MCP_TRUSTED_PROXIES``, and the gateway
+reads that proxy's headers only on an authenticated request. The principal decides
+which rows ``policy.authz.rowFilters`` lets a caller read. So, like
+``jurisdiction``, all three are verified-only: a value the client supplies about
+itself never binds them, whatever the auth mode, and a gateway that could never
+bind a principal its row filters need refuses to start instead of serving every
+call a denial.
 
 These tests drive the resolver, the real Streamable HTTP transport, the in-memory
 stdio session and the real CLI.
@@ -44,6 +46,9 @@ from .test_extensibility_and_runtime import _free_port, _running_http_server  # 
 
 TOKEN = "test-shared-token-not-a-secret"  # pragma: allowlist secret
 CERT_ATTRS = ("client_cn", "client_fingerprint")
+#: The principal the row filter on ``_cn_expose`` names; a client that states it
+#: about itself must not read its rows.
+CN_PRINCIPAL = "client:C0001"
 
 #: The three ways ``--transport http`` ends up serving without auth.
 UNAUTHENTICATED_HTTP_ENVS: Dict[str, Dict[str, str]] = {
@@ -75,7 +80,7 @@ def _cn_expose(tmp_path: Path) -> Dict[str, Any]:
         },
     )
     expose["policy"] = {
-        "rowFilters": [{"column": "customer_id", "equals": "${caller.client_cn}"}],
+        "authz": {"rowFilters": [{"principal": CN_PRINCIPAL, "where": "customer_id = 'C0001'"}]},
     }
     return expose
 
@@ -122,11 +127,16 @@ def test_self_attested_certificate_attributes_never_bind(tmp_path: Path, scope):
     server = _server(_cn_expose(tmp_path), tmp_path)
     _model, _use_case, attrs = server._resolve_request_identity(
         _request_context(
-            client_info={"client_cn": "C0002", "client_fingerprint": "ff", "tenant_id": "acme"},
+            client_info={
+                "client_cn": "C0002",
+                "client_fingerprint": "ff",
+                "principal": CN_PRINCIPAL,
+                "tenant_id": "acme",
+            },
             scope=scope,
         )
     )
-    for attr in CERT_ATTRS:
+    for attr in (*CERT_ATTRS, "principal"):
         assert attr not in attrs, attrs
     # Unauthenticated self-attestation of other attributes is unchanged.
     assert attrs["tenant_id"] == "acme"
@@ -179,8 +189,8 @@ async def test_unauthenticated_http_does_not_bind_a_self_attested_cn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_env: str
 ):
     """Behind a listed proxy but with auth not actually enabled, a client
-    naming its own CN gets no rows: neither the proxy header nor the
-    self-attested value binds ``${caller.client_cn}``."""
+    naming its own CN and principal gets no rows: neither the proxy header nor
+    the self-attested values bind, so the row filter refuses the call."""
     audit_root = _isolated_env(
         monkeypatch,
         tmp_path,
@@ -190,7 +200,11 @@ async def test_unauthenticated_http_does_not_bind_a_self_attested_cn(
     port = _free_port()
     with _running_http_server(server, port):
         payload = await _sample_over_http(
-            port, {"X-Client-CN": "C0001"}, client_cn="C0002", client_fingerprint="ff"
+            port,
+            {"X-Client-CN": "C0001"},
+            client_cn="C0002",
+            client_fingerprint="ff",
+            principal=CN_PRINCIPAL,
         )
     assert payload.get("rows") is None, payload
     assert payload.get("error"), payload
@@ -209,7 +223,7 @@ async def test_unauthenticated_http_without_a_proxy_does_not_bind_a_self_atteste
     server = _server(_cn_expose(tmp_path), tmp_path)
     port = _free_port()
     with _running_http_server(server, port):
-        payload = await _sample_over_http(port, {}, client_cn="C0003")
+        payload = await _sample_over_http(port, {}, client_cn="C0003", principal=CN_PRINCIPAL)
     assert payload.get("rows") is None, payload
     assert payload.get("error"), payload
 
@@ -221,7 +235,10 @@ async def test_stdio_does_not_bind_a_self_attested_cn(
     _isolated_env(monkeypatch, tmp_path, {})
     server = _server(_cn_expose(tmp_path), tmp_path)
     async with open_inmemory_session(
-        server.server, **self_attesting_client_kwargs("cn-test", "1.0.0", client_cn="C0002")
+        server.server,
+        **self_attesting_client_kwargs(
+            "cn-test", "1.0.0", client_cn="C0002", principal=CN_PRINCIPAL
+        ),
     ) as client:
         result = await client.call_tool("sample", {"limit": 10})
     payload = json.loads(result.content[0].text)
@@ -230,7 +247,7 @@ async def test_stdio_does_not_bind_a_self_attested_cn(
 
 
 # ---------------------------------------------------------------------
-# CLI: a configuration that can never honour a certificate refuses to start
+# CLI: a configuration that can never honour a certificate or a principal refuses to start
 # ---------------------------------------------------------------------
 
 
@@ -264,8 +281,9 @@ def _write_contract(tmp_path: Path, *, cn_filter: bool) -> Path:
     if cn_filter:
         text += (
             "    policy:\n"
-            "      rowFilters:\n"
-            '        - { column: customer_id, equals: "${caller.client_cn}" }\n'
+            "      authz:\n"
+            "        rowFilters:\n"
+            '          - { principal: "client:C0001", where: "customer_id = \'C0001\'" }\n'
         )
     contract = tmp_path / "contract.fluid.yaml"
     contract.write_text(text, encoding="utf-8")
@@ -338,11 +356,11 @@ def test_cli_trusted_proxies_without_auth_refuses_to_start(tmp_path: Path, auth_
 
 
 @pytest.mark.parametrize("auth_env", list(UNAUTHENTICATED_HTTP_ENVS), ids=str)
-def test_cli_certificate_row_filter_without_auth_refuses_to_start(tmp_path: Path, auth_env: str):
+def test_cli_row_filter_without_auth_refuses_to_start(tmp_path: Path, auth_env: str):
     proc = _serve(tmp_path, UNAUTHENTICATED_HTTP_ENVS[auth_env], transport="http", cn_filter=True)
     output = proc.stdout + proc.stderr
     assert proc.returncode == 2, output
-    assert "caller.client_cn" in output
+    assert "policy.authz.rowFilters" in output and "HTTP auth is off" in output
     assert "Traceback" not in output
 
 
@@ -364,17 +382,17 @@ def test_cli_unauthenticated_http_beyond_loopback_refuses_to_start(tmp_path: Pat
     assert "Traceback" not in output
 
 
-def test_cli_certificate_row_filter_over_stdio_refuses_to_start(tmp_path: Path):
+def test_cli_row_filter_over_stdio_refuses_to_start(tmp_path: Path):
     proc = _serve(tmp_path, {}, transport="stdio", cn_filter=True)
     output = proc.stdout + proc.stderr
     assert proc.returncode == 2, output
-    assert "caller.client_cn" in output
+    assert "policy.authz.rowFilters" in output and "carries no verified identity" in output
     assert "Traceback" not in output
 
 
-def test_cli_stdio_without_a_certificate_filter_still_serves(tmp_path: Path):
-    """stdio does not read FLUID_MCP_TRUSTED_PROXIES; only a contract that
-    needs a certificate makes it refuse."""
+def test_cli_stdio_without_a_row_filter_still_serves(tmp_path: Path):
+    """stdio does not read FLUID_MCP_TRUSTED_PROXIES; only a contract whose row
+    filters need a verified principal makes it refuse."""
     proc = _serve(
         tmp_path, {"FLUID_MCP_TRUSTED_PROXIES": "127.0.0.1"}, transport="stdio", cn_filter=False
     )
@@ -391,7 +409,7 @@ def _validator(**kwargs: Any) -> auth_mod.AuthValidator:
     return auth_mod.AuthValidator(**kwargs)
 
 
-def test_gate_allows_an_authenticated_gateway_behind_a_trusted_proxy(tmp_path: Path):
+def test_gate_allows_an_authenticated_gateway_behind_a_trusted_proxy():
     from fluid_build.cli.mcp_output_port import _cert_identity_gate_unsatisfiable
 
     validator = _validator(
@@ -399,38 +417,17 @@ def test_gate_allows_an_authenticated_gateway_behind_a_trusted_proxy(tmp_path: P
         shared_token=TOKEN,
         trusted_proxies=auth_mod.parse_trusted_proxies("127.0.0.1"),
     )
-    assert (
-        _cert_identity_gate_unsatisfiable(
-            _cn_expose(tmp_path), transport="http", http_auth=validator
-        )
-        is None
-    )
+    assert _cert_identity_gate_unsatisfiable(transport="http", http_auth=validator) is None
 
 
-def test_gate_allows_an_unauthenticated_gateway_that_needs_no_certificate(tmp_path: Path):
+def test_gate_allows_an_unauthenticated_gateway_that_relies_on_no_proxy():
     from fluid_build.cli.mcp_output_port import _cert_identity_gate_unsatisfiable
 
-    expose = _cn_expose(tmp_path)
-    expose["policy"] = {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]}
     assert (
-        _cert_identity_gate_unsatisfiable(
-            expose, transport="http", http_auth=_validator(mode="none")
-        )
+        _cert_identity_gate_unsatisfiable(transport="http", http_auth=_validator(mode="none"))
         is None
     )
-
-
-def test_gate_sees_a_certificate_attribute_inside_an_in_list(tmp_path: Path):
-    from fluid_build.cli.mcp_output_port import _cert_identity_gate_unsatisfiable
-
-    expose = _cn_expose(tmp_path)
-    expose["policy"] = {
-        "rowFilters": [{"column": "fp", "in": ["${caller.client_fingerprint}", "static"]}]
-    }
-    message = _cert_identity_gate_unsatisfiable(
-        expose, transport="http", http_auth=_validator(mode="none")
-    )
-    assert message is not None and "caller.client_fingerprint" in message
+    assert _cert_identity_gate_unsatisfiable(transport="stdio", http_auth=None) is None
 
 
 @pytest.mark.parametrize(
@@ -444,13 +441,12 @@ def test_gate_sees_a_certificate_attribute_inside_an_in_list(tmp_path: Path):
         ),
     ],
 )
-def test_gate_message_names_what_keeps_auth_off(tmp_path: Path, kwargs, names):
+def test_gate_message_names_what_keeps_auth_off(kwargs, names):
     from fluid_build.cli.mcp_output_port import _cert_identity_gate_unsatisfiable
 
-    message = _cert_identity_gate_unsatisfiable(
-        _cn_expose(tmp_path), transport="http", http_auth=_validator(**kwargs)
-    )
-    assert message is not None
+    validator = _validator(**kwargs, trusted_proxies=auth_mod.parse_trusted_proxies("127.0.0.1"))
+    message = _cert_identity_gate_unsatisfiable(transport="http", http_auth=validator)
+    assert message is not None and "FLUID_MCP_TRUSTED_PROXIES" in message
     for name in names:
         assert name in message, message
 

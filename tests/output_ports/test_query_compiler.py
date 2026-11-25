@@ -19,9 +19,10 @@ import pytest
 from fluid_build.output_ports.mcp.query_compiler import (
     CompiledQuery,
     QueryValidationError,
+    RowFilterUnavailable,
     compile_free_form_sql,
-    compile_row_filter_clauses,
     compile_semantic_query,
+    row_filter_predicate,
 )
 
 from ._fixtures import make_expose
@@ -159,48 +160,72 @@ def test_render_bigquery_no_substring_collision_at_twelve_params():
 
 
 # ---------------------------------------------------------------------
-# Row-filter identifier quoting is dialect-aware (BigQuery needs backticks)
+# A row-filter predicate is checked as the engine reads it
 # ---------------------------------------------------------------------
 
-_RF_EXPOSE = {
-    "policy": {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]},
-}
+_RF_PRINCIPAL = "tenant:acme"
 
 
-def test_row_filter_quoting_bigquery_uses_backticks():
-    # BigQuery reads ANSI "tenant_id" as a STRING LITERAL → predicate always
-    # false → zero rows. It MUST be backtick-quoted instead.
-    clauses, params = compile_row_filter_clauses(
-        _RF_EXPOSE, {"tenant_id": "acme"}, dialect="bigquery"
+def _rf_expose(where: str):
+    return {
+        "exposeId": "demo",
+        "contract": {"schema": [{"name": "tenant_id"}]},
+        "policy": {"authz": {"rowFilters": [{"principal": _RF_PRINCIPAL, "where": where}]}},
+    }
+
+
+def test_row_filter_double_quotes_are_refused_on_bigquery():
+    # BigQuery reads ANSI "tenant_id" as a STRING LITERAL, so the predicate would
+    # compare two strings and select every row (or none). It is refused there.
+    with pytest.raises(RowFilterUnavailable, match="other columns on this engine"):
+        row_filter_predicate(
+            _rf_expose("\"tenant_id\" = 'acme'"), {"principal": _RF_PRINCIPAL}, dialect="bigquery"
+        )
+    assert (
+        row_filter_predicate(
+            _rf_expose("tenant_id = 'acme'"), {"principal": _RF_PRINCIPAL}, dialect="bigquery"
+        )
+        == "((_fluid_rows.tenant_id = 'acme'))"
     )
-    assert clauses == ["`tenant_id` = :p_0"]
-    assert params == ["acme"]
 
 
 @pytest.mark.parametrize("dialect", [None, "duckdb", "snowflake", "postgres", "athena"])
-def test_row_filter_quoting_non_bigquery_uses_ansi_double_quotes(dialect):
-    clauses, params = compile_row_filter_clauses(_RF_EXPOSE, {"tenant_id": "acme"}, dialect=dialect)
-    assert clauses == ['"tenant_id" = :p_0']
-    assert params == ["acme"]
+def test_row_filter_double_quotes_are_an_identifier_elsewhere(dialect):
+    predicate = row_filter_predicate(
+        _rf_expose("\"tenant_id\" = 'acme'"), {"principal": _RF_PRINCIPAL}, dialect=dialect
+    )
+    assert predicate == "((_fluid_rows.\"tenant_id\" = 'acme'))"
 
 
-def test_semantic_query_threads_dialect_into_rowfilter_quoting():
-    # End-to-end: compile_semantic_query passes dialect through to the merged
-    # rowFilter so a BigQuery query gets backticked tenant_id.
+def test_semantic_query_threads_dialect_into_the_row_filter_check():
+    # End-to-end: compile_semantic_query passes dialect through, so a BigQuery
+    # query refuses a predicate BigQuery would read differently.
+    columns = [{"name": "id"}, {"name": "tenant_id"}]
     expose = make_expose(
+        columns=columns,
         semantics={"name": "p", "measures": [{"name": "n", "agg": "count", "expr": "id"}]},
     )
-    expose["policy"] = {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]}
+    expose["policy"] = _rf_expose("\"tenant_id\" = 'acme'")["policy"]
+    with pytest.raises(RowFilterUnavailable):
+        compile_semantic_query(
+            expose=expose,
+            measure="n",
+            limit=10,
+            caller_attributes={"principal": _RF_PRINCIPAL},
+            table_reference="`proj.ds.t`",
+            dialect="bigquery",
+        )
+    expose["policy"] = _rf_expose("tenant_id = 'acme'")["policy"]
     compiled = compile_semantic_query(
         expose=expose,
         measure="n",
         limit=10,
-        caller_attributes={"tenant_id": "acme"},
+        caller_attributes={"principal": _RF_PRINCIPAL},
         table_reference="`proj.ds.t`",
         dialect="bigquery",
     )
-    assert "`tenant_id` = :p_0" in compiled.sql
-    assert compiled.params == ["acme"]
+    assert "`proj.ds.t` AS _fluid_rows WHERE ((_fluid_rows.tenant_id = 'acme'))" in compiled.sql
+    assert compiled.params == []
 
 
 # ---------------------------------------------------------------------
@@ -693,16 +718,22 @@ def test_balanced_or_filter_stays_contained_next_to_row_filters():
     """A legitimate OR filter must stay inside its parens so the ANDed
     RLS clause still constrains every branch."""
     expose = _expose_with_filtered_metric("status = 'completed' OR status = 'shipped'")
-    expose["policy"] = {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]}
+    expose["contract"]["schema"].append({"name": "tenant_id"})
+    expose["policy"] = {
+        "authz": {"rowFilters": [{"principal": "tenant:t-1", "where": "tenant_id = 't-1'"}]}
+    }
     compiled = compile_semantic_query(
         expose=expose,
         metric="completed_revenue",
         limit=10,
         table_reference="orders",
-        caller_attributes={"tenant_id": "t-1"},
+        caller_attributes={"principal": "tenant:t-1"},
     )
-    assert "(status = 'completed' OR status = 'shipped') AND (\"tenant_id\" = :p_0)" in compiled.sql
-    assert compiled.params == ["t-1"]
+    # The metric's OR is parenthesised in the outer WHERE; the row filter is applied
+    # inside the projection the whole statement reads, so no branch escapes it.
+    assert "WHERE (status = 'completed' OR status = 'shipped')" in compiled.sql
+    assert "orders AS _fluid_rows WHERE ((_fluid_rows.tenant_id = 't-1'))" in compiled.sql
+    assert compiled.params == []
 
 
 # ---------------------------------------------------------------------

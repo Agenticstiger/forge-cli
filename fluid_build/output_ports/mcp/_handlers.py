@@ -85,14 +85,13 @@ def tool_sample(
         limit = 10
     cap = state.policy.max_sample_rows
     effective = min(max(limit, 1), cap)
-    # Pass caller_attributes so any policy.rowFilters[] in the
-    # contract resolve their ${caller.*} placeholders against
-    # THIS request's caller identity. The kwarg is the per-request
-    # identity threaded down from the dispatcher; it falls back to
-    # ``state.caller_attributes`` only for legacy callers that don't
-    # pass it (back-compat for existing tests + stdio). Drivers that
-    # don't override sample() use the base impl, which compiles the
-    # filter into a parameterised WHERE clause.
+    # Pass caller_attributes so any policy.authz.rowFilters in the
+    # contract resolve against THIS request's verified principal. The
+    # kwarg is the per-request identity threaded down from the
+    # dispatcher; it falls back to ``state.caller_attributes`` only for
+    # callers that don't pass it (tests). Drivers that don't override
+    # sample() use the base impl, which limits the read to the rows the
+    # principal may read.
     attrs = caller_attributes if caller_attributes is not None else state.caller_attributes
     result = driver.sample(limit=effective, caller_attributes=attrs)
     return {
@@ -148,15 +147,15 @@ def tool_query(
         dimensions=args.get("dimensions"),
         filters=args.get("filters"),
         limit=_resolve_limit(args.get("limit"), cap=state.policy.max_sample_rows),
-        # Enforce policy.rowFilters[] on the query tool (was bypassed — only
-        # sample applied them); merged into the compiled WHERE. ``attrs`` is
-        # this request's caller identity (falls back to state for legacy
-        # callers that don't pass the kwarg).
+        # Enforce policy.authz.rowFilters on the query tool: the compiled
+        # statement reads the table through the rows the caller's principal may
+        # read. ``attrs`` is this request's verified identity (falls back to
+        # state for callers that don't pass the kwarg).
         caller_attributes=attrs,
         table_reference=descriptor.table_reference,
-        # Pass the engine dialect so a merged rowFilter column is quoted for
-        # THIS engine — backticks on BigQuery (ANSI double-quotes there read
-        # as a string literal → predicate always false → zero rows).
+        # Pass the engine dialect so a row-filter predicate is checked as THIS
+        # engine reads it (on BigQuery a double-quoted name is a string, so a
+        # predicate written with one is refused rather than misread).
         dialect=descriptor.dialect,
         # Column-level policy, enforced at COMPILE time. The driver's
         # ``project()`` drops restricted columns / redacts PII by matching
@@ -202,13 +201,12 @@ def tool_query_sql(
         table_reference=descriptor.table_reference,
         limit=_resolve_limit(args.get("limit"), cap=state.policy.max_sample_rows),
         restricted_columns=restricted,
-        # Enforce policy.rowFilters[] on the free-form query_sql tool. RLS
-        # can't be safely applied to arbitrary caller SQL (a spoofable filter
-        # column in the caller's projection), so the compiler FAILS CLOSED:
-        # when the expose declares rowFilters it raises QueryValidationError
-        # steering the caller to the semantic ``query`` tool instead of
-        # wrapping. ``attrs`` is this request's caller identity (falls back to
-        # state for legacy callers that don't pass the kwarg).
+        # Enforce policy.authz.rowFilters on the free-form query_sql tool: every
+        # read of the exposed table in the caller's statement is rewritten to
+        # the rows the caller's principal may read (never a wrap around the
+        # statement, whose projection the caller controls). ``attrs`` is this
+        # request's verified identity (falls back to state for callers that
+        # don't pass the kwarg).
         expose=state.expose,
         caller_attributes=attrs,
         dialect=descriptor.dialect,

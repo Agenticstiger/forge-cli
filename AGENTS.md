@@ -305,9 +305,10 @@ exposes:
 The **Fluid MCP output port** (`fluid mcp output-port serve`, NEW in v0.7.4) reads
 the contract and enforces `allowedModels`/`deniedModels`,
 `allowedUseCases`/`deniedUseCases`, `maxTokensPerRequest`/`maxTokensPerDay`,
-PII/PHI row redaction (via column `sensitivity` markers), and per-tenant
-`policy.rowFilters[]` automatically on every read. When you connect to a
-fluid data product through that gateway, the contract is the policy.
+PII/PHI row redaction (via column `sensitivity` markers), and
+`policy.authz.rowFilters` (each caller reads the rows its verified principal may
+read) automatically on every read. When you connect to a fluid data product
+through that gateway, the contract is the policy.
 
 Outside the gateway, the **`fluid_build.output_ports.iam_compiler`** module
 emits Snowflake row-access policies + Postgres `CREATE POLICY` statements that

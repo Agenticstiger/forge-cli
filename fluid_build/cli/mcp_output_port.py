@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Iterable, List, Mapping, Optional, Tuple
 
 from ._common import CLIError, load_contract_with_overlay
 
@@ -497,11 +497,16 @@ def _run_serve(args, logger: logging.Logger) -> int:
         sys.stderr.write(unsatisfiable)
         sys.stderr.flush()
         return 2
-    cert_unsatisfiable = _cert_identity_gate_unsatisfiable(
-        expose, transport=transport, http_auth=http_auth
-    )
+    cert_unsatisfiable = _cert_identity_gate_unsatisfiable(transport=transport, http_auth=http_auth)
     if cert_unsatisfiable is not None:
         sys.stderr.write(cert_unsatisfiable)
+        sys.stderr.flush()
+        return 2
+    rows_unsatisfiable = _row_filter_gate_unsatisfiable(
+        expose, transport=transport, http_auth=http_auth
+    )
+    if rows_unsatisfiable is not None:
+        sys.stderr.write(rows_unsatisfiable)
         sys.stderr.flush()
         return 2
     logger.info(
@@ -861,64 +866,103 @@ def _jurisdiction_refusal_reason(http_auth: AuthValidator) -> Optional[Tuple[str
 
 
 def _cert_identity_gate_unsatisfiable(
-    expose, *, transport: str, http_auth: Optional[AuthValidator]
+    *, transport: str, http_auth: Optional[AuthValidator]
 ) -> Optional[str]:
-    """Refuse at startup when client-certificate identity could never bind.
+    """Refuse at startup an HTTP gateway relying on a proxy it would ignore.
 
-    ``${caller.client_cn}`` / ``${caller.client_fingerprint}`` bind only from
-    the ``X-Client-CN`` / ``X-Client-Fingerprint`` headers of a trusted proxy,
-    and the gateway reads those only on a request its auth middleware has
-    authenticated (``shared-token`` with a token, or ``jwt`` with issuer,
-    audience and JWKS URL). A client's own claim to a certificate never binds
-    them. So two setups can never honour a certificate:
+    ``client_cn`` / ``client_fingerprint`` bind only from the ``X-Client-CN`` /
+    ``X-Client-Fingerprint`` headers of a trusted proxy, and the gateway reads those
+    only on a request its auth middleware has authenticated (``shared-token`` with a
+    token, or ``jwt`` with issuer, audience and JWKS URL). So an HTTP gateway with
+    ``FLUID_MCP_TRUSTED_PROXIES`` set and auth not actually enabled looks protected
+    and is not: no certificate would ever be honoured, and anyone who can reach it
+    could call it. stdio reads no headers, so it is not refused here.
 
-    * stdio, which carries no headers, when a rowFilter keys on one;
-    * HTTP with auth not actually enabled, when a rowFilter keys on one or
-      ``FLUID_MCP_TRUSTED_PROXIES`` is set — the operator is relying on the
-      proxy, and the gateway would ignore it.
-
-    Like ``_jurisdiction_gate_unsatisfiable`` this turns a stream of per-call
-    denials, or a deployment that looks protected and is not, into one
-    message at startup. Returns the message, or ``None`` when serving is fine.
+    Like ``_jurisdiction_gate_unsatisfiable`` this turns a deployment that looks
+    protected and is not into one message at startup. Returns the message, or
+    ``None`` when serving is fine.
     """
-    from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
-    from fluid_build.output_ports.mcp.query_compiler import row_filter_caller_attributes
-
-    needed = sorted(MTLS_IDENTITY_ATTRS.intersection(row_filter_caller_attributes(expose)))
-    named = ", ".join(f"${{caller.{attr}}}" for attr in needed)
-    if transport != "http" or http_auth is None:
-        if not needed:
-            return None
-        return (
-            f"fluid mcp output-port: refusing to serve over {transport!r}.\n"
-            f"  A rowFilter on this expose reads {named}, which binds only from a "
-            "client certificate forwarded by a trusted mTLS proxy. "
-            f"{transport!r} carries no headers, so every call would be denied.\n"
-            "  Serve it over HTTP with auth, behind the proxy:\n"
-            "    FLUID_MCP_AUTH_MODE=shared-token FLUID_MCP_AUTH_TOKEN=... \\\n"
-            "    FLUID_MCP_TRUSTED_PROXIES=127.0.0.1 \\\n"
-            "      fluid mcp output-port serve <contract> --transport http\n"
-        )
-    if http_auth.is_enabled():
+    if transport != "http" or http_auth is None or http_auth.is_enabled():
         return None
-    if needed:
-        relied_on = f"A rowFilter on this expose reads {named}"
-        tail = ""
-    elif http_auth.trusted_proxies:
-        relied_on = "FLUID_MCP_TRUSTED_PROXIES is set"
-        tail = "  If no proxy forwards client certificates, unset FLUID_MCP_TRUSTED_PROXIES.\n"
-    else:
+    if not http_auth.trusted_proxies:
         return None
     return (
         "fluid mcp output-port: refusing to serve unauthenticated.\n"
-        f"  {relied_on}, but HTTP auth is off ({http_auth.disabled_reason()}). "
+        f"  FLUID_MCP_TRUSTED_PROXIES is set, but HTTP auth is off "
+        f"({http_auth.disabled_reason()}). "
         "The gateway reads a trusted proxy's X-Client-CN / X-Client-Fingerprint "
         "headers only on an authenticated request, so no client certificate would "
         "ever be honoured, and anyone who can reach the gateway could call it.\n"
         "  Enable auth: FLUID_MCP_AUTH_MODE=shared-token with FLUID_MCP_AUTH_TOKEN "
         "(the token the proxy sends), or FLUID_MCP_AUTH_MODE=jwt with "
         "FLUID_MCP_JWT_ISSUER, FLUID_MCP_JWT_AUDIENCE and FLUID_MCP_JWT_JWKS_URL.\n"
-        f"{tail}"
+        "  If no proxy forwards client certificates, unset FLUID_MCP_TRUSTED_PROXIES.\n"
+    )
+
+
+def _row_filter_gate_unsatisfiable(
+    expose: Mapping[str, Any], *, transport: str, http_auth: Optional[AuthValidator]
+) -> Optional[str]:
+    """Refuse at startup an expose whose row filters no request could satisfy.
+
+    Every read of an expose that declares ``policy.authz.rowFilters`` is limited to
+    the rows the caller's verified principal may read, and refused when the request
+    carries none. A principal binds only from a JWT claim mapped to it
+    (``FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal``), so stdio, HTTP with auth off,
+    ``shared-token`` (a token carries no identity) and ``jwt`` without that mapping
+    would deny every call. The old ``policy.rowFilters`` key, which every call
+    refuses, and a filter that cannot be applied are refused here too, with the
+    reason. Returns the message, or ``None`` when serving is fine.
+    """
+    from fluid_build.output_ports.mcp.auth import PRINCIPAL_ATTR
+    from fluid_build.output_ports.mcp.query_compiler import (
+        RowFilterIdentityMissing,
+        RowFilterUnavailable,
+        declares_row_filters,
+        row_filter_predicate,
+    )
+
+    try:
+        if not declares_row_filters(expose):
+            return None
+        # Every filter is parsed here, as the first call would: a malformed one stops
+        # the gateway now rather than refusing each call. No principal is passed, so
+        # a well-formed policy ends in RowFilterIdentityMissing.
+        row_filter_predicate(expose, {})
+    except RowFilterUnavailable as exc:
+        return (
+            "fluid mcp output-port: refusing to serve: this expose's row filters cannot "
+            f"be applied.\n  {exc}\n"
+        )
+    except RowFilterIdentityMissing:
+        pass
+    mapped = (
+        transport == "http"
+        and http_auth is not None
+        and http_auth.is_enabled()
+        and http_auth.mode == "jwt"
+        and PRINCIPAL_ATTR in http_auth.jwt_claim_mappings.values()
+    )
+    if mapped:
+        return None
+    if transport != "http" or http_auth is None:
+        why = f"{transport!r} carries no verified identity"
+    elif not http_auth.is_enabled():
+        why = f"HTTP auth is off ({http_auth.disabled_reason()})"
+    elif http_auth.mode != "jwt":
+        why = f"FLUID_MCP_AUTH_MODE={http_auth.mode} carries no caller identity"
+    else:
+        why = "no JWT claim is mapped to the principal"
+    return (
+        "fluid mcp output-port: refusing to serve: this expose declares "
+        "policy.authz.rowFilters, which limit each caller to the rows its principal may "
+        f"read, and {why}, so every call would be refused.\n"
+        "  Serve it over HTTP with JWT auth and map the claim that carries a caller's "
+        "principal:\n"
+        "    FLUID_MCP_AUTH_MODE=jwt FLUID_MCP_JWT_ISSUER=... FLUID_MCP_JWT_AUDIENCE=... "
+        "FLUID_MCP_JWT_JWKS_URL=... \\\n"
+        "    FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal \\\n"
+        "      fluid mcp output-port serve <contract> --transport http\n"
     )
 
 

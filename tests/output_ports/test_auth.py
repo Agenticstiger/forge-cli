@@ -326,7 +326,7 @@ def test_from_env_jwt_mode_pulls_issuer_audience_jwks(
     # …and the defaults the operator did NOT mention survive. This assertion
     # used to be an exact-equality check, which pinned the env var REPLACING the
     # defaults: mapping one extra claim silently dropped model/use_case/tenant_id,
-    # turning off the agentPolicy gates and emptying ${caller.*} row filters.
+    # turning off the agentPolicy gates.
     # See tests/output_ports/test_jwt_claim_mapping_merge.py.
     assert v.jwt_claim_mappings["use_case"] == "use_case"
     assert v.jwt_claim_mappings["tenant_id"] == "tenant_id"

@@ -1,25 +1,25 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Regression tests: ``policy.rowFilters[]`` (row-level security) MUST be
+"""Regression tests: ``policy.authz.rowFilters`` (row-level security) MUST be
 enforced on the ``query`` and ``query_sql`` tools — not just ``sample``.
 
-Before this fix, ``EngineDriver.query()`` executed the compiled statement with
-NO row filter (only ``sample()`` applied one), so a contract declaring a
-multi-tenant ``rowFilter`` (``tenant_id = ${caller.tenant_id}``) had it silently
-BYPASSED on ``tool_query`` / ``tool_query_sql`` — a caller received every
-tenant's rows. These tests pin:
+These pin, at the compiler and the handler:
 
-1. the row filter merged into the semantic ``query`` WHERE (offset placeholders);
-2. free-form ``query_sql`` REJECTED (fail-closed) when the expose declares
-   ``policy.rowFilters[]`` — RLS cannot be safely enforced on arbitrary caller
-   SQL (a spoofable filter column in the caller's projection), so the compiler
-   raises :class:`QueryValidationError` instead of wrapping;
-3. fail-closed (:class:`RowFilterIdentityMissing`) on the query path when a
-   referenced caller attribute is absent;
-4. the handler wiring actually passes ``caller_attributes`` / ``expose`` through
-   (so the compiled SQL the driver executes carries the filter + bound params,
-   and the ``query_sql`` handler surfaces the rejection).
+1. the semantic ``query`` reads the table through
+   ``(SELECT <columns> FROM <table> AS _fluid_rows WHERE <predicate>)``, and a
+   caller's own filter still binds its parameter beside it;
+2. free-form ``query_sql`` reads every reference to the exposed table through the
+   same filtered projection, so a caller-shaped projection (a literal aliased as
+   the filter column) cannot widen it;
+3. fail-closed (:class:`RowFilterIdentityMissing`) when the request carries no
+   principal a filter or reader names, and (:class:`RowFilterUnavailable`) when a
+   filter cannot be applied, the old ``policy.rowFilters`` key included;
+4. the handler wiring passes ``caller_attributes`` / ``expose`` through, so the
+   SQL the driver executes is the filtered one, and a refusal never reaches it.
+
+``tests/output_ports/test_mcp_authz_row_filters.py`` runs the same policy end to
+end on DuckDB.
 """
 
 from __future__ import annotations
@@ -30,19 +30,27 @@ import pytest
 
 from fluid_build.output_ports.mcp._handlers import tool_query, tool_query_sql
 from fluid_build.output_ports.mcp.query_compiler import (
-    QueryValidationError,
     RowFilterIdentityMissing,
+    RowFilterUnavailable,
     compile_free_form_sql,
     compile_semantic_query,
+    row_filter_predicate,
 )
 
 _MEASURES = [{"name": "row_count", "agg": "count", "expr": "id"}]
+_SCHEMA = [{"name": "id"}, {"name": "tenant_id"}, {"name": "region"}, {"name": "secret"}]
+ACME = "group:acme@tenants.example"
 
 TENANT_EXPOSE = {
     "exposeId": "demo",
+    "contract": {"schema": _SCHEMA},
     "semantics": {"measures": _MEASURES},
-    "policy": {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]},
+    "policy": {"authz": {"rowFilters": [{"principal": ACME, "where": "tenant_id = 'acme'"}]}},
 }
+_PROJECTION = (
+    "(SELECT id, tenant_id, region, secret FROM db.t AS _fluid_rows "
+    "WHERE ((_fluid_rows.tenant_id = 'acme')))"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -52,126 +60,105 @@ TENANT_EXPOSE = {
 
 
 class TestSemanticQueryRowFilter:
-    def test_row_filter_merged_into_where(self):
+    def test_row_filter_sits_inside_the_projection(self):
         compiled = compile_semantic_query(
             expose=TENANT_EXPOSE,
             measure="row_count",
             limit=100,
-            caller_attributes={"tenant_id": "acme"},
+            caller_attributes={"principal": ACME},
             table_reference="db.t",
         )
-        assert "WHERE" in compiled.sql
-        assert '"tenant_id" = :p_0' in compiled.sql
-        assert compiled.params == ["acme"]
+        assert f"FROM {_PROJECTION} AS _fluid_allowed" in compiled.sql
+        assert compiled.params == []
 
-    def test_row_filter_placeholder_offset_after_user_filter(self):
-        # A caller-supplied filter owns :p_0; the row filter MUST take :p_1 so
-        # the two never collide into one bound value.
-        expose = {**TENANT_EXPOSE, "contract": {"schema": [{"name": "region"}]}}
+    def test_a_callers_filter_still_binds_beside_the_row_filter(self):
         compiled = compile_semantic_query(
-            expose=expose,
+            expose=TENANT_EXPOSE,
             measure="row_count",
             filters={"region": "us"},
             limit=100,
-            caller_attributes={"tenant_id": "acme"},
+            caller_attributes={"principal": ACME},
             table_reference="db.t",
         )
-        assert "(region) = :p_0" in compiled.sql
-        assert '"tenant_id" = :p_1' in compiled.sql
-        assert compiled.params == ["us", "acme"]
+        assert "WHERE ((region) = :p_0)" in compiled.sql
+        assert _PROJECTION in compiled.sql
+        assert compiled.params == ["us"]
 
-    def test_in_filter_resolves_list(self):
-        expose = {
-            "exposeId": "demo",
-            "semantics": {"measures": _MEASURES},
-            "policy": {"rowFilters": [{"column": "region", "in": "${caller.regions}"}]},
-        }
-        compiled = compile_semantic_query(
-            expose=expose,
-            measure="row_count",
-            limit=10,
-            caller_attributes={"regions": ["us", "eu"]},
-            table_reference="db.t",
-        )
-        assert '"region" IN (:p_0, :p_1)' in compiled.sql
-        assert compiled.params == ["us", "eu"]
-
-    def test_fail_closed_when_caller_attribute_missing(self):
-        with pytest.raises(RowFilterIdentityMissing, match="tenant_id"):
+    def test_fail_closed_when_the_principal_is_missing(self):
+        with pytest.raises(RowFilterIdentityMissing, match="principal"):
             compile_semantic_query(
                 expose=TENANT_EXPOSE,
                 measure="row_count",
                 limit=100,
-                caller_attributes={"model_id": "x"},
+                caller_attributes={"model_id": "x", "tenant_id": "acme"},
                 table_reference="db.t",
             )
 
-    def test_no_rowfilter_no_where(self):
+    def test_no_rowfilter_no_projection(self):
         compiled = compile_semantic_query(
             expose={"exposeId": "d", "semantics": {"measures": _MEASURES}},
             measure="row_count",
             limit=10,
-            caller_attributes={"tenant_id": "acme"},
+            caller_attributes={"principal": ACME},
             table_reference="db.t",
         )
-        assert '"tenant_id"' not in compiled.sql
+        assert "_fluid_rows" not in compiled.sql and "FROM db.t" in compiled.sql
 
 
 class TestFreeFormQueryRowFilter:
-    def test_rejects_when_rowfilters_declared(self):
-        # FAIL CLOSED: RLS cannot be enforced on arbitrary caller SQL (the
-        # caller controls the subquery projection, so it can spoof the filter
-        # column → cross-tenant read). The compiler must REJECT rather than
-        # wrap. The message steers the caller to the semantic ``query`` tool.
-        with pytest.raises(QueryValidationError, match="row filter"):
-            compile_free_form_sql(
-                sql="SELECT id, tenant_id FROM db.t",
-                table_reference="db.t",
-                limit=50,
-                expose=TENANT_EXPOSE,
-                caller_attributes={"tenant_id": "acme"},
-            )
+    def test_every_read_of_the_table_is_filtered(self):
+        compiled = compile_free_form_sql(
+            sql="SELECT a.id FROM db.t AS a JOIN db.t AS b ON a.id = b.id",
+            table_reference="db.t",
+            limit=50,
+            expose=TENANT_EXPOSE,
+            caller_attributes={"principal": ACME},
+        )
+        assert compiled.sql.count(_PROJECTION) == 2
+        assert compiled.params == []
 
-    def test_rejection_blocks_projection_spoof(self):
-        # The concrete RLS-bypass the rejection closes: a caller-controlled
-        # projection that fabricates the tenant_id column. This must NOT
-        # compile (previously it wrapped into a cross-tenant read).
-        with pytest.raises(QueryValidationError, match="row filter"):
-            compile_free_form_sql(
-                sql="SELECT 'acme' AS tenant_id, secret FROM other_tenant_table",
-                table_reference="db.t",
-                limit=50,
-                expose=TENANT_EXPOSE,
-                caller_attributes={"tenant_id": "acme"},
-            )
+    def test_a_projection_spoof_cannot_widen_the_filter(self):
+        # A caller-controlled projection that fabricates the filter column. The
+        # filter is applied where the table is read, inside the projection, so the
+        # caller's alias never meets it.
+        compiled = compile_free_form_sql(
+            sql="SELECT 'acme' AS tenant_id, secret FROM db.t",
+            table_reference="db.t",
+            limit=50,
+            expose=TENANT_EXPOSE,
+            caller_attributes={"principal": ACME},
+        )
+        assert compiled.sql.startswith(
+            f"SELECT 'acme' AS tenant_id, secret FROM {_PROJECTION} AS t"
+        )
 
-    def test_no_wrap_when_no_rowfilters(self):
+    def test_no_rewrite_when_no_rowfilters(self):
         compiled = compile_free_form_sql(
             sql="SELECT id FROM db.t",
             table_reference="db.t",
             limit=50,
         )
-        assert "SELECT * FROM (" not in compiled.sql
+        assert "SELECT * FROM (" not in compiled.sql and "_fluid_rows" not in compiled.sql
         assert compiled.sql.rstrip().endswith("LIMIT 50")
         assert compiled.params == []
 
     def test_no_double_limit_when_caller_already_limited(self):
-        # FIX: the server-side LIMIT must not be appended a second time when
-        # the caller's SQL already ends in ``LIMIT <n>`` (two trailing LIMITs
-        # is a syntax error on most engines).
-        compiled = compile_free_form_sql(
-            sql="SELECT id FROM db.t LIMIT 5",
-            table_reference="db.t",
-            limit=50,
-        )
-        # Exactly one LIMIT, and it's the caller's.
-        assert compiled.sql.count("LIMIT") == 1
-        assert compiled.sql.rstrip().endswith("LIMIT 5")
+        # The server-side LIMIT must not be appended a second time when the caller's
+        # SQL already ends in ``LIMIT <n>`` (two trailing LIMITs is a syntax error on
+        # most engines), row filter or not.
+        for expose, attrs in ((None, None), (TENANT_EXPOSE, {"principal": ACME})):
+            compiled = compile_free_form_sql(
+                sql="SELECT id FROM db.t LIMIT 5",
+                table_reference="db.t",
+                limit=50,
+                expose=expose,
+                caller_attributes=attrs,
+            )
+            assert compiled.sql.count("LIMIT") == 1
+            assert compiled.sql.rstrip().endswith("LIMIT 5")
 
-    def test_fail_closed_when_caller_attribute_missing(self):
-        # Missing ${caller.*} attribute fails closed via RowFilterIdentityMissing
-        # — raised while resolving the placeholder, BEFORE the rejection check.
-        with pytest.raises(RowFilterIdentityMissing, match="tenant_id"):
+    def test_fail_closed_when_the_principal_is_missing(self):
+        with pytest.raises(RowFilterIdentityMissing, match="principal"):
             compile_free_form_sql(
                 sql="SELECT id FROM db.t",
                 table_reference="db.t",
@@ -221,21 +208,17 @@ def _fake_state(expose, caller_attributes, driver):
 class TestHandlerWiring:
     def test_tool_query_executes_rowfiltered_sql(self):
         driver = _CapturingDriver()
-        state = _fake_state(TENANT_EXPOSE, {"tenant_id": "acme"}, driver)
+        state = _fake_state(TENANT_EXPOSE, {"principal": ACME}, driver)
         tool_query(state, {"measure": "row_count", "limit": 10})
         assert driver.captured is not None
-        assert '"tenant_id" = :p_0' in driver.captured.sql
-        assert "acme" in driver.captured.params
+        assert _PROJECTION in driver.captured.sql
 
-    def test_tool_query_sql_rejected_when_rowfilters_declared(self):
-        # FAIL CLOSED at the handler: a free-form query_sql call against an
-        # RLS-protected expose raises QueryValidationError and never reaches
-        # the driver (no SQL executed).
+    def test_tool_query_sql_executes_rowfiltered_sql(self):
         driver = _CapturingDriver()
-        state = _fake_state(TENANT_EXPOSE, {"tenant_id": "acme"}, driver)
-        with pytest.raises(QueryValidationError, match="row filter"):
-            tool_query_sql(state, {"sql": "SELECT id, tenant_id FROM db.t", "limit": 10})
-        assert driver.captured is None
+        state = _fake_state(TENANT_EXPOSE, {"principal": ACME}, driver)
+        tool_query_sql(state, {"sql": "SELECT id, tenant_id FROM db.t", "limit": 10})
+        assert driver.captured is not None
+        assert _PROJECTION in driver.captured.sql
 
     def test_tool_query_fail_closed_never_executes(self):
         driver = _CapturingDriver()
@@ -257,91 +240,89 @@ class TestHandlerWiring:
 # ---------------------------------------------------------------------------
 
 _MALFORMED_ROW_FILTERS = [
-    pytest.param({"column": "tenant_id", "like": "acme%"}, id="unknown-operator"),
-    pytest.param({"column": "tenant_id", "equal": "acme"}, id="misspelt-operator"),
-    pytest.param({"column": "tenant_id"}, id="no-operator"),
-    pytest.param({"column": "tenant_id", "equals": "acme", "in": ["a", "b"]}, id="two-operators"),
-    pytest.param({"column": 7, "equals": "acme"}, id="non-string-column"),
-    pytest.param({"column": ["tenant_id"], "equals": "acme"}, id="list-column"),
-    pytest.param({"column": "", "equals": "acme"}, id="empty-column"),
-    pytest.param({"equals": "acme"}, id="no-column"),
-    pytest.param("tenant_id", id="not-a-mapping"),
+    pytest.param({"principal": ACME, "where": "plan = 'gold'"}, id="undeclared-column"),
+    pytest.param({"principal": ACME}, id="no-predicate"),
+    pytest.param({"where": "tenant_id = 'acme'"}, id="no-principal"),
+    pytest.param({"principal": 7, "where": "tenant_id = 'acme'"}, id="non-string-principal"),
+    pytest.param({"principal": ACME, "where": ["tenant_id = 'acme'"]}, id="list-predicate"),
+    pytest.param({"principal": ACME, "where": "tenant_id = 'acme' OR"}, id="not-an-expression"),
+    pytest.param({"principal": ACME, "where": "tenant_id", "name": "Bad Name"}, id="bad-name"),
+    pytest.param("tenant_id = 'acme'", id="not-a-mapping"),
 ]
 
 
 def _expose_with_row_filter(entry):
-    return {
-        "exposeId": "demo",
-        "semantics": {"measures": _MEASURES},
-        "policy": {"rowFilters": [entry]},
-    }
+    return {**TENANT_EXPOSE, "policy": {"authz": {"rowFilters": [entry]}}}
 
 
 class TestMalformedRowFilterIsRefused:
     @pytest.mark.parametrize("entry", _MALFORMED_ROW_FILTERS)
     def test_semantic_query(self, entry):
-        with pytest.raises(QueryValidationError, match="rowFilters"):
+        with pytest.raises(RowFilterUnavailable, match="rowFilters"):
             compile_semantic_query(
                 expose=_expose_with_row_filter(entry),
                 measure="row_count",
                 limit=10,
+                caller_attributes={"principal": ACME},
                 table_reference="db.t",
             )
 
     @pytest.mark.parametrize("entry", _MALFORMED_ROW_FILTERS)
     def test_free_form_query(self, entry):
-        with pytest.raises(QueryValidationError, match="rowFilters"):
+        with pytest.raises(RowFilterUnavailable, match="rowFilters"):
             compile_free_form_sql(
                 sql="SELECT id FROM db.t",
                 table_reference="db.t",
                 limit=10,
                 expose=_expose_with_row_filter(entry),
+                caller_attributes={"principal": ACME},
             )
 
     @pytest.mark.parametrize("entry", _MALFORMED_ROW_FILTERS)
     def test_sample_predicate(self, entry):
-        from fluid_build.output_ports.mcp.drivers.base import EngineDriver
-
-        with pytest.raises(QueryValidationError, match="rowFilters"):
-            EngineDriver.compile_row_filter_predicate(
-                _expose_with_row_filter(entry), caller_attributes={}
-            )
+        # ``sample`` resolves its predicate through the same function.
+        with pytest.raises(RowFilterUnavailable, match="rowFilters"):
+            row_filter_predicate(_expose_with_row_filter(entry), {"principal": ACME})
 
     def test_a_valid_entry_beside_a_malformed_one_does_not_hide_it(self):
         expose = {
-            "exposeId": "demo",
-            "semantics": {"measures": _MEASURES},
+            **TENANT_EXPOSE,
             "policy": {
-                "rowFilters": [
-                    {"column": "tenant_id", "equals": "${caller.tenant_id}"},
-                    {"column": "region", "starts_with": "eu"},
-                ]
+                "authz": {
+                    "rowFilters": [
+                        {"principal": ACME, "where": "tenant_id = 'acme'"},
+                        {"principal": "group:other@tenants.example", "where": "region LIKE"},
+                    ]
+                }
             },
         }
-        with pytest.raises(QueryValidationError, match="rowFilters"):
+        with pytest.raises(RowFilterUnavailable, match=r"rowFilters\[1\]"):
             compile_semantic_query(
                 expose=expose,
                 measure="row_count",
                 limit=10,
-                caller_attributes={"tenant_id": "acme"},
+                caller_attributes={"principal": ACME},
                 table_reference="db.t",
             )
 
-    def test_the_message_names_the_entry_position_and_the_supported_operators(self):
-        with pytest.raises(QueryValidationError) as caught:
+    def test_the_old_key_is_refused_with_the_field_to_use(self):
+        expose = {
+            **TENANT_EXPOSE,
+            "policy": {"rowFilters": [{"column": "tenant_id", "equals": "acme"}]},
+        }
+        with pytest.raises(RowFilterUnavailable, match=r"policy\.authz\.rowFilters"):
             compile_semantic_query(
-                expose=_expose_with_row_filter({"column": "tenant_id", "like": "x"}),
+                expose=expose,
                 measure="row_count",
                 limit=10,
+                caller_attributes={"principal": ACME},
                 table_reference="db.t",
             )
-        message = str(caught.value)
-        assert "rowFilters[0]" in message and "equals" in message and "in" in message
 
     def test_no_row_filter_and_an_empty_list_are_not_malformed(self):
-        for policy in ({}, {"rowFilters": []}, {"rowFilters": None}):
+        for policy in ({}, {"authz": {}}, {"authz": {"rowFilters": []}}, {"authz": None}):
             compiled = compile_semantic_query(
-                expose={"exposeId": "d", "semantics": {"measures": _MEASURES}, "policy": policy},
+                expose={**TENANT_EXPOSE, "policy": policy},
                 measure="row_count",
                 limit=10,
                 table_reference="db.t",

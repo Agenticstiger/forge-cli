@@ -243,32 +243,6 @@ def test_honoured_headers_bind_and_log_nothing(caplog):
     assert _ignored_records(caplog) == []
 
 
-@pytest.mark.parametrize("attr", ["client_cn", "client_fingerprint"])
-def test_missing_certificate_attribute_error_points_at_trusted_proxies(attr: str):
-    from fluid_build.output_ports.mcp.query_compiler import (
-        RowFilterIdentityMissing,
-        compile_row_filter_clauses,
-    )
-
-    expose = {
-        "policy": {"rowFilters": [{"column": "customer_id", "equals": f"${{caller.{attr}}}"}]}
-    }
-    with pytest.raises(RowFilterIdentityMissing, match="FLUID_MCP_TRUSTED_PROXIES"):
-        compile_row_filter_clauses(expose, {"sub": "x"})
-
-
-def test_missing_non_certificate_attribute_error_has_no_proxy_hint():
-    from fluid_build.output_ports.mcp.query_compiler import (
-        RowFilterIdentityMissing,
-        compile_row_filter_clauses,
-    )
-
-    expose = {"policy": {"rowFilters": [{"column": "tenant", "equals": "${caller.tenant_id}"}]}}
-    with pytest.raises(RowFilterIdentityMissing) as excinfo:
-        compile_row_filter_clauses(expose, {"sub": "x"})
-    assert "FLUID_MCP_TRUSTED_PROXIES" not in str(excinfo.value)
-
-
 @pytest.mark.parametrize("bad", ["proxy.internal", "*"])
 def test_trusted_proxies_error_example_is_a_single_address_not_a_wide_range(bad: str):
     with pytest.raises(auth_mod.AuthConfigError) as excinfo:
@@ -282,7 +256,8 @@ def test_trusted_proxies_error_example_is_a_single_address_not_a_wide_range(bad:
 
 
 def _cn_filtered_server(tmp_path: Path) -> OutputPortMcpServer:
-    """An expose whose rowFilter keys on the forwarded certificate CN."""
+    """A plain expose: the forwarded certificate is observed on the audit record,
+    which is the only thing it binds."""
     csv_path = write_customer_csv(tmp_path / "customers.csv")
     expose = make_expose(
         binding={
@@ -291,9 +266,6 @@ def _cn_filtered_server(tmp_path: Path) -> OutputPortMcpServer:
             "location": {"path": str(csv_path), "table": "customer_profiles"},
         },
     )
-    expose["policy"] = {
-        "rowFilters": [{"column": "customer_id", "equals": "${caller.client_cn}"}],
-    }
     contract = {
         "fluidVersion": "0.7.4",
         "kind": "DataProduct",
@@ -337,9 +309,9 @@ def _auth_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 async def test_direct_client_cannot_choose_its_certificate_cn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """No trusted proxy configured: a client that sets X-Client-CN itself
-    does not get rows selected by that value, and the audit record shows the
-    real auth layer with no certificate identity."""
+    """No trusted proxy configured: a client that sets X-Client-CN itself is
+    not attributed to that certificate; the audit record shows the real auth
+    layer with no certificate identity."""
     audit_root = _auth_env(monkeypatch, tmp_path)
     server = _cn_filtered_server(tmp_path)
     port = _free_port()
@@ -347,19 +319,12 @@ async def test_direct_client_cannot_choose_its_certificate_cn(
         payload = await _sample_over_http(
             port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS}
         )
-    assert payload.get("rows") is None, payload
-    assert payload.get("error"), payload
+    assert payload.get("error") is None, payload
     records = _audit_records(audit_root)
     assert records, "a data_access record must be written"
     assert records[0]["authKind"] == "shared-token"
     assert "clientCertCn" not in records[0]
     assert "clientCertFingerprint" not in records[0]
-    # The operator-facing audit trail says which setting would bind it.
-    annotated = [
-        json.loads(path.read_text(encoding="utf-8"))["payload"].get("annotatedMessage", "")
-        for path in sorted(audit_root.glob("*.json"))
-    ]
-    assert any("FLUID_MCP_TRUSTED_PROXIES" in m for m in annotated), annotated
 
 
 @pytest.mark.asyncio
@@ -368,7 +333,7 @@ async def test_forwarded_for_header_cannot_impersonate_a_trusted_proxy(
 ):
     """The trust check reads the TCP peer, not an X-Forwarded-For value the
     client wrote."""
-    _auth_env(monkeypatch, tmp_path)
+    audit_root = _auth_env(monkeypatch, tmp_path)
     monkeypatch.setenv("FLUID_MCP_TRUSTED_PROXIES", "192.0.2.10")
     server = _cn_filtered_server(tmp_path)
     port = _free_port()
@@ -381,7 +346,9 @@ async def test_forwarded_for_header_cannot_impersonate_a_trusted_proxy(
                 **CERT_HEADERS,
             },
         )
-    assert payload.get("rows") is None, payload
+    assert payload.get("error") is None, payload
+    records = _audit_records(audit_root)
+    assert records and "clientCertCn" not in records[0], records
 
 
 @pytest.mark.asyncio
@@ -397,7 +364,6 @@ async def test_trusted_proxy_certificate_identity_binds_and_is_audited(
             port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS}
         )
     assert payload.get("error") is None, payload
-    assert [row["customer_id"] for row in payload["rows"]] == ["C0001"]
     record = _audit_records(audit_root)[0]
     assert record["authKind"] == "shared-token"
     assert record["clientCertCn"] == "C0001"

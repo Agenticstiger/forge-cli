@@ -7,11 +7,16 @@
 0.7.6) lets its principal read only the rows its ``where`` predicate selects. A reader
 no filter names reads every row, and a principal has at most one filter per expose.
 
-Every consumer reads the filters through :func:`parse_row_filters`. The IaC emitters
-(``fluid_build.iac.row_access``) write each filter into the platform's own policy (a
-BigQuery row access policy, a Lake Formation data cells filter, a Unity Catalog row
-filter); a consumer that applies the filters itself reads the same parse, so the two
-enforce the same filter. The predicate is parsed with sqlglot rather than trusted: a statement
+Two consumers read the filters through :func:`parse_row_filters`:
+
+* the IaC emitters (``fluid_build.iac.row_access``), which write each filter into the
+  platform's own policy (a BigQuery row access policy, a Lake Formation data cells
+  filter, a Unity Catalog row filter);
+* the MCP output-port gateway (``fluid_build.output_ports.mcp.query_compiler``), which
+  applies the filters itself on every read it serves.
+
+So the filter a platform enforces and the filter the gateway enforces are the same
+filter. The predicate is parsed with sqlglot rather than trusted: a statement
 separator, a comment, a subquery, a set operation, any clause besides the WHERE
 (``GROUP BY``, ``HAVING``, ``QUALIFY``, ``WINDOW``, ``ORDER BY``, ``LIMIT``), a bind
 placeholder or a column the schema does not declare is refused. What a policy holds

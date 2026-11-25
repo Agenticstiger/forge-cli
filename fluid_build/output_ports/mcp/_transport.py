@@ -120,8 +120,8 @@ class _ForwardedCertIdentity:
     ``FLUID_MCP_TRUSTED_PROXIES``; anyone else could have set the headers
     itself.
 
-    When honoured the values bind ``${caller.client_cn}`` /
-    ``${caller.client_fingerprint}`` (via ``fluid_auth_attrs``) and are kept
+    When honoured the values bind the ``client_cn`` / ``client_fingerprint``
+    caller attributes (via ``fluid_auth_attrs``) and are kept
     apart under ``fluid_mtls_identity`` so the data_access audit record can
     name the certificate next to ``authKind`` without mistaking a token claim
     for it.
@@ -192,9 +192,8 @@ class _ForwardedCertIdentity:
             why = f"the values the trusted proxy {peer} sent contain control characters"
         self._logger.warning(
             "output_port_mtls_headers_ignored: X-Client-CN / X-Client-Fingerprint "
-            "ignored because %s. Any row filter on ${caller.client_cn} or "
-            "${caller.client_fingerprint} denies this request (logged once per "
-            "reason and peer).",
+            "ignored because %s. The audit record of this request names no client "
+            "certificate (logged once per reason and peer).",
             why,
             extra={"peer": peer, "reason": reason},
         )

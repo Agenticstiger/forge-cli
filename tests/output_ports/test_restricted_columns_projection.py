@@ -31,6 +31,12 @@ from fluid_build.output_ports.mcp.query_compiler import (  # noqa: E402
 
 LEAK_MARKER = "DENIED-"
 
+#: A principal ``policy.authz.rowFilters`` limits to tenant t1's rows, and the caller
+#: attributes of a request whose verified identity is that principal.
+T1 = "group:tenant-t1@northwind.example"
+AS_T1 = {"principal": T1}
+_T1_ROWS = [{"principal": T1, "where": "tenant_id = 't1'"}]
+
 
 @pytest.fixture()
 def con():
@@ -83,7 +89,7 @@ def _expose(
         "semantics": semantics,
     }
     if row_filters:
-        expose["policy"] = {"rowFilters": row_filters}
+        expose["policy"] = {"authz": {"rowFilters": row_filters}}
     return expose
 
 
@@ -237,13 +243,13 @@ def test_a_standard_from_form_inside_a_function_is_not_mistaken_for_a_subquery(c
 def test_row_filter_on_a_restricted_column_still_isolates_rows(con):
     """The filter column is policy, not caller input: it may be a column the
     agent is denied, and it must still narrow the rows."""
-    expose = _expose(row_filters=[{"column": "tenant_id", "equals": "${caller.tenant}"}])
+    expose = _expose(row_filters=_T1_ROWS)
     kind, rows = _run(
         con,
         expose,
         restricted=("region", "tenant_id"),
         dimensions=["segment"],
-        caller_attributes={"tenant": "t1"},
+        caller_attributes=AS_T1,
     )
     assert kind == "rows", rows
     assert {segment: float(total) for segment, total in rows} == {"retail": 30.0}
@@ -252,9 +258,9 @@ def test_row_filter_on_a_restricted_column_still_isolates_rows(con):
 def test_row_filter_is_not_bypassed_by_a_subquery_over_the_base_table(con):
     expose = _expose(
         dimension_expr="EXISTS(FROM customers WHERE tenant_id = 't2')",
-        row_filters=[{"column": "tenant_id", "equals": "${caller.tenant}"}],
+        row_filters=_T1_ROWS,
     )
-    kind, detail = _run(con, expose, dimensions=["d"], caller_attributes={"tenant": "t1"})
+    kind, detail = _run(con, expose, dimensions=["d"], caller_attributes=AS_T1)
     assert kind in ("refused", "engine_error"), f"evaluated: {detail!r}"
 
 
@@ -327,8 +333,8 @@ def test_a_restricted_expose_with_nothing_readable_declared_fails_closed():
         )
 
 
-def test_row_filter_sits_inside_the_projection_with_bound_parameters():
-    expose = _expose(row_filters=[{"column": "tenant_id", "equals": "${caller.tenant}"}])
+def test_row_filter_sits_inside_the_projection_beside_bound_parameters():
+    expose = _expose(row_filters=_T1_ROWS)
     compiled = compile_semantic_query(
         expose=expose,
         measure="m",
@@ -338,14 +344,14 @@ def test_row_filter_sits_inside_the_projection_with_bound_parameters():
         table_reference="customers",
         dialect="duckdb",
         restricted_columns=("region", "tenant_id"),
-        caller_attributes={"tenant": "t1"},
+        caller_attributes=AS_T1,
     )
     assert (
-        'FROM (SELECT id, segment, amount FROM customers WHERE ("tenant_id" = :p_1)) '
-        "AS _fluid_allowed"
+        "FROM (SELECT id, segment, amount FROM customers AS _fluid_rows "
+        "WHERE ((_fluid_rows.tenant_id = 't1'))) AS _fluid_allowed"
     ) in compiled.sql
     assert "WHERE ((segment) = :p_0)\n" in compiled.sql
-    assert compiled.params == ["retail", "t1"]
+    assert compiled.params == ["retail"]
 
 
 # ---------------------------------------------------------------------
@@ -369,7 +375,7 @@ def test_projection_parses_in_every_dialect(dialect, read, table):
 
     expose = _expose(
         measure_expr="amount * 2",
-        row_filters=[{"column": "tenant_id", "in": "${caller.tenants}"}],
+        row_filters=[{"principal": T1, "where": "tenant_id IN ('t1', 't2')"}],
     )
     compiled = compile_semantic_query(
         expose=expose,
@@ -380,7 +386,7 @@ def test_projection_parses_in_every_dialect(dialect, read, table):
         table_reference=table,
         dialect=dialect,
         restricted_columns=("region", "tenant_id"),
-        caller_attributes={"tenants": ["t1", "t2"]},
+        caller_attributes=AS_T1,
     )
     for rendered in (compiled.sql, compiled.render_sql_for_dialect(dialect)):
         # sqlglot reads ``%`` as modulo, so Snowflake's DB-API ``%(p_N)s`` is swapped
@@ -471,12 +477,13 @@ def test_driver_guard_admits_the_compiled_projection_and_still_refuses_other_sel
     from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
 
     compiled = compile_semantic_query(
-        expose=_expose(row_filters=[{"column": "tenant_id", "equals": "t1"}]),
+        expose=_expose(row_filters=_T1_ROWS),
         measure="m",
         dimensions=["segment"],
         limit=5,
         table_reference="customers",
         restricted_columns=("region",),
+        caller_attributes=AS_T1,
     )
     guard_against_injection_markers(compiled.sql)
     for hostile in (
@@ -509,25 +516,20 @@ def test_end_to_end_through_the_driver_on_a_restricted_expose(tmp_path):
         "2,DENIED-US,retail,20,t1\n"
         "3,DENIED-EU,wholesale,30,t2\n"
     )
-    expose = _expose(
-        dimension_expr='"region"',
-        row_filters=[{"column": "tenant_id", "equals": "${caller.tenant}"}],
-    )
+    expose = _expose(dimension_expr='"region"', row_filters=_T1_ROWS)
     expose["exposeId"] = "customers"
     expose["binding"] = {
         "platform": "local",
         "format": "csv",
         "location": {"path": str(csv), "table": "customers"},
     }
-    expose["policy"]["authz"] = {
-        "columnRestrictions": [
-            {"principal": "*", "columns": ["region", "tenant_id"], "access": "deny"}
-        ]
-    }
+    expose["policy"]["authz"]["columnRestrictions"] = [
+        {"principal": "*", "columns": ["region", "tenant_id"], "access": "deny"}
+    ]
     driver = build_driver(expose=expose, contract={"exposes": [expose]})
     state = SimpleNamespace(
         expose=expose,
-        caller_attributes={"tenant": "t1"},
+        caller_attributes=AS_T1,
         policy=SimpleNamespace(max_sample_rows=100),
         query_timeout_seconds=None,
         get_driver=lambda: driver,
@@ -1042,9 +1044,9 @@ def test_the_engine_parser_cross_check_runs_on_the_rewritten_statement(monkeypat
     seen: List[str] = []
     real = query_compiler._crosscheck_duckdb_projection
 
-    def spy(sql, name, allowed):
+    def spy(sql, name, allowed, predicate=None):
         seen.append(sql)
-        return real(sql, name, allowed)
+        return real(sql, name, allowed, predicate)
 
     monkeypatch.setattr(query_compiler, "_crosscheck_duckdb_projection", spy)
     compile_free_form_sql(
@@ -1154,7 +1156,7 @@ def test_free_form_sql_without_restrictions_needs_no_expose():
 # ``query``: every WHERE term is parenthesised, so no expression can end the row filter
 # ---------------------------------------------------------------------
 
-_TENANT_FILTER = [{"column": "tenant_id", "equals": "${caller.tenant}"}]
+_TENANT_FILTER = _T1_ROWS
 # The tenant t1 holds amounts 10 and 20; t2 holds 30. The right answer for t1 is 30.
 _TENANT_ONLY_SUM = 30.0
 _ESCAPING_DIMENSION = "amount > 15 OR id"
@@ -1171,7 +1173,7 @@ def test_a_filtered_dimension_whose_expression_has_an_or_cannot_widen_the_row_fi
         restricted=restricted,
         dimensions=[],
         filters={"d": True},
-        caller_attributes={"tenant": "t1"},
+        caller_attributes=AS_T1,
     )
     assert kind == "rows", rows
     assert [float(total) for (total,) in rows] == [_TENANT_ONLY_SUM]
@@ -1184,7 +1186,7 @@ def test_a_metric_filter_with_an_or_cannot_widen_the_row_filter(con):
         expose,
         restricted=(),
         use_metric=True,
-        caller_attributes={"tenant": "t1"},
+        caller_attributes=AS_T1,
     )
     assert kind == "rows", rows
     assert [float(total) for (total,) in rows] == [_TENANT_ONLY_SUM]
@@ -1195,8 +1197,8 @@ def test_every_where_term_is_parenthesised():
         dimension_expr=_ESCAPING_DIMENSION,
         metric_filter="amount > 15 OR id > 0",
         row_filters=[
-            {"column": "tenant_id", "equals": "${caller.tenant}"},
-            {"column": "region", "in": "${caller.regions}"},
+            {"principal": T1, "where": "tenant_id = 't1'"},
+            {"principal": "group:regions@northwind.example", "where": "region IN ('a', 'b')"},
         ],
     )
     for restricted in ((), ("region",)):
@@ -1208,7 +1210,7 @@ def test_every_where_term_is_parenthesised():
             table_reference="customers",
             dialect="duckdb",
             restricted_columns=restricted,
-            caller_attributes={"tenant": "t1", "regions": ["a", "b"]},
+            caller_attributes={"principal": [T1, "group:regions@northwind.example"]},
         )
         where_lines = [
             line
@@ -1219,8 +1221,11 @@ def test_every_where_term_is_parenthesised():
         assert "((amount > 15 OR id) = :p_0)" in where
         assert "((segment) = :p_1)" in where
         assert "(amount > 15 OR id > 0)" in where
-        assert '("tenant_id" = :p_2)' in where
-        assert '("region" IN (:p_3, :p_4))' in where
+        # The row filter is the union of the caller's two principals' filters, each
+        # parenthesised, inside the projection.
+        assert (
+            "WHERE ((_fluid_rows.tenant_id = 't1') OR (_fluid_rows.region IN ('a', 'b')))"
+        ) in where
         # Between terms there is only an ``AND``, never a bare predicate.
         assert re.search(r"\) AND \(", where)
 
@@ -1297,21 +1302,19 @@ def _pii_state(
             "location": {"path": str(csv), "table": "customers"},
         },
     }
-    policy: Dict[str, Any] = {}
+    authz: Dict[str, Any] = {}
     if row_filters:
-        policy["rowFilters"] = row_filters
+        authz["rowFilters"] = row_filters
     if restricted_columns:
-        policy["authz"] = {
-            "columnRestrictions": [
-                {"principal": "*", "columns": list(restricted_columns), "access": "deny"}
-            ]
-        }
-    if policy:
-        expose["policy"] = policy
+        authz["columnRestrictions"] = [
+            {"principal": "*", "columns": list(restricted_columns), "access": "deny"}
+        ]
+    if authz:
+        expose["policy"] = {"authz": authz}
     driver = build_driver(expose=expose, contract={"exposes": [expose]})
     return SimpleNamespace(
         expose=expose,
-        caller_attributes={"tenant": "t1"},
+        caller_attributes=AS_T1,
         policy=SimpleNamespace(max_sample_rows=100),
         query_timeout_seconds=None,
         get_driver=lambda: driver,

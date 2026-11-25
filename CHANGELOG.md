@@ -332,6 +332,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The MCP output port enforces the row filters a contract declares under
+  `policy.authz.rowFilters`.** The gateway read row filters from `policy.rowFilters`, a key no
+  contract schema allows, and ignored `exposes[].policy.authz.rowFilters`, so `sample`, `query` and
+  `query_sql` served every row of an expose whose row-level security was declared the schema's way.
+  Each read now goes through `(SELECT <allowed columns> FROM <table> AS _fluid_rows WHERE
+  <predicate>)` wherever the table is read: on `query_sql` a subquery, a CTE, a set operation's
+  branch and a second reference to the table each see only the caller's rows, and the predicate's
+  columns are qualified with `_fluid_rows`, so they never resolve to a column of the caller's own
+  statement. A caller reads the union of the filters that name its principals, as BigQuery combines
+  row access policies, and a principal in `policy.authz.readers` that no filter names reads every
+  row. Every filter is parsed by the same code the IaC emitters write platform policies from, then
+  checked as the engine reads it: a predicate BigQuery or Spark would read differently (a
+  double-quoted name is a string there) is refused on those engines. It fails closed. A request
+  with no principal a filter or reader names is refused (`RowFilterIdentityMissing`), every call on
+  an expose whose filter cannot be applied is refused (`RowFilterUnavailable`), and
+  `fluid mcp output-port serve` refuses to start an expose with row filters when no request could
+  carry a principal: over stdio, over HTTP without auth or with a shared token, and with JWT auth
+  when no claim is mapped to `principal`. The principal binds only from a verified credential; a
+  client that states its own is ignored in every auth mode.
 - **The IaC row-filter check refuses a predicate with a subquery, a clause besides its WHERE, or a
   bind placeholder.** `EXISTS (SELECT ...)`, `HAVING`, `QUALIFY`, `WINDOW` and `?` / `:name` /
   `$1` placeholders passed the check into the platform's row access policy or data cells filter,
@@ -342,19 +361,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
   not part of the relation an expression sees, however the expression is written. The name check
   stays as the early, readable refusal, and it now reads `"..."` as a quoted identifier on every
-  engine except BigQuery and Spark, where it is a string. `policy.rowFilters` are applied inside the
+  engine except BigQuery and Spark, where it is a string. Row filters are applied inside the
   projection, so a row filter may still name a restricted column. On an expose that restricts
   columns or filters rows, an expression that contains a subquery is refused. Two things a contract
   author may notice: on such an expose an expression can only use columns declared in
   `contract.schema` (an undeclared column is no longer projected), and an expose whose schema
   declares no readable column is refused by `query`. Exposes without restrictions keep the same
   statement as before, except that every term of the `WHERE` is now parenthesised.
-- **`query` applies a row filter to every row an expression can see, and refuses a row filter it
-  cannot read.** Each term of the `WHERE` is parenthesised, so a measure, dimension or metric-filter
-  expression containing `OR` can no longer widen the `policy.rowFilters` ANDed to it. A
-  `policy.rowFilters[]` entry that is not an object, has no string `column`, has an operator other
-  than `equals` / `in`, or names two operators is now refused with a validation error on `sample`,
-  `query` and `query_sql`; it used to be skipped.
+- **`query` applies a row filter to every row an expression can see.** Each term of the `WHERE` is
+  parenthesised, so a measure, dimension or metric-filter expression containing `OR` can no longer
+  widen a predicate ANDed to it.
 - **`query` refuses an expression that would read a redacted column without naming it.** On an
   expose with columns marked `sensitivity: pii` / `phi` / `sensitive`, a measure, dimension,
   metric-filter or filter expression may not use `COLUMNS(...)`, `IDENTIFIER(...)`, a `*` that
@@ -523,6 +539,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   libpq bundled in duckdb 1.5.1's postgres extension predates it (it needs libpq 16).
 
 ### Upgrade notes
+
+- **The MCP output port no longer reads `policy.rowFilters`.** No contract schema allows the key,
+  and the gateway now refuses an expose that still carries it, on every call and at `serve`, rather
+  than serve it as though it had no row filter. Move each filter to
+  `exposes[].policy.authz.rowFilters` as `{principal, where}`: a filter that took its value from
+  `${caller.<attr>}` becomes one filter per principal with the value written into the predicate
+  (`tenant_id = 'acme'` for `tenant:acme`). Serve such an expose over HTTP with JWT auth and map
+  the claim that carries a caller's principal: `FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal`.
+  On an expose with row filters the query tools read only the columns `contract.schema` declares,
+  as they already did on an expose with column restrictions.
 
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over

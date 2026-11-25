@@ -19,7 +19,7 @@ This directory carries two ready-to-edit templates:
 | **Bearer token** | A leaked client cert — the attacker would also need the shared secret. | Proxy AND gateway (`FLUID_MCP_AUTH_TOKEN`) |
 | **Trusted-proxy allow-list** | A client that reaches the gateway without the proxy and sets the certificate headers itself. | Gateway (`FLUID_MCP_TRUSTED_PROXIES`) |
 | **`agentPolicy.allowedModels` / `allowedUseCases`** | A legitimate client running an unapproved model or use case. | Gateway (per-`tools/call`) |
-| **`policy.rowFilters[]`** | A legitimate client bound to a different tenant. | Gateway (per-row WHERE clause) |
+| **`policy.authz.rowFilters`** | A legitimate client acting as a different principal, or reading rows its principal may not. | Gateway (row filter on every read of the table) |
 | **Snowflake row-access policy** (compiled via `fluid_build.output_ports.iam_compiler`) | Bypass-the-gateway reads — analyst querying Snowflake directly. | Cloud (warehouse-side) |
 
 ## Quick start
@@ -54,8 +54,8 @@ This directory carries two ready-to-edit templates:
    the proxy sets only when the request's TCP peer is listed in
    `FLUID_MCP_TRUSTED_PROXIES` (IPs or CIDRs, comma-separated; empty by
    default). From any other peer they are ignored, so
-   `${caller.client_cn}` row filters and the `clientCertCn` audit field
-   work only once this is set, and only with the bearer token above: the
+   the `clientCertCn` audit field works only once this is set, and only
+   with the bearer token above: the
    gateway reads the headers only on an authenticated request, and refuses
    to start if this variable is set while auth is off. A client cannot
    supply its own CN any other way. If the proxy runs on another host or in
