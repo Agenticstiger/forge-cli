@@ -674,6 +674,86 @@ def test_a_nullable_child_column_of_a_link_statistic_is_released_and_counts_know
     assert drawn.document["tables"]["loan"]["columns"]["shelf"]["statistics"]
 
 
+def test_a_column_that_both_groups_and_is_counted_through_a_link_may_hold_no_value():
+    # loan.shelf is optional: it is counted through the link to member and groups the children
+    # per parent of fine. A record with no value lands in no cell of either, so it never refuses.
+    contract = copy.deepcopy(CONTRACT)
+    contract["exposes"].append(
+        {
+            "exposeId": "fine",
+            "kind": "table",
+            "binding": {
+                "platform": "local",
+                "format": "parquet",
+                "location": {"path": "./out/fine.parquet"},
+            },
+            "contract": {
+                "schema": [
+                    {"name": "fine_id", "type": "INT", "required": True},
+                    {"name": "loan_id", "type": "INT", "required": True},
+                ]
+            },
+            "semantics": {
+                "entities": [{"name": "fine", "type": "primary", "expr": "fine_id"}],
+                "relationships": [
+                    {
+                        "name": "charged_on",
+                        "to": "loan",
+                        "fromColumns": ["loan_id"],
+                        "toColumns": ["loan_id"],
+                        "cardinality": "many_to_one",
+                    }
+                ],
+            },
+        }
+    )
+    request = _request(member=True)
+    request["tables"]["fine"] = {
+        "columns": {"fine_id": {"domain": "number"}, "loan_id": {"domain": "number"}}
+    }
+    request["relationships"] = [
+        {
+            "parent": {"table": "member", "columns": ["member_id"]},
+            "child": {"table": "loan", "columns": ["member_id"]},
+            "statistics": ["marginalHistogram/1"],
+            "linked": [{"column": "shelf", "parentColumn": "branch"}],
+        },
+        {
+            "parent": {"table": "loan", "columns": ["loan_id"]},
+            "child": {"table": "fine", "columns": ["loan_id"]},
+            "statistics": ["marginalHistogram/1"],
+            "groupBy": ["shelf"],
+        },
+    ]
+    backend = FakeBackend()
+    plan = fr.plan_follow_release(
+        contract,
+        _asked(request, backend),
+        backend,
+        unit="member",
+        rho=release.parse_rho("1"),
+        follows=(parse_follow(FOLLOW),),
+    )
+    assert plan.structure[("loan", "shelf")].nullable
+    rows_of = {
+        "member": members(),
+        "loan": loans(),
+        "fine": [{"fine_id": str(n + 1), "loan_id": str(1 + (n * 7) % 400)} for n in range(120)],
+    }
+    read = {
+        table: sources.SourceColumns(
+            description="rows",
+            row_count=len(rows_of[table]),
+            values={column.name: [row[column.name] for row in rows_of[table]] for column in cols},
+        )
+        for table, cols in dict(plan.reads).items()
+    }
+    rows = fr.encode_follow_rows(plan, read, backend)
+    drawn = fr.draw_follow(plan, rows, SEED, backend, cliques={})
+    fined = [each for each in drawn.document["relationships"] if each["child"]["table"] == "fine"]
+    assert any(statistic.get("groupBy") == "shelf" for statistic in fined[0]["statistics"])
+
+
 # ---- the command line: nothing printed holds a count ----------------------------------------------
 
 

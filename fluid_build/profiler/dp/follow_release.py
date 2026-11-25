@@ -395,6 +395,24 @@ def _unlisted(contract: Mapping[str, Any], table: str, bits: int) -> _TableColum
     )
 
 
+def _nullable_where_allowed(
+    contract: Mapping[str, Any], table: str, column: str, made: ReleasedColumn
+) -> ReleasedColumn:
+    """*made*, nullable unless the contract declares *table*'s *column* ``required: true``.
+
+    A record with no value lands in no cell: a parent with no group value is in the group that is
+    never written, and a child with no value is in no cell of its group, so a unit still changes at
+    most the cells its reach charges. A NULL in a column the contract requires refuses the release.
+    One structure serves every statistic that groups by or counts the column, so all agree.
+    """
+    expose = next(
+        (item for item in iter_exposes(dict(contract)) if item.get("exposeId") == table), {}
+    )
+    if _schema_of(expose).get(column, {}).get("required") is True:
+        return made
+    return replace(made, nullable=True)
+
+
 def _schema_of(expose: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
     from fluid_build.profiler.dp.release import _schema
 
@@ -684,7 +702,9 @@ def plan_follow_release(
                         )
                         continue
                     relations.append(replace(base, group=made))
-                    structure[(each.parent, name)] = made
+                    structure[(each.parent, name)] = _nullable_where_allowed(
+                        contract, each.parent, name, made
+                    )
                     extra_read.setdefault(each.parent, []).append(name)
                     label = _label_of(contract, each.parent, name) if m_parent == 0 else None
                     if label is not None:
@@ -717,15 +737,7 @@ def plan_follow_release(
                 contract, backend, each.child, column, bits, keys=keyed.get(each.child, frozenset())
             )
             if child_made is not None:
-                entry = _schema_of(
-                    next(
-                        item
-                        for item in iter_exposes(dict(contract))
-                        if item.get("exposeId") == each.child
-                    )
-                ).get(column, {})
-                if entry.get("required") is not True:
-                    child_made = replace(child_made, nullable=True)
+                child_made = _nullable_where_allowed(contract, each.child, column, child_made)
             by_made, by_why = _group_structure(
                 contract,
                 backend,
@@ -754,7 +766,9 @@ def plan_follow_release(
                 )
             )
             structure[(each.child, column)] = child_made
-            structure[(each.parent, parent_column)] = by_made
+            structure[(each.parent, parent_column)] = _nullable_where_allowed(
+                contract, each.parent, parent_column, by_made
+            )
             extra_read.setdefault(each.child, []).append(column)
             extra_read.setdefault(each.parent, []).append(parent_column)
             note_keys(each.parent, each.parent_columns)
