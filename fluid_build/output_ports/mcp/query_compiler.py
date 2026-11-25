@@ -1900,6 +1900,35 @@ def _refuse_unprojectable_reads(tree: Any, exposed_name: str, read: Optional[str
     return tables
 
 
+# The schema an unqualified DuckDB binding's table lives in, so ``main.customers`` names
+# the same view as ``customers`` there.
+_DEFAULT_SCHEMA = {"duckdb": "main"}
+
+
+def _refuse_another_schemas_table(tables: List[Any], exposed: Any, read: Optional[str]) -> None:
+    """Refuse a read that names the exposed table in another schema or catalog than the
+    binding's. The projection would serve the exposed table's rows under that name, so
+    the caller would be shown one table's rows labelled as another's. A part the caller
+    writes must be the binding's; a part the binding leaves out may be written only as
+    the engine's default (DuckDB's ``main`` schema)."""
+    exposed_name = exposed.name.casefold()
+    expected = {
+        "db": exposed.text("db") or _DEFAULT_SCHEMA.get(read or "", ""),
+        "catalog": exposed.text("catalog"),
+    }
+    for table in tables:
+        if table.name.casefold() != exposed_name:
+            continue
+        for part, value in expected.items():
+            written = table.text(part)
+            if written and written.casefold() != value.casefold():
+                raise QueryValidationError(
+                    f"sql reads {table.sql(dialect=read)!r}, a table of that name in another "
+                    "schema or catalog than the exposed table's; write the table unqualified "
+                    "or as the expose names it."
+                )
+
+
 def _splice_projection(sql: str, tables: List[Any], exposed: Any, projection: str) -> str:
     """``sql`` with ``projection`` written over the source span of every read of the
     exposed table, so everything else in the statement reaches the engine exactly as
@@ -2024,6 +2053,7 @@ def _project_exposed_table(
     _require_plain_sources(tree)
     exposed_name = exposed.name.casefold()
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
+    _refuse_another_schemas_table(tables, exposed, read)
     row_filter = (
         ""
         if predicate is None

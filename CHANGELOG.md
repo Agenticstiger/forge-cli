@@ -409,6 +409,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strings and its policy kept every row. `fluid generate iac` and `fluid apply` now refuse such a
   filter for BigQuery and Unity Catalog, and check Lake Formation filters as Athena reads them,
   with the same check the MCP output port makes.
+- **`query_sql` refuses the exposed table's name under another schema or catalog.** On an expose
+  that restricts columns or filters rows, `other.customers` was read as the exposed table, so the
+  caller saw its filtered rows under another table's name. A read now names the table unqualified
+  or as the expose binds it (on DuckDB, `main` is the binding's schema).
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is

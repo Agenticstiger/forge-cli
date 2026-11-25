@@ -1066,3 +1066,54 @@ def test_without_sqlglot_no_row_filter_is_applied_unchecked(monkeypatch):
         query_compiler.row_filter_predicate(_expose(), _as(EU))
     with pytest.raises(UnsupportedBindingError, match="sqlglot"):
         row_filters_for(_expose())
+
+
+# ---------------------------------------------------------------------
+# The exposed table is read under its own schema and catalog only
+# ---------------------------------------------------------------------
+
+_BINDINGS = {"duckdb": "customers", "postgres": "logistics.public.customers"}
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        ("duckdb", "SELECT id FROM other.customers"),
+        ("duckdb", "SELECT id FROM x.main.customers"),
+        ("duckdb", "SELECT c.id FROM customers AS c, customers.customers"),
+        ("postgres", "SELECT id FROM other.customers"),
+        ("postgres", "SELECT id FROM x.public.customers"),
+    ],
+)
+def test_a_table_of_the_exposed_name_in_another_schema_is_refused(dialect, sql):
+    """It would be served the exposed table's filtered rows under another table's name."""
+    with pytest.raises(query_compiler.QueryValidationError, match="another schema or catalog"):
+        query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference=_BINDINGS[dialect],
+            limit=10,
+            expose=_expose(),
+            caller_attributes=_as(EU),
+            dialect=dialect,
+        )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        ("duckdb", "SELECT id FROM main.customers"),
+        ("postgres", "SELECT id FROM customers"),
+        ("postgres", "SELECT id FROM public.customers"),
+        ("postgres", "SELECT id FROM logistics.public.customers"),
+    ],
+)
+def test_the_exposed_table_may_be_named_as_its_binding_names_it(dialect, sql):
+    compiled = query_compiler.compile_free_form_sql(
+        sql=sql,
+        table_reference=_BINDINGS[dialect],
+        limit=10,
+        expose=_expose(),
+        caller_attributes=_as(EU),
+        dialect=dialect,
+    )
+    assert "_fluid_rows.region = 'EU'" in compiled.sql
