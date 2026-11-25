@@ -317,11 +317,11 @@ def test_two_clean_runs_give_one_identity_and_changed_bytes_a_new_one(
     _install(monkeypatch, bundled)
     _package(work)
     _write_lock(work, _entry())
-    first, second = _release(work, "rel-1"), _release(work, "rel-2")
+    first, second = _release(work, "first"), _release(work, "second")
     assert first["identity_digest"] == second["identity_digest"]
     _package(work, b"package, rebuilt")
     _write_lock(work, _entry(sha256=_sha(b"package, rebuilt")))
-    third = _release(work, "rel-3")
+    third = _release(work, "third")
     assert third["identity_digest"] != first["identity_digest"]
     assert third["identity"]["external"][0]["digest"] == {"sha256": _sha(b"package, rebuilt")}
 
