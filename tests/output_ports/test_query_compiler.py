@@ -1488,6 +1488,12 @@ def test_a_name_or_star_against_the_keyword_still_compiles(sql):
         pytest.param("SELECT pg_advisory_lock(1)", id="advisory-lock"),
         pytest.param("SELECT pg_sleep(5)", id="sleep"),
         pytest.param("SELECT pg_terminate_backend(1)", id="other-session"),
+        pytest.param("SELECT pg_try_advisory_lock(1)", id="try-advisory-lock"),
+        pytest.param("SELECT currval('customers_id_seq')", id="current-sequence"),
+        pytest.param("SELECT pg_notify('c', 'm')", id="notify"),
+        pytest.param("SELECT pg_switch_wal()", id="switch-wal"),
+        pytest.param("SELECT pg_drop_replication_slot('s')", id="replication-slot"),
+        pytest.param("SELECT loread(1, 2)", id="large-object-read"),
     ],
 )
 def test_query_sql_refuses_what_reads_raw_pages_other_requests_or_the_session(sql):
@@ -1502,3 +1508,11 @@ def test_query_sql_refuses_what_reads_raw_pages_other_requests_or_the_session(sq
         guard_against_injection_markers(sql)
     with pytest.raises(ValueError):
         validate_sql_expression_allowlist(sql.split(None, 1)[1])
+
+
+def test_a_name_that_only_starts_like_a_refused_function_is_not_refused():
+    """A CTE written ``lo_x(a)`` is not a call to a large-object function."""
+    from fluid_build.providers._sql_safety import names_refused_postgres_function
+
+    assert not names_refused_postgres_function("WITH lo_x(a) AS (SELECT 1) SELECT a FROM lo_x")
+    assert names_refused_postgres_function("SELECT lo_get(16384)")

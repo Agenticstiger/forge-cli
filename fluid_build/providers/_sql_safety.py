@@ -72,9 +72,11 @@ def names_refused_duckdb_function(sql: str) -> bool:
 #: rows a table has locked; ``pg_prepared_statement`` and ``pg_cursor`` show other
 #: requests' statements on the shared connection; ``set_config`` and
 #: ``current_setting`` set and read the session every later request on that connection
-#: runs in; ``nextval`` and ``setval`` change a sequence; ``pg_relation_filepath`` names a
-#: table's file for the file readers below; and ``pg_cancel_backend``,
-#: ``pg_terminate_backend`` and ``pg_reload_conf`` reach other sessions and the server.
+#: runs in; ``nextval``, ``setval`` and ``currval`` touch a sequence;
+#: ``pg_relation_filepath`` names a table's file for the file readers below; the
+#: large-object functions read and write server files; and ``pg_cancel_backend``,
+#: ``pg_terminate_backend``, ``pg_reload_conf``, ``pg_switch_wal``, ``pg_notify`` and the
+#: replication-slot functions reach other sessions and the server.
 #: No table node and no column
 #: name shows in the text a check here reads, so the engine reads past any column
 #: projection or row filter the caller's statement was limited to. Refused as a call,
@@ -84,14 +86,37 @@ POSTGRES_REFUSED_FUNCTIONS = frozenset(
     {
         "connectby",
         "current_setting",
+        "currval",
         "cursor_to_xml",
         "cursor_to_xmlschema",
+        "lo_close",
+        "lo_creat",
+        "lo_create",
+        "lo_export",
+        "lo_from_bytea",
+        "lo_get",
+        "lo_import",
+        "lo_lseek",
+        "lo_lseek64",
+        "lo_open",
+        "lo_put",
+        "lo_tell",
+        "lo_tell64",
+        "lo_truncate",
+        "lo_truncate64",
+        "lo_unlink",
+        "loread",
+        "lowrite",
         "nextval",
         "pg_cancel_backend",
         "pg_cursor",
+        "pg_drop_replication_slot",
+        "pg_notify",
         "pg_prepared_statement",
         "pg_relation_filepath",
         "pg_reload_conf",
+        "pg_replication_slot_advance",
+        "pg_switch_wal",
         "pg_terminate_backend",
         "pgrowlocks",
         "query_to_xml",
@@ -140,11 +165,11 @@ POSTGRES_REFUSED_RELATIONS = frozenset({"pg_cursors", "pg_prepared_statements"})
 #: Families whose every member is refused: ``schema_to_xml*``, ``database_to_xml*``,
 #: ``crosstab*`` (tablefunc), ``dblink*``, ``pgstat*`` (pgstattuple) and ``pg_stat*``
 #: (the statistics functions, such as ``pg_stat_get_live_tuples``); the server-file
-#: readers and writers ``pg_read_*``, ``pg_ls_*``, ``pg_file_*`` (adminpack) and ``lo_*``
-#: (large objects), which read a table's own files; ``pg_get_wal*`` (pg_walinspect) and
+#: readers and writers ``pg_read_*``, ``pg_ls_*`` and ``pg_file_*`` (adminpack), which read
+#: a table's own files; ``pg_get_wal*`` (pg_walinspect) and
 #: ``pg_logical*`` (logical decoding), which read the changes made to every row;
-#: ``pg_create_*`` (replication slots, restore points); ``pg_advisory*`` (locks that
-#: outlive a request); and ``pg_sleep*``.
+#: ``pg_create_*`` (replication slots, restore points); ``pg_advisory*`` and
+#: ``pg_try_advisory*`` (locks that outlive a request); and ``pg_sleep*``.
 POSTGRES_REFUSED_FUNCTION_PREFIXES = (
     "schema_to_xml",
     "database_to_xml",
@@ -155,11 +180,11 @@ POSTGRES_REFUSED_FUNCTION_PREFIXES = (
     "pg_read_",
     "pg_ls_",
     "pg_file_",
-    "lo_",
     "pg_get_wal",
     "pg_logical",
     "pg_create_",
     "pg_advisory",
+    "pg_try_advisory",
     "pg_sleep",
 )
 
