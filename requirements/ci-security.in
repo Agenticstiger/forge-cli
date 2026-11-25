@@ -3,5 +3,5 @@
 # environment, never into the project's, so the audit sees only what the project
 # resolves. Regenerate with scripts/ci/compile_requirements.sh.
 bandit[toml]
-semgrep==1.163.0
+semgrep==1.186.0
 pip-audit

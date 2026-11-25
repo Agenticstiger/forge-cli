@@ -1,0 +1,11 @@
+# Overrides for requirements/ci-security.txt. scripts/ci/compile_requirements.sh
+# passes this file to uv pip compile as --override, and the Security Scan job
+# installs the lock with --no-deps so pip does not re-check the pins it replaces.
+# The extension is not .txt or .in on purpose, so Dependabot leaves it alone.
+#
+# semgrep pins mcp exactly (mcp==1.29.0 in 1.186.0 and 1.187.0). Every mcp
+# release before 1.30.0 carries GHSA-qx49-fqc8-xw99 (high) and four moderate
+# advisories. The job only runs `semgrep scan` with a local rule file, which
+# does not touch mcp, so the lock takes the first fixed 1.x release instead.
+# Remove the line once semgrep itself pins mcp>=1.30.0.
+mcp==1.30.0

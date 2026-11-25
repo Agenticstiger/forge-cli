@@ -960,17 +960,19 @@ jobs:
       # pip-audit, bandit and semgrep are named in requirements/ci-security.in
       # and hash-locked in ci-security.txt. They go into their own virtual
       # environment, so nothing they depend on lands in the set the audit
-      # below reads.
+      # below reads. --no-deps installs exactly the lock, which uv resolved in
+      # full: requirements/ci-security.overrides replaces semgrep's exact mcp
+      # pin, and pip would otherwise refuse the lock over that pin.
       - name: Install security tools (hash-locked, separate environment)
         run: |
           python -m venv "${SECURITY_TOOLS}"
-          "${SECURITY_TOOLS}/bin/python" -m pip install --require-hashes -r requirements/ci-security.txt
+          "${SECURITY_TOOLS}/bin/python" -m pip install --require-hashes --no-deps -r requirements/ci-security.txt
       - name: pip-audit dependency CVE scan
         # Fails the build on any known-vulnerable dependency. Keeps the
         # litellm / jinja2 / h11 / cryptography CVE floors honest over time.
         #
         # This audits the project's REAL resolved closure and nothing else.
-        # semgrep==1.163.0 pins mcp==1.23.3, which caps pyjwt at 2.12.1 —
+        # semgrep==1.163.0 pinned mcp==1.23.3, which capped pyjwt at 2.12.1 —
         # below pyjwt's own CVE floor (PYSEC-2026-175/177/178/179, fixed in
         # 2.13.0). Installing the SAST scanners into the project's env would
         # therefore drag a known-vulnerable pyjwt we don't even ship into the
