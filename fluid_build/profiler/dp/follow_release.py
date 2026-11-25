@@ -67,7 +67,13 @@ from fluid_build.profiler._stats import Request, StatisticsBackend
 from fluid_build.profiler.dp import bounding, consistency, rank_noise, selection
 from fluid_build.profiler.dp.bounding import ROWS, UnitPlan
 from fluid_build.profiler.dp.discrete_gaussian import sample_discrete_gaussian
-from fluid_build.profiler.dp.follows import FollowPlan, FollowSpec, keep_rows, plan_follows
+from fluid_build.profiler.dp.follows import (
+    FollowEdge,
+    FollowPlan,
+    FollowSpec,
+    keep_rows,
+    plan_follows,
+)
 from fluid_build.profiler.dp.randomness import SeededSource
 from fluid_build.profiler.dp.record import ReleaseRecord
 from fluid_build.profiler.dp.release import (
@@ -369,11 +375,6 @@ def _entity_units_reason(
     )
 
 
-def _edge_key(edge: Any) -> Tuple[str, Tuple[str, ...], str, Tuple[str, ...]]:
-    """The tables and key columns a followed edge joins."""
-    return (edge.parent, edge.spec.parent_columns, edge.child, edge.spec.child_columns)
-
-
 def _entity_relationships(
     declared: Sequence[runner.Relationship],
 ) -> Set[Tuple[str, Tuple[str, ...], str, Tuple[str, ...]]]:
@@ -419,6 +420,27 @@ def _entity_link_reason(
     if each.entity and parent_column not in each.stable:
         return _unstable_reason(parent_column)
     return why_units
+
+
+def _children_sensitivity(
+    each: runner.Relationship,
+    followed: Optional[FollowEdge],
+    m_parent: int,
+    m_child: int,
+    why_units: Optional[str],
+) -> Tuple[int, int, Optional[str]]:
+    """The L1 and squared L2 sensitivity of a relationship's children-per-parent histogram.
+
+    Both are ``0`` and the last value says why when the histogram is not released.
+    """
+    others = m_child - (followed.max_children * m_parent if followed is not None else 0)
+    if why_units is not None:
+        return 0, 0, why_units
+    if m_parent >= 1 and others == 0:
+        return m_parent, m_parent * m_parent, None
+    if m_parent == 0 and m_child >= 1:
+        return 2 * m_child, 2 * m_child * m_child, None
+    return 0, 0, _relation_reason(each, m_parent, m_child)
 
 
 def _asked_statistics(request: Request, relationship: runner.Relationship) -> Tuple[str, ...]:
@@ -637,7 +659,12 @@ def plan_follow_release(
     for edge in tree.edges:
         note_keys(edge.parent, edge.spec.parent_columns)
         note_keys(edge.child, edge.spec.child_columns)
-        if _edge_key(edge) not in entities:
+        if (
+            edge.parent,
+            edge.spec.parent_columns,
+            edge.child,
+            edge.spec.child_columns,
+        ) not in entities:
             parent_sets.append((edge.parent, edge.spec.parent_columns))  # an entity's key repeats
     for each in declared:
         counted, group_by, linked = asked_for.relationship_asks(request, each)
@@ -657,22 +684,11 @@ def plan_follow_release(
             if name != "marginalHistogram/1":
                 not_released.append((f"{name} of {spelled}", _NOT_NOISY))
         if counted:
-            others = m_child - (followed.max_children * m_parent if followed is not None else 0)
-            if why_units is not None:
-                not_released.append((f"children per parent of {spelled}", why_units))
-                l1 = squared = 0
-            elif m_parent >= 1 and others == 0:
-                l1, squared = m_parent, m_parent * m_parent
-            elif m_parent == 0 and m_child >= 1:
-                l1, squared = 2 * m_child, 2 * m_child * m_child
-            else:
-                not_released.append(
-                    (
-                        f"children per parent of {spelled}",
-                        _relation_reason(each, m_parent, m_child),
-                    )
-                )
-                l1 = squared = 0
+            l1, squared, why_not = _children_sensitivity(
+                each, followed, m_parent, m_child, why_units
+            )
+            if why_not is not None:
+                not_released.append((f"children per parent of {spelled}", why_not))
             if squared:
                 cap = None if followed is None else followed.max_children
                 if (
