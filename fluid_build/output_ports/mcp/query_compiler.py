@@ -2171,7 +2171,9 @@ def _declared_column_types(expose: Mapping[str, Any]) -> Dict[str, bool]:
 
 def _refuse_a_casting_comparison(node: Any, string_columns: Mapping[str, bool]) -> None:
     """Refuse a comparison that would cast a string column row by row: a declared string
-    column against a number or a boolean, or against a column of another declared type."""
+    column against anything that is not a string (a number, a date, a boolean, a column
+    of another declared type), however it is parenthesised, and position by position
+    when tuples are compared."""
     from sqlglot import exp
 
     if isinstance(node, exp.In):
@@ -2180,26 +2182,64 @@ def _refuse_a_casting_comparison(node: Any, string_columns: Mapping[str, bool]) 
         sides = [node.this, node.args.get("low"), node.args.get("high")]
     else:
         sides = [node.this, node.expression]
+    sides = [_unparen(side) for side in sides if side is not None]
+    tuples = [side for side in sides if isinstance(side, exp.Tuple)]
+    if tuples and len(tuples) == len(sides) and len({len(t.expressions) for t in tuples}) == 1:
+        groups = [
+            [_unparen(t.expressions[i]) for t in tuples] for i in range(len(tuples[0].expressions))
+        ]
+    else:
+        groups = [sides]
+    for group in groups:
+        kinds = {_value_kind(side, string_columns) for side in group} - {None}
+        columns = [
+            side
+            for side in group
+            if isinstance(side, exp.Column) and _value_kind(side, string_columns) == "string"
+        ]
+        if columns and kinds == {"string", "other"}:
+            raise QueryValidationError(
+                f"sql compares {columns[0].sql()!r}, a string column, with a value of another "
+                "type; on an expose with row filters write the value as a string literal (the "
+                "engine would cast every row's value, and fail on a withheld one)."
+            )
 
-    def kind(side: Any) -> Optional[str]:
-        if isinstance(side, exp.Column) and side.name.casefold() in string_columns:
-            return "string" if string_columns[side.name.casefold()] else "other"
-        if isinstance(side, exp.Literal):
-            return "string" if side.is_string else "other"
-        if isinstance(side, (exp.Boolean, exp.Neg)):
-            return "other"
-        if isinstance(side, (exp.Cast, exp.TryCast)) and side.find(exp.Column) is None:
-            return "string" if side.to.is_type(*exp.DataType.TEXT_TYPES) else "other"
+
+def _unparen(node: Any) -> Any:
+    from sqlglot import exp
+
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
+
+
+def _value_kind(side: Any, string_columns: Mapping[str, bool]) -> Optional[str]:
+    """``"string"``, ``"other"`` or ``None`` (not known) for one side of a comparison. A
+    column has its declared type's kind. A constant is a string when every value in it is
+    a string literal or a cast to a text type, and ``"other"`` otherwise: a number, a
+    date, the current time, arithmetic, an array of numbers."""
+    from sqlglot import exp
+
+    side = _unparen(side)
+    if isinstance(side, exp.Column):
+        known = string_columns.get(side.name.casefold())
+        return None if known is None else ("string" if known else "other")
+    if isinstance(side, exp.Null) or side.find(exp.Column) is not None:
         return None
-
-    kinds = {kind(side) for side in sides} - {None}
-    columns = [s for s in sides if isinstance(s, exp.Column) and kind(s) == "string"]
-    if columns and kinds == {"string", "other"}:
-        raise QueryValidationError(
-            f"sql compares {columns[0].sql()!r}, a string column, with a value of another "
-            "type; on an expose with row filters write the value as a string literal (the "
-            "engine would cast every row's value, and fail on a withheld one)."
-        )
+    if isinstance(side, exp.Literal):
+        return "string" if side.is_string else "other"
+    if isinstance(side, (exp.Cast, exp.TryCast)):
+        return "string" if side.to.is_type(*exp.DataType.TEXT_TYPES) else "other"
+    if isinstance(side, (exp.Array, exp.Tuple, exp.Any, exp.All, exp.Anonymous)):
+        values = [
+            value
+            for value in side.find_all(exp.Literal, exp.Cast, exp.TryCast)
+            if not isinstance(value.parent, (exp.Cast, exp.TryCast))
+        ]
+        if values and all(_value_kind(value, string_columns) == "string" for value in values):
+            return "string"
+        return "other"
+    return "other"
 
 
 @functools.lru_cache(maxsize=1)
