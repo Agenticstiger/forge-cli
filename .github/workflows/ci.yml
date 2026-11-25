@@ -769,6 +769,46 @@ jobs:
         run: docker logs fluid-openbao
 
   # ──────────────────────────────────────────────────────────────
+  # Postgres role check. The MCP gateway's Postgres driver refuses to serve an
+  # expose with row filters as a superuser or as a member of a predefined role
+  # that reads past the tables an expose names. This runs that check against a
+  # real Postgres 17 server, with one role per membership, held directly and
+  # through another role, and a plain role. Free and secret-less like the jobs
+  # above. Docker is CI-only for forge: the test skips wherever
+  # FLUID_TEST_POSTGRES_DSN is unset.
+  # ──────────────────────────────────────────────────────────────
+  postgres-role-check:
+    name: Postgres role check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73
+        env:
+          POSTGRES_PASSWORD: fluid-ci-only  # pragma: allowlist secret
+        ports:
+          - 55433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,postgres]"
+      - name: Run the role check against Postgres 17
+        env:
+          FLUID_TEST_POSTGRES_DSN: postgresql://postgres:fluid-ci-only@127.0.0.1:55433/postgres  # pragma: allowlist secret
+        run: python -m pytest -v -p no:randomly -m integration tests/output_ports/test_postgres_role_check_live.py
+
+  # ──────────────────────────────────────────────────────────────
   # DuckDB floor. pyproject.toml takes duckdb>=1.5.0 with no ceiling, and
   # DuckDB 2.0 needs Python 3.11, so the only other job on 1.5.x is the
   # Python 3.10 test leg, which gets the newest 1.5 patch, never the floor.
