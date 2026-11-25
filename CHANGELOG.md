@@ -512,9 +512,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare name and then quoted, so a column named like a reserved word (`order`) or a session value
   (`current_user`, and `user` on Postgres) is read as itself. A read of the table without an
   alias takes the caller's own name for it, folded and quoted the same way, so a table named like
-  a reserved word reads too. `sample` keeps only the declared columns of the rows it reads,
-  matched without regard to case, so a column the engine returns in another case is still
-  returned. `query` is unchanged: it reads only what the contract's semantics name.
+  a reserved word reads too; a quoted name that Postgres or Snowflake reads as another table
+  than the exposed one is refused, and so is a Postgres cast to an object identifier type
+  (`regclass`, `regproc` and the like), which looks a name up in the catalog. `split` and
+  `string_to_array` are listed functions. `sample` keeps, for each declared name, the column the
+  engine reads for it, or the only column of that name in another case, so a quoted mixed-case
+  column is still returned and a column whose name differs from a declared one only in case is
+  not. `query` is unchanged: it reads only what the contract's semantics name.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is

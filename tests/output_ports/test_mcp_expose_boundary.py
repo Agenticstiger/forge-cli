@@ -120,6 +120,50 @@ def test_sample_keeps_a_declared_column_named_like_a_keyword(tmp_path):
     assert payload["rows"] == [{"id": 1, "update": "a", "union": "b"}]
 
 
+@pytest.mark.parametrize(
+    ("dialect", "columns", "declared", "kept"),
+    [
+        # Postgres and Snowflake can hold two columns whose names differ only in case;
+        # the declared name keeps the column the engine reads for it.
+        ("postgres", ["id", "notes", "NOTES"], ["id", "notes"], ["id", "notes"]),
+        ("snowflake", ["ID", "NOTES", "notes"], ["id", "notes"], ["ID", "NOTES"]),
+        # A quoted mixed-case column, the only one of its name, is still read.
+        ("postgres", ["id", "UserId"], ["id", "UserId"], ["id", "UserId"]),
+        ("duckdb", ["ID", "Region"], ["id", "region"], ["ID", "Region"]),
+    ],
+)
+def test_sample_keeps_the_column_the_engine_reads_for_each_declared_name(
+    dialect, columns, declared, kept
+):
+    expose = _expose(schema=[{"name": name} for name in declared])
+    assert query_compiler.declared_result_columns(expose, columns, dialect) == kept
+
+
+def test_sample_refuses_when_no_column_is_the_declared_names_own():
+    expose = _expose(schema=[{"name": "id"}, {"name": "notes"}])
+    with pytest.raises(query_compiler.QueryValidationError, match="several columns named"):
+        query_compiler.declared_result_columns(expose, ["id", "Notes", "NOTES"], "postgres")
+
+
+def test_sample_does_not_return_an_undeclared_column_named_like_a_declared_one(state_for):
+    """The declared ``order`` keeps its own column; an undeclared ``ORDER`` the engine
+    also returns is dropped, and does not take the declared column's place."""
+    state = state_for(_expose(schema=[{"name": "id"}, {"name": "order"}]))
+    driver = state.get_driver()
+    execute = driver.execute
+
+    def with_a_case_twin(**kwargs: Any) -> Any:
+        result = execute(**kwargs)
+        rows = tuple({**row, "ORDER": "UNDECLARED"} for row in result.rows)
+        return SimpleNamespace(columns=(*result.columns, "ORDER"), rows=rows)
+
+    driver.execute = with_a_case_twin
+    payload = tool_sample(state, {"limit": 10})
+    assert payload["columns"] == ["id", "order"]
+    assert "UNDECLARED" not in repr(payload)
+    assert sorted(row["order"] for row in payload["rows"]) == [7, 8, 9]
+
+
 def test_a_filtered_callers_sample_returns_only_the_declared_columns(state_for):
     state = state_for(_expose(row_filters=_EU_ONLY))
     payload = tool_sample(state, {"limit": 10}, caller_attributes={"principal": EU})
@@ -292,6 +336,73 @@ def test_the_projection_takes_the_callers_name_for_the_table_quoted(dialect, ref
         dialect=dialect,
     )
     assert f") AS {alias}\nLIMIT 10" in compiled.sql, compiled.sql
+
+
+@pytest.mark.parametrize(
+    ("dialect", "reference", "sql", "refused"),
+    [
+        ("postgres", "public.customers", 'SELECT id FROM "Customers"', True),
+        ("postgres", "public.customers", 'SELECT id FROM "customers"', False),
+        ("postgres", "public.customers", "SELECT id FROM Customers", False),
+        ("snowflake", "PUBLIC.CUSTOMERS", 'SELECT id FROM "customers"', True),
+        ("snowflake", "PUBLIC.CUSTOMERS", 'SELECT id FROM "CUSTOMERS"', False),
+        ("snowflake", "PUBLIC.CUSTOMERS", "SELECT id FROM customers", False),
+    ],
+)
+def test_a_quoted_name_the_engine_reads_as_another_table_is_refused(
+    dialect, reference, sql, refused
+):
+    """Postgres and Snowflake keep the case of a quoted name, so ``"Customers"`` is
+    another table there than ``customers``: serving the exposed table's rows under it
+    would label them as that table's."""
+
+    def compile_it() -> Any:
+        return query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference=reference,
+            limit=10,
+            expose=_expose(schema=[{"name": "id"}]),
+            dialect=dialect,
+        )
+
+    if refused:
+        with pytest.raises(query_compiler.QueryValidationError, match="another table"):
+            compile_it()
+    else:
+        compile_it()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 'pg_authid'::regclass AS r FROM customers",
+        "SELECT CAST('lower' AS regproc) AS r FROM customers",
+        "SELECT id::regrole AS r FROM customers",
+    ],
+)
+def test_a_postgres_cast_that_looks_a_name_up_is_refused(sql):
+    with pytest.raises(query_compiler.QueryValidationError, match="looks a name up"):
+        query_compiler.compile_free_form_sql(
+            sql=sql,
+            table_reference="customers",
+            limit=10,
+            expose=_expose(),
+            dialect="postgres",
+        )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "call"),
+    [("duckdb", "string_split(region, ',')"), ("postgres", "string_to_array(region, ',')")],
+)
+def test_splitting_a_string_is_a_listed_function(dialect, call):
+    query_compiler.compile_free_form_sql(
+        sql=f"SELECT {call} AS parts FROM customers",
+        table_reference="customers",
+        limit=10,
+        expose=_expose(),
+        dialect=dialect,
+    )
 
 
 def test_a_table_named_like_a_reserved_word_reads_end_to_end():

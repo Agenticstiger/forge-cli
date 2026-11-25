@@ -51,6 +51,7 @@ from ..query_compiler import (
     catalog_columns_sql,
     column_type,
     declared_columns,
+    declared_result_columns,
     row_filter_predicate,
     select_body,
     strip_projection_open,
@@ -424,10 +425,11 @@ class EngineDriver(ABC):
 
         A column the contract does not declare is dropped before the rows leave the
         driver, so a column added to the table later stays unreadable until the
-        contract declares it. The declared columns are matched by name without regard
-        to case, as the engine returns them, so a quoted or mixed-case column is read
-        as the table holds it. Restricted columns are then left out and PII columns
-        masked (:meth:`project`). An expose that declares no column is refused.
+        contract declares it. Each declared name keeps the column the engine reads for
+        it (:func:`...query_compiler.declared_result_columns`), so a column whose name
+        differs from a declared one only in case is not returned with it. Restricted
+        columns are then left out and PII columns masked (:meth:`project`). An expose
+        that declares no column is refused.
 
         ``caller_attributes`` is the request's verified identity. When the
         contract declares ``policy.authz.rowFilters``,
@@ -445,14 +447,14 @@ class EngineDriver(ABC):
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
         predicate = row_filter_predicate(self.expose, caller_attributes, dialect=descriptor.dialect)
-        declared = {name.casefold() for name in declared_columns(self.expose)}
+        declared_columns(self.expose)  # refuses an expose that declares no column
         source = descriptor.table_reference
         if predicate is not None:
             # The predicate is the contract's own literal SQL, its columns qualified
             # with ROW_FILTER_ALIAS; it binds no parameter.
             source = f"{source} AS {ROW_FILTER_ALIAS} WHERE {predicate}"
         result = self.execute(sql=f"SELECT * FROM {source} LIMIT {limit}", params=())
-        kept = [column for column in result.columns if str(column).casefold() in declared]
+        kept = declared_result_columns(self.expose, result.columns, descriptor.dialect)
         declared_rows = [{column: row[column] for column in kept} for row in result.rows]
         visible_columns, rows = self.project(declared_rows, columns=kept)
         truncated = len(rows) >= limit

@@ -1730,6 +1730,40 @@ def declared_columns(expose: Mapping[str, Any]) -> List[str]:
     return names
 
 
+def declared_result_columns(
+    expose: Mapping[str, Any], columns: Iterable[Any], dialect: Optional[str]
+) -> List[str]:
+    """The columns of a ``SELECT *`` result that ``contract.schema`` declares, in the
+    result's order. For each declared name it is the column the engine reads for that
+    bare name (folded the way the engine folds an unquoted name); failing that, the one
+    column whose name matches without regard to case, so a quoted mixed-case column is
+    still read. A table can hold two columns whose names differ only in case (Postgres,
+    Snowflake): one that is not the declared name's column is never returned, and when
+    neither is, the read is refused."""
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    names = [str(column) for column in columns]
+    chosen: Set[str] = set()
+    for declared in declared_columns(expose):
+        candidates = [name for name in names if name.casefold() == declared.casefold()]
+        engine_name = _resolved_name(_identifier(declared), read) if read else declared
+        exact = [name for name in candidates if name == engine_name]
+        if exact or len(candidates) == 1:
+            chosen.add((exact or candidates)[0])
+        elif candidates:
+            raise QueryValidationError(
+                f"The table holds several columns named {declared!r} in different cases, and "
+                "none is the one the engine reads for that name; sample cannot tell which one "
+                "contract.schema declares. Expose the column through a view."
+            )
+    return [name for name in names if name in chosen]
+
+
+def _identifier(name: str) -> Any:
+    from sqlglot import exp
+
+    return exp.to_identifier(name, quoted=False)
+
+
 def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
     """The columns ``query_sql``'s projection selects on ``expose``: the ones
     ``contract.schema`` declares (:func:`declared_columns`), less ``restricted``, in
@@ -2123,6 +2157,8 @@ def _allowed_functions() -> Tuple[Tuple[type, ...], FrozenSet[str]]:
         exp.StrPosition,
         exp.Initcap,
         exp.SplitPart,
+        exp.Split,
+        exp.StringToArray,
         exp.RegexpLike,
         exp.RegexpReplace,
         exp.RegexpExtract,
@@ -2261,6 +2297,15 @@ def _refuse_unlisted_functions(tree: Any, sql: str = "", read: Optional[str] = N
     for operator in tree.find_all(exp.Operator):
         # ``OPERATOR(schema.op)`` calls the function behind an operator a schema defines.
         raise QueryValidationError(_unlisted_function(operator.sql(dialect=read)[:80]))
+    for cast in tree.find_all(exp.Cast, exp.TryCast):
+        # Postgres's object identifier types (``regclass``, ``regproc``, ``regrole``...)
+        # look a name up in the catalog: a cast to one tells whether another relation,
+        # function or role exists.
+        if read == "postgres" and cast.to.sql(dialect=read).casefold().startswith("reg"):
+            raise QueryValidationError(
+                f"sql casts to {cast.to.sql(dialect=read)}, which looks a name up in the "
+                "catalog; query_sql reads only the exposed table."
+            )
 
 
 def _written_name(node: Any, sql: str) -> Optional[str]:
@@ -3532,6 +3577,12 @@ def _refuse_another_schemas_table(
     for table in tables:
         if table.name.casefold() != exposed_name:
             continue
+        if _resolved_name(table.this, read) != _resolved_name(exposed.this, read):
+            raise QueryValidationError(
+                f"sql reads {table.sql(dialect=read)!r}, which the engine reads as another "
+                "table than the exposed one (it keeps the case of a quoted name); name the "
+                f"exposed table as {' or '.join(accepted)}."
+            )
         for part, value in expected.items():
             written = table.text(part)
             if written and written.casefold() != value.casefold():
@@ -3540,6 +3591,23 @@ def _refuse_another_schemas_table(
                     "schema or catalog than the exposed table's; name the exposed table as "
                     f"{' or '.join(accepted)}."
                 )
+
+
+def _resolved_name(identifier: Any, read: Optional[str]) -> str:
+    """The name an engine that folds unquoted names (Postgres, Snowflake) reads for
+    ``identifier``: a quoted name as written, an unquoted one folded. Elsewhere names
+    are compared without regard to case."""
+    from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
+
+    name: str = identifier.name
+    if read is None:
+        return name.casefold()
+    strategy = Dialect.get_or_raise(read).normalization_strategy
+    if strategy not in (NormalizationStrategy.LOWERCASE, NormalizationStrategy.UPPERCASE):
+        return name.casefold()
+    if identifier.quoted:
+        return name
+    return name.lower() if strategy is NormalizationStrategy.LOWERCASE else name.upper()
 
 
 def _accepted_spellings(name: str, db: str, catalog: str) -> List[str]:
