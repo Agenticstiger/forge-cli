@@ -228,6 +228,18 @@ def _workspace(tmp_path, monkeypatch, *, stable=True, rows=None, request=None, c
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _no_clique_choice(monkeypatch):
+    """Choose no clique: the releases here are read for their relationships, not their cliques.
+
+    Choosing cliques runs OpenDP (the ``[privacy]`` extra), which the unit lanes do not install,
+    so the choice is fixed to none, as a release with no categorical pair would make it.
+    """
+    from fluid_build.profiler.dp import selection
+
+    monkeypatch.setattr(selection, "select_cliques", lambda *args, **kwargs: ())
+
+
 @pytest.fixture
 def registry(monkeypatch):
     backend = FakeBackend()
