@@ -21,6 +21,14 @@ before anything is measured, from the seed and from each parent's own children, 
   (squared ``m_T**2``), released only when the unit follows the relationship or does not reach the
   parent, with the parent column's contract levels as its groups.
 
+A relationship that reaches an entity of a table with a validity window
+(RFC-versioned-relationships section 2) counts its children per entity, not per version: the
+parents are the distinct entity keys among the target's kept rows, and the target's parent key
+repeats by design, so it is not checked for repeated keys. The charge is the same as for a table
+whose rows are parents, argued per entity in :func:`plan_follow_release`. It is released only where
+an entity cannot span two units (:func:`_entity_units_reason`), and a release whose records put an
+entity's versions in two units is refused (``profile_release_entity_units``).
+
 Where the unit follows a relationship the children per parent lie in the integer bins ``0``
 to the cap; elsewhere in a fixed public ladder that ends at 10**9, and a count beyond it refuses
 the release, naming the relationship only. Every group key is a contract level or a public bin
@@ -59,7 +67,13 @@ from fluid_build.profiler._stats import Request, StatisticsBackend
 from fluid_build.profiler.dp import bounding, consistency, rank_noise, selection
 from fluid_build.profiler.dp.bounding import ROWS, UnitPlan
 from fluid_build.profiler.dp.discrete_gaussian import sample_discrete_gaussian
-from fluid_build.profiler.dp.follows import FollowPlan, FollowSpec, keep_rows, plan_follows
+from fluid_build.profiler.dp.follows import (
+    FollowEdge,
+    FollowPlan,
+    FollowSpec,
+    keep_rows,
+    plan_follows,
+)
 from fluid_build.profiler.dp.randomness import SeededSource
 from fluid_build.profiler.dp.record import ReleaseRecord
 from fluid_build.profiler.dp.release import (
@@ -68,12 +82,16 @@ from fluid_build.profiler.dp.release import (
     DEFAULT_ROW_FLOOR,
     LEVELS,
     LINK,
+    NO_CELL,
+    PAIR_DAYS,
+    PAIRS,
     RANK,
     RELATION,
     RULE_NAME,
     WORKLOAD_UNUSED,
     EncodedRows,
     Part,
+    Placement,
     PublicStructures,
     ReleasedColumn,
     ReleasedTable,
@@ -90,13 +108,24 @@ from fluid_build.profiler.dp.release import (
     _table_not_released,
     _TableColumns,
     _version,
+    added_units,
+    agrees,
     decimal_text,
+    fit_prefix,
+    left_out_reason,
+    noise_label,
+    other_table_pairs,
+    pair_cells,
+    pair_label,
+    paired_columns,
+    place_known,
     place_values,
     public_structures,
     release_parts,
     scale_units,
     selection_share,
     split_budget,
+    table_cells,
 )
 
 __all__ = [
@@ -108,6 +137,7 @@ __all__ = [
     "LinkStat",
     "RelationStat",
     "TablePlan",
+    "admit",
     "build_follow_record",
     "check_follow_record",
     "check_selection_available",
@@ -183,6 +213,9 @@ class RelationStat:
     #: L1 and squared L2 sensitivity to one unit.
     l1: int
     sensitivity: int
+    #: The relationship reaches an entity: its parents are the distinct entity keys of the parent
+    #: table, one for each entity and not one for each version.
+    entity: bool = False
 
     @property
     def groups(self) -> int:
@@ -262,6 +295,12 @@ class FollowReleasePlan:
     key_sets: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
     #: The key column tuples that name a parent row, which must be unique.
     parent_sets: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
+    #: The entities a statistic of the release counts under a unit that reaches their table:
+    #: ``(table, entity columns, parent table of the edge into it, that edge's parent columns, its
+    #: child columns on the table)``. The records must put an entity's versions in one unit.
+    entity_units: Tuple[
+        Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]], ...
+    ] = ()
 
     @property
     def selects(self) -> bool:
@@ -298,6 +337,7 @@ def _declared_relationships(
             if child is None or parent is None or len(child) != len(parent):
                 continue
             name = entry.get("name")
+            stable = runner._entity_stable(exposes[str(entry["to"])], parent)
             found.append(
                 runner.Relationship(
                     expose_id,
@@ -305,9 +345,137 @@ def _declared_relationships(
                     str(entry["to"]),
                     child,
                     parent,
+                    entity=stable is not None,
+                    stable=stable or frozenset(),
                 )
             )
     return found
+
+
+def _entity_units_reason(
+    relationship: runner.Relationship, tree: FollowPlan, m_parent: int
+) -> Optional[str]:
+    """Why a statistic over the entities of *relationship*'s parent cannot be released, or ``None``.
+
+    An entity of a versioned table is released only when it cannot span two units: the unit does
+    not reach the table (``m_T = 0``, its rows are fixed), or reaches it through a followed
+    relationship whose child columns on the table are the natural entity or columns a
+    ``dependency`` makes stable per entity, so every version of an entity follows the same parent
+    row. The unit's own expose is no such table: each of its rows is a unit. The reason is
+    decided by the contract and the flags alone.
+    """
+    if m_parent == 0:
+        return None
+    edge = tree.edge_into(relationship.parent)
+    if edge is not None and set(edge.spec.child_columns) <= relationship.stable:
+        return None
+    return (
+        "an entity's versions could follow different units: follow "
+        f"{relationship.parent} by its natural entity or by a column stable per entity"
+    )
+
+
+def _entity_relationships(
+    declared: Sequence[runner.Relationship],
+) -> Set[Tuple[str, Tuple[str, ...], str, Tuple[str, ...]]]:
+    """The relationships that reach an entity of a versioned table, by their joined key columns."""
+    return {
+        (each.parent, each.parent_columns, each.child, each.child_columns)
+        for each in declared
+        if each.entity
+    }
+
+
+def _note_entity_units(
+    tree: FollowPlan,
+    each: runner.Relationship,
+    entity_units: List[Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]]],
+    note_keys: Callable[[str, Tuple[str, ...]], None],
+) -> None:
+    """A statistic counts the entities of a reached table: its records must put each in one unit."""
+    edge = tree.edge_into(each.parent)
+    if each.entity and edge is not None:
+        item = (
+            each.parent,
+            each.parent_columns,
+            edge.parent,
+            edge.spec.parent_columns,
+            edge.spec.child_columns,
+        )
+        if item not in entity_units:
+            entity_units.append(item)
+            note_keys(edge.parent, edge.spec.parent_columns)
+            note_keys(edge.child, edge.spec.child_columns)
+
+
+def _unstable_reason(column: str) -> str:
+    """Why a column that is not stable per entity cannot group an entity's children."""
+    return f"{column}: {runner._UNSTABLE}"
+
+
+def _entity_link_reason(
+    each: runner.Relationship, parent_column: str, why_units: Optional[str]
+) -> Optional[str]:
+    """Why a statistic grouped through a link into an entity table is not released, or ``None``."""
+    if each.entity and parent_column not in each.stable:
+        return _unstable_reason(parent_column)
+    return why_units
+
+
+def _link_structure(
+    contract: Mapping[str, Any],
+    backend: StatisticsBackend,
+    each: runner.Relationship,
+    column: str,
+    parent_column: str,
+    bits: int,
+    keyed: Mapping[str, FrozenSet[str]],
+) -> Tuple[Optional[ReleasedColumn], Optional[ReleasedColumn], str]:
+    """The cells of the child column a link counts and of the parent column it is grouped by.
+
+    Either is ``None`` when it has none, and the last value says why. The counted child column may
+    hold no value where the contract does not require one.
+    """
+    child_made, why = _group_structure(
+        contract, backend, each.child, column, bits, keys=keyed.get(each.child, frozenset())
+    )
+    if child_made is not None:
+        child_made = _nullable_where_allowed(contract, each.child, column, child_made)
+    by_made, by_why = _group_structure(
+        contract,
+        backend,
+        each.parent,
+        parent_column,
+        bits,
+        keys=keyed.get(each.parent, frozenset()),
+    )
+    if by_made is not None and not by_made.categorical:
+        by_made, by_why = None, (
+            f"{parent_column}: a group is keyed by the parent column's value, and only the "
+            "levels an enum(...) or a boolean column declares are public"
+        )
+    return child_made, by_made, why or by_why
+
+
+def _children_sensitivity(
+    each: runner.Relationship,
+    followed: Optional[FollowEdge],
+    m_parent: int,
+    m_child: int,
+    why_units: Optional[str],
+) -> Tuple[int, int, Optional[str]]:
+    """The L1 and squared L2 sensitivity of a relationship's children-per-parent histogram.
+
+    Both are ``0`` and the last value says why when the histogram is not released.
+    """
+    others = m_child - (followed.max_children * m_parent if followed is not None else 0)
+    if why_units is not None:
+        return 0, 0, why_units
+    if m_parent >= 1 and others == 0:
+        return m_parent, m_parent * m_parent, None
+    if m_parent == 0 and m_child >= 1:
+        return 2 * m_child, 2 * m_child * m_child, None
+    return 0, 0, _relation_reason(each, m_parent, m_child)
 
 
 def _asked_statistics(request: Request, relationship: runner.Relationship) -> Tuple[str, ...]:
@@ -343,6 +511,24 @@ def _unlisted(contract: Mapping[str, Any], table: str, bits: int) -> _TableColum
         rank_pairs=(),
         rank_left_out=(),
     )
+
+
+def _nullable_where_allowed(
+    contract: Mapping[str, Any], table: str, column: str, made: ReleasedColumn
+) -> ReleasedColumn:
+    """*made*, nullable unless the contract declares *table*'s *column* ``required: true``.
+
+    A record with no value lands in no cell: a parent with no group value is in the group that is
+    never written, and a child with no value is in no cell of its group, so a unit still changes at
+    most the cells its reach charges. A NULL in a column the contract requires refuses the release.
+    One structure serves every statistic that groups by or counts the column, so all agree.
+    """
+    expose = next(
+        (item for item in iter_exposes(dict(contract)) if item.get("exposeId") == table), {}
+    )
+    if _schema_of(expose).get(column, {}).get("required") is True:
+        return made
+    return replace(made, nullable=True)
 
 
 def _schema_of(expose: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
@@ -493,7 +679,12 @@ def plan_follow_release(
     ]
     used_keys: Dict[str, List[Tuple[str, ...]]] = {}
     parent_sets: List[Tuple[str, Tuple[str, ...]]] = []
+    entity_units: List[Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]]] = []
     extra_read: Dict[str, List[str]] = {}
+    entities = _entity_relationships(declared)
+
+    def note_entities(each: runner.Relationship) -> None:
+        _note_entity_units(tree, each, entity_units, note_keys)
 
     def note_keys(table: str, names: Tuple[str, ...]) -> None:
         if names not in used_keys.setdefault(table, []):
@@ -503,7 +694,13 @@ def plan_follow_release(
     for edge in tree.edges:
         note_keys(edge.parent, edge.spec.parent_columns)
         note_keys(edge.child, edge.spec.child_columns)
-        parent_sets.append((edge.parent, edge.spec.parent_columns))
+        if (
+            edge.parent,
+            edge.spec.parent_columns,
+            edge.child,
+            edge.spec.child_columns,
+        ) not in entities:
+            parent_sets.append((edge.parent, edge.spec.parent_columns))  # an entity's key repeats
     for each in declared:
         counted, group_by, linked = asked_for.relationship_asks(request, each)
         stats = _asked_statistics(request, each)
@@ -517,23 +714,16 @@ def plan_follow_release(
             f"{each.parent}({', '.join(each.parent_columns)})"
         )
         m_parent, m_child = reach.get(each.parent, 0), reach.get(each.child, 0)
+        why_units = _entity_units_reason(each, tree, m_parent) if each.entity else None
         for name in stats:
             if name != "marginalHistogram/1":
                 not_released.append((f"{name} of {spelled}", _NOT_NOISY))
         if counted:
-            others = m_child - (followed.max_children * m_parent if followed is not None else 0)
-            if m_parent >= 1 and others == 0:
-                l1, squared = m_parent, m_parent * m_parent
-            elif m_parent == 0 and m_child >= 1:
-                l1, squared = 2 * m_child, 2 * m_child * m_child
-            else:
-                not_released.append(
-                    (
-                        f"children per parent of {spelled}",
-                        _relation_reason(each, m_parent, m_child),
-                    )
-                )
-                l1 = squared = 0
+            l1, squared, why_not = _children_sensitivity(
+                each, followed, m_parent, m_child, why_units
+            )
+            if why_not is not None:
+                not_released.append((f"children per parent of {spelled}", why_not))
             if squared:
                 cap = None if followed is None else followed.max_children
                 if (
@@ -560,12 +750,24 @@ def plan_follow_release(
                     None,
                     l1,
                     squared,
+                    each.entity,
                 )
                 relations.append(base)
                 note_keys(each.parent, each.parent_columns)
                 note_keys(each.child, each.child_columns)
-                parent_sets.append((each.parent, each.parent_columns))
+                if each.entity:
+                    note_entities(each)
+                else:
+                    parent_sets.append((each.parent, each.parent_columns))
                 for name in group_by:
+                    if each.entity and name not in each.stable:
+                        not_released.append(
+                            (
+                                f"children per parent of {spelled} grouped by {each.parent}.{name}",
+                                _unstable_reason(name),
+                            )
+                        )
+                        continue
                     made, why = _group_structure(
                         contract,
                         backend,
@@ -590,7 +792,9 @@ def plan_follow_release(
                         )
                         continue
                     relations.append(replace(base, group=made))
-                    structure[(each.parent, name)] = made
+                    structure[(each.parent, name)] = _nullable_where_allowed(
+                        contract, each.parent, name, made
+                    )
                     extra_read.setdefault(each.parent, []).append(name)
                     label = _label_of(contract, each.parent, name) if m_parent == 0 else None
                     if label is not None:
@@ -601,6 +805,10 @@ def plan_follow_release(
                 not_released.append(
                     (what, f"the unit does not reach {each.child}, so its rows are fixed")
                 )
+                continue
+            why_link = _entity_link_reason(each, parent_column, why_units)
+            if why_link is not None:
+                not_released.append((what, why_link))
                 continue
             if followed is None and m_parent != 0:
                 not_released.append(
@@ -613,37 +821,11 @@ def plan_follow_release(
                     )
                 )
                 continue
-            child_made, why = _group_structure(
-                contract, backend, each.child, column, bits, keys=keyed.get(each.child, frozenset())
+            child_made, by_made, why = _link_structure(
+                contract, backend, each, column, parent_column, bits, keyed
             )
-            if child_made is not None:
-                entry = _schema_of(
-                    next(
-                        item
-                        for item in iter_exposes(dict(contract))
-                        if item.get("exposeId") == each.child
-                    )
-                ).get(column, {})
-                if entry.get("required") is not True:
-                    child_made, why = None, (
-                        f"{column}: the contract does not declare it required: true, and a "
-                        "record with no value is refused, never counted"
-                    )
-            by_made, by_why = _group_structure(
-                contract,
-                backend,
-                each.parent,
-                parent_column,
-                bits,
-                keys=keyed.get(each.parent, frozenset()),
-            )
-            if by_made is not None and not by_made.categorical:
-                by_made, by_why = None, (
-                    f"{parent_column}: a group is keyed by the parent column's value, and only the "
-                    "levels an enum(...) or a boolean column declares are public"
-                )
             if child_made is None or by_made is None:
-                not_released.append((what, why or by_why))
+                not_released.append((what, why))
                 continue
             links.append(
                 LinkStat(
@@ -657,11 +839,14 @@ def plan_follow_release(
                 )
             )
             structure[(each.child, column)] = child_made
-            structure[(each.parent, parent_column)] = by_made
+            structure[(each.parent, parent_column)] = _nullable_where_allowed(
+                contract, each.parent, parent_column, by_made
+            )
             extra_read.setdefault(each.child, []).append(column)
             extra_read.setdefault(each.parent, []).append(parent_column)
             note_keys(each.parent, each.parent_columns)
             note_keys(each.child, each.child_columns)
+            note_entities(each)
             label = _label_of(contract, each.parent, parent_column) if m_parent == 0 else None
             if label is not None:
                 warnings.append(_warning(each.parent, parent_column, label))
@@ -699,7 +884,11 @@ def plan_follow_release(
             for definition in ("kendallTau/1", "spearmanRho/1")
             if any(each[0] == definition for each in found.rank_pairs)
         )
-        needed = set(each.name for each in released) | set(extra_read.get(table, ()))
+        needed = (
+            set(each.name for each in released)
+            | set(extra_read.get(table, ()))
+            | set(paired_columns(found.date_pairs))
+        )
         read = tuple(column for column in found.expose_plan.columns if column.name in needed)
         asked = found.asked
         in_request = set() if asked is None else {each.name for each in asked.columns}
@@ -730,6 +919,8 @@ def plan_follow_release(
             rank_deltas=deltas,
             clique_method=clique_method,
             reach=m,
+            date_pairs=found.date_pairs,
+            date_required=found.date_required,
         )
         tables.append(TablePlan(table, m, table_plan, asked is not None))
         if asked is not None:
@@ -739,6 +930,8 @@ def plan_follow_release(
                 )
             )
             not_released.extend(found.rank_left_out)
+            not_released.extend(found.date_left_out)
+            not_released.extend(found.clique_left_out)
     # the reached tables first, then the others, in the request's order
     fixed: List[Tuple[str, Tuple[Tuple[str, str], ...]]] = []
     for table in sorted((set(request_tables(request)) | set(extra_read)) - set(tree.order)):
@@ -748,6 +941,7 @@ def plan_follow_release(
         if asked_table is not None:
             wanted |= {each.name for each in asked_table.columns}
             not_released.append((f"table {table}", _FIXED))
+            not_released.extend(other_table_pairs(asked_table, _FIXED))
         domains = tuple(
             (column.name, column.domain) for column in expose_plan.columns if column.name in wanted
         )
@@ -784,6 +978,7 @@ def plan_follow_release(
         structure=structure,
         key_sets=tuple((table, names) for table, sets in used_keys.items() for names in sets),
         parent_sets=tuple(dict.fromkeys(parent_sets)),
+        entity_units=tuple(entity_units),
     )
     parts = follow_parts(plan, {})
     if not parts:
@@ -912,9 +1107,79 @@ def follow_parts(
     return tuple(parts)
 
 
+def admit(
+    plan: FollowReleasePlan, cliques: Mapping[str, Sequence[Sequence[str]]]
+) -> Tuple[FollowReleasePlan, Tuple[Tuple[str, str], ...]]:
+    """The plan a release holds, once its added parts are fitted into the cap, and what is left out.
+
+    The parts the release always held keep their place and are never left out. The added parts
+    are admitted in this order while the release's cells stay within
+    ``selection.MOST_RELEASE_CELLS``: every date pair (the tables in the plan's order, the pairs
+    in the request's), then every column that may hold a null (tables, then columns, in the plan's
+    order), then every link statistic whose counted child column may hold a null. The first that
+    does not fit is left out and so is every one after it. A left-out part is named by its label
+    and the reason, never a count. The decision reads the cliques only, which are released under the
+    selection's share. The plan comes back as it was when every added part fits.
+    """
+    parts = follow_parts(plan, cliques)
+    by_label = {each.part.label: each.part for each in parts}
+    pairs: List[Tuple[Part, ...]] = []
+    columns: List[Tuple[Part, ...]] = []
+    for each in plan.tables:
+        mine = release_parts(each.plan, cliques.get(each.table, ()))
+        own_pairs, own_columns = added_units(each.plan, mine)
+        for found, into in ((own_pairs, pairs), (own_columns, columns)):
+            into.extend(
+                tuple(by_label[f"{each.table}/{part.label}"] for part in unit) for unit in found
+            )
+    links = [(by_label[link.label],) for link in plan.links if link.column.nullable]
+    units = [*pairs, *columns, *links]
+    if not units:
+        return plan, ()
+    added = {part.label for unit in units for part in unit}
+    fixed = sum(each.part.cells for each in parts if each.part.label not in added)
+    fits = fit_prefix(fixed, [sum(part.cells for part in unit) for unit in units])
+    if fits == len(units):
+        return plan, ()
+    gone = {part.label for unit in units[fits:] for part in unit}
+    reason = left_out_reason()
+    left = tuple((part.label, reason) for unit in units[fits:] for part in unit)
+    tables: List[TablePlan] = []
+    for each in plan.tables:
+        inner = each.plan
+        kept = replace(
+            inner,
+            columns=tuple(
+                column
+                for column in inner.columns
+                if f"{each.table}/{noise_label((column.name,))}" not in gone
+            ),
+            date_pairs=tuple(
+                pair
+                for pair in inner.date_pairs
+                if f"{each.table}/{pair_label(PAIR_DAYS, *pair)}" not in gone
+            ),
+        )
+        tables.append(replace(each, plan=kept))
+    return (
+        replace(
+            plan,
+            tables=tuple(tables),
+            links=tuple(link for link in plan.links if link.label not in gone),
+        ),
+        left,
+    )
+
+
 def describe(
     plan: FollowReleasePlan, cliques: Mapping[str, Sequence[Sequence[str]]]
 ) -> Tuple[Fraction, Tuple[ReleasedTable, ...]]:
+    """The share of each part and the parts, checked against the cells a release may hold.
+
+    The added parts are fitted into the cap first (:func:`admit`); the parts the release always
+    held are refused when they alone hold too many.
+    """
+    plan, _ = admit(plan, cliques)
     parts = follow_parts(plan, cliques)
     cells = sum(each.part.cells for each in parts)
     if cells > selection.MOST_RELEASE_CELLS:
@@ -992,7 +1257,9 @@ def encode_follow_rows(
 
     A refusal names a table, a column and a row, never a value or how many. Each parent key must
     name one row: a key held by two rows would make the stated sensitivity understate what one
-    unit changes.
+    unit changes. The one exception is the key of a relationship that reaches an entity, which a
+    table with a validity window repeats by design: there each entity must follow one parent row
+    of the table the unit reaches it through, or the entity would sit in two units.
     """
     exact: Dict[str, Dict[str, List[Any]]] = {}
     counts: Dict[str, int] = {}
@@ -1027,10 +1294,22 @@ def encode_follow_rows(
                 "key to name one row",
                 {"next": "key the relationship by columns that are unique in the parent table"},
             )
+    for table, entity, edge_parent, edge_parent_names, edge_child_names in plan.entity_units:
+        _one_unit_each(
+            table,
+            entity,
+            keys[(table, entity)],
+            keys[(table, edge_child_names)],
+            keys[(edge_parent, edge_parent_names)],
+        )
     placed: Dict[Tuple[str, str], List[Optional[int]]] = {}
     for (table, name), column in plan.structure.items():
         found = exact[table][name]
-        nullable = _released_in(plan, table, name) is None and (table, name) not in _links_of(plan)
+        released_as = _released_in(plan, table, name)
+        counted_as = (table, name) in _links_of(plan)
+        nullable = (released_as is None or released_as.nullable) and (
+            not counted_as or column.nullable
+        )
         at = [index for index, value in enumerate(found) if value is not None]
         if not nullable and len(at) != len(found):
             index = next(i for i, value in enumerate(found) if value is None)
@@ -1040,7 +1319,14 @@ def encode_follow_rows(
                 "one in every row",
                 {"next": "fix the records, or the contract's column type, then release"},
             )
-        cells = place_values(name, column, [found[i] for i in at], backend, plan.fractional_bits)
+        cells = place_values(
+            name,
+            column,
+            [found[i] for i in at],
+            backend,
+            plan.fractional_bits,
+            Placement(table, at),
+        )
         full: List[Optional[int]] = [None] * len(found)
         for index, cell in zip(at, cells, strict=True):
             full[index] = cell
@@ -1053,18 +1339,11 @@ def encode_follow_rows(
         cells_of: Dict[str, List[int]] = {}
         levels: Dict[str, Sequence[str]] = {}
         for name, column in released.items():
-            found = exact[table][name]
-            for index, value in enumerate(found):
-                if value is None:
-                    raise ReleaseRefused(
-                        "profile_release_null",
-                        f"table {table!r} column {name!r} row {index}: no value, and the "
-                        "release needs one in every row",
-                        {"next": "fix the records, or the contract's column type, then release"},
-                    )
             if column.categorical:
                 levels[name] = column.levels
-            cells_of[name] = place_values(name, column, found, backend, plan.fractional_bits)
+            cells_of[name] = place_known(
+                name, column, exact[table][name], backend, plan.fractional_bits, table=table
+            )
         grid: Dict[str, List[int]] = {}
         if each.plan.rank_pairs:
             encode = backend.encoder(plan.fractional_bits)
@@ -1082,8 +1361,43 @@ def encode_follow_rows(
             contents=rows_bytes,
             levels=levels,
             grid=grid,
+            pairs=pair_cells(each.plan, exact[table], table=table),
         )
     return FollowRows(counts=counts, tables=encoded, contents=contents, keys=keys, placed=placed)
+
+
+def _one_unit_each(
+    table: str,
+    entity: Tuple[str, ...],
+    entities: Sequence[Optional[bytes]],
+    follows: Sequence[Optional[bytes]],
+    parents: Sequence[Optional[bytes]],
+) -> None:
+    """Refuse a table whose entity follows more than one parent row of the table above it.
+
+    *entities* and *follows* are each row's entity key and its key into the parent table of the
+    edge the unit reaches the table through, *parents* the keys of that table's rows. A row that
+    follows no row (a null key, a key no row holds) is dropped by the truncation, so it is none
+    of an entity's rows here. An entity whose rows follow two rows would be in two units, and
+    removing one unit would change the other's count of it: the stated sensitivity needs one
+    unit for each entity. Names the table and the columns, never a value or a row.
+    """
+    held = {key for key in parents if key is not None}
+    seen: Dict[bytes, bytes] = {}
+    for key, follow in zip(entities, follows, strict=True):
+        if key is None or follow is None or follow not in held:
+            continue
+        if seen.setdefault(key, follow) != follow:
+            raise ReleaseRefused(
+                "profile_release_entity_units",
+                f"an entity of {table!r} ({', '.join(map(repr, entity))}) has versions that follow "
+                "different rows of the table the unit reaches it through, so one entity would be "
+                "in more than one unit and the stated sensitivity would not hold",
+                {
+                    "next": "follow the table by its natural entity, or keep the column stable "
+                    "per entity in the data"
+                },
+            )
 
 
 def _released_in(plan: FollowReleasePlan, table: str, name: str) -> Optional[ReleasedColumn]:
@@ -1118,6 +1432,10 @@ class FollowRelease:
     selected: Optional[Mapping[str, Tuple[Tuple[str, ...], ...]]]
     selection_rho: Fraction
     share: Fraction
+    #: The plan of what was released: the plan without the added parts that did not fit.
+    plan: Optional[FollowReleasePlan] = None
+    #: Each added part left out, ``(label, reason)``, in the order they were to be fitted in.
+    left_out: Tuple[Tuple[str, str], ...] = ()
 
     @property
     def measurement_rho(self) -> Fraction:
@@ -1168,7 +1486,12 @@ def _relation_counts(
     kept: Mapping[str, Sequence[int]],
     backend: StatisticsBackend,
 ) -> List[int]:
-    """The cells of one relationship histogram, group by group, before noise."""
+    """The cells of one relationship histogram, group by group, before noise.
+
+    A parent is a row of the parent table, or, where the relationship reaches an entity, each
+    distinct non-null entity key among its kept rows. An entity is in the group of its rows'
+    value of the grouping column when they all agree, and in none when they do not.
+    """
     parents = rows.keys[(relation.parent, relation.parent_columns)]
     children = rows.keys[(relation.child, relation.child_columns)]
     parent_rows: Sequence[int] = (
@@ -1178,7 +1501,7 @@ def _relation_counts(
         kept[relation.child] if relation.child in kept else range(rows.counts[relation.child])
     )
     tally = Counter(key for at in child_rows if (key := children[at]) is not None)
-    counts = [tally.get(key, 0) if (key := parents[at]) is not None else 0 for at in parent_rows]
+    counts, entities = _children_per_parent(relation, parents, parent_rows, tally)
     cells = _children_cells(relation, counts, backend, plan.fractional_bits)
     width = relation.cells
     flat = [0] * (relation.groups * width)
@@ -1186,12 +1509,56 @@ def _relation_counts(
         for cell in cells:
             flat[cell] += 1
     else:
-        groups = rows.placed[(relation.parent, relation.group.name)]
-        for at, cell in zip(parent_rows, cells, strict=True):
-            group = groups[at]
+        placed = rows.placed[(relation.parent, relation.group.name)]
+        if relation.entity:
+            of_entity = _entity_groups(parents, parent_rows, placed)
+            groups: List[Optional[int]] = [of_entity[key] for key in entities]
+        else:
+            groups = [placed[at] for at in parent_rows]
+        for group, cell in zip(groups, cells, strict=True):
             if group is not None:
                 flat[group * width + cell] += 1
     return flat
+
+
+def _children_per_parent(
+    relation: RelationStat,
+    parents: Sequence[Optional[bytes]],
+    parent_rows: Sequence[int],
+    tally: Mapping[bytes, int],
+) -> Tuple[List[int], List[bytes]]:
+    """The children of each parent, and the entity keys they are of when the parent is an entity.
+
+    A parent is a row of the parent table, or, where the relationship reaches an entity, each
+    distinct non-null entity key among its rows (the keys are then the second value).
+    """
+    if not relation.entity:
+        return [
+            tally.get(key, 0) if (key := parents[at]) is not None else 0 for at in parent_rows
+        ], []
+    entities = list(dict.fromkeys(key for at in parent_rows if (key := parents[at]) is not None))
+    return [tally.get(key, 0) for key in entities], entities
+
+
+def _entity_groups(
+    parents: Sequence[Optional[bytes]],
+    parent_rows: Sequence[int],
+    placed: Sequence[Optional[int]],
+) -> Dict[bytes, Optional[int]]:
+    """The group each entity is in: its rows' value of the grouping column when they all agree.
+
+    An entity whose rows disagree is in no group (``None``), and a row with no key is no entity.
+    """
+    of_entity: Dict[bytes, Optional[int]] = {}
+    for at in parent_rows:
+        key = parents[at]
+        if key is None:
+            continue
+        if key in of_entity and of_entity[key] != placed[at]:
+            of_entity[key] = None
+        else:
+            of_entity.setdefault(key, placed[at])
+    return of_entity
 
 
 def _link_counts(link: LinkStat, rows: FollowRows, kept: Mapping[str, Sequence[int]]) -> List[int]:
@@ -1203,15 +1570,7 @@ def _link_counts(link: LinkStat, rows: FollowRows, kept: Mapping[str, Sequence[i
     )
     child_rows: Sequence[int] = kept[link.child]
     by = rows.placed[(link.parent, link.by.name)]
-    reached: Dict[bytes, Optional[int]] = {}
-    for at in parent_rows:
-        key = parents[at]
-        if key is None:
-            continue
-        if key in reached and reached[key] != by[at]:
-            reached[key] = None
-        else:
-            reached.setdefault(key, by[at])
+    reached = _entity_groups(parents, parent_rows, by)
     cells = rows.placed[(link.child, link.column.name)]
     width = link.column.size
     flat = [0] * (link.by.size * width)
@@ -1286,6 +1645,7 @@ def draw_follow(
             released[each.table] = tuple(tuple(c) for c in joined)
     if chosen is not None and not chosen:
         chosen = None
+    plan, left_out = admit(plan, released)
     share, tables = describe(plan, released)
     measured = measure_counts(plan, rows, kept, tables, backend)
     values_of: Dict[str, Tuple[str, ...]] = {}
@@ -1293,7 +1653,7 @@ def draw_follow(
         mine = [item for item in tables if item.table == each.table and item.kind in _TABLE_KINDS]
         counted = [item for item in mine if item.kind != RANK]
         if counted:
-            values_of.update(_count_values(counted, measured, seed))
+            values_of.update(_count_values(counted, measured, seed, each.plan))
         for item in mine:
             if item.kind == RANK:
                 first, second = item.columns
@@ -1324,10 +1684,12 @@ def draw_follow(
         selected=chosen,
         selection_rho=sum((selection_share(each.plan) for each in plan.tables), Fraction(0)),
         share=share,
+        plan=plan,
+        left_out=left_out,
     )
 
 
-_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK)
+_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK, *PAIRS)
 
 
 def measure_counts(
@@ -1346,16 +1708,12 @@ def measure_counts(
     relations = {relation.label: relation for relation in plan.relations}
     links = {link.label: link for link in plan.links}
     for table in tables:
-        if table.kind in (CLIQUE, LEVELS, BINS):
-            encoded = rows.tables[table.table]
-            rows_kept = kept[table.table]
-            cell = [0] * len(rows_kept)
-            for name, size in zip(table.columns, table.sizes, strict=True):
-                index = encoded.cells[name]
-                cell = [value * size + index[i] for value, i in zip(cell, rows_kept, strict=True)]
+        if table.kind in (CLIQUE, LEVELS, BINS, *PAIRS):
+            cells = table_cells(table, rows.tables[table.table], kept[table.table])
             counts = [0] * table.cells
-            for value in cell:
-                counts[value] += 1
+            for value in cells:
+                if value != NO_CELL:  # a row with no value in a column lands in no cell
+                    counts[value] += 1
             found[table.label] = counts
         elif table.kind == RELATION:
             found[table.label] = _relation_counts(plan, relations[table.label], rows, kept, backend)
@@ -1365,32 +1723,47 @@ def measure_counts(
 
 
 def _count_values(
-    counted: Sequence[ReleasedTable], measured: Mapping[str, Sequence[int]], seed: bytes
+    counted: Sequence[ReleasedTable],
+    measured: Mapping[str, Sequence[int]],
+    seed: bytes,
+    plan: ReleasePlan,
 ) -> Dict[str, Tuple[str, ...]]:
-    """The noisy counts of one table's count tables, made to agree, as decimal text."""
-    sigma2 = Fraction(counted[0].scale_units ** 2, 10**12)
+    """The noisy counts of one table's count tables as decimal text.
+
+    The cliques and the histograms of required columns are made to agree; a histogram of a column
+    that may hold a null and the days and the order of a date pair are noised on their own
+    (:func:`~fluid_build.profiler.dp.release.agrees`).
+    """
     count_tables: List[consistency.CountTable] = []
+    found: Dict[str, Tuple[str, ...]] = {}
     for table in counted:
+        sigma2 = Fraction(table.scale_units**2, 10**12)
         source = SeededSource(seed, table.label)
         values = tuple(
             Fraction(count + sample_discrete_gaussian(sigma2, source))
             for count in measured[table.label]
         )
-        count_tables.append(
-            consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
-        )
-    try:
-        forest = consistency.junction_forest(count_tables)
-        agreed = consistency.make_consistent(count_tables)
-        texts = consistency.to_decimal_text(count_tables, agreed, forest)
-    except ValueError as error:
-        raise ReleaseRefused(
-            "profile_release_not_a_forest",
-            f"the tables of the release cannot be made to agree: {error}",
-            {"next": "report it with your forge-cli version"},
-        ) from None
-    _agree(counted, texts)
-    return {table.label: cells for table, cells in zip(counted, texts, strict=True)}
+        if agrees(plan, table):
+            count_tables.append(
+                consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
+            )
+        else:
+            found[table.label] = tuple(_integer_text(value) for value in values)
+    if count_tables:
+        together = [table for table in counted if agrees(plan, table)]
+        try:
+            forest = consistency.junction_forest(count_tables)
+            agreed = consistency.make_consistent(count_tables)
+            texts = consistency.to_decimal_text(count_tables, agreed, forest)
+        except ValueError as error:
+            raise ReleaseRefused(
+                "profile_release_not_a_forest",
+                f"the tables of the release cannot be made to agree: {error}",
+                {"next": "report it with your forge-cli version"},
+            ) from None
+        _agree(together, texts)
+        found.update({table.label: cells for table, cells in zip(together, texts, strict=True)})
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1650,7 +2023,7 @@ def check_follow_record(
             or not isinstance(owner, str)
         ):
             raise _mismatch("a table's columns are not names")
-        if stated.get("kind") in (RANK, RELATION, LINK):
+        if stated.get("kind") in (RANK, RELATION, LINK, *PAIRS):
             continue
         if len(columns) >= 2:
             by_table[owner] = (*by_table.get(owner, ()), tuple(columns))

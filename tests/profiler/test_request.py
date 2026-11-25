@@ -296,10 +296,10 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
     )
     link = "orders(customer_id) to customers(customer_id)"
     # A public profile forms date pairs, dates and exposure; what it cannot it names once it has
-    # read the records, with the reason it has.
+    # read the records, with the reason it has. A private release forms date pairs of DATE columns
+    # and names the ones it cannot when it plans, so its request-only list has none.
     assert asked_for.unformed(asked) == [("workload status of orders", asked_for.NO_WORKLOAD)]
     assert asked_for.unformed(asked, private=True) == [
-        ("date pair placed_at to shipped_at of orders", asked_for.NO_DATE_PAIRS),
         ("calendar of orders.placed_at", asked_for.NO_CALENDAR),
         ("workload status of orders", asked_for.NO_WORKLOAD),
         (f"dates customers.joined_at to orders.placed_at of {link}", asked_for.NO_DATES),

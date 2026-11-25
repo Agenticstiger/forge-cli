@@ -14,9 +14,16 @@ never the seed. Only the standard library is imported at module scope.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__all__ = ["report"]
+__all__ = [
+    "columns_text",
+    "left_out_words",
+    "part_words",
+    "report",
+    "say_not_released",
+    "unknown_values_notes",
+]
 
 _KIND = {
     "clique": "clique of",
@@ -25,7 +32,81 @@ _KIND = {
     "rank": "rank correlation",
     "relationship": "children per parent,",
     "link": "histogram grouped through a link,",
+    "pairDays": "days of the date pair",
+    "pairOrder": "order of the date pair",
 }
+
+
+def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
+    """What the histograms of columns that may hold a null and of date pairs count, in words.
+
+    Names columns and pairs only: the format holds no noisy null count, so none is released, and a
+    share of nulls is never stated.
+    """
+    place = "" if table is None else f" of exposes[{table}]"
+    notes: List[str] = []
+    nullable = [each.name for each in plan.columns if each.nullable]
+    if nullable:
+        notes.append(
+            f"The histogram of {', '.join(nullable)}{place}, which the contract does not declare "
+            "required, counts the column's known values: a record with no value lands in no cell. "
+            "It joins no clique, and no null count or share of nulls is released."
+        )
+    if plan.date_pairs:
+        notes.append(
+            f"The days and the order of each date pair{place} count the records where both dates "
+            "are known, on the whole public ladder of days: "
+            + "; ".join(f"{start} to {end}" for start, end in plan.date_pairs)
+            + "."
+        )
+    return notes
+
+
+def columns_text(table: Any) -> str:
+    """The columns of a released table as a report line names them: a date pair reads start to end."""
+    joiner = " to " if table.kind in ("pairDays", "pairOrder") else ", "
+    return joiner.join(table.columns)
+
+
+def part_words(label: str, table: Optional[str] = None) -> str:
+    """A release part's label in the words the other items it leaves out are named with.
+
+    ``[<table>/]pair/<days|order>/<start>/<end>`` is a date pair, ``[<table>/]noise/<column>`` a
+    column's histogram, and ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped
+    through a link; any other label is said as it is.
+    """
+    steps = label.split("/")
+    if steps[0] == "link" and len(steps) >= 4 and "." in steps[1]:
+        child, column = steps[1].split(".", 1)
+        return f"{column} of {child} grouped by {steps[3]}"
+    if steps[0] not in ("noise", "pair") and len(steps) > 1:
+        table, steps = steps[0], steps[1:]
+    where = f" of {table}" if table else ""
+    if steps[0] == "pair" and len(steps) == 4:
+        return f"date pair {steps[2]} to {steps[3]}{where}"
+    if steps[0] == "noise" and len(steps) == 2:
+        return f"{steps[1]}{where}"
+    return label
+
+
+def left_out_words(
+    left_out: Sequence[Tuple[str, str]], table: Optional[str] = None
+) -> List[Tuple[str, str]]:
+    """The parts the cap leaves out, each named once in words (a pair's two parts are one)."""
+    found: Dict[Tuple[str, str], None] = {}
+    for label, reason in left_out:
+        found.setdefault((part_words(label, table), reason), None)
+    return list(found)
+
+
+def say_not_released(say: Any, plan: Any, drawn: Any) -> None:
+    """Say what the release does not hold, one line for each reason: the plan's and the cap's."""
+    by_reason: Dict[str, List[str]] = {}
+    left = left_out_words(drawn.left_out, getattr(plan, "table", None))
+    for what, reason in (*plan.not_released, *left):
+        by_reason.setdefault(reason, []).append(what)
+    for reason, items in by_reason.items():
+        say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
 
 
 def _words(plan: Any) -> List[str]:
@@ -119,7 +200,9 @@ def report(
     rests += (
         " The guarantee covers data that meets the contract (required columns hold a value, "
         "values lie in their declared levels and ranges, and each followed parent key names one "
-        "row); data that does not is refused, releases nothing, and the refusal is for the data "
+        "row, except that a followed relationship out of a versioned table by its natural entity "
+        "repeats its key by design and then needs an entity's versions to follow one parent row, "
+        "refused as profile_release_entity_units otherwise); data that does not is refused, releases nothing, and the refusal is for the data "
         "owner (it names a table, a column and a row): a refusal is not covered by the "
         "guarantee."
     )
@@ -135,15 +218,15 @@ def report(
                 soft_wrap=True,
             )
             continue
-        if table.kind in ("relationship", "link"):
-            what = table.label
-        else:
-            what = ", ".join(table.columns)
+        what = table.label if table.kind in ("relationship", "link") else columns_text(table)
         say(
             f"  {_KIND[table.kind]} {what}{place}: noise scale {table.scale}, share rho "
             f"{table.share}, squared L2 sensitivity {table.sensitivity} for one unit",
             soft_wrap=True,
         )
+    for each in (drawn.plan or plan).tables:
+        for line in unknown_values_notes(each.plan, each.table):
+            say(line, soft_wrap=True)
     if plan.selects:
         chosen: Dict[str, Any] = dict(drawn.cliques)
         listed = "; ".join(
@@ -155,11 +238,7 @@ def report(
             "from the release record" if rederived else f"chosen with {plan.clique_method.upper()}"
         )
         say(f"Cliques {origin}: {listed or 'none'}.", soft_wrap=True)
-    by_reason: Dict[str, List[str]] = {}
-    for what, reason in plan.not_released:
-        by_reason.setdefault(reason, []).append(what)
-    for reason, items in by_reason.items():
-        say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
+    say_not_released(say, plan, drawn)
     if rederived:
         say("Drawn again from the release record: the profile has the recorded digest.")
     say(f"Wrote {out} (readable by you alone; read it before you share it).", soft_wrap=True)

@@ -68,6 +68,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   statement, and only whole numbers, group keys and bits back. A statement that times out or runs
   out of memory takes that status and the others still run; a process that dies is replaced.
 
+- **A private release fits its added parts within the cells it may measure.** With
+  `--privacy-unit`, a date pair's days and order, a column the contract does not declare required
+  and a link statistic over such a column are fitted into the 65,536 cells a release may measure
+  once its cliques are chosen: the date pairs first, then the columns, then the links, each while
+  the release stays within the cap. The first that does not fit is left out, and so is every one
+  after it. The report names each part left out with the reason, never a count. The parts a
+  release always held keep their place, and a release whose other parts alone hold too many cells
+  still refuses. A release with no added part over the cap is drawn as before.
+- **A private release holds nullable columns and date pairs.** With `--privacy-unit`, own rows or
+  `--follow`, a column the contract does not declare `required: true` is released like a required
+  one: its public levels or bins, a noisy histogram with a share of its own, counting the column's
+  known values (a record with no value lands in no cell, so a unit still changes at most `m_T`
+  cells by one each). It joins no clique and no consistency step, and no null count or share of
+  nulls is released. A null in a required column still refuses the release. The same holds for a
+  nullable child column of a statistic grouped through a link. Each date pair of two DATE
+  columns the request asks of a table the release holds gets a noisy histogram of the days from
+  start to end on the whole public ladder, never trimmed, and a noisy order (after, before, same),
+  both over the rows where both dates are known, each a share of the budget charged like every
+  count table of its table. A pair with a timestamp or a key column, a calendar and a
+  relationship's dates and exposure are still named as not released, with their reasons, and
+  `--strict` refuses a date pair the contract shows cannot be formed. The document names format
+  1-3-0 with a date pair, and `--rederive` recomputes both. The help and the report now say that a
+  followed relationship out of a versioned table by its natural entity repeats its key by design,
+  with the entity-versions precondition, instead of that every followed parent key names one row.
+
+- **`fluid profile` publishes the history of a table with a validity window.** A table whose
+  contract declares a slowly changing dimension (one natural entity and a start and an end
+  dimension, both DATE or both timestamp columns) gets a `history` in a default profile: the
+  entities by their number of versions, their first starts, the days from a version's start to the
+  next one's, how consecutive versions meet (the same instant, the day before, a gap or an
+  overlap, with the zeros the contract's `chain` declares published as zeros), how the last
+  version ends, and, for each categorical column that declares its levels, its value on the first
+  version and the changes between versions, with the changes counted by the column that moves.
+  Each member goes through the same disclosure checks as every other statistic, and a table that
+  cannot form one is named under Not measured. The document names format 1-3-0. A request or a
+  private release writes no history. A default profile of such a table no longer lists the
+  window's own start and end under `datePairs`: the pair is named under Not measured, since its
+  days and the history's version lengths would give each other's withheld cells back. A table
+  without a validity window keeps the same bytes.
+
+- **A private release counts children per entity of a versioned table.** With `--privacy-unit`
+  and `--follow`, a relationship into a table with a validity window, whose `toColumns` are its
+  natural entity, is released as children per entity: the parents are the distinct entity keys of
+  the rows the unit keeps, and the table's repeated key is no longer refused. It is charged as a
+  histogram whose parents are the unit's rows of that table, and released only where an entity
+  cannot sit in two units: the unit does not reach the table, or follows it by its natural entity
+  or by a column a `dependency` makes stable per entity. Otherwise it is named under not released,
+  with that reason. Records that put one entity's versions in two units are refused with
+  `profile_release_entity_units`, naming the table and the columns only. A grouping by a parent
+  column needs a column stable per entity, and the release never writes a `history` member.
+
+- **`fluid profile` counts children per entity through a relationship into a versioned table.**
+  A relationship whose `toColumns` are exactly the natural entity of a table that declares a
+  validity window is counted one parent per entity, not one per version: the parents are the
+  table's distinct non-null entity keys, and the children per parent, their structural classes
+  and the parents with no child are read per entity. A grouping of those counts by a parent
+  column, and a child column grouped through the link by a parent column, are formed only for a
+  column a `dependency` from the natural entity makes stable, because an entity's versions may
+  disagree on any other. Dates and exposure are not formed through such a relationship, and say
+  so. A relationship into a window by any other columns stays left out, with its reason, and
+  `--strict` refuses an ask of it before any record is read.
+
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
   active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
   histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed

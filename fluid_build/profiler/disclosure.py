@@ -865,7 +865,9 @@ def pinned_children_cells(
     """The withheld cells of a children-per-parent table a reader may work out exactly.
 
     The table counts parents by their number of children, on bins whose lower edges are
-    *lower_edges* (the first 0; each bin ends below the next, the last has no top). The
+    *lower_edges* (each bin ends below the next, the last has no top; the first is 0 for
+    children per parent, and 1 for the versions of an entity, which every entity holds at least
+    one of, with no *childless* one). The
     reader is the strongest a profile can meet: it knows the exact number of parents,
     the exact number of children they hold together (*children*), how many parents hold
     none because their key is null (*childless*), each published cell's band, and the

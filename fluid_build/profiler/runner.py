@@ -67,6 +67,7 @@ from fluid_build.profiler import (
     document,
     facts,
     grouped,
+    history,
     query_rates,
     ranks,
     sources,
@@ -338,6 +339,12 @@ class Relationship:
     counted: bool = True
     group_by: Tuple[str, ...] = ()
     linked: Tuple[Tuple[str, str], ...] = ()
+    #: The relationship reaches an entity of a table with a validity window: its parents are the
+    #: distinct entity keys of the target, one per entity and not one per version
+    #: (RFC-versioned-relationships section 2). ``stable`` are the target's columns that every
+    #: version of an entity agrees on, which a grouping by a parent column needs.
+    entity: bool = False
+    stable: FrozenSet[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -897,6 +904,9 @@ def _plan_profile(
     relationships, relationships_left_out = _keys_not_counted_at_edges(
         relationships, relationships_left_out, edges
     )
+    relationships, relationships_left_out = _entities_beside_counted_keys(
+        relationships, relationships_left_out
+    )
     if request is not None:
         relationships = [_with_asks(each, request) for each in relationships]
     keys = _key_columns(relationships)
@@ -1094,6 +1104,16 @@ def profile_exposes(
             )  # fmt: skip
         )
     )
+    if request is None:  # a request has no ask for a history, and a bundle's table has its own
+        date_notes.extend(
+            history.form_histories(
+                history.HistoryStage(
+                    raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
+                    tallies, fractional_bits, timings,
+                    frozenset((each.child, tuple(each.child_columns)) for each in relationships),
+                )  # fmt: skip
+            )
+        )
     counted_entries: Dict[int, Tuple[Dict[str, Any], RelationshipResult]] = {
         position: _children_per_parent(
             each,
@@ -1411,7 +1431,14 @@ def _refuse_unformable(
         )
     )
     found.extend(answered.not_measured)
-    found.extend(dates.contract_unformed(request, by_plan, held, relationships))
+    found.extend(
+        dates.contract_unformed(
+            request, by_plan, held, [each for each in relationships if not each.entity]
+        )
+    )
+    for each in relationships:
+        if each.entity:
+            found.extend(_entity_date_notes(each, asked_for.relationship_dates_asks(request, each)))
     found.extend(calendars.contract_unformed(request, by_plan, held))
     for table in request.tables:
         domains = {column.name: column.domain for column in by_plan[table.expose_id].columns}
@@ -1463,9 +1490,11 @@ def _relationship_dates(
         asked_for.relationship_dates_asks(request, rel) if request is not None else (None, None)
         for rel in relationships
     ]
+    # A relationship that reaches an entity forms no dates and no exposure: what it was asked is
+    # named, and what is left of it is its children per entity.
+    notes = _drop_entity_asks(relationships, asks)
     dates.choose_lifetimes(stage, relationships, [exposure for _, exposure in asks])
     docs: List[Dict[str, Any]] = []
-    notes: List[Tuple[str, str]] = []
     for position, rel in enumerate(relationships):
         entry = counted_entries[position][0] if position in counted_entries else None
         asked_dates, asked_exposure = asks[position]
@@ -1479,14 +1508,66 @@ def _relationship_dates(
             )
         notes.extend(extra_notes)
         if entry is None and extras:
-            entry = {
-                "parent": {"table": rel.parent, "columns": list(rel.parent_columns)},
-                "child": {"table": rel.child, "columns": list(rel.child_columns)},
-                "statistics": [],
-            }
+            entry = _bare_entry(rel)
         if entry is not None:
             docs.append({**entry, **extras})
     return docs, notes
+
+
+def _drop_entity_asks(
+    relationships: Sequence[Relationship], asks: List[Any]
+) -> List[Tuple[str, str]]:
+    """Name what each relationship that reaches an entity was asked, and leave it nothing to form.
+
+    *asks* holds each relationship's (dates, exposure) asks, and is changed in place.
+    """
+    notes: List[Tuple[str, str]] = []
+    for position, rel in enumerate(relationships):
+        if rel.entity:
+            notes.extend(_entity_date_notes(rel, asks[position]))
+            asks[position] = ((), ())
+    return notes
+
+
+def _bare_entry(rel: Relationship) -> Dict[str, Any]:
+    """The ``relationships[]`` entry of a relationship the profile does not count."""
+    return {
+        "parent": {"table": rel.parent, "columns": list(rel.parent_columns)},
+        "child": {"table": rel.child, "columns": list(rel.child_columns)},
+        "statistics": [],
+    }
+
+
+#: Why a relationship that reaches an entity forms no dates and no exposure.
+_ENTITY_DATES = (
+    "a parent here is an entity with a row per version, so a date of a parent is not one date"
+)
+
+
+def _entity_date_notes(
+    relationship: Relationship,
+    asked: Tuple[
+        Optional[Sequence[Tuple[str, str]]], Optional[Sequence[Tuple[str, Optional[str]]]]
+    ],
+) -> List[Tuple[str, str]]:
+    """What a relationship that reaches an entity is asked of dates and exposure, each with why not.
+
+    Without a request (*asked* is ``None, None``) one line says the relationship forms neither.
+    The reason is the contract's, so ``--strict`` refuses the same asks with the same words.
+    """
+    parent, child = relationship.parent, relationship.child
+    link = f"{child}({', '.join(relationship.child_columns)}) to {parent}"
+    dates_asked, exposure_asked = asked
+    if dates_asked is None and exposure_asked is None:
+        return [(f"dates and exposure of {link}", _ENTITY_DATES)]
+    found = [
+        (f"dates {parent}.{first} to {child}.{second} of {link}", _ENTITY_DATES)
+        for first, second in dates_asked or ()
+    ]
+    for start, end in exposure_asked or ():
+        span = start if end is None else f"{start} to {end}"
+        found.append((f"exposure {parent}.{span} of {link}", _ENTITY_DATES))
+    return found
 
 
 def _unread_date_asks(
@@ -1594,8 +1675,9 @@ def _answer_groupings(
     for position, each in enumerate(relationships):
         spelled = f"{each.child}({', '.join(each.child_columns)}) to {each.parent}"
         if each.counted and each.group_by:
+            wanted_by, unstable = _stable_names(each, each.group_by)
             chosen, missing = grouped.parent_groupings(
-                each.group_by,
+                wanted_by,
                 parent=each.parent,
                 domains=domains[each.parent],
                 read=by_expose[each.parent][1],
@@ -1606,7 +1688,8 @@ def _answer_groupings(
             result.relationship_groupings[position] = chosen
             grouped_by.setdefault(each.parent, set()).update(name for name, _ in chosen)
             result.not_measured.extend(
-                (f"children per parent of {spelled} {what}", why) for what, why in missing
+                (f"children per parent of {spelled} {what}", why)
+                for what, why in [*missing, *unstable]
             )
         for column, parent_column in each.linked:
             made = _linked_statistic(
@@ -1637,6 +1720,32 @@ def _answer_groupings(
     return result
 
 
+#: Why a parent column is no grouping through a relationship that reaches an entity.
+_UNSTABLE = (
+    "an entity's versions may disagree on it: the contract declares no dependency from the "
+    "natural entity that makes it stable per entity"
+)
+
+
+def _stable_names(
+    relationship: Relationship, names: Sequence[str]
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """The parent columns in *names* a grouping may use, and each one that may not, with why.
+
+    A parent is an entity where the relationship reaches one, and its versions are in one group
+    only when they agree on the column, which the contract says for the columns a dependency from
+    the natural entity makes stable. Any other column of a parent that is a row is a grouping.
+    """
+    if not relationship.entity:
+        return list(names), []
+    kept = [name for name in names if name in relationship.stable]
+    return kept, [
+        (f"grouped by {relationship.parent}.{name}", f"{name}: {_UNSTABLE}")
+        for name in names
+        if name not in relationship.stable
+    ]
+
+
 def _linked_statistic(
     relationship: Relationship,
     column: str,
@@ -1655,6 +1764,8 @@ def _linked_statistic(
     none (:func:`grouped.link_assignment`).
     """
     child, parent = relationship.child, relationship.parent
+    if relationship.entity and parent_column not in relationship.stable:
+        return f"{parent_column}: {_UNSTABLE}"
     base = grouped.histogram_of(structures.get(child), column)
     by = grouped.histogram_of(structures.get(parent), parent_column)
     if column not in domains[child]:
@@ -1955,9 +2066,10 @@ def _declared_relationships(
 
     A relationship is counted when the profile reads both its exposes, without a bundle
     (a bundle's profile answers its block alone), and both keys are columns it reads in
-    one domain each, pair by pair. One whose target declares a validity window is not:
-    a parent there has a row per version. Every other is returned with why, never
-    guessed at. Both come in the contract's order, whatever order the call names the
+    one domain each, pair by pair. One whose target declares a validity window is counted
+    only when it reaches an entity (:func:`_entity_stable`), one parent per entity and not
+    one per version; any other into a window is not, a parent there having a row per
+    version. Every other is returned with why, never guessed at. Both come in the contract's order, whatever order the call names the
     exposes in, so the document's bytes do not depend on it.
     """
     from fluid_build.data_rules._model import declares_validity_window
@@ -1984,12 +2096,19 @@ def _declared_relationships(
             ):
                 continue
             reason: Optional[str] = None
+            stable: Optional[FrozenSet[str]] = None
             if not isinstance(target, str) or target not in planned:
                 reason = "its target is not profiled in this call: profile both exposes together"
             elif plan.expose_id in blocks or target in blocks:
                 reason = "a profile that answers a bundle answers its fidelity block alone"
-            elif declares_validity_window(exposes[target]):
-                reason = "its target declares a validity window, so a parent has a row per version"
+            elif (
+                declares_validity_window(exposes[target])
+                and (stable := _entity_stable(exposes[target], parent_columns)) is None
+            ):
+                reason = (
+                    "its target declares a validity window and its toColumns are not the "
+                    "target's natural entity, so a parent has a row per version"
+                )
             elif not child_columns or len(child_columns) != len(parent_columns):
                 reason = "its fromColumns and toColumns are not two lists of one length"
             else:
@@ -1998,9 +2117,37 @@ def _declared_relationships(
                 left_out.append((plan.expose_id, name, reason))
             else:
                 counted.append(
-                    Relationship(plan.expose_id, name, str(target), child_columns, parent_columns)
+                    Relationship(
+                        plan.expose_id,
+                        name,
+                        str(target),
+                        child_columns,
+                        parent_columns,
+                        entity=stable is not None,
+                        stable=stable or frozenset(),
+                    )
                 )
     return counted, left_out
+
+
+def _entity_stable(
+    expose: Mapping[str, Any], parent_columns: Sequence[str]
+) -> Optional[FrozenSet[str]]:
+    """The columns stable per entity, when *parent_columns* are exactly the natural entity of *expose*.
+
+    ``None`` when the table's validity window is not well formed, or its natural entity is not
+    the columns named (a relationship that does not reach an entity,
+    RFC-versioned-relationships section 2). The columns are those a ``dependency`` from the
+    entity makes stable (every version of an entity agrees on them), and the entity's own.
+    """
+    from fluid_build.data_rules._model import stable_columns
+    from fluid_build.forge_datamodel.semantics_builder import version_window
+
+    semantics = expose.get("semantics")
+    window = version_window(semantics) if isinstance(semantics, Mapping) else None
+    if window is None or tuple(parent_columns) != (window.key,):
+        return None
+    return stable_columns(expose, (window.key,)) | {window.key}
 
 
 def _column_names(value: Any) -> Tuple[str, ...]:
@@ -2086,6 +2233,52 @@ def _keys_not_counted_at_edges(
     return kept, out
 
 
+#: Why children per entity are not counted where the entity is also a counted foreign key.
+_ENTITY_IS_A_COUNTED_KEY = (
+    "its target's natural entity is the foreign key of a relationship this profile counts, and "
+    "the entities it counts beside that relationship's parents would give the parents with no "
+    "version back"
+)
+
+
+def counts_the_entity(
+    counted_keys: Iterable[Tuple[str, Sequence[str]]], table: str, entity: Sequence[str]
+) -> bool:
+    """Whether a counted relationship's key on *table* holds every column of *entity*.
+
+    Its distinct tuples are then at least the entities, each version of an entity holding one
+    tuple when the other columns are stable, so its children per parent and the entity count
+    together give its childless bin back, whatever other columns the key also holds.
+    """
+    wanted = set(entity)
+    return any(child == table and wanted <= set(columns) for child, columns in counted_keys)
+
+
+def _entities_beside_counted_keys(
+    relationships: Sequence[Relationship],
+    left_out: Sequence[Tuple[str, str, str]],
+) -> Tuple[List[Relationship], List[Tuple[str, str, str]]]:
+    """*relationships* less any that counts the entities of a table whose entity is a counted key.
+
+    Children per entity count one parent per entity of the target, so they state the number of
+    entities. Where the target's entity is itself the foreign key of a counted relationship, that
+    number is the distinct count of the key :func:`_key_columns` withholds: beside that
+    relationship's parents it gives back the parents with no version, a cell of its histogram.
+    Such a relationship is named and left out; the choice reads the contract alone. A counted
+    key that holds the entity among more columns counts no fewer distinct tuples than there are
+    entities, so it is a counted key of the entity too (:func:`counts_the_entity`).
+    """
+    counted_keys = {(each.child, tuple(each.child_columns)) for each in relationships}
+    kept: List[Relationship] = []
+    out = list(left_out)
+    for each in relationships:
+        if each.entity and counts_the_entity(counted_keys, each.parent, each.parent_columns):
+            out.append((each.child, each.name, _ENTITY_IS_A_COUNTED_KEY))
+        else:
+            kept.append(each)
+    return kept, out
+
+
 def _children_per_parent(
     relationship: Relationship,
     tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
@@ -2117,7 +2310,8 @@ def _children_counted(
 
     Each parent row counts once, by the child rows whose key equals its own, compared as
     the registry reads both (a parent whose key is null, like a child's null key, matches
-    none). The counts go through the output check for counts at edges in a call of their
+    none). Where the relationship reaches an entity of a versioned table, each entity counts
+    once, not each version: the parents are the table's distinct non-null keys. The counts go through the output check for counts at edges in a call of their
     own, as ``check_edge_counts`` documents for a relationship's count of children, and
     are spelled as a column's histogram is.
 
@@ -2128,6 +2322,20 @@ def _children_counted(
     audit of withheld cells runs group by group, on the parents and children of each.
     """
     parents, counts = _parent_counts(relationship, tables, backend)
+    if relationship.entity:
+        # A grouping by a parent column is placed by the entity's versions: a group when they
+        # all agree, none when they do not.
+        rows = _keys(tables[relationship.parent], relationship.parent_columns, backend)
+        groupings = [
+            (
+                name,
+                replace(
+                    grouping,
+                    assigned=grouped.link_assignment(parents, rows, grouping.assigned),
+                ),
+            )
+            for name, grouping in groupings
+        ]
     encode = backend.encoder(fractional_bits)
     statistic = DeclaredStatistic(
         identifier="marginalHistogram/1",
@@ -2212,8 +2420,16 @@ def _parent_counts(
     tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
     backend: StatisticsBackend,
 ) -> Tuple[List[Tuple[Any, ...]], List[int]]:
-    """Each parent row's key and its number of children, in the order the parent's rows were read."""
-    parents = _keys(tables[relationship.parent], relationship.parent_columns, backend)
+    """Each parent's key and its number of children, in the order the parent's rows were read.
+
+    A parent is a row, or, where the relationship reaches an entity of a versioned table, an
+    entity: each distinct key the table holds, in the order first read (a row with a null key
+    names no entity).
+    """
+    rows = _keys(tables[relationship.parent], relationship.parent_columns, backend)
+    parents = (
+        list(dict.fromkeys(key for key in rows if None not in key)) if relationship.entity else rows
+    )
     children = Counter(
         key
         for key in _keys(tables[relationship.child], relationship.child_columns, backend)
@@ -2237,7 +2453,7 @@ def _counted_links(
     found: List["query_rates.CountedLink"] = []
     for position, (_, result) in counted.items():
         each = relationships[position]
-        if len(each.child_columns) != 1 or len(each.parent_columns) != 1:
+        if each.entity or len(each.child_columns) != 1 or len(each.parent_columns) != 1:
             continue
         _, counts = _parent_counts(each, tables, backend)
         bins = tuple(

@@ -160,6 +160,15 @@ _TIMESTAMP_PAIR = (
 _KEY_COLUMN = "a key of a counted relationship, which its children per parent describe"
 _EXPOSURE_DATE = "an exposure is formed over DATE columns, whose days are whole"
 _NO_DAY_HISTOGRAM = "its first or last day bin holds fewer than the least cell, so its days have no outer edge to publish"
+
+#: Why a default profile leaves out the date pair of a validity window's own start and end: the
+#: table's ``history`` states the days from each version's start to the next version's start, and
+#: where a version ends at the next start the pair's days count nearly the same versions, so the
+#: difference of two cells would give back a cell either withholds.
+_WINDOW_PAIR = (
+    "its start and end are the table's validity window, whose history states the days from one "
+    "version to the next, and the two would give each other's withheld cells back"
+)
 _NO_WINDOW = (
     "an exposure states its window, and the parent's start has no published span or declared range"
 )
@@ -860,11 +869,15 @@ def table_date_pairs(
     held = stage.held_of(table)
     dates = table_dates(stage.shared, plan, read, stage.backend)
     pairs, notes = _candidate_pairs(plan, held, asked)
+    window = _window_pair(stage.raw_exposes[table]) if asked is None else None
     checks = _check_texts(stage.raw_exposes[table])
     context = stage.pair_context(table)
     entries: List[Dict[str, Any]] = []
     for start, end in pairs:
         what = f"date pair {start} to {end} of {table}"
+        if window is not None and frozenset((start, end)) == window:
+            notes.append((what, _WINDOW_PAIR))
+            continue
         reason = first_reason([(dates, start, held, table), (dates, end, held, table)])
         if reason is not None:
             notes.append((what, reason))
@@ -887,6 +900,19 @@ def table_date_pairs(
             }
         )
     return entries, notes
+
+
+def _window_pair(expose: Mapping[str, Any]) -> Optional[FrozenSet[str]]:
+    """The start and end columns of the expose's validity window, or ``None`` without one.
+
+    Read from the contract alone, so the pair it names is left out of a default profile whether
+    or not the table's history forms: the choice never depends on a record.
+    """
+    from fluid_build.forge_datamodel.semantics_builder import version_window
+
+    semantics = expose.get("semantics")
+    window = version_window(semantics if isinstance(semantics, Mapping) else {})
+    return None if window is None else frozenset((window.start_column, window.end_column))
 
 
 # ---------------------------------------------------------------------------
@@ -1178,7 +1204,10 @@ def _is_childless(stage: DateStage, sides: _Sides) -> bool:
     ):
         return False
     children = Counter(key for key in sides.child_keys if None not in key)
-    return all(None not in key and children.get(key, 0) > 0 for key in sides.parent_keys)
+    parents = sides.parent_keys
+    if sides.relationship.entity:  # a row with no key names no entity, so it is no parent
+        parents = [key for key in parents if None not in key]
+    return all(None not in key and children.get(key, 0) > 0 for key in parents)
 
 
 def relationship_extras(

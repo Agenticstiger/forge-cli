@@ -92,8 +92,9 @@ _TIMESTAMP_NEVER_BOTH = (
 #: with one of these reasons (:func:`unformed`), and ``--strict`` refuses a request that
 #: holds one. A public profile forms a table's date pairs and calendar and a relationship's dates and
 #: exposure (:mod:`fluid_build.profiler.dates`) and names the ones it cannot with a reason of
-#: their own; a private release forms none of them, and names each with the reasons below.
-NO_DATE_PAIRS = "a private release forms no date pair"
+#: their own; a private release forms a table's date pairs of DATE columns (and names the others
+#: with the reason it has for each, from the contract alone), and no calendar, relationship dates
+#: or exposure, which it names with the reasons below.
 NO_CALENDAR = "a private release forms no calendar"
 NO_WORKLOAD = (
     "a workload weighs the column sets a private release may join, and this profile joins none"
@@ -482,19 +483,17 @@ def unformed(
     """Each ask of *request* of a kind ``fluid profile`` does not form, with why: ``(what, reason)``.
 
     Decided from the request alone, before any record is read: a workload entry, and, for a
-    *private* release only, a consumer query, a table's date pairs and calendar and a
-    relationship's dates and exposure (a public profile forms those, and names one it cannot
-    with the reason it has, once it has read the records; which queries it answers needs the
-    contract, :func:`fluid_build.profiler.query_rates.plan_queries`). *workload* is the reason a workload
+    *private* release only, a consumer query, a table's calendar and a relationship's dates and
+    exposure (a public profile forms those, and names one it cannot with the reason it has, once
+    it has read the records; which queries it answers needs the contract,
+    :func:`fluid_build.profiler.query_rates.plan_queries`). A private release does form a table's
+    date pairs of DATE columns, and names one it cannot with the contract's reason when it plans.
+    *workload* is the reason a workload
     entry is not used, which a private release words its own way. Never a value: only tables,
     columns, names and reasons.
     """
     found: List[Tuple[str, str]] = []
     for table in request.tables:
-        for pair in table.date_pairs if private else ():
-            found.append(
-                (f"date pair {pair.start} to {pair.end} of {table.expose_id}", NO_DATE_PAIRS)
-            )
         for column in table.calendar if private else ():
             found.append((f"calendar of {table.expose_id}.{column}", NO_CALENDAR))
         for entry in table.workload:
