@@ -2299,12 +2299,11 @@ def _refuse_conditions_that_can_fail(
     fail there, so that an error would tell the caller the row exists.
 
     A planner may merge the filtered projection into the statement and run a WHERE or a
-    JOIN's ON on rows before the filter. Each condition may therefore hold only
-    :func:`_condition_nodes` (a subquery in it is checked as its own statement), and a
-    subquery, a derived table or a CTE may select only columns, literals, ``*``,
-    aggregates and window functions: a value it computes could be pushed into a condition
-    of the statement around it. The outer statement's own select list, its aggregates,
-    HAVING and window functions see only the rows the filter keeps."""
+    JOIN's ON on rows before the filter. Each condition (:func:`_conditions`) may
+    therefore hold only :func:`_condition_nodes`. A subquery in it is checked as its own
+    statement, and :func:`_refuse_values_a_subquery_computes` covers the values a
+    subquery selects. The outer statement's own select list, its aggregates, HAVING and
+    window functions see only the rows the filter keeps."""
     from sqlglot import exp
 
     allowed = _condition_nodes()
@@ -2321,19 +2320,7 @@ def _refuse_conditions_that_can_fail(
         exp.In,
         exp.Between,
     )
-    # A HAVING or QUALIFY term over a plain column is a WHERE an optimizer may push down;
-    # its aggregates and window functions are values of the rows the filter keeps.
-    # An aggregate's own FILTER (WHERE ...) is part of the aggregate: it sees kept rows.
-    conditions = [
-        (where.this, ())
-        for where in tree.find_all(exp.Where)
-        if not isinstance(where.parent, exp.Filter)
-    ]
-    conditions += [(join.args["on"], ()) for join in tree.find_all(exp.Join) if join.args.get("on")]
-    conditions += [
-        (node.this, (exp.AggFunc, exp.Window)) for node in tree.find_all(exp.Having, exp.Qualify)
-    ]
-    for condition, kept in conditions:
+    for condition, kept in _conditions(tree):
         stops = subqueries + kept
         for node in condition.walk(prune=lambda n: isinstance(n, stops) or _is_constant(n)):
             if isinstance(node, stops) or _is_constant(node):
@@ -2349,6 +2336,37 @@ def _refuse_conditions_that_can_fail(
                     "and LIKE (an engine may evaluate it on a row the filter removes, where "
                     "anything that can fail would tell the caller the row exists)."
                 )
+
+
+def _conditions(tree: Any) -> List[Tuple[Any, Tuple[type, ...]]]:
+    """Each condition a planner could run before the row filter, with the node types in it
+    that see only the rows the filter keeps.
+
+    A HAVING or QUALIFY term over a plain column is a WHERE an optimizer may push down;
+    its aggregates and window functions are values of the rows the filter keeps. An
+    aggregate's own FILTER (WHERE ...) is part of the aggregate: it sees kept rows."""
+    from sqlglot import exp
+
+    conditions: List[Tuple[Any, Tuple[type, ...]]] = [
+        (where.this, ())
+        for where in tree.find_all(exp.Where)
+        if not isinstance(where.parent, exp.Filter)
+    ]
+    conditions += [(join.args["on"], ()) for join in tree.find_all(exp.Join) if join.args.get("on")]
+    conditions += [
+        (node.this, (exp.AggFunc, exp.Window)) for node in tree.find_all(exp.Having, exp.Qualify)
+    ]
+    return conditions
+
+
+def _refuse_values_a_subquery_computes(tree: Any, read: Optional[str] = None) -> None:
+    """Refuse a value a subquery, a derived table or a CTE computes: a condition of the
+    statement around it could be pushed down onto the rows the row filter removes, where
+    computing the value could fail. Such a select holds only columns, literals, ``*``,
+    aggregates and window functions, and the computing happens in the outer select
+    (:func:`_outermost_selects`)."""
+    from sqlglot import exp
+
     outer = set(map(id, _outermost_selects(tree)))
     for select in tree.find_all(exp.Select):
         if id(select) in outer:
@@ -2555,6 +2573,7 @@ def _project_exposed_table(
         # row the filter removes that would fail there.
         _refuse_unlisted_functions(tree, read)
         _refuse_conditions_that_can_fail(tree, string_columns, read)
+        _refuse_values_a_subquery_computes(tree, read)
     exposed_name = exposed.name.casefold()
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
     _refuse_another_schemas_table(tables, exposed, read, catalog)
