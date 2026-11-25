@@ -291,3 +291,56 @@ def test_postgres_runs_each_request_in_a_read_only_transaction_it_rolls_back():
         "SELECT id FROM t",
         "ROLLBACK",
     ]
+
+
+def _connecting(monkeypatch, role_row, *, filtered):
+    """A PostgresDriver whose psycopg connects to a fake server; the role query answers
+    ``role_row`` (``rolsuper``, the privileged roles it is a member of)."""
+    import sys
+    import types
+
+    cursor = MagicMock()
+    cursor.__enter__ = lambda self: self
+    cursor.__exit__ = lambda self, *a: None
+    cursor.fetchall.return_value = [role_row]
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setitem(
+        sys.modules, "psycopg", types.SimpleNamespace(connect=lambda **_: connection)
+    )
+    expose = _pg_expose()
+    if filtered:
+        expose["policy"] = {
+            "authz": {"rowFilters": [{"principal": "group:eu@x.example", "where": "id > 0"}]}
+        }
+    return PostgresDriver(expose=expose, contract={}), connection
+
+
+@pytest.mark.parametrize(
+    ("role_row", "named"),
+    [((True, []), "superuser"), ((False, ["pg_read_server_files"]), "pg_read_server_files")],
+    ids=["superuser", "reads-server-files"],
+)
+def test_postgres_refuses_to_serve_row_filters_as_a_privileged_role(monkeypatch, role_row, named):
+    """Such a role can read a table's files and the write-ahead log, past any filter."""
+    from fluid_build.output_ports.mcp.query_compiler import RowFilterUnavailable
+
+    driver, connection = _connecting(monkeypatch, role_row, filtered=True)
+    with pytest.raises(RowFilterUnavailable, match=named):
+        driver._get_connection()
+    connection.close.assert_called_once()
+    assert driver._connection is None
+
+
+def test_postgres_serves_row_filters_as_a_role_that_reads_only_tables(monkeypatch):
+    driver, connection = _connecting(monkeypatch, (False, []), filtered=True)
+    assert driver._get_connection() is connection
+
+
+def test_postgres_warns_about_a_privileged_role_on_an_expose_without_row_filters(
+    monkeypatch, caplog
+):
+    driver, connection = _connecting(monkeypatch, (False, ["pg_monitor"]), filtered=False)
+    with caplog.at_level("WARNING"):
+        assert driver._get_connection() is connection
+    assert "postgres_privileged_role" in caplog.text and "pg_monitor" in caplog.text

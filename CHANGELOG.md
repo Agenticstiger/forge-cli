@@ -420,6 +420,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_advisory*`, `pg_sleep*`, `current_setting`, `nextval`, `setval`, `pg_relation_filepath`,
   `pg_cancel_backend`, `pg_terminate_backend` and `pg_reload_conf`. A role allowed to call the
   file and write-ahead-log readers reads the rows a row filter withholds.
+- **The Postgres driver refuses to serve an expose with row filters as a privileged role.** At
+  connect it checks whether the role is a superuser or a member of `pg_read_server_files`,
+  `pg_write_server_files`, `pg_execute_server_program` or `pg_monitor`. If it is, every read of an
+  expose with row filters is refused with that reason, and any other expose logs a warning.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
