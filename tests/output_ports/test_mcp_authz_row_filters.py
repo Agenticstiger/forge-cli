@@ -459,8 +459,7 @@ def test_query_sql_refuses_a_source_the_filter_cannot_cover(sql):
 
 
 def test_every_read_of_the_exposed_table_carries_the_filter():
-    import sqlglot
-    from sqlglot import exp
+    from sqlglot import exp, parse_one
 
     compiled = query_compiler.compile_free_form_sql(
         sql=(
@@ -474,7 +473,7 @@ def test_every_read_of_the_exposed_table_carries_the_filter():
         caller_attributes=_as(EU),
         dialect="duckdb",
     )
-    tree = sqlglot.parse_one(compiled.sql, read="duckdb")
+    tree = parse_one(compiled.sql, read="duckdb")
     reads = [table for table in tree.find_all(exp.Table) if table.name == "customers"]
     assert len(reads) == 4
     for table in reads:

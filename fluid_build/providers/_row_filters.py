@@ -93,8 +93,8 @@ def parse_predicate(where: str, at: str, *, dialect: Optional[str] = None) -> An
             _ONE_EXPRESSION_HINT,
         )
     try:
-        import sqlglot
         from sqlglot import expressions as exp
+        from sqlglot import parse_one
         from sqlglot.errors import SqlglotError
     except ImportError:  # pragma: no cover - sqlglot is a base dependency
         raise RowFilterError(
@@ -103,7 +103,7 @@ def parse_predicate(where: str, at: str, *, dialect: Optional[str] = None) -> An
             ("Reinstall data-product-forge with its base dependencies.",),
         ) from None
     try:
-        tree = sqlglot.parse_one(f"SELECT 1 FROM t WHERE {where}", read=dialect)
+        tree = parse_one(f"SELECT 1 FROM t WHERE {where}", read=dialect)
     except RecursionError:
         raise RowFilterError(
             f"{at}.where nests too deeply to be checked.",
