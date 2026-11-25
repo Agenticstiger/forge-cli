@@ -1422,3 +1422,70 @@ def test_a_contract_expression_cannot_dump_a_table_as_xml(where, expression, dia
             dialect=dialect,
             **kwargs,
         )
+
+
+# ---------------------------------------------------------------------
+# The body after the leading SELECT is checked whole
+# ---------------------------------------------------------------------
+
+# Written against the keyword, with no space after it, the start of the body is still
+# part of the body every check reads.
+_AGAINST_THE_KEYWORD = [
+    'SELECT(SELECT"region"FROM"customers"WHERE"id"=3)AS"x",id FROM customers',
+    'SELECT(SELECT"string_agg"("region",\',\')FROM"customers")AS"x" FROM customers',
+    'SELECT*FROM"customers"UNION(SELECT*FROM"customers")',
+]
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", None])
+@pytest.mark.parametrize("sql", _AGAINST_THE_KEYWORD)
+def test_query_sql_checks_what_is_written_against_the_select_keyword(sql, dialect):
+    with pytest.raises(ValueError, match="Invalid SQL expression"):
+        compile_free_form_sql(sql=sql, table_reference="customers", limit=10, dialect=dialect)
+
+
+@pytest.mark.parametrize("sql", _AGAINST_THE_KEYWORD)
+def test_the_driver_guard_reads_what_is_written_against_the_select_keyword(sql):
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+
+    with pytest.raises(ValueError, match="banned keyword"):
+        guard_against_injection_markers(sql)
+
+
+@pytest.mark.parametrize(
+    "sql", ['SELECT"region" FROM customers', "SELECT*FROM customers", "SELECT\tid FROM customers"]
+)
+def test_a_name_or_star_against_the_keyword_still_compiles(sql):
+    compiled = compile_free_form_sql(sql=sql, table_reference="customers", limit=10)
+    assert compiled.sql.startswith(sql)
+
+
+# ---------------------------------------------------------------------
+# Postgres functions and views that reach past the statement
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param("SELECT set_config('TimeZone', 'UTC', false) WHERE true", id="set-config"),
+        pytest.param("SELECT heap_page_items(get_raw_page('public.customers', 0))", id="raw-page"),
+        pytest.param("SELECT bt_page_items('customers_pkey', 1)", id="index-page"),
+        pytest.param("SELECT pgrowlocks('public.customers')", id="row-locks"),
+        pytest.param("SELECT pg_prepared_statement()", id="prepared-statement-function"),
+        pytest.param("SELECT name, statement FROM pg_prepared_statements", id="prepared-view"),
+        pytest.param("SELECT name FROM pg_cursors", id="cursor-view"),
+    ],
+)
+def test_query_sql_refuses_what_reads_raw_pages_other_requests_or_the_session(sql):
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+    from fluid_build.providers._sql_safety import validate_sql_expression_allowlist
+
+    with pytest.raises(QueryValidationError, match="changes the session"):
+        compile_free_form_sql(
+            sql=sql, table_reference="public.customers", limit=10, dialect="postgres"
+        )
+    with pytest.raises(ValueError, match="changes the session"):
+        guard_against_injection_markers(sql)
+    with pytest.raises(ValueError):
+        validate_sql_expression_allowlist(sql.split(None, 1)[1])

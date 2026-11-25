@@ -468,6 +468,20 @@ _PROJECTION_OPEN_RE = re.compile(
 )
 
 
+# A statement's leading ``SELECT`` keyword, after any opening parentheses. The keyword
+# ends at its word boundary, not at the first space: in ``SELECT(...)`` or
+# ``SELECT"name"`` the body starts right after it.
+_LEADING_SELECT_RE = re.compile(r"(?i)\(*select\b")
+
+
+def select_body(sql: str) -> Optional[str]:
+    """``sql`` after its leading ``SELECT`` keyword (and any opening parentheses before
+    it), or ``None`` when it does not start with one. The checks that read a statement's
+    body read this, so nothing written against the keyword is left out of them."""
+    match = _LEADING_SELECT_RE.match(sql)
+    return None if match is None else sql[match.end() :]
+
+
 def strip_projection_open(sql_body: str) -> str:
     """Remove the compiler's own projection ``(SELECT <columns> FROM`` opening from a
     rendered statement body, so a driver's body-keyword guard sees only the rest.
@@ -2126,16 +2140,14 @@ def compile_free_form_sql(
     candidate = sql.strip()
     if not candidate:
         raise QueryValidationError("sql must be a non-empty string")
-    if not candidate.lower().lstrip("(").startswith("select"):
+    # ``_sql_safety`` blocks the SELECT keyword in expression mode, so it reads the body
+    # after the leading SELECT: everything after the keyword's word boundary, a name or
+    # a parenthesis written against the keyword included. A SELECT with no body is
+    # malformed and rejected outright.
+    body = select_body(candidate)
+    if body is None:
         raise QueryValidationError("Only SELECT statements are allowed in --allow-sql mode")
-    # ``_sql_safety`` blocks the SELECT keyword in expression mode, so
-    # we hand it only the body after the leading SELECT. Splitting on
-    # *any* whitespace (``str.split(None, 1)``) defends against the
-    # tab/newline bypass that would skip validation when only ASCII
-    # spaces are checked. A SELECT with no body (a single-token
-    # ``SELECT``) is malformed and rejected outright.
-    parts = candidate.split(None, 1)
-    if len(parts) < 2:
+    if not body.strip():
         raise QueryValidationError("sql must contain a SELECT body")
     if names_refused_duckdb_function(candidate):
         raise QueryValidationError(
@@ -2148,12 +2160,14 @@ def compile_free_form_sql(
     if names_refused_postgres_function(candidate):
         raise QueryValidationError(
             "sql may not call a function that reads a relation or runs a query given as "
-            "text (table_to_xml, query_to_xml, cursor_to_xml, schema_to_xml, "
-            "database_to_xml, ts_stat, ts_rewrite, connectby, crosstab, dblink, pgstattuple, "
-            "pg_stat_* and their variants), or write a name or a string with Unicode escapes "
-            '(U&"..."). Select the columns of the exposed table directly.'
+            "text, or that changes the session (table_to_xml, query_to_xml, cursor_to_xml, "
+            "schema_to_xml, database_to_xml, ts_stat, ts_rewrite, connectby, crosstab, "
+            "dblink, pgstattuple, pg_stat_*, pgrowlocks, get_raw_page and the other "
+            "pageinspect functions, pg_cursor, pg_prepared_statement, set_config and their "
+            "variants), name the pg_cursors or pg_prepared_statements views, or write a name "
+            'or a string with Unicode escapes (U&"..."). Select the columns of the exposed '
+            "table directly."
         )
-    body = parts[1]
     validate_sql_expression_allowlist(body)
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
         raise QueryValidationError("limit must be an integer in [1, 1_000_000]")

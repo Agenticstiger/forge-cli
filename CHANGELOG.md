@@ -386,6 +386,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `contract.yaml` resources returned `policy.authz` (readers, writers, column restrictions and
   row-filter predicates), which the `describe` tool and the statement shown to the caller leave
   out. Both now omit `policy.authz` and the old `policy.rowFilters`.
+- **`query_sql` checks its whole statement after the leading `SELECT`.** Text written against the
+  keyword, with no space after it, was left out of the keyword and character checks that read the
+  rest of the statement, and out of the drivers' statement guard. Both now read everything after the
+  keyword.
+- **`query_sql`, contract expressions and the drivers' statement guard refuse more Postgres
+  functions, on every expose.** `set_config` changes the session later requests run in; the
+  pageinspect functions read raw pages, filtered rows included; `pgrowlocks` reports locked rows;
+  and `pg_prepared_statement` and `pg_cursor` show other requests' statements on the shared
+  connection. The `pg_prepared_statements` and `pg_cursors` views are refused by name.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -583,7 +592,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table.** A statement that joins another table or reads a catalog view there is now refused; read
   the other table through its own expose. On every expose, `query_sql` refuses `ts_stat`,
   `ts_rewrite`, `connectby`, the `crosstab*`, `dblink*`, `pgstat*` and `pg_stat*` functions, and
-  names or strings written with Unicode escapes (`U&"..."`).
+  names or strings written with Unicode escapes (`U&"..."`). It also refuses `set_config`, the
+  pageinspect functions, `pgrowlocks`, `pg_prepared_statement`, `pg_cursor` and the
+  `pg_prepared_statements` and `pg_cursors` views.
 - **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so

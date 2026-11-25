@@ -47,6 +47,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 from ..query_compiler import (
     ROW_FILTER_ALIAS,
     row_filter_predicate,
+    select_body,
     strip_projection_open,
 )
 from ..query_compiler import (
@@ -91,7 +92,6 @@ def guard_against_injection_markers(sql: str) -> None:
     keyword (UNION / DROP / …) into the body."""
     if any(marker in sql for marker in _INJECTION_MARKERS):
         raise ValueError(f"Refusing to execute statement with injection marker: {sql!r}")
-    parts = sql.split(None, 1)
     if names_refused_duckdb_function(sql):
         raise ValueError(
             "Refusing to execute statement that calls a DuckDB logging function, reads a "
@@ -99,12 +99,15 @@ def guard_against_injection_markers(sql: str) -> None:
         )
     if names_refused_postgres_function(sql):
         raise ValueError(
-            "Refusing to execute statement that calls a function which reads a relation "
-            "or runs a query given as text, or that writes a name with Unicode escapes"
+            "Refusing to execute statement that calls a function which reads a relation, "
+            "runs a query given as text or changes the session, or that writes a name with "
+            "Unicode escapes"
         )
-    # The one body SELECT the compiler writes itself: the allowed-column projection
-    # an expose with column restrictions is read through.
-    if len(parts) >= 2 and _TAIL_BLOCKED_TOKENS.search(strip_projection_open(parts[1])):
+    # The body is everything after the leading SELECT keyword, a name or a parenthesis
+    # written against it included. The one body SELECT the compiler writes itself is the
+    # allowed-column projection an expose that restricts columns or rows is read through.
+    body = select_body(sql.lstrip())
+    if _TAIL_BLOCKED_TOKENS.search(strip_projection_open(sql if body is None else body)):
         raise ValueError(
             "Refusing to execute statement: rendered SQL body contains a "
             f"banned keyword (compiler safety regression). sql={sql!r}"
