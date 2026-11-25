@@ -51,6 +51,17 @@ def _levels(entry: Dict[str, Any]) -> Dict[str, Optional[int]]:
     return dict(zip(entry["levels"], group["levelCounts"], strict=True))
 
 
+def _published(entry: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """An ``order`` entry's count per level, ``None`` for a level whose cell is withheld."""
+    (group,) = entry["groups"]
+    assert group["status"] == "F"
+    status = group.get("cellStatus", "F" * len(entry["levels"]))
+    return {
+        level: count if state == "F" else None
+        for level, count, state in zip(entry["levels"], group["levelCounts"], status, strict=True)
+    }
+
+
 def _cells(entry: Dict[str, Any]) -> List[Optional[int]]:
     (group,) = entry["groups"]
     assert group["status"] == "F"
@@ -106,6 +117,22 @@ def _loans(gaps: Sequence[int] = GAPS, broken: int = 0) -> List[Dict[str, Any]]:
                 "audited": opened.isoformat() + "T10:00:00Z",
             }
         )
+    return rows
+
+
+def _by_offset(counts: Dict[int, int]) -> List[Dict[str, Any]]:
+    """Rows whose closing is ``offset`` days from the opening, ``counts[offset]`` of each."""
+    rows = []
+    for offset, count in counts.items():
+        for number in range(count):
+            opened = date(2023, 1, 1) + timedelta(days=number % 300)
+            rows.append(
+                {
+                    "opened": opened.isoformat(),
+                    "closed": (opened + timedelta(days=offset)).isoformat(),
+                    "audited": opened.isoformat() + "T10:00:00Z",
+                }
+            )
     return rows
 
 
@@ -287,6 +314,56 @@ def test_an_end_bin_under_the_least_cell_publishes_no_day_histogram(tmp_path):
     load_profile_text(result.canonical.decode("utf-8"))
     said = dict(result.not_measured)
     assert "fewer than the least cell" in said["days of date pair opened to closed of loans"]
+
+
+def test_a_few_records_on_the_same_day_withhold_the_same_level_and_not_before(tmp_path):
+    # The first and the last bin of the days stand on a hundred records each; the cell of day 0
+    # holds three. The small cell is withheld and one more with it, so it cannot be read from the
+    # total: that is "after" (the larger of the two others stays withheld with it), never "before".
+    rows = _by_offset({-1: 100, 0: 3, 5: 100, 45: 100, 300: 100})
+    result = _profile_loans(tmp_path, _loans_contract(), rows)
+    (pair,) = _pairs(result).values()
+    assert pair["statistics"] != []
+    assert _published(pair["order"]) == {"after": None, "before": 100, "same": None}
+    # The same pair with day 0 holding enough records publishes all three.
+    full = _profile_loans(
+        tmp_path, _loans_contract(), _by_offset({-1: 100, 0: 100, 5: 100, 45: 100, 300: 100})
+    )
+    (whole,) = _pairs(full).values()
+    assert all(count is not None for count in _published(whole["order"]).values())
+
+
+def test_with_no_record_before_the_start_before_is_an_implied_zero_and_the_others_are_published(
+    tmp_path,
+):
+    rows = _by_offset({0: 100, 1: 100, 5: 100, 45: 100, 300: 100})
+    result = _profile_loans(tmp_path, _loans_contract(), rows)
+    (pair,) = _pairs(result).values()
+    order = _published(pair["order"])
+    assert order["before"] == 0  # under the outer edges: implied empty
+    assert order["same"] is not None and order["after"] is not None
+
+
+def test_a_last_day_bin_under_the_least_cell_publishes_no_day_histogram(tmp_path):
+    # A hundred loans close each on the same day and on the fifth day, three close after nine
+    # hundred days: the last bin holds fewer than ten records, so no record places the outer edge.
+    rows = _by_offset({0: 100, 5: 100, 45: 100, 900: 3})
+    result = _profile_loans(tmp_path, _loans_contract(), rows)
+    (pair,) = _pairs(result).values()
+    assert pair["statistics"] == []
+    assert _published_zeros(pair) == 0
+    said = dict(result.not_measured)
+    assert "fewer than the least cell" in said["days of date pair opened to closed of loans"]
+
+
+def test_exactly_the_least_cell_in_each_end_bin_publishes_the_day_histogram(tmp_path):
+    rows = _by_offset({1: 10, 5: 100, 45: 100, 900: 10})
+    result = _profile_loans(tmp_path, _loans_contract(), rows)
+    (pair,) = _pairs(result).values()
+    (days,) = pair["statistics"]
+    assert days["bins"][0] == "1"
+    assert days["bins"][-1] == str(dates.DAY_LADDER[dates.DAY_LADDER.index(731) + 1])
+    assert "days of date pair opened to closed of loans" not in dict(result.not_measured)
 
 
 def test_a_rule_the_records_break_publishes_no_zero(tmp_path):
@@ -485,10 +562,11 @@ def _shop_contract(
     filtered: bool = False,
     signup_rules: Optional[List[Dict[str, Any]]] = None,
     rule: bool = True,
+    ordered: bool = True,
 ) -> Dict[str, Any]:
-    parent_rules: List[Dict[str, Any]] = [
-        {"id": "left", "check": "left_on IS NULL OR left_on >= signup"}
-    ]
+    parent_rules: List[Dict[str, Any]] = (
+        [{"id": "left", "check": "left_on IS NULL OR left_on >= signup"}] if ordered else []
+    )
     if derive:
         aggregate: Dict[str, Any] = {"function": "count", "from": "orders", "via": "owner"}
         if filtered:
@@ -728,6 +806,47 @@ def test_exposure_states_children_and_active_days_inside_the_published_span(tmp_
     )
     assert lifetime["activeDays"]["value"] == days
     load_profile_text(result.canonical.decode("utf-8"))
+
+
+def test_a_parent_whose_end_is_before_its_start_is_active_to_the_window_end(tmp_path):
+    customers = _customers()
+    for customer in customers[::4]:  # a quarter of the parents end before they start
+        customer["left_on"] = (
+            date.fromisoformat(customer["signup"]) - timedelta(days=20)
+        ).isoformat()
+    orders = _orders()
+    asked = _request(
+        RequestTable(
+            "customers",
+            False,
+            (
+                RequestColumn("customer_id", "number"),
+                RequestColumn("signup", "timestamp", (), ("marginalHistogram/1",)),
+                RequestColumn("left_on", "timestamp"),
+            ),
+        ),
+        RequestTable(
+            "orders",
+            False,
+            (RequestColumn("customer_id", "number"), RequestColumn("placed", "timestamp")),
+        ),
+        relationships=[
+            RequestRelationship(
+                RequestEnd("customers", ("customer_id",)),
+                RequestEnd("orders", ("customer_id",)),
+                (),
+                exposure=(RequestExposure("signup", "left_on"),),
+            )
+        ],
+    )
+    result = _profile_shop(
+        tmp_path, _shop_contract(ordered=False), orders=orders, customers=customers, request=asked
+    )
+    (lifetime,) = _relationship(result)["exposure"]
+    assert (lifetime["start"], lifetime["end"]) == ("signup", "left_on")
+    assert lifetime["activeDays"]["status"] == "F"
+    _, days = _expected_exposure(lifetime, customers, orders)
+    assert lifetime["activeDays"]["value"] == days
 
 
 def test_exposure_takes_its_window_from_a_declared_range_without_a_span(tmp_path):

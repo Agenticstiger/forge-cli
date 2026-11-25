@@ -259,3 +259,61 @@ def test_a_column_with_no_value_has_its_own_reason(tmp_path):
     assert table.no_span == (
         ("day", "no record holds a value; its quartiles stay on the type's ladder"),
     )
+
+
+# -- the end bins of a span ----------------------------------------------------------------
+
+_MS_PER_DAY = 86_400_000
+
+
+def _ms(day: date) -> int:
+    return (day - date(1970, 1, 1)).days * _MS_PER_DAY
+
+
+def _span(*parts: tuple) -> tuple:
+    """``date_span`` of (day, count) parts at the default least cell of ten."""
+    values = [_ms(day) for day, count in parts for _ in range(count)]
+    return defaults.date_span(values, 10)
+
+
+def _month(index: int) -> date:
+    """The first day of the month *index* months after January 2000."""
+    return date(2000 + index // 12, index % 12 + 1, 1)
+
+
+def test_a_small_last_month_falls_to_years_and_a_small_last_year_leaves_no_span():
+    # A last month under the least cell: the months are refused, the years hold a hundred each.
+    edges, reason = _span(
+        (date(2020, 3, 1), 100),
+        (date(2020, 12, 1), 100),
+        (date(2021, 2, 1), 100),
+        (date(2021, 6, 1), 3),
+    )
+    assert reason is None and len(edges) == 3  # the years 2020 and 2021
+    assert edges[0].startswith("2020-01-01") and edges[-1].startswith("2022-01-01")
+    # A last year as small too: nothing stands on enough records, and the reason says so.
+    edges, reason = _span((date(2020, 3, 1), 100), (date(2021, 6, 1), 3))
+    assert edges is None
+    assert reason is not None and "fewer than 10 records" in reason
+
+
+def test_a_small_first_month_falls_to_years():
+    edges, reason = _span((date(2020, 3, 1), 3), (date(2020, 8, 1), 100), (date(2021, 6, 1), 100))
+    assert reason is None and len(edges) == 3
+
+
+def test_exactly_the_least_cell_in_each_end_month_keeps_months():
+    edges, reason = _span((date(2020, 3, 1), 10), (date(2020, 5, 1), 100), (date(2020, 7, 1), 10))
+    assert reason is None
+    assert len(edges) == 6  # the months March to July, and the edge after
+    edges, reason = _span((date(2020, 3, 1), 10), (date(2020, 5, 1), 100), (date(2020, 7, 1), 9))
+    assert reason is None and len(edges) == 2  # July falls short: calendar year 2020 alone
+
+
+def test_a_span_of_the_most_bins_keeps_months_and_one_more_falls_to_years():
+    most = defaults.MOST_SPAN_BINS
+    assert most == 240
+    edges, reason = _span((_month(0), 20), (_month(most - 1), 20))
+    assert reason is None and len(edges) == most + 1
+    edges, reason = _span((_month(0), 20), (_month(most), 20))
+    assert reason is None and len(edges) == 22  # the twenty-one years 2000 to 2020, and one more
