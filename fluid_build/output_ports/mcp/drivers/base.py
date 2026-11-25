@@ -50,7 +50,7 @@ from ..query_compiler import (
     ColumnType,
     catalog_columns_sql,
     column_type,
-    readable_columns,
+    declared_columns,
     row_filter_predicate,
     select_body,
     strip_projection_open,
@@ -418,14 +418,16 @@ class EngineDriver(ABC):
         limit: int,
         caller_attributes: Optional[Mapping[str, Any]] = None,
     ) -> SampleResult:
-        """Default ``sample`` implementation: ``SELECT <declared columns> FROM <table>
-        [AS _fluid_rows WHERE <row filter>] LIMIT n``.
+        """Default ``sample`` implementation: ``SELECT * FROM <table>
+        [AS _fluid_rows WHERE <row filter>] LIMIT n``, keeping only the columns
+        ``contract.schema`` declares (:func:`...query_compiler.declared_columns`).
 
-        It reads only the columns ``contract.schema`` declares, less the restricted
-        ones (:func:`...query_compiler.readable_columns`), each folded and quoted the
-        way the engine reads the bare name (:func:`...query_compiler.projection_columns`),
-        so a column the contract does not declare never leaves the engine. An expose
-        that declares no column is refused.
+        A column the contract does not declare is dropped before the rows leave the
+        driver, so a column added to the table later stays unreadable until the
+        contract declares it. The declared columns are matched by name without regard
+        to case, as the engine returns them, so a quoted or mixed-case column is read
+        as the table holds it. Restricted columns are then left out and PII columns
+        masked (:meth:`project`). An expose that declares no column is refused.
 
         ``caller_attributes`` is the request's verified identity. When the
         contract declares ``policy.authz.rowFilters``,
@@ -443,16 +445,16 @@ class EngineDriver(ABC):
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
         predicate = row_filter_predicate(self.expose, caller_attributes, dialect=descriptor.dialect)
-        columns = projection_columns(
-            readable_columns(self.expose, self._restricted_columns), descriptor.dialect
-        )
+        declared = {name.casefold() for name in declared_columns(self.expose)}
         source = descriptor.table_reference
         if predicate is not None:
             # The predicate is the contract's own literal SQL, its columns qualified
             # with ROW_FILTER_ALIAS; it binds no parameter.
             source = f"{source} AS {ROW_FILTER_ALIAS} WHERE {predicate}"
-        result = self.execute(sql=f"SELECT {columns} FROM {source} LIMIT {limit}", params=())
-        visible_columns, rows = self.project(result.rows, columns=result.columns)
+        result = self.execute(sql=f"SELECT * FROM {source} LIMIT {limit}", params=())
+        kept = [column for column in result.columns if str(column).casefold() in declared]
+        declared_rows = [{column: row[column] for column in kept} for row in result.rows]
+        visible_columns, rows = self.project(declared_rows, columns=kept)
         truncated = len(rows) >= limit
         return SampleResult(columns=visible_columns, rows=rows, truncated=truncated)
 

@@ -496,6 +496,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value a subquery computes is refused. A reader no filter narrows is not limited, and the
   `query_sql` tool's description states these limits. A refusal names the function or the
   condition as the caller wrote it where the parser kept its position.
+- **`query_sql` and `sample` read only what the expose declares, for every caller.** On every
+  expose, and for a reader no row filter narrows as well, `query_sql` reads the exposed table
+  through a projection of the columns `contract.schema` declares, and reads no other relation
+  besides `VALUES`, `UNNEST` and, on DuckDB, a `FROM`-first CTE of its own: no other table, view,
+  catalog view (`information_schema` included), table function or file. Every caller may call only
+  the listed functions, since a function can read past the projection through its argument (a
+  view's definition, the server's settings, an object's DDL); the condition limits stay with the
+  callers a row filter narrows. Each projected column is folded to the case the engine gives a
+  bare name and then quoted, so a column named like a reserved word (`order`) or a session value
+  (`current_user`, and `user` on Postgres) is read as itself. A read of the table without an
+  alias takes the caller's own name for it, folded and quoted the same way, so a table named like
+  a reserved word reads too. `sample` keeps only the declared columns of the rows it reads,
+  matched without regard to case, so a column the engine returns in another case is still
+  returned. `query` is unchanged: it reads only what the contract's semantics name.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is
@@ -699,11 +713,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`query_sql` and `sample` read only the columns `contract.schema` declares, on every expose.**
   `sample` no longer returns a column the contract does not declare. On an expose without column
   restrictions or row filters, and for a reader of one with row filters, a `query_sql` statement
-  that joins another table or reads a catalog view is now refused, and one that names an
-  undeclared column fails on that column: declare the column, or read the other table through
-  its own expose. Both tools refuse an expose whose `contract.schema` declares no column, or a
-  column whose name is not a plain identifier (a letter or underscore, then letters, digits and
-  underscores).
+  that joins another table or reads a catalog view is now refused, one that names an undeclared
+  column fails on that column, and one that calls a function the list does not name is refused:
+  declare the column, read the other table through its own expose, or compute the value
+  elsewhere. Both tools refuse an expose whose `contract.schema` declares no column, and
+  `query_sql` one whose readable columns include a name that is not a plain identifier (a letter
+  or underscore, then letters, digits and underscores).
 - **A row filter with a double-quoted column name is refused for BigQuery and Databricks.** Both
   read the name as a string. Write the column name bare.
 - **A caller a row filter narrows writes `query_sql` conditions as typed comparisons.** The
@@ -714,10 +729,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)` for a date relative to today. Keep
   comparisons of exact numbers within 38 digits; a column of unknown precision, such as
   Postgres's unconstrained `numeric`, meets another exact number only once the table gives it
-  a precision and scale. Write LIKE patterns as string
-  literals without `ESCAPE` or a backslash, and compute values (casts, arithmetic, other
-  functions) in the outer select list. Only listed functions may be called, and the row and
-  string generators are no longer listed.
+  a precision and scale. Write LIKE patterns
+  as string literals without `ESCAPE` or a backslash, and compute values (casts, arithmetic,
+  other functions) in the outer select list. Only listed functions may be called, and the row
+  and string generators are no longer listed.
 - **sqlglot 30.1 or newer is required.** 26.16 and older record no identifier positions, so the MCP
   output port refused every row filter on them, and releases before 30.1 refuse some valid
   `query_sql` reads on an expose with row filters (a DuckDB `EXISTS (FROM ...)` subquery, for one).

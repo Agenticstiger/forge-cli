@@ -368,7 +368,8 @@ def test_lower_upper_and_coalesce_over_typed_values_are_allowed(where, dialect):
     ],
 )
 def test_other_shapes_stay_refused(dialect, where):
-    with pytest.raises(query_compiler.QueryValidationError, match=_REFUSAL):
+    """Refused by the condition fence, or before it by the function list."""
+    with pytest.raises(query_compiler.QueryValidationError, match=f"{_REFUSAL}|which query_sql"):
         _compile(f"SELECT id FROM customers WHERE {where}", dialect)
 
 

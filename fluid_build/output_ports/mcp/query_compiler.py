@@ -505,8 +505,9 @@ def strip_projection_open(sql_body: str) -> str:
     The remainder (table reference, row-filter predicate, alias, outer clauses) is
     still scanned in full: only the opening goes, so a ``SELECT`` anywhere else in the
     statement (a union branch, a scalar subquery over another column list) is still
-    refused. The shape removed is the one :func:`compile_semantic_query` and
-    :func:`compile_free_form_sql` render for an expose that restricts columns or rows.
+    refused. The shape removed is the one :func:`compile_semantic_query` renders
+    for an expose that restricts columns or rows, and :func:`compile_free_form_sql` for
+    every expose.
     """
     return _PROJECTION_OPEN_RE.sub("(", sql_body)
 
@@ -1702,38 +1703,66 @@ _FILE_LIKE_TABLE_RE = re.compile(r"[./\\*:]")
 _PROJECTION_CLAUSES = frozenset({"expressions", "from", "from_", "where"})
 
 
-def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
-    """The columns ``sample`` and ``query_sql`` read on ``expose``: the ones
-    ``contract.schema`` declares, minus ``restricted``, in schema order.
-
-    The expose is the boundary for every caller, readers included: a column the
-    contract does not declare is not read, so a column added to the table later stays
-    unreadable until the contract declares it. Fails closed when the contract declares
-    no column, or a column whose name is not a plain identifier, since the projection
-    selects each column by its name."""
+def declared_columns(expose: Mapping[str, Any]) -> List[str]:
+    """The column names ``contract.schema`` declares on ``expose``, as written, in schema
+    order. ``sample`` and ``query_sql`` read only these, for every caller, so a column
+    added to the table later stays unreadable until the contract declares it. Raises
+    :class:`QueryValidationError` when the contract declares none."""
     contract = expose.get("contract")
     schema = contract.get("schema") if isinstance(contract, Mapping) else None
-    declared: List[str] = []
-    for column in schema if isinstance(schema, list) else []:
-        name = column.get("name") if isinstance(column, Mapping) else None
-        if not isinstance(name, str):
-            continue
-        try:
-            declared.append(validate_ident(name))
-        except ValueError:
-            raise QueryValidationError(
-                f"contract.schema declares the column {name!r}, which is not a plain "
-                "identifier (a letter or underscore, then letters, digits and underscores). "
-                "sample and query_sql read only the columns contract.schema declares, each "
-                "by its plain name: rename the column, or expose it through a view."
-            ) from None
-    if not declared:
+    names = [
+        column["name"]
+        for column in (schema if isinstance(schema, list) else [])
+        if isinstance(column, Mapping) and isinstance(column.get("name"), str)
+    ]
+    if not names:
         raise QueryValidationError(
             "This expose declares no column in contract.schema, so sample and query_sql "
             "have nothing they may read: they read only the columns the contract declares. "
             "Declare the expose's columns in contract.schema."
         )
-    return _allowed_names(declared, restricted)
+    return names
+
+
+def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
+    """The columns ``query_sql``'s projection selects on ``expose``: the ones
+    ``contract.schema`` declares (:func:`declared_columns`), less ``restricted``, in
+    schema order. A restricted column is never read, so only the others must be plain
+    identifiers: the projection selects each by its name. Fails closed when a column it
+    selects is not one, or when every declared column is restricted."""
+    denied = {name.casefold() for name in restricted}
+    readable: List[str] = []
+    seen: Set[str] = set()
+    for name in declared_columns(expose):
+        folded = name.casefold()
+        if folded in denied or folded in seen:
+            continue
+        seen.add(folded)
+        try:
+            readable.append(validate_ident(name))
+        except ValueError:
+            raise QueryValidationError(
+                f"contract.schema declares the column {name!r}, which is not a plain "
+                "identifier (a letter or underscore, then letters, digits and underscores). "
+                "query_sql reads the exposed table through a projection that names each "
+                "declared column: rename the column, or expose it through a view."
+            ) from None
+    if not readable:
+        raise QueryValidationError(
+            "Every column this expose declares is restricted, so query_sql has no column "
+            "it may read."
+        )
+    return readable
+
+
+def _engine_identifier(identifier: Any, read: Optional[str]) -> str:
+    """``identifier`` quoted, naming what the engine reads it as: an unquoted name is
+    folded first, the way :func:`_projected_name` folds a bare name, and a quoted name
+    is kept as written."""
+    if identifier.quoted:
+        written: str = identifier.sql(dialect=read)
+        return written
+    return _projected_name(identifier.name, read) if read is not None else identifier.name
 
 
 def _projected_name(name: str, read: Optional[str]) -> str:
@@ -1755,13 +1784,6 @@ def _projected_name(name: str, read: Optional[str]) -> str:
     return rendered
 
 
-def projection_columns(names: Iterable[str], dialect: Optional[str]) -> str:
-    """The select list of a projection of ``names`` on the engine a driver's
-    ``dialect`` token names, each column as :func:`_projected_name` renders it."""
-    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
-    return ", ".join(_projected_name(name, read) for name in names)
-
-
 def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
     """Refuse a caller statement that uses the ``TABLE`` keyword.
 
@@ -1781,8 +1803,7 @@ def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
         raise _unreadable_sql() from None
     if any(token.token_type == TokenType.TABLE for token in tokens):
         raise QueryValidationError(
-            "sql may not use the TABLE keyword on an expose that restricts columns or rows; "
-            "select from the exposed table by name."
+            "sql may not use the TABLE keyword; select from the exposed table by name."
         )
 
 
@@ -1818,8 +1839,7 @@ def _require_plain_sources(tree: Any) -> None:
         if not _is_plain_source(node.this, allow_lateral=isinstance(node, (exp.From, exp.Join))):
             raise QueryValidationError(
                 "sql may only read from tables named in the usual way, subqueries, UNNEST "
-                "and VALUES on an expose that restricts columns or rows; query the exposed "
-                "table directly."
+                "and VALUES; query the exposed table directly."
             )
 
 
@@ -2010,16 +2030,16 @@ def _refuse_unprojectable_reads(tree: Any, exposed_name: str, read: Optional[str
     for table in tables:
         if not isinstance(table.this, exp.Identifier) or _FILE_LIKE_TABLE_RE.search(table.name):
             raise QueryValidationError(
-                "sql may not read from a table function or a file path on an expose that "
-                "restricts columns or rows; query the exposed table directly."
+                "sql may not read from a table function or a file path; query the exposed "
+                "table directly."
             )
     # Any other relation is outside the projection: a catalog view such as Postgres's
     # ``pg_stats`` holds values of every row and column of the table.
     for name in _names_outside_ctes(tree, read):
         if name.casefold() != exposed_name:
             raise QueryValidationError(
-                f"sql reads {name!r}; on an expose that restricts columns or rows a "
-                "statement reads only the exposed table, its own CTEs, VALUES and UNNEST."
+                f"sql reads {name!r}; a statement reads only the exposed table, VALUES, "
+                "UNNEST and a CTE of its own (on DuckDB, written FROM-first)."
             )
     return tables
 
@@ -2255,9 +2275,9 @@ def _written_name(node: Any, sql: str) -> Optional[str]:
 
 def _unlisted_function(name: str) -> str:
     return (
-        f"sql calls {name}, which a statement on an expose with row filters may not call: it "
-        "may use aggregates, window functions, and the common conditional, math, string, "
-        "date, conversion, JSON and array functions."
+        f"sql calls {name}, which query_sql may not call: a statement may use aggregates, "
+        "window functions, and the common conditional, math, string, date, conversion, JSON "
+        "and array functions."
     )
 
 
@@ -3504,10 +3524,14 @@ def _accepted_spellings(name: str, db: str, catalog: str) -> List[str]:
     return spellings
 
 
-def _splice_projection(sql: str, tables: List[Any], exposed: Any, projection: str) -> str:
+def _splice_projection(
+    sql: str, tables: List[Any], exposed: Any, projection: str, read: Optional[str] = None
+) -> str:
     """``sql`` with ``projection`` written over the source span of every read of the
     exposed table, so everything else in the statement reaches the engine exactly as
-    written (sqlglot cannot print every engine function it can parse)."""
+    written (sqlglot cannot print every engine function it can parse). A read without
+    an alias gets the caller's name for the table as one, quoted, so a table named like
+    a reserved word (``public.order``) still reads."""
     exposed_name = exposed.name.casefold()
     splices: List[Tuple[int, int, str]] = []
     for table in tables:
@@ -3516,7 +3540,11 @@ def _splice_projection(sql: str, tables: List[Any], exposed: Any, projection: st
         spans = [part.meta for part in table.parts]
         if any("start" not in span or "end" not in span for span in spans):
             raise _unreadable_sql()
-        replacement = projection if table.args.get("alias") else f"{projection} AS {exposed.name}"
+        replacement = (
+            projection
+            if table.args.get("alias")
+            else f"{projection} AS {_engine_identifier(table.this, read)}"
+        )
         splices.append((min(m["start"] for m in spans), max(m["end"] for m in spans), replacement))
     rewritten = sql
     for begin, finish, replacement in sorted(splices, reverse=True):
@@ -3629,10 +3657,13 @@ def _project_exposed_table(
     tree = statements[0]
     _require_plain_sources(tree)
     exposed_name = exposed.name.casefold()
+    # Every caller: only listed functions. Some engine functions read past the
+    # projection, naming another relation or the server's state by an argument (a
+    # view's definition, the server's settings, an object's DDL).
+    _refuse_unlisted_functions(tree, sql, read)
     if predicate is not None:
-        # A filtered caller: only listed functions, and nothing a planner could run on a
-        # row the filter removes that would raise an error there.
-        _refuse_unlisted_functions(tree, sql, read)
+        # A filtered caller: nothing a planner could run on a row the filter removes
+        # that would raise an error there.
         _refuse_conditions_that_can_fail(tree, sql, column_types, exposed_name, read)
         _refuse_values_a_subquery_computes(tree, read)
     tables = _refuse_unprojectable_reads(tree, exposed_name, read)
@@ -3644,7 +3675,7 @@ def _project_exposed_table(
     )
     columns = ", ".join(_projected_name(name, read) for name in allowed)
     projection = f"(SELECT {columns} FROM {table_reference}{row_filter})"
-    rewritten = _splice_projection(sql, tables, exposed, projection)
+    rewritten = _splice_projection(sql, tables, exposed, projection, read)
     try:
         checked = sqlglot.parse_one(rewritten, read=read)
     except SqlglotError:
@@ -3736,7 +3767,8 @@ def compile_free_form_sql(
       projection of the columns ``contract.schema`` declares (:func:`readable_columns`),
       for every caller: a reader no filter narrows reads every row of that projection,
       and a filtered caller the rows above. The statement reads nothing else: only the
-      exposed table, its own CTEs, ``VALUES`` and ``UNNEST``, so no other table, view,
+      exposed table, ``VALUES``, ``UNNEST`` and a CTE of its own (on DuckDB, written
+      FROM-first), so no other table, view,
       catalog view, table function or file. It may not use the ``TABLE`` keyword, and
       on DuckDB the engine's own parser checks the rewritten statement too, the row
       filter included. Without an ``expose`` only the checks above apply.

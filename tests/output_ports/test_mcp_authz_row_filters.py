@@ -488,7 +488,7 @@ def test_an_unfiltered_reader_reads_every_row_of_the_declared_projection():
     no row filter: every row, but nothing the contract does not declare."""
     compiled = _compile_for("SELECT id FROM customers", EVERYONE)
     assert compiled.sql.startswith("SELECT id FROM (SELECT ")
-    assert compiled.sql.endswith(" FROM customers) AS customers\nLIMIT 10")
+    assert compiled.sql.endswith(' FROM customers) AS "customers"\nLIMIT 10')
     assert "_fluid_rows" not in compiled.sql and compiled.row_filter is None
 
 
@@ -930,7 +930,7 @@ def test_a_cte_name_is_matched_the_way_postgres_folds_it(sql, refused):
         with pytest.raises(query_compiler.QueryValidationError, match="sql reads"):
             project()
     else:
-        assert '(SELECT "id" FROM customers) AS customers' in project()
+        assert '(SELECT "id" FROM customers) AS "customers"' in project()
 
 
 @pytest.mark.parametrize(
@@ -1150,9 +1150,13 @@ def test_a_filtered_caller_may_call_the_listed_functions(dialect, sql):
     assert "_fluid_rows.region = 'EU'" in _compile_for(sql, dialect=dialect).sql
 
 
-def test_an_unfiltered_reader_is_not_limited_to_the_listed_functions():
-    """A reader no filter narrows reads every row, so no row is withheld from it."""
-    assert "my_lookup" in _compile_for("SELECT my_lookup(region) FROM customers", EVERYONE).sql
+def test_an_unfiltered_reader_calls_only_listed_functions_too():
+    """A reader no filter narrows has no row withheld, so its conditions are not
+    limited. The function list still holds: a function can read past the projection."""
+    sql = "SELECT id FROM customers WHERE CAST(segment AS INT) > 0"
+    assert "CAST(segment AS INT)" in _compile_for(sql, EVERYONE).sql
+    with pytest.raises(query_compiler.QueryValidationError, match="calls my_lookup, which"):
+        _compile_for("SELECT my_lookup(region) FROM customers", EVERYONE)
 
 
 # ---------------------------------------------------------------------
