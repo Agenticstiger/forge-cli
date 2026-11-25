@@ -1020,6 +1020,7 @@ module = [
     "fluid_build.profiler.document",
     "fluid_build.profiler.facts",
     "fluid_build.profiler.grouped",
+    "fluid_build.profiler.history",
     "fluid_build.profiler.per_entity",
     "fluid_build.profiler.ranks",
     "fluid_build.profiler.request",
