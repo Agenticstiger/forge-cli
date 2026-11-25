@@ -2261,7 +2261,7 @@ _TYPE_KINDS: Tuple[Tuple[str, FrozenSet[str]], ...] = (
             | {"float32", "float4", "float64", "float8", "hugeint", "int", "int128", "int16"}
             | {"int2", "int32", "int4", "int64", "int8", "integer", "mediumint", "money"}
             | {"number", "numeric", "real", "smallint", "tinyint", "ubigint", "uhugeint"}
-            | {"uinteger", "usmallint", "utinyint"}
+            | {"uinteger", "usmallint", "utinyint", "long", "short", "byte"}
         ),
     ),
     ("boolean", frozenset({"bool", "boolean"})),
@@ -2329,6 +2329,11 @@ def catalog_columns_sql(table_reference: str, dialect: Optional[str]) -> str:
         filters = [f"lower(table_name) = {quote_string_literal(table.name.lower())}"]
         if db is not None:
             filters.append(f"lower(table_schema) = {quote_string_literal(db.name.lower())}")
+        else:
+            # The schema an unqualified name resolves to, so a same-named table in
+            # another schema is not read as this one.
+            current = "current_schema" if read == "trino" else "current_schema()"
+            filters.append(f"table_schema = {current}")
     return f"SELECT column_name, data_type FROM {source} WHERE {' AND '.join(filters)}"
 
 
@@ -2636,6 +2641,7 @@ def _refuse_an_untyped_comparison(
     scope_of: Mapping[int, Any],
     kept: Tuple[type, ...],
     read: Optional[str],
+    declared: Mapping[str, Optional[str]],
 ) -> None:
     """Refuse a comparison unless every side has a known scalar kind and the kinds match:
     an engine casts a mismatched value, and a cast of a column's value runs on every row
@@ -2643,7 +2649,7 @@ def _refuse_an_untyped_comparison(
     function (HAVING, QUALIFY) compare values of the rows the filter keeps."""
     from sqlglot import exp
 
-    if kept and node.find(*kept) is not None:
+    if kept and (node.find(*kept) is not None or _names_a_kept_alias(node, kinds, kept, declared)):
         return
     groups = _comparison_sides(node)
     query = node.args.get("query") if isinstance(node, exp.In) else None
@@ -2680,8 +2686,43 @@ def _refuse_an_untyped_comparison(
             )
 
 
+def _names_a_kept_alias(
+    node: Any,
+    kinds: Mapping[int, Optional[str]],
+    kept: Tuple[type, ...],
+    declared: Mapping[str, Optional[str]],
+) -> bool:
+    """Whether ``node`` (a HAVING or QUALIFY term) reads a column that names, in its own
+    select list, an aggregate or a window function, and no declared column: such an
+    alias is a value of the rows the filter keeps (``QUALIFY r = 1`` for
+    ``row_number() OVER (...) AS r``). An alias that shadows a declared column could be
+    read as that column, so it is typed as one."""
+    from sqlglot import exp
+
+    select = node.find_ancestor(exp.Select)
+    if select is None:
+        return False
+    aliases = {
+        item.alias.casefold()
+        for item in select.expressions
+        if isinstance(item, exp.Alias) and item.this.find(*kept) is not None
+    }
+    columns = [node] if isinstance(node, exp.Column) else list(node.find_all(exp.Column))
+    return any(
+        not column.table
+        and kinds.get(id(column)) is None
+        and column.name.casefold() in aliases
+        and column.name.casefold() not in declared
+        for column in columns
+    )
+
+
 def _refuse_a_non_boolean_operand(
-    node: Any, kinds: Mapping[int, Optional[str]], kept: Tuple[type, ...], read: Optional[str]
+    node: Any,
+    kinds: Mapping[int, Optional[str]],
+    kept: Tuple[type, ...],
+    read: Optional[str],
+    declared: Mapping[str, Optional[str]],
 ) -> None:
     """Refuse a condition, or an operand of AND, OR, NOT or IS TRUE / IS FALSE, that is
     not itself a predicate: an engine would cast the value to a boolean on every row it
@@ -2691,15 +2732,15 @@ def _refuse_a_non_boolean_operand(
 
     node = _unparen(node)
     if isinstance(node, (exp.And, exp.Or)):
-        _refuse_a_non_boolean_operand(node.this, kinds, kept, read)
-        _refuse_a_non_boolean_operand(node.expression, kinds, kept, read)
+        _refuse_a_non_boolean_operand(node.this, kinds, kept, read, declared)
+        _refuse_a_non_boolean_operand(node.expression, kinds, kept, read, declared)
         return
     if isinstance(node, exp.Not):
-        _refuse_a_non_boolean_operand(node.this, kinds, kept, read)
+        _refuse_a_non_boolean_operand(node.this, kinds, kept, read, declared)
         return
     if isinstance(node, exp.Is):
         if not isinstance(node.expression, exp.Null):
-            _refuse_a_non_boolean_operand(node.this, kinds, kept, read)
+            _refuse_a_non_boolean_operand(node.this, kinds, kept, read, declared)
         return
     predicates = (
         exp.EQ,
@@ -2722,7 +2763,7 @@ def _refuse_a_non_boolean_operand(
         return
     if isinstance(node, exp.Column) and kinds.get(id(node)) == "boolean":
         return
-    if kept and isinstance(node, kept):
+    if kept and (isinstance(node, kept) or _names_a_kept_alias(node, kinds, kept, declared)):
         return
     raise QueryValidationError(
         f"sql uses {node.sql(dialect=read)[:80]!r} as a condition; on an expose with row "
@@ -2774,6 +2815,23 @@ def _refuse_an_unknown_truth_test(sql: str, read: Optional[str]) -> None:
                 "sql tests a value with IS UNKNOWN; on an expose with row filters test it with "
                 "IS NULL, or write a comparison (an engine casts the value to a boolean on "
                 "every row it reads)."
+            )
+
+
+def _refuse_renamed_table_columns(tree: Any, read: Optional[str]) -> None:
+    """Refuse a table reference with an alias column list (``customers AS c(a, b)``).
+    It renames the table's columns by position, so a name in the statement would no
+    longer be the declared column of that name, and its type could not be checked. A
+    derived table's column list is read by position instead."""
+    from sqlglot import exp
+
+    for table in tree.find_all(exp.Table):
+        alias = table.args.get("alias")
+        if isinstance(alias, exp.TableAlias) and alias.columns:
+            raise QueryValidationError(
+                f"sql renames the columns of {table.sql(dialect=read)[:80]!r} with an alias "
+                "column list; on an expose with row filters name a table's columns as its "
+                "declaration does (a renamed column could not be typed)."
             )
 
 
@@ -2855,6 +2913,7 @@ def _refuse_conditions_that_can_fail(
     from sqlglot import exp
 
     declared = declared or {}
+    _refuse_renamed_table_columns(tree, read)
     kinds, scope_of = _kinds_of_columns(tree, declared, exposed_name)
     _refuse_an_unknown_truth_test(sql, read)
     _refuse_untyped_joins(tree, kinds, scope_of, declared, exposed_name, read)
@@ -2873,7 +2932,7 @@ def _refuse_conditions_that_can_fail(
         exp.Between,
     )
     for condition, kept in _conditions(tree):
-        _refuse_a_non_boolean_operand(condition, kinds, kept, read)
+        _refuse_a_non_boolean_operand(condition, kinds, kept, read, declared)
         stops = subqueries + kept
         for node in condition.walk(prune=lambda n: isinstance(n, stops) or _is_constant(n)):
             if isinstance(node, stops) or _is_constant(node):
@@ -2881,7 +2940,7 @@ def _refuse_conditions_that_can_fail(
             if isinstance(node, exp.Escape):
                 _refuse_a_like_that_can_fail(node.this, kinds, scope_of, read)
             if isinstance(node, comparisons):
-                _refuse_an_untyped_comparison(node, kinds, scope_of, kept, read)
+                _refuse_an_untyped_comparison(node, kinds, scope_of, kept, read, declared)
             if isinstance(node, (exp.Like, exp.ILike)):
                 _refuse_a_like_that_can_fail(node, kinds, scope_of, read)
             if isinstance(node, (exp.Lower, exp.Upper, exp.Coalesce)) and (

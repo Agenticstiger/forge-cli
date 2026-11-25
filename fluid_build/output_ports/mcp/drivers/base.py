@@ -460,7 +460,10 @@ class EngineDriver(ABC):
                 fields = {str(key).lower(): value for key, value in row.items()}
                 name = fields.get("column_name")
                 if isinstance(name, str):
-                    kinds[name.casefold()] = kind_of_type(fields.get("data_type"))
+                    kind = kind_of_type(fields.get("data_type"))
+                    folded = name.casefold()
+                    # Two catalog rows for one name with different kinds: not known.
+                    kinds[folded] = kind if kinds.get(folded, kind) == kind else None
             self._physical_kinds = kinds
         return dict(self._physical_kinds)
 

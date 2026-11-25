@@ -459,8 +459,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     refused;
   - both sides of a comparison have one known kind (string, number, boolean, date and time,
     interval, binary or uuid). A column has the kind of the type `contract.schema` declares for
-    it, read through CTEs and derived tables that select it unchanged, and that type must be
-    the table's own, which the gateway reads from the engine's catalog once per expose. A
+    it, read through CTEs and derived tables that select it unchanged (a derived table's column
+    list by position; an alias column list on a table reference is refused), and that type must
+    be the table's own, which the gateway reads from the engine's catalog once per expose, in
+    the current schema when the binding names none (a name the catalog reports with two kinds
+    is not typed). A
     constant is a literal, a cast or an interval of one, or the current date or time. A column
     declared without a type, a `VALUES` or `UNNEST` column, a computed value and a JSON, array,
     map or struct value are not compared, a `USING` column must have one kind on both sides,

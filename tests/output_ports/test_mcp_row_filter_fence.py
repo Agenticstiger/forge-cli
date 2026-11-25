@@ -20,6 +20,7 @@ Each refused statement below is one the engine could fail on for a withheld row'
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -201,6 +202,44 @@ def test_a_comparison_the_gateway_cannot_type_is_refused(sql, dialect):
 def test_what_a_subquery_or_a_renaming_returns_is_typed_or_refused(sql):
     with pytest.raises(query_compiler.QueryValidationError, match=_REFUSAL):
         _fence(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            "SELECT count(*) FROM customers AS c(a1, a2, created) "
+            "WHERE c.created = DATE '2024-01-01'",
+            id="exposed-table",
+        ),
+        pytest.param(
+            "SELECT * FROM (WITH x AS (FROM customers) FROM x AS y(p, q) WHERE q = 'EU') AS z",
+            id="cte-reference",
+        ),
+    ],
+)
+@pytest.mark.parametrize("dialect", ["duckdb", "snowflake"])
+def test_an_alias_column_list_on_a_table_is_refused(sql, dialect):
+    """It renames the columns by position, so a name no longer has its declared type."""
+    if "WITH" in sql and dialect != "duckdb":
+        pytest.skip("a FROM-first CTE is DuckDB syntax")
+    with pytest.raises(query_compiler.QueryValidationError, match="alias column list"):
+        _fence(sql, dialect)
+
+
+def test_a_window_alias_is_a_kept_value_in_qualify():
+    _compile(
+        "SELECT id, row_number() OVER (PARTITION BY region ORDER BY id) AS r "
+        "FROM customers QUALIFY r = 1"
+    )
+
+
+def test_an_alias_that_shadows_a_column_is_still_typed():
+    with pytest.raises(query_compiler.QueryValidationError, match=_REFUSAL):
+        _compile(
+            "SELECT amount, count(*) AS amount FROM customers GROUP BY amount "
+            "HAVING amount = '5'"
+        )
 
 
 @pytest.mark.parametrize(
@@ -433,6 +472,25 @@ def test_the_table_types_are_read_once_per_driver(state_for):
     assert sum("information_schema.columns" in sql for sql in seen) == 1
 
 
+def test_conflicting_catalog_rows_leave_a_column_untyped(state_for):
+    """Two rows for one name with different kinds (a same-named table elsewhere) make
+    the column's kind unknown, so its declared type cannot be confirmed."""
+    state = state_for(_CSV_SCHEMA)
+    driver = state.get_driver()
+    execute = driver.execute
+
+    def doubled(**kwargs: Any):
+        result = execute(**kwargs)
+        if "information_schema" not in kwargs["sql"]:
+            return result
+        extra = {"column_name": "amount", "data_type": "VARCHAR"}
+        return SimpleNamespace(columns=result.columns, rows=(*result.rows, extra))
+
+    driver.execute = doubled
+    with pytest.raises(query_compiler.RowFilterUnavailable, match="'amount' as a number"):
+        _ids(state, "SELECT id FROM customers")
+
+
 def test_an_unreadable_catalog_refuses_a_filtered_caller(state_for):
     state = state_for(_CSV_SCHEMA)
     driver = state.get_driver()
@@ -455,7 +513,7 @@ def test_an_unreadable_catalog_refuses_a_filtered_caller(state_for):
             "duckdb",
             "customers",
             "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE lower(table_name) = 'customers'",
+            "WHERE lower(table_name) = 'customers' AND table_schema = current_schema()",
         ),
         (
             "postgres",
@@ -502,6 +560,8 @@ def test_the_catalog_statement_each_engine_runs(dialect, reference, statement):
         ("VARIANT", "complex"),
         ("jsonb", "complex"),
         ("row(a integer)", "complex"),
+        ("LONG", "number"),
+        ("SHORT", "number"),
         ("USER-DEFINED", None),
         ("", None),
     ],
