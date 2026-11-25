@@ -64,14 +64,18 @@ def names_refused_duckdb_function(sql: str) -> bool:
 
 #: Postgres functions that read a relation or run a statement given as a string: the
 #: XML family returns a whole table, schema, database or query result, ``ts_stat`` and
-#: ``ts_rewrite`` run a query given as text (``ts_stat('SEL' || 'ECT ... FROM t')``
-#: spells it without the word), ``connectby`` reads a table named in text, and the
+#: ``ts_rewrite`` run a query given as text (which a statement can put together at run
+#: time), ``connectby`` reads a table named in text, and the
 #: ``crosstab``, ``dblink`` and ``pgstat`` families run a query or read a relation by
 #: name, and the ``pg_stat`` family reports a relation's row counts. The pageinspect
 #: functions return raw pages, so raw tuples of every row; ``pgrowlocks`` reports the
 #: rows a table has locked; ``pg_prepared_statement`` and ``pg_cursor`` show other
-#: requests' statements on the shared connection; and ``set_config`` changes the
-#: session every later request on that connection runs in. No table node and no column
+#: requests' statements on the shared connection; ``set_config`` and
+#: ``current_setting`` set and read the session every later request on that connection
+#: runs in; ``nextval`` and ``setval`` change a sequence; ``pg_relation_filepath`` names a
+#: table's file for the file readers below; and ``pg_cancel_backend``,
+#: ``pg_terminate_backend`` and ``pg_reload_conf`` reach other sessions and the server.
+#: No table node and no column
 #: name shows in the text a check here reads, so the engine reads past any column
 #: projection or row filter the caller's statement was limited to. Refused as a call,
 #: in any case, quoted or schema-qualified, on every dialect; a column that only shares
@@ -79,15 +83,22 @@ def names_refused_duckdb_function(sql: str) -> bool:
 POSTGRES_REFUSED_FUNCTIONS = frozenset(
     {
         "connectby",
+        "current_setting",
         "cursor_to_xml",
         "cursor_to_xmlschema",
+        "nextval",
+        "pg_cancel_backend",
         "pg_cursor",
         "pg_prepared_statement",
+        "pg_relation_filepath",
+        "pg_reload_conf",
+        "pg_terminate_backend",
         "pgrowlocks",
         "query_to_xml",
         "query_to_xml_and_xmlschema",
         "query_to_xmlschema",
         "set_config",
+        "setval",
         "table_to_xml",
         "table_to_xml_and_xmlschema",
         "table_to_xmlschema",
@@ -128,7 +139,12 @@ POSTGRES_REFUSED_FUNCTIONS = frozenset(
 POSTGRES_REFUSED_RELATIONS = frozenset({"pg_cursors", "pg_prepared_statements"})
 #: Families whose every member is refused: ``schema_to_xml*``, ``database_to_xml*``,
 #: ``crosstab*`` (tablefunc), ``dblink*``, ``pgstat*`` (pgstattuple) and ``pg_stat*``
-#: (the statistics functions, such as ``pg_stat_get_live_tuples``).
+#: (the statistics functions, such as ``pg_stat_get_live_tuples``); the server-file
+#: readers and writers ``pg_read_*``, ``pg_ls_*``, ``pg_file_*`` (adminpack) and ``lo_*``
+#: (large objects), which read a table's own files; ``pg_get_wal*`` (pg_walinspect) and
+#: ``pg_logical*`` (logical decoding), which read the changes made to every row;
+#: ``pg_create_*`` (replication slots, restore points); ``pg_advisory*`` (locks that
+#: outlive a request); and ``pg_sleep*``.
 POSTGRES_REFUSED_FUNCTION_PREFIXES = (
     "schema_to_xml",
     "database_to_xml",
@@ -136,6 +152,15 @@ POSTGRES_REFUSED_FUNCTION_PREFIXES = (
     "dblink",
     "pgstat",
     "pg_stat",
+    "pg_read_",
+    "pg_ls_",
+    "pg_file_",
+    "lo_",
+    "pg_get_wal",
+    "pg_logical",
+    "pg_create_",
+    "pg_advisory",
+    "pg_sleep",
 )
 
 _POSTGRES_REFUSED_RE = re.compile(

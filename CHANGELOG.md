@@ -413,6 +413,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that restricts columns or filters rows, `other.customers` was read as the exposed table, so the
   caller saw its filtered rows under another table's name. A read now names the table unqualified
   or as the expose binds it (on DuckDB, `main` is the binding's schema).
+- **More Postgres functions are refused on every expose: those that read server files, the
+  write-ahead log or logical-decoding changes, or touch the session, sequences, locks or other
+  sessions.** `query_sql`, contract expressions and the drivers' statement guard refuse
+  `pg_read_*`, `pg_ls_*`, `pg_file_*`, `lo_*`, `pg_get_wal*`, `pg_logical*`, `pg_create_*`,
+  `pg_advisory*`, `pg_sleep*`, `current_setting`, `nextval`, `setval`, `pg_relation_filepath`,
+  `pg_cancel_backend`, `pg_terminate_backend` and `pg_reload_conf`. A role allowed to call the
+  file and write-ahead-log readers reads the rows a row filter withholds.
 - **The governed `query` tool evaluates every measure, dimension and filter expression over the
   columns the expose allows.** On an expose with `columnRestrictions` or masking, the statement now
   reads `FROM (SELECT <allowed columns> FROM <table>) AS _fluid_allowed`, so a restricted column is

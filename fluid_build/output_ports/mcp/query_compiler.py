@@ -2182,14 +2182,16 @@ def compile_free_form_sql(
         )
     if names_refused_postgres_function(candidate):
         raise QueryValidationError(
-            "sql may not call a function that reads a relation or runs a query given as "
-            "text, or that changes the session (table_to_xml, query_to_xml, cursor_to_xml, "
-            "schema_to_xml, database_to_xml, ts_stat, ts_rewrite, connectby, crosstab, "
-            "dblink, pgstattuple, pg_stat_*, pgrowlocks, get_raw_page and the other "
-            "pageinspect functions, pg_cursor, pg_prepared_statement, set_config and their "
-            "variants), name the pg_cursors or pg_prepared_statements views, or write a name "
-            'or a string with Unicode escapes (U&"..."). Select the columns of the exposed '
-            "table directly."
+            "sql may not call a function that reads a relation, a server file or the "
+            "write-ahead log, runs a query given as text, or changes the session or the "
+            "server (table_to_xml, query_to_xml, cursor_to_xml, schema_to_xml, "
+            "database_to_xml, ts_stat, ts_rewrite, connectby, crosstab, dblink, pgstattuple, "
+            "pg_stat_*, pgrowlocks, get_raw_page and the other pageinspect functions, "
+            "pg_read_*, pg_ls_*, lo_*, pg_get_wal_*, pg_logical_*, pg_cursor, "
+            "pg_prepared_statement, set_config, current_setting, nextval, setval, pg_sleep, "
+            "pg_advisory_* and their variants), name the pg_cursors or pg_prepared_statements "
+            'views, or write a name or a string with Unicode escapes (U&"..."). Select the '
+            "columns of the exposed table directly."
         )
     validate_sql_expression_allowlist(body)
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
