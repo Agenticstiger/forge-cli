@@ -1245,6 +1245,20 @@ def _measured_for_request(
         ),
     ):
         rates = query_rates.measure(query_plans, by_table, backend, rule, links)
+        for queried in rates.tables:
+            # a column's published cells are held beside the facts and queries that read it
+            named = set(query_plans.columns_of(queried)) | {
+                column
+                for each in fact_plans
+                if each.reason is None and each.table == queried
+                for column in each.columns
+            }
+            rates.fold(
+                queried,
+                query_rates.published_cells(
+                    tables_doc.get(queried, {}), by_table[queried], backend, named, fractional_bits
+                ),
+            )
         invariants, fact_results, unmeasured = _fact_entries(
             contract, fact_plans, by_table, rule, tallies[0], rates
         )
@@ -1806,7 +1820,8 @@ def _fact_entries(
             # the table's queries are members of the same set as its facts
             names = [each.name for each in on_table]
             passed = {name for name in names if refused[name] is None}
-            withheld = rates.check_table(table, names, states, passed, together, rule)
+            columns = {each.name: frozenset(each.columns) for each in on_table}
+            withheld = rates.check_table(table, names, states, passed, together, rule, columns)
         elif on_table:
             assert together is not None
             withheld = _differenced(on_table, states, refused, rule, together)

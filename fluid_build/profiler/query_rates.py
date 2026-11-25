@@ -95,6 +95,16 @@ is written as a fact withheld by it (``D``); a group that is the only way to a w
 size withholds the others the same way, so some groups of a query may be published and others
 withheld. Nothing is published that depends on a query's text.
 
+A column's published cells are held in the same set (:func:`published_cells`): the levels of an
+ungrouped level histogram and the bins of an ungrouped histogram of a number or timestamp
+column, each with the rows of its withheld cells as one more cell, or the rows with a value
+where the column's ``count`` or ``nullCount`` is published. They are published already, so the
+set check never withholds them (``fixed`` in
+:func:`~fluid_build.profiler.disclosure.suppress_differencing`). A column's cells are held beside
+the parts whose texts read the column, and for small cells only, before any rounding:
+``region IN ('NORTH', 'WEST')`` less a published ``NORTH`` cell would be a withheld ``WEST``
+one, so that query is withheld.
+
 **One way per table.** A run counts one table's records one way: as its rows (a fact asked of the
 table, a table unit, a view unit) or as its entities by one column (an entity unit). A fact
 decides first, then the first query in the request's order that is answered; a query whose unit
@@ -111,10 +121,13 @@ As a backstop, any failure that still depends on the records withholds every que
 with :data:`RUN_FAILED`, so a run says at most one bit (that some statement failed), never which
 query or which record.
 
-**What is left.** A query is checked as a set with the table's facts and the other queries and
-units over that table, not with a column's level histogram, ``nullCount`` or row count beside
-it (facts have the same limit), and an entity unit's population is not checked with its table's
-own statistics, which count the same records where every entity holds one row. A counted entity
+**What is left.** The cells of a grouped statistic, a quantile, a support, a calendar, a date
+span or pair and a relationship's counts are not held in a table's set, a column's cells are not
+held beside a part that does not read the column, and no zero cell is looked for beside a
+column's cells (a part that names the column empties many of them by its text). A table's facts
+asked with no query over that table keep the facts' own check, without its columns' cells. An
+entity unit's population is not checked with its table's own statistics, which count the same
+records where every entity holds one row. A counted entity
 population is checked apart from the parent table's own facts and queries: two sets over the
 same rows, never crossed with each other, so a query over the parent's rows and one over its
 entities are not differenced together. A reader can difference such counts, and the rounding
@@ -136,7 +149,9 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from decimal import Context, Decimal, InvalidOperation, localcontext
+from fractions import Fraction
 from typing import (
+    AbstractSet,
     Any,
     Callable,
     Dict,
@@ -182,6 +197,7 @@ __all__ = [
     "QueryResult",
     "measure",
     "plan_queries",
+    "published_cells",
     "report_lines",
 ]
 
@@ -1518,6 +1534,12 @@ class Measured:
         self.populations: List[_Population] = []
         self._entity_true: Dict[int, int] = {}
         self._populations_checked = False
+        #: Each table's published column cells, held in its set check (:meth:`fold`).
+        self._cells: Dict[str, List["_Cells"]] = {}
+
+    def fold(self, table: str, cells: Sequence["_Cells"]) -> None:
+        """Hold *cells*, a table's published column cells, in that table's set check."""
+        self._cells[table] = list(cells)
 
     def has_table(self, table: str) -> bool:
         return bool(self.tables.get(table))
@@ -1553,14 +1575,20 @@ class Measured:
         fact_passed: Set[str],
         together: Any,
         rule: disclosure.DisclosureRule,
+        fact_columns: Optional[Mapping[str, AbstractSet[str]]] = None,
     ) -> Set[str]:
         """Check *table*'s queries and *facts* as one set; return the facts to withhold.
 
-        *together* is what the facts' texts allow (:func:`fluid_build.profiler.facts.states_together`).
-        The queries' groups the set withholds are recorded for :meth:`entries`.
+        *together* is what the facts' texts allow
+        (:func:`fluid_build.profiler.facts.states_together`) and *fact_columns* the columns each
+        fact's rule reads. The queries' groups the set withholds are recorded for
+        :meth:`entries`. Each column's published cells (:meth:`fold`) are then held with the
+        parts that read the column, small cells only.
         """
         self._checked.add(table)
-        layout = _Layout(self.tables.get(table, []), self._own, facts, fact_states, fact_passed)
+        layout = _Layout(
+            self.tables.get(table, []), self._own, facts, fact_states, fact_passed, fact_columns
+        )
         if not layout.width:
             return set()
         cells = Counter(zip(*layout.states, strict=True))
@@ -1569,11 +1597,21 @@ class Measured:
         def factors(order: Sequence[int]) -> disclosure.Factors:
             return layout.factors(order, together)
 
+        folds = [
+            (each.column, each.folded(layout, together)) for each in self._cells.get(table, [])
+        ]
+        small_only = replace(rule, zeros_disclosive=False)
         while True:
             candidates = [at for at in range(layout.width) if at not in dead]
             found = set(
                 disclosure.suppress_differencing(cells, candidates, rule, factors, _ALL_STATES)
             )
+            for column, (folded, fixed, folded_factors) in folds:
+                reading = [at for at in candidates if column in layout.columns_at[at]]
+                if reading:
+                    found |= disclosure.suppress_differencing(
+                        folded, reading, small_only, folded_factors, _ALL_STATES, fixed
+                    )
             new = (found | layout.dependants(dead | found)) - dead
             if not new:
                 break
@@ -1850,8 +1888,12 @@ class _Layout:
         facts: Sequence[str],
         fact_states: Mapping[str, bytes],
         fact_passed: Set[str],
+        fact_columns: Optional[Mapping[str, AbstractSet[str]]] = None,
     ) -> None:
         self.states: List[bytes] = []
+        #: The columns of the table each position's text reads (a fact's rule, a query and its
+        #: unit, a group's column): a column's published cells are held beside these parts only.
+        self.columns_at: List[FrozenSet[str]] = []
         self.fact_of: Dict[int, str] = {}
         self.query_of: Dict[int, Tuple[int, int]] = {}
         self._fact_at: Dict[str, int] = {}
@@ -1864,6 +1906,7 @@ class _Layout:
             if name in fact_passed:
                 at = len(self.states)
                 self.states.append(fact_states[name])
+                self.columns_at.append(frozenset((fact_columns or {}).get(name, ())))
                 self.fact_of[at] = name
                 self._fact_at[name] = at
         by_column: Dict[str, List[_Member]] = {}
@@ -1874,6 +1917,7 @@ class _Layout:
                     held = self._unit_of(each)
                     at = len(self.states)
                     self.states.append(each.outcomes)
+                    self.columns_at.append(_read_columns(each.plan))
                     self.query_of[at] = (each.plan.index, 0)
                     if held is None:
                         self._single.append((at, each.plan.index))
@@ -1893,6 +1937,9 @@ class _Layout:
         if key not in self._units:
             self._units[key] = (len(self.states), [])
             self.states.append(member.unit)
+            self.columns_at.append(frozenset())
+        at = self._units[key][0]
+        self.columns_at[at] = self.columns_at[at] | _read_columns(member.plan)
         return self._units[key][1]
 
     def _add_column(
@@ -1914,6 +1961,10 @@ class _Layout:
         for kind, level, slot in parts:
             at = len(self.states)
             positions.append(at)
+            reads = frozenset({column})
+            self.columns_at.append(
+                reads if kind == "P" else reads | _read_columns(grouped[slot].plan)
+            )
             if kind == "P":
                 self.states.append(bytes(_IN if g == level else _OUT for g in assigned))
             else:
@@ -1962,6 +2013,158 @@ class _Layout:
             elif all(at in dead for at in queries):
                 more.add(unit_at)
         return more - dead
+
+
+@dataclass(frozen=True)
+class _Cells:
+    """One column's published cells, held in its table's set check and never withheld there.
+
+    ``assigned`` is each row's published cell (an index into the cells) or ``None``: the row's
+    value is null. The last cell is the rows of the levels the histogram withholds when its
+    ``k`` is published, since ``k`` less the published cells counts them.
+    """
+
+    column: str
+    assigned: Tuple[Optional[int], ...] = field(repr=False)
+    width: int
+
+    def folded(
+        self, layout: "_Layout", together: Any
+    ) -> Tuple[
+        "Counter[Combination]", FrozenSet[int], Callable[[Sequence[int]], disclosure.Factors]
+    ]:
+        """The exact counts of the set's parts with these cells, their positions, and factors."""
+        first = layout.width
+        fixed = frozenset(range(first, first + self.width))
+        marks = [
+            tuple(_IN if cell == at else _OUT for at in range(self.width)) for cell in self.assigned
+        ]
+        cells: Counter[Combination] = Counter(
+            (*row, *mark) for row, mark in zip(zip(*layout.states, strict=True), marks, strict=True)
+        )
+        one_hot = frozenset(
+            {(_OUT,) * self.width}
+            | {
+                tuple(_IN if at == cell else _OUT for at in range(self.width))
+                for cell in range(self.width)
+            }
+        )
+
+        def factors(order: Sequence[int]) -> disclosure.Factors:
+            parts = [at for at in order if at < first]
+            mine = tuple(at for at in order if at >= first)
+            found = list(layout.factors(parts, together))
+            if mine:
+                chosen = [at - first for at in mine]
+                found.append(
+                    (mine, frozenset(tuple(each[at] for at in chosen) for each in one_hot))
+                )
+            return found
+
+        return cells, fixed, factors
+
+
+def published_cells(
+    table: Mapping[str, Any],
+    read: Any,
+    backend: StatisticsBackend,
+    named: AbstractSet[str],
+    fractional_bits: int,
+) -> List[_Cells]:
+    """The published cells of each column of *table* in *named*, to hold in its set check.
+
+    *table* is the table's document entry, *read* its one read and *named* the columns the
+    table's facts and queries read. A column's cells are those of each ungrouped level
+    histogram, and each ungrouped histogram of a number or timestamp column, whose group is
+    published; a column with neither whose ``count`` or ``nullCount`` is published has one cell,
+    the rows with a value. A column none of the parts reads shares no cell with them by their
+    texts, and the set check holds it beside the parts that read it only.
+    """
+    found: List[_Cells] = []
+    columns = table.get("columns")
+    if not isinstance(columns, Mapping):
+        return found
+    for name, entry in columns.items():
+        if name not in named or not isinstance(entry, Mapping) or name not in read.values:
+            continue
+        histograms = [each for each in entry.get("statistics") or () if _foldable(each)]
+        if not histograms and not _counted(entry.get("metrics")):
+            continue
+        domain = str(entry.get("domain") or "")
+        values = [
+            backend.read_value(domain, raw, column=name, row_index=index)
+            for index, raw in enumerate(read.values[name])
+        ]
+        if not histograms:
+            found.append(_Cells(name, tuple(None if each is None else 0 for each in values), 1))
+        for statistic in histograms:
+            found.append(_histogram_cells(name, statistic, values, backend, fractional_bits))
+    return found
+
+
+def _foldable(statistic: Any) -> bool:
+    """Whether *statistic* is an ungrouped level or marginal histogram whose group is published."""
+    if not isinstance(statistic, Mapping) or "groupBy" in statistic or "groupByLink" in statistic:
+        return False
+    if statistic.get("definition") not in ("levelHistogram/1", "marginalHistogram/1"):
+        return False
+    groups = statistic.get("groups")
+    return (
+        isinstance(groups, Sequence)
+        and len(groups) == 1
+        and isinstance(groups[0], Mapping)
+        and groups[0].get("status") == disclosure.FREE
+        and (
+            statistic.get("definition") == "levelHistogram/1"
+            or len(statistic.get("bins") or ()) > 1
+        )
+    )
+
+
+def _counted(metrics: Any) -> bool:
+    """Whether a column's ``count`` or ``nullCount`` is published: its rows with a value are."""
+    if not isinstance(metrics, Mapping):
+        return False
+    return any(
+        isinstance(metrics.get(name), Mapping) and metrics[name].get("status") == disclosure.FREE
+        for name in ("count", "nullCount")
+    )
+
+
+def _histogram_cells(
+    name: str,
+    statistic: Mapping[str, Any],
+    values: Sequence[Any],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> _Cells:
+    """The published cells of one histogram :func:`_foldable` admits, with each row's cell."""
+    known = [index for index, value in enumerate(values) if value is not None]
+    if statistic.get("definition") == "levelHistogram/1":
+        keys = [str(each) for each in statistic.get("levels") or ()]
+        index_of = {level: at for at, level in enumerate(keys)}
+        placed = [index_of.get(values[at], -1) for at in known]
+    else:
+        edges = [Fraction(str(each)) for each in statistic.get("bins") or ()]
+        placed = list(backend.bin_cells([values[at] for at in known], edges, fractional_bits))
+        keys = [str(each) for each in edges[:-1]]
+    (group,) = statistic["groups"]
+    status = group.get("cellStatus") or [disclosure.FREE] * len(keys)
+    shown = [at for at, each in enumerate(status) if each == disclosure.FREE]
+    cell_of = {at: position for position, at in enumerate(shown)}
+    rest = len(shown)  # a value in a withheld cell: k less the published cells counts them
+    assigned: List[Optional[int]] = [None] * len(values)
+    for at, cell in zip(known, placed, strict=True):
+        assigned[at] = cell_of.get(cell, rest)
+    return _Cells(name, tuple(assigned), rest + 1)
+
+
+def _read_columns(plan: QueryPlan) -> FrozenSet[str]:
+    """The columns a row-level query and its unit read, its grouping column included."""
+    found = {column for _, column in plan.reads}
+    if plan.group_by is not None:
+        found.add(plan.group_by)
+    return frozenset(found)
 
 
 def _inside(queries: int) -> FrozenSet[Combination]:

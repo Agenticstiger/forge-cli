@@ -46,10 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row's value is refused before any read with the gateway's own condition fence, and any failure
   that still depends on the records withholds every query of the run with one fixed message, so
   a run says at most that some statement failed, never which. A query is checked as a set with the
-  table's facts and the other queries over it, not with a column's level histogram, `nullCount`
-  or row count beside it, and an entity unit is not checked with its table's own statistics,
-  which count the same records where every entity holds one row: a reader can difference such
-  counts, and the rounding hides the difference only when neither count lies at a rounding edge.
+  table's facts and the other queries over it, and with the published cells of each column the
+  parts read (an ungrouped level histogram, an ungrouped histogram of a number or timestamp
+  column, or the rows with a value where `count` or `nullCount` is published), for small cells
+  before any rounding, the published cells never withheld. Grouped statistics, quantiles,
+  calendars, date spans and pairs, zero cells beside a column's cells, and an entity unit beside
+  its table's own statistics, which count the same records where every entity holds one row, are
+  not checked together: a reader can difference such counts, and the rounding hides the
+  difference only when neither count lies at a rounding edge.
   The report adds `Queries: N of M published whole`.
 
 

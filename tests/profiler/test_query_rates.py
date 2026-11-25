@@ -885,3 +885,144 @@ def test_a_value_that_does_not_load_withholds_the_queries_that_read_other_column
     )
     assert set(_said(result).values()) == {query_rates.RUN_FAILED}
     assert len(_said(result)) == 2
+
+
+# ---- a query beside a column's published cells ------------------------------------------------
+
+
+def _three_west() -> List[Dict[str, Any]]:
+    """Three WEST stations; the others alternate NORTH and SOUTH, so WEST's cell is withheld."""
+    stations = _stations()
+    for n, station in enumerate(stations):
+        station["region"] = "WEST" if n < 3 else ("NORTH" if n % 2 else "SOUTH")
+    return stations
+
+
+def _with_histogram(tmp_path: Path, *queries, stations):
+    region = _stats.RequestColumn("region", "category", (), ("levelHistogram/1",))
+    request = _stats.Request(
+        None, 16, (_stats.RequestTable("station", False, (region,)),), (), (), tuple(queries)
+    )
+    result = profile_exposes(
+        CONTRACT,
+        _sources(tmp_path, queries, stations=stations),
+        backend=FakeBackend(),
+        request=request,
+    )
+    (histogram,) = result.document["tables"]["station"]["columns"]["region"]["statistics"]
+    (group,) = histogram["groups"]
+    assert group["cellStatus"] == ["F", "C", "C"]  # NORTH published; SOUTH, WEST withheld
+    return result
+
+
+def test_a_query_that_a_published_cell_would_difference_to_a_withheld_one_is_withheld(tmp_path):
+    # NORTH or WEST, less the published NORTH cell, is the withheld WEST cell
+    either = _on_table("either", "SELECT station_id FROM station WHERE region IN ('NORTH','WEST')")
+    result = _with_histogram(tmp_path, either, stations=_three_west())
+    assert _withheld(_entry(result, "either"))
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT station_id FROM station WHERE region IN ('SOUTH','WEST')",
+        NORTH,
+    ],
+)
+def test_a_query_the_published_cells_cannot_split_stays_answered(tmp_path, sql):
+    result = _with_histogram(tmp_path, _on_table("whole", sql), stations=_three_west())
+    assert not _withheld(_entry(result, "whole"))
+
+
+def test_a_query_that_names_no_counted_column_is_not_checked_against_its_cells(tmp_path):
+    # its rows split the NORTH cell into a small part, but nothing published names that part
+    low = _on_table("low", "SELECT station_id FROM station WHERE altitude <= 20")
+    result = _with_histogram(tmp_path, low, stations=_three_west())
+    assert not _withheld(_entry(result, "low"))
+
+
+def _altitudes(tmp_path: Path, *queries, column: _stats.RequestColumn, stations):
+    contract = json.loads(json.dumps(CONTRACT))
+    (altitude,) = [
+        each for each in contract["exposes"][0]["contract"]["schema"] if each["name"] == "altitude"
+    ]
+    altitude["validationRules"] = [{"type": "range", "constraint": ">= 0 and <= 300"}]
+    request = _stats.Request(
+        None, 16, (_stats.RequestTable("station", False, (column,)),), (), (), tuple(queries)
+    )
+    return profile_exposes(
+        contract,
+        _sources(tmp_path, queries, stations=stations),
+        backend=FakeBackend(),
+        request=request,
+    )
+
+
+def _three_high() -> List[Dict[str, Any]]:
+    stations = _stations()
+    for n, station in enumerate(stations):
+        station["altitude"] = 280 if n < 3 else n % 270
+    return stations
+
+
+@pytest.mark.parametrize(("floor", "withheld"), [(245, True), (250, False)])
+def test_a_query_that_cuts_a_small_piece_out_of_a_published_bin_is_withheld(
+    tmp_path, floor, withheld
+):
+    # at 245 the query less the published top bin is the few stations from 245 to 249
+    high = _on_table("high", f"SELECT station_id FROM station WHERE altitude >= {floor}")
+    histogram = _stats.RequestColumn("altitude", "number", (), ("marginalHistogram/1",))
+    result = _altitudes(tmp_path, high, column=histogram, stations=_three_high())
+    (statistic,) = result.document["tables"]["station"]["columns"]["altitude"]["statistics"]
+    assert statistic["bins"][-2:] == ["250", "300"] and "cellStatus" not in statistic["groups"][0]
+    assert _withheld(_entry(result, "high")) is withheld
+
+
+def test_a_query_that_differs_from_a_published_count_of_values_by_a_few_rows_is_withheld(tmp_path):
+    stations = _stations()
+    for station in stations[100:120]:
+        station["altitude"] = None
+    either = _on_table(
+        "either", "SELECT station_id FROM station WHERE altitude IS NULL OR station_id = 's050'"
+    )
+    counted = _stats.RequestColumn("altitude", "number", ("count",), ())
+    result = _altitudes(tmp_path, either, column=counted, stations=stations)
+    assert (
+        result.document["tables"]["station"]["columns"]["altitude"]["metrics"]["count"]["status"]
+        == disclosure.FREE
+    )
+    assert _withheld(_entry(result, "either"))
+
+
+def test_a_fact_that_a_published_cell_would_difference_to_a_withheld_one_is_withheld(tmp_path):
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["exposes"][0]["contract"]["invariants"].append(
+        {"id": "north_or_west", "check": "region = 'NORTH' OR region = 'WEST'"}
+    )
+    fact = _stats.RequestFact("station.north_or_west", "station", "north_or_west")
+    low = _on_table("low", "SELECT station_id FROM station WHERE altitude <= 150")
+    region = _stats.RequestColumn("region", "category", (), ("levelHistogram/1",))
+    request = _stats.Request(
+        None, 16, (_stats.RequestTable("station", False, (region,)),), (), (fact,), (low,)
+    )
+    result = profile_exposes(
+        contract,
+        _sources(tmp_path, (low,), stations=_three_west()),
+        backend=FakeBackend(),
+        request=request,
+    )
+    (invariant,) = result.document["invariants"]
+    assert {each["status"] for each in invariant["statistics"][0]["groups"]} == {"C"}
+
+
+def test_a_view_unit_that_a_published_cell_would_difference_to_a_withheld_one_is_withheld(
+    tmp_path,
+):
+    # the view keeps NORTH and WEST, so its published k less the NORTH cell is WEST's
+    view = "SELECT * FROM station WHERE region = 'NORTH' OR region = 'WEST'"
+    query = (
+        f'WITH "v" AS ({view}) SELECT "v"."station_id" AS "station_id" FROM "v" AS "v" '
+        'WHERE "v"."altitude" >= 100'
+    )
+    result = _with_histogram(tmp_path, _on_view("kept", query, view), stations=_three_west())
+    assert _withheld(_entry(result, "kept"))
