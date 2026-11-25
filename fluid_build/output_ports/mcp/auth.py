@@ -14,11 +14,11 @@ Two pluggable schemes that the gateway selects via
 * ``jwt`` — RFC 7519 JSON Web Token bearer. The gateway validates
   the signature against an issuer's JWKS endpoint (RS256 / ES256 /
   EdDSA), verifies ``iss`` / ``aud`` / ``exp`` / ``nbf``, and maps
-  configured claims into ``caller_attributes`` (so
-  ``policy.rowFilters`` ``${caller.<attr>}`` placeholders resolve
-  cryptographically rather than via self-attestation). Industry-
-  standard pattern — works with Auth0, Okta, Keycloak, AWS Cognito,
-  Google IAP, Azure AD.
+  configured claims into ``caller_attributes`` (so the principal a
+  ``policy.authz.rowFilters`` entry names, and the agentPolicy model
+  and use case, come from the issuer rather than from the client).
+  Industry-standard pattern: works with Auth0, Okta, Keycloak, AWS
+  Cognito, Google IAP, Azure AD.
 
 mTLS (client-cert-bound identity) is best handled by the reverse
 proxy in front of the gateway — see
@@ -52,10 +52,15 @@ from typing import Any, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, Uni
 #: Claim -> caller-attribute mappings applied when an operator configures none.
 #:
 #: These are not decoration. ``model`` and ``use_case`` are the inputs to the
-#: agentPolicy gate (``decide()`` in fluid_build.policy.decision), and ``sub`` /
-#: ``tenant_id`` are what ``${caller.*}`` row filters interpolate. Losing any of
-#: them does not fail — it silently widens access, which is why
+#: agentPolicy gate (``decide()`` in fluid_build.policy.decision), and ``sub``
+#: attributes each call on the audit trail. Losing ``model`` or ``use_case`` does
+#: not fail: it silently widens access, which is why
 #: ``FLUID_MCP_JWT_CLAIM_MAPPING`` MERGES over these rather than replacing them.
+#:
+#: No claim maps to :data:`PRINCIPAL_ATTR` by default: an operator whose exposes
+#: declare ``policy.authz.rowFilters`` names the claim that carries a caller's
+#: logical principal (``FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal``), and until
+#: one does, every call on such an expose is refused.
 #:
 #: ``jurisdiction`` is the exception to that sentence and is worth knowing:
 #: losing it does NOT widen access, it closes the gate completely. A contract
@@ -91,6 +96,14 @@ MTLS_IDENTITY_HEADERS: Tuple[Tuple[str, str], ...] = (
 #: proxy that terminated it. See ``OutputPortMcpServer._resolve_request_identity``.
 MTLS_IDENTITY_ATTRS: FrozenSet[str] = frozenset(name for _, name in MTLS_IDENTITY_HEADERS)
 
+#: The caller attribute naming the logical principal (or a list of them) a request
+#: acts as, written as the contract writes ``exposes[].policy.authz.rowFilters[].principal``
+#: and ``policy.authz.readers``. It decides which rows a caller reads, so like the
+#: certificate attributes it binds from the verified channel only: a JWT claim mapped
+#: to it with ``FLUID_MCP_JWT_CLAIM_MAPPING=<claim>=principal``. A client naming its
+#: own principal would pick its own row filter, or a reader's every row.
+PRINCIPAL_ATTR = "principal"
+
 TrustedNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 
@@ -120,9 +133,10 @@ class AuthDecision:
     """Result of validating a request's auth header.
 
     ``allowed`` is the gate. ``caller_attributes`` populates the
-    same map ``policy.rowFilters`` reads — JWT claims show up here
-    as e.g. ``{"sub": "alice@corp.example", "model": "claude-haiku",
-    "tenant_id": "acme"}`` per the configured claim mapping.
+    verified caller attributes the gateway's policy reads. JWT claims
+    show up here as e.g. ``{"sub": "alice@corp.example", "model":
+    "claude-haiku", "principal": "group:analysts@corp.example"}`` per the
+    configured claim mapping.
     ``deny_reason`` is set on a denial so the gateway can return a
     typed 401 with a structured error.
     """
@@ -224,9 +238,8 @@ class AuthValidator:
                 # MERGE over the defaults, never replace them. Assigning `parsed`
                 # wholesale meant an operator mapping one extra claim silently
                 # dropped sub/model/use_case/tenant_id — turning off the
-                # agentPolicy model and use-case gates and emptying every
-                # ${caller.*} row filter, with no error and a server still
-                # reporting healthy. An operator who really wants a default gone
+                # agentPolicy model and use-case gates, with no error and a
+                # server still reporting healthy. An operator who really wants a default gone
                 # can still map it away explicitly; what they can no longer do is
                 # lose it by accident while adding something unrelated.
                 kwargs["jwt_claim_mappings"] = {**DEFAULT_JWT_CLAIM_MAPPINGS, **parsed}

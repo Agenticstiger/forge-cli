@@ -304,36 +304,8 @@ which forwards the verified certificate as `X-Client-CN` and
 request authenticated with `shared-token` or `jwt` **and** whose TCP peer
 is listed in `FLUID_MCP_TRUSTED_PROXIES`, the same allow-list idea as
 uvicorn's `--forwarded-allow-ips`. From any other peer they are ignored.
-When honoured they bind `${caller.client_cn}` and
-`${caller.client_fingerprint}` in `policy.rowFilters`. Nothing else binds
-them: a client that names its own certificate in `clientInfo` or in its
-`fluid` capability block is ignored, in every auth mode. If a filter keys on
-them and they were not honoured, the call fails closed.
-
-`serve` refuses to start, with exit code 2, when a certificate could never
-be honoured:
-
-- `--transport http` with auth not actually enabled (`FLUID_MCP_AUTH_MODE=none`,
-  `shared-token` without `FLUID_MCP_AUTH_TOKEN`, or `jwt` missing the
-  issuer, audience or JWKS URL) while `FLUID_MCP_TRUSTED_PROXIES` is set or
-  a rowFilter reads `${caller.client_cn}` / `${caller.client_fingerprint}`.
-  The message names the variable that keeps auth off.
-- `--transport stdio` when a rowFilter reads either attribute, since a pipe
-  carries no headers.
-
-```bash
-FLUID_MCP_AUTH_MODE=shared-token FLUID_MCP_AUTH_TOKEN=... \
-FLUID_MCP_TRUSTED_PROXIES=127.0.0.1 \
-  fluid mcp output-port serve ./contract.fluid.yaml --transport http --host 127.0.0.1
-```
-
-The peer is the TCP peer: the gateway does not take it from
-`X-Forwarded-For`, so uvicorn's access log shows the proxy's address.
-
-List only the proxy's own address, or the narrowest CIDR that covers your
-proxy replicas. Any peer inside a listed range can assert any client
-certificate, so a wide range such as a whole pod or VPC network lets every
-host on it choose its own `${caller.client_cn}`.
+What a verified certificate binds, when `serve` refuses to start, and how narrow
+`FLUID_MCP_TRUSTED_PROXIES` should be are on the [forge_docs MCP page](https://agenticstiger.github.io/forge_docs/advanced/mcp.html).
 
 When the gateway ignores the two headers it logs
 `output_port_mtls_headers_ignored` at WARNING with the reason and the peer

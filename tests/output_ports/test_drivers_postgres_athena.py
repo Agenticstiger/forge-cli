@@ -144,6 +144,30 @@ def test_postgres_execute_rewrites_named_placeholders_to_psycopg_form():
     assert result.rows == ({"customer_id": "C1"},)
 
 
+def test_postgres_a_literal_percent_survives_pyformat_binding():
+    """psycopg reads a statement with bound parameters as a pyformat string, so a ``%``
+    in a LIKE pattern is doubled; with no parameters it is left as written."""
+    driver = PostgresDriver(expose=_pg_expose(), contract={})
+    fake_conn = MagicMock()
+    fake_cursor = MagicMock()
+    fake_cursor.__enter__ = lambda self: self
+    fake_cursor.__exit__ = lambda self, *a: None
+    fake_cursor.description = []
+    fake_cursor.fetchall.return_value = []
+    fake_conn.cursor.return_value = fake_cursor
+    driver._connection = fake_conn
+
+    sql = "SELECT count(*) FROM t WHERE (region LIKE 'EU%') AND (segment = :p_0)"
+    driver.execute(sql=sql, params=("smb",))
+    called_sql, bound = fake_cursor.execute.call_args_list[-1].args
+    assert "LIKE 'EU%%'" in called_sql and bound == {"p_0": "smb"}
+    assert called_sql % {"p_0": "'smb'"} == sql.replace(":p_0", "'smb'")
+    driver.execute(sql="SELECT count(*) FROM t WHERE region LIKE 'EU%'", params=())
+    assert fake_cursor.execute.call_args_list[-1].args == (
+        "SELECT count(*) FROM t WHERE region LIKE 'EU%'",
+    )
+
+
 def test_postgres_close_is_idempotent():
     driver = PostgresDriver(expose=_pg_expose(), contract={})
     fake_conn = MagicMock()
@@ -235,3 +259,35 @@ def test_athena_health_check_pings_workgroup_listing():
     assert health["status"] == "ok"
     assert health["engine"] == "athena"
     fake_client.list_work_groups.assert_called_once()
+
+
+def test_postgres_runs_each_request_in_a_read_only_transaction_it_rolls_back():
+    """In autocommit neither the connection's read-only flag nor a SET LOCAL reaches the
+    next statement. Each request is its own read-only transaction instead, rolled back
+    so no session setting a statement changes outlives it."""
+    driver = PostgresDriver(expose=_pg_expose(), contract={})
+    events = []
+    fake_cursor = MagicMock()
+    fake_cursor.__enter__ = lambda self: self
+    fake_cursor.__exit__ = lambda self, *a: None
+    fake_cursor.description = []
+    fake_cursor.fetchall.return_value = []
+    fake_cursor.execute.side_effect = lambda statement, *a: events.append(statement)
+    transaction = MagicMock()
+    transaction.__enter__ = lambda self: events.append("BEGIN")
+    transaction.__exit__ = lambda self, *a: events.append("ROLLBACK")
+    fake_conn = MagicMock()
+    fake_conn.transaction.return_value = transaction
+    fake_conn.cursor.return_value = fake_cursor
+    driver._connection = fake_conn
+
+    driver.execute(sql="SELECT id FROM t", params=(), timeout_seconds=2)
+
+    fake_conn.transaction.assert_called_once_with(force_rollback=True)
+    assert events == [
+        "BEGIN",
+        "SET TRANSACTION READ ONLY",
+        "SET LOCAL statement_timeout = 2000",
+        "SELECT id FROM t",
+        "ROLLBACK",
+    ]

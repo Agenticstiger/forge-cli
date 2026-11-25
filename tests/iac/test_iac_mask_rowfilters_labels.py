@@ -763,3 +763,20 @@ class TestAwsGrantPrincipalSpelling:
         res = _aws_resources(_aws(row_filters=[CONSENT]))
         (flt,) = res["aws_lakeformation_data_cells_filter"].values()
         assert flt["table_data"][0]["column_wildcard"] == [{"excluded_column_names": []}]
+
+
+@pytest.mark.parametrize(
+    "where",
+    ['"consent" = true', 'consent = true AND "suppressed" IS NULL'],
+    ids=["quoted", "mixed"],
+)
+def test_bigquery_refuses_a_filter_it_would_read_with_other_columns(where):
+    """BigQuery reads a double-quoted name as a string, so the policy would keep every row."""
+    error = _refusal("gcp", _gcp(row_filters=[{"principal": ANALYSTS, "where": where}]))
+    assert "reads other columns on this engine" in str(error)
+
+
+def test_lake_formation_reads_a_double_quoted_name_as_the_column():
+    res = _aws_resources(_aws(row_filters=[{"principal": ANALYSTS, "where": '"consent" = true'}]))
+    (flt,) = res["aws_lakeformation_data_cells_filter"].values()
+    assert flt["table_data"][0]["row_filter"] == [{"filter_expression": '"consent" = true'}]

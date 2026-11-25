@@ -78,13 +78,19 @@ dependencies = [
   # thread per instance, which leaked unboundedly with a per-session
   # SessionState. Reintroduce a backend here only if a multi-replica
   # deployment needs shared limits.)
-  # Borrowed SQL parser (MIT). Real consumers: fluid_build/iac/row_access.py
-  # (parses and validates a row-filter predicate before it is written into a
-  # platform policy; it FAILS OPEN if sqlglot is missing, so keep this in the
-  # base install), iac/providers/databricks_access.py, forge/core/validators.py
-  # and the from_ddl parser. (providers/_sql_safety.py does not use it.)
+  # Borrowed SQL parser (MIT). Real consumers: fluid_build/providers/_row_filters.py
+  # (parses and validates a row-filter predicate before the IaC emitters write it
+  # into a platform policy and before the MCP gateway applies it; without sqlglot
+  # every row filter is refused, so keep this in the base install),
+  # output_ports/mcp/query_compiler.py, iac/providers/databricks_access.py,
+  # forge/core/validators.py and the from_ddl parser. (providers/_sql_safety.py
+  # does not use it.)
   # Borrowed-not-built per /borrow-before-build: https://github.com/tobymao/sqlglot
-  "sqlglot>=25.0",
+  # 26.20 is the oldest release run and found to apply a row filter. 26.16 and older
+  # record no identifier positions, which the gateway needs to qualify a predicate's
+  # columns, so they refuse every row filter (26.17 to 26.19 add the positions but were
+  # not run).
+  "sqlglot>=26.20",
   # Bitol-vendor-listed Python library for ODCS v3.1.0. Provides typed
   # Pydantic v2 models + ``from_file()`` / ``to_yaml()`` for lossless
   # ODCS YAML I/O. Maintained by the ``datacontract`` org (same folks

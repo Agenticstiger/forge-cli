@@ -138,14 +138,21 @@ class PostgresDriver(EngineDriver):
         # The compiler uses fully-qualified table reference baked into
         # the SQL string; psycopg does the parameter-binding for the
         # caller's filter/limit values.
-        rendered = _PARAM_REWRITE.sub(r"%(p_\1)s", sql)
-        guard_against_injection_markers(rendered)
         bound: Dict[str, Any] = {f"p_{index}": value for index, value in enumerate(params)}
-        with connection.cursor() as cursor:
+        # With parameters bound psycopg reads the statement as a pyformat string, so a
+        # literal ``%`` (a LIKE pattern or a modulo in a contract expression or a row
+        # filter) is doubled before the bind markers are written in.
+        rendered = _PARAM_REWRITE.sub(r"%(p_\1)s", sql.replace("%", "%%") if bound else sql)
+        guard_against_injection_markers(rendered)
+        # Each request is a read-only transaction of its own, rolled back at the end. The
+        # connection is shared by every caller and runs in autocommit, where neither its
+        # read-only flag nor a SET LOCAL lasts past one statement. Inside the transaction
+        # both hold, and a session setting the statement changes is undone with it, so no
+        # caller's statement runs under state another caller left on the connection.
+        with connection.transaction(force_rollback=True), connection.cursor() as cursor:
+            cursor.execute("SET TRANSACTION READ ONLY")
             if timeout_seconds is not None and timeout_seconds > 0:
-                # Postgres supports per-statement timeouts via SET
-                # LOCAL. We use SET LOCAL inside an implicit
-                # transaction so it auto-resets after the statement.
+                # A per-request timeout: SET LOCAL lasts until this transaction ends.
                 ms = max(1, int(timeout_seconds * 1000))
                 cursor.execute(f"SET LOCAL statement_timeout = {ms}")
             if bound:
@@ -227,7 +234,8 @@ class PostgresDriver(EngineDriver):
             redacted = {k: ("***" if k in {"password", "passfile"} else v) for k, v in opts.items()}
             self.logger.debug("postgres_connect: %s", redacted)
         self._connection = psycopg.connect(**opts)
-        # Default to read-only sessions — the gateway never mutates.
+        # Transactions psycopg starts are read-only (execute runs each request in one):
+        # the gateway never writes.
         self._connection.read_only = True
         self._connection.autocommit = True
         return self._connection

@@ -62,29 +62,85 @@ def names_refused_duckdb_function(sql: str) -> bool:
     return _DUCKDB_REFUSED_RE.search(sql) is not None
 
 
-#: Postgres functions that return a whole table, schema, database or query result as
-#: XML. They take the relation or the statement as a string argument, so no table node
-#: and no column name shows in the text a check here reads, and the engine reads past
-#: any column projection the caller's statement was limited to. Refused as a call, in
-#: any case, quoted or schema-qualified, on every dialect; a column that only shares a
-#: name is not a call.
+#: Postgres functions that read a relation or run a statement given as a string: the
+#: XML family returns a whole table, schema, database or query result, ``ts_stat`` and
+#: ``ts_rewrite`` run a query given as text (``ts_stat('SEL' || 'ECT ... FROM t')``
+#: spells it without the word), ``connectby`` reads a table named in text, and the
+#: ``crosstab``, ``dblink`` and ``pgstat`` families run a query or read a relation by
+#: name, and the ``pg_stat`` family reports a relation's row counts. The pageinspect
+#: functions return raw pages, so raw tuples of every row; ``pgrowlocks`` reports the
+#: rows a table has locked; ``pg_prepared_statement`` and ``pg_cursor`` show other
+#: requests' statements on the shared connection; and ``set_config`` changes the
+#: session every later request on that connection runs in. No table node and no column
+#: name shows in the text a check here reads, so the engine reads past any column
+#: projection or row filter the caller's statement was limited to. Refused as a call,
+#: in any case, quoted or schema-qualified, on every dialect; a column that only shares
+#: a name is not a call.
 POSTGRES_REFUSED_FUNCTIONS = frozenset(
     {
+        "connectby",
         "cursor_to_xml",
         "cursor_to_xmlschema",
+        "pg_cursor",
+        "pg_prepared_statement",
+        "pgrowlocks",
         "query_to_xml",
         "query_to_xml_and_xmlschema",
         "query_to_xmlschema",
+        "set_config",
         "table_to_xml",
         "table_to_xml_and_xmlschema",
         "table_to_xmlschema",
+        "ts_rewrite",
+        "ts_stat",
+        # pageinspect: raw pages, and the tuples in them
+        "brin_metapage_info",
+        "brin_page_items",
+        "brin_page_type",
+        "brin_revmap_data",
+        "bt_metap",
+        "bt_multi_page_stats",
+        "bt_page_items",
+        "bt_page_stats",
+        "fsm_page_contents",
+        "get_raw_page",
+        "gin_leafpage_items",
+        "gin_metapage_info",
+        "gin_page_opaque_info",
+        "gist_page_items",
+        "gist_page_items_bytea",
+        "gist_page_opaque_info",
+        "hash_bitmap_info",
+        "hash_metapage_info",
+        "hash_page_items",
+        "hash_page_stats",
+        "hash_page_type",
+        "heap_page_item_attrs",
+        "heap_page_items",
+        "heap_tuple_infomask_flags",
+        "page_checksum",
+        "page_header",
+        "tuple_data_split",
     }
 )
-#: ``schema_to_xml*`` and ``database_to_xml*`` are a family: every member is refused.
-POSTGRES_REFUSED_FUNCTION_PREFIXES = ("schema_to_xml", "database_to_xml")
+#: The views over :data:`POSTGRES_REFUSED_FUNCTIONS`' ``pg_cursor`` and
+#: ``pg_prepared_statement``: refused by name, called or not, on every dialect.
+POSTGRES_REFUSED_RELATIONS = frozenset({"pg_cursors", "pg_prepared_statements"})
+#: Families whose every member is refused: ``schema_to_xml*``, ``database_to_xml*``,
+#: ``crosstab*`` (tablefunc), ``dblink*``, ``pgstat*`` (pgstattuple) and ``pg_stat*``
+#: (the statistics functions, such as ``pg_stat_get_live_tuples``).
+POSTGRES_REFUSED_FUNCTION_PREFIXES = (
+    "schema_to_xml",
+    "database_to_xml",
+    "crosstab",
+    "dblink",
+    "pgstat",
+    "pg_stat",
+)
 
 _POSTGRES_REFUSED_RE = re.compile(
-    r"(?i)\b(?:"
+    r"(?i)\b(?:" + "|".join(sorted(POSTGRES_REFUSED_RELATIONS)) + r")\b"
+    r"|\b(?:"
     + "|".join(sorted(POSTGRES_REFUSED_FUNCTIONS))
     + "|"
     + "|".join(rf"{prefix}\w*" for prefix in POSTGRES_REFUSED_FUNCTION_PREFIXES)
@@ -92,10 +148,20 @@ _POSTGRES_REFUSED_RE = re.compile(
 )
 
 
+#: A name or a string written with Unicode escapes (Postgres and Trino):
+#: ``U&"ts!005Fstat" UESCAPE '!'`` is the identifier ``ts_stat``, which no check on the
+#: text would find. ``U&`` must touch the quote, so this is every such spelling.
+_UNICODE_ESCAPE_RE = re.compile(r"(?i)\bu&[\"']")
+
+
 def names_refused_postgres_function(sql: str) -> bool:
-    """Whether ``sql`` calls one of :data:`POSTGRES_REFUSED_FUNCTIONS` or a
-    ``schema_to_xml*`` / ``database_to_xml*`` function."""
-    return _POSTGRES_REFUSED_RE.search(sql) is not None
+    """Whether ``sql`` calls one of :data:`POSTGRES_REFUSED_FUNCTIONS` or a member of a
+    :data:`POSTGRES_REFUSED_FUNCTION_PREFIXES` family, names one of
+    :data:`POSTGRES_REFUSED_RELATIONS`, or writes a name or a string with Unicode
+    escapes (``U&"..."``, ``U&'...'``), which can spell any of them."""
+    return (
+        _POSTGRES_REFUSED_RE.search(sql) is not None or _UNICODE_ESCAPE_RE.search(sql) is not None
+    )
 
 
 _BLOCKED_EXPR_TOKENS = re.compile(

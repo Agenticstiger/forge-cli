@@ -130,9 +130,12 @@ class SnowflakeDriver(EngineDriver):
         timeout_seconds: Optional[float] = None,
     ) -> QueryResult:
         connection = self._get_connection()
-        rendered = _PARAM_REWRITE.sub(r"%(p_\1)s", sql)
-        guard_against_injection_markers(rendered)
         bound = {f"p_{index}": value for index, value in enumerate(params)}
+        # With parameters bound the connector reads the statement as a pyformat string,
+        # so a literal ``%`` (a LIKE pattern or a modulo in a contract expression or a row
+        # filter) is doubled before the bind markers are written in.
+        rendered = _PARAM_REWRITE.sub(r"%(p_\1)s", sql.replace("%", "%%") if bound else sql)
+        guard_against_injection_markers(rendered)
         cursor = connection.cursor()
         try:
             if timeout_seconds is not None:

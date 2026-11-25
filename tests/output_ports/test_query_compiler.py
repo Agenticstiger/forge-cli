@@ -19,9 +19,10 @@ import pytest
 from fluid_build.output_ports.mcp.query_compiler import (
     CompiledQuery,
     QueryValidationError,
+    RowFilterUnavailable,
     compile_free_form_sql,
-    compile_row_filter_clauses,
     compile_semantic_query,
+    row_filter_predicate,
 )
 
 from ._fixtures import make_expose
@@ -159,48 +160,72 @@ def test_render_bigquery_no_substring_collision_at_twelve_params():
 
 
 # ---------------------------------------------------------------------
-# Row-filter identifier quoting is dialect-aware (BigQuery needs backticks)
+# A row-filter predicate is checked as the engine reads it
 # ---------------------------------------------------------------------
 
-_RF_EXPOSE = {
-    "policy": {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]},
-}
+_RF_PRINCIPAL = "tenant:acme"
 
 
-def test_row_filter_quoting_bigquery_uses_backticks():
-    # BigQuery reads ANSI "tenant_id" as a STRING LITERAL → predicate always
-    # false → zero rows. It MUST be backtick-quoted instead.
-    clauses, params = compile_row_filter_clauses(
-        _RF_EXPOSE, {"tenant_id": "acme"}, dialect="bigquery"
+def _rf_expose(where: str):
+    return {
+        "exposeId": "demo",
+        "contract": {"schema": [{"name": "tenant_id"}]},
+        "policy": {"authz": {"rowFilters": [{"principal": _RF_PRINCIPAL, "where": where}]}},
+    }
+
+
+def test_row_filter_double_quotes_are_refused_on_bigquery():
+    # BigQuery reads ANSI "tenant_id" as a STRING LITERAL, so the predicate would
+    # compare two strings and select every row (or none). It is refused there.
+    with pytest.raises(RowFilterUnavailable, match="other columns on this engine"):
+        row_filter_predicate(
+            _rf_expose("\"tenant_id\" = 'acme'"), {"principal": _RF_PRINCIPAL}, dialect="bigquery"
+        )
+    assert (
+        row_filter_predicate(
+            _rf_expose("tenant_id = 'acme'"), {"principal": _RF_PRINCIPAL}, dialect="bigquery"
+        )
+        == "((_fluid_rows.tenant_id = 'acme'))"
     )
-    assert clauses == ["`tenant_id` = :p_0"]
-    assert params == ["acme"]
 
 
 @pytest.mark.parametrize("dialect", [None, "duckdb", "snowflake", "postgres", "athena"])
-def test_row_filter_quoting_non_bigquery_uses_ansi_double_quotes(dialect):
-    clauses, params = compile_row_filter_clauses(_RF_EXPOSE, {"tenant_id": "acme"}, dialect=dialect)
-    assert clauses == ['"tenant_id" = :p_0']
-    assert params == ["acme"]
+def test_row_filter_double_quotes_are_an_identifier_elsewhere(dialect):
+    predicate = row_filter_predicate(
+        _rf_expose("\"tenant_id\" = 'acme'"), {"principal": _RF_PRINCIPAL}, dialect=dialect
+    )
+    assert predicate == "((_fluid_rows.\"tenant_id\" = 'acme'))"
 
 
-def test_semantic_query_threads_dialect_into_rowfilter_quoting():
-    # End-to-end: compile_semantic_query passes dialect through to the merged
-    # rowFilter so a BigQuery query gets backticked tenant_id.
+def test_semantic_query_threads_dialect_into_the_row_filter_check():
+    # End-to-end: compile_semantic_query passes dialect through, so a BigQuery
+    # query refuses a predicate BigQuery would read differently.
+    columns = [{"name": "id"}, {"name": "tenant_id"}]
     expose = make_expose(
+        columns=columns,
         semantics={"name": "p", "measures": [{"name": "n", "agg": "count", "expr": "id"}]},
     )
-    expose["policy"] = {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]}
+    expose["policy"] = _rf_expose("\"tenant_id\" = 'acme'")["policy"]
+    with pytest.raises(RowFilterUnavailable):
+        compile_semantic_query(
+            expose=expose,
+            measure="n",
+            limit=10,
+            caller_attributes={"principal": _RF_PRINCIPAL},
+            table_reference="`proj.ds.t`",
+            dialect="bigquery",
+        )
+    expose["policy"] = _rf_expose("tenant_id = 'acme'")["policy"]
     compiled = compile_semantic_query(
         expose=expose,
         measure="n",
         limit=10,
-        caller_attributes={"tenant_id": "acme"},
+        caller_attributes={"principal": _RF_PRINCIPAL},
         table_reference="`proj.ds.t`",
         dialect="bigquery",
     )
-    assert "`tenant_id` = :p_0" in compiled.sql
-    assert compiled.params == ["acme"]
+    assert "`proj.ds.t` AS _fluid_rows WHERE ((_fluid_rows.tenant_id = 'acme'))" in compiled.sql
+    assert compiled.params == []
 
 
 # ---------------------------------------------------------------------
@@ -693,16 +718,22 @@ def test_balanced_or_filter_stays_contained_next_to_row_filters():
     """A legitimate OR filter must stay inside its parens so the ANDed
     RLS clause still constrains every branch."""
     expose = _expose_with_filtered_metric("status = 'completed' OR status = 'shipped'")
-    expose["policy"] = {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]}
+    expose["contract"]["schema"].append({"name": "tenant_id"})
+    expose["policy"] = {
+        "authz": {"rowFilters": [{"principal": "tenant:t-1", "where": "tenant_id = 't-1'"}]}
+    }
     compiled = compile_semantic_query(
         expose=expose,
         metric="completed_revenue",
         limit=10,
         table_reference="orders",
-        caller_attributes={"tenant_id": "t-1"},
+        caller_attributes={"principal": "tenant:t-1"},
     )
-    assert "(status = 'completed' OR status = 'shipped') AND (\"tenant_id\" = :p_0)" in compiled.sql
-    assert compiled.params == ["t-1"]
+    # The metric's OR is parenthesised in the outer WHERE; the row filter is applied
+    # inside the projection the whole statement reads, so no branch escapes it.
+    assert "WHERE (status = 'completed' OR status = 'shipped')" in compiled.sql
+    assert "orders AS _fluid_rows WHERE ((_fluid_rows.tenant_id = 't-1'))" in compiled.sql
+    assert compiled.params == []
 
 
 # ---------------------------------------------------------------------
@@ -1302,7 +1333,7 @@ def _xml_dump_statements():
 @pytest.mark.parametrize("dialect", ["postgres", None])
 @pytest.mark.parametrize("sql", _xml_dump_statements())
 def test_query_sql_refuses_a_function_that_dumps_a_table_as_xml(sql, dialect):
-    with pytest.raises(QueryValidationError, match="as XML"):
+    with pytest.raises(QueryValidationError, match="reads a relation or runs a query"):
         compile_free_form_sql(
             sql=sql, table_reference="public.customers", limit=10, dialect=dialect
         )
@@ -1315,7 +1346,7 @@ def test_query_sql_refuses_the_xml_dump_inside_a_larger_statement(name):
         f"SELECT length({name}('public.customers', true, false, '')::text) AS n",
         f"SELECT id FROM public.customers WHERE {name}('x', true, false, '') IS NOT NULL",
     ):
-        with pytest.raises(QueryValidationError, match="as XML"):
+        with pytest.raises(QueryValidationError, match="reads a relation or runs a query"):
             compile_free_form_sql(sql=sql, table_reference="public.customers", limit=10)
 
 
@@ -1391,3 +1422,70 @@ def test_a_contract_expression_cannot_dump_a_table_as_xml(where, expression, dia
             dialect=dialect,
             **kwargs,
         )
+
+
+# ---------------------------------------------------------------------
+# The body after the leading SELECT is checked whole
+# ---------------------------------------------------------------------
+
+# Written against the keyword, with no space after it, the start of the body is still
+# part of the body every check reads.
+_AGAINST_THE_KEYWORD = [
+    'SELECT(SELECT"region"FROM"customers"WHERE"id"=3)AS"x",id FROM customers',
+    'SELECT(SELECT"string_agg"("region",\',\')FROM"customers")AS"x" FROM customers',
+    'SELECT*FROM"customers"UNION(SELECT*FROM"customers")',
+]
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", None])
+@pytest.mark.parametrize("sql", _AGAINST_THE_KEYWORD)
+def test_query_sql_checks_what_is_written_against_the_select_keyword(sql, dialect):
+    with pytest.raises(ValueError, match="Invalid SQL expression"):
+        compile_free_form_sql(sql=sql, table_reference="customers", limit=10, dialect=dialect)
+
+
+@pytest.mark.parametrize("sql", _AGAINST_THE_KEYWORD)
+def test_the_driver_guard_reads_what_is_written_against_the_select_keyword(sql):
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+
+    with pytest.raises(ValueError, match="banned keyword"):
+        guard_against_injection_markers(sql)
+
+
+@pytest.mark.parametrize(
+    "sql", ['SELECT"region" FROM customers', "SELECT*FROM customers", "SELECT\tid FROM customers"]
+)
+def test_a_name_or_star_against_the_keyword_still_compiles(sql):
+    compiled = compile_free_form_sql(sql=sql, table_reference="customers", limit=10)
+    assert compiled.sql.startswith(sql)
+
+
+# ---------------------------------------------------------------------
+# Postgres functions and views that reach past the statement
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param("SELECT set_config('TimeZone', 'UTC', false) WHERE true", id="set-config"),
+        pytest.param("SELECT heap_page_items(get_raw_page('public.customers', 0))", id="raw-page"),
+        pytest.param("SELECT bt_page_items('customers_pkey', 1)", id="index-page"),
+        pytest.param("SELECT pgrowlocks('public.customers')", id="row-locks"),
+        pytest.param("SELECT pg_prepared_statement()", id="prepared-statement-function"),
+        pytest.param("SELECT name, statement FROM pg_prepared_statements", id="prepared-view"),
+        pytest.param("SELECT name FROM pg_cursors", id="cursor-view"),
+    ],
+)
+def test_query_sql_refuses_what_reads_raw_pages_other_requests_or_the_session(sql):
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+    from fluid_build.providers._sql_safety import validate_sql_expression_allowlist
+
+    with pytest.raises(QueryValidationError, match="changes the session"):
+        compile_free_form_sql(
+            sql=sql, table_reference="public.customers", limit=10, dialect="postgres"
+        )
+    with pytest.raises(ValueError, match="changes the session"):
+        guard_against_injection_markers(sql)
+    with pytest.raises(ValueError):
+        validate_sql_expression_allowlist(sql.split(None, 1)[1])

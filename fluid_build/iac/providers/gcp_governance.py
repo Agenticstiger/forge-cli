@@ -810,7 +810,7 @@ def row_policies(
     filter names: BigQuery shows a principal the union of the policies naming it, so
     a filtered identity in it would read every row.
     """
-    filters = row_filters_for(exposure, index)
+    filters = row_filters_for(exposure, index, dialect="bigquery")
     if not filters:
         return []
     binding = exposure.get("binding") or {}
@@ -877,7 +877,7 @@ def validate_bigquery_governance(
             "attach to table columns, so restrict the columns of the table the view reads.",
             (),
         )
-    if row_filters_for(exposure, index) and is_view:
+    if row_filters_for(exposure, index, dialect="bigquery") and is_view:
         raise UnsupportedBindingError(
             "row-filter-view",
             f"{where}.policy.authz.rowFilters is set on a BigQuery view; row access policies "
@@ -964,7 +964,7 @@ def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: s
         asked.append("binding.encryption")
     if restrictions_for(exposure, index):
         asked.append("policy.authz.columnRestrictions")
-    if row_filters_for(exposure, index):
+    if row_filters_for(exposure, index, dialect="bigquery"):
         asked.append("policy.authz.rowFilters")
     if asked:
         raise UnsupportedBindingError(
