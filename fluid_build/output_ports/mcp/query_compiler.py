@@ -1702,12 +1702,64 @@ _FILE_LIKE_TABLE_RE = re.compile(r"[./\\*:]")
 _PROJECTION_CLAUSES = frozenset({"expressions", "from", "from_", "where"})
 
 
-def _declared_column_names(expose: Mapping[str, Any]) -> List[str]:
-    names: List[str] = []
-    for column in (expose.get("contract") or {}).get("schema") or []:
-        if isinstance(column, Mapping) and isinstance(column.get("name"), str):
-            names.append(validate_ident(column["name"]))
-    return names
+def readable_columns(expose: Mapping[str, Any], restricted: Iterable[str] = ()) -> List[str]:
+    """The columns ``sample`` and ``query_sql`` read on ``expose``: the ones
+    ``contract.schema`` declares, minus ``restricted``, in schema order.
+
+    The expose is the boundary for every caller, readers included: a column the
+    contract does not declare is not read, so a column added to the table later stays
+    unreadable until the contract declares it. Fails closed when the contract declares
+    no column, or a column whose name is not a plain identifier, since the projection
+    selects each column by its name."""
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    declared: List[str] = []
+    for column in schema if isinstance(schema, list) else []:
+        name = column.get("name") if isinstance(column, Mapping) else None
+        if not isinstance(name, str):
+            continue
+        try:
+            declared.append(validate_ident(name))
+        except ValueError:
+            raise QueryValidationError(
+                f"contract.schema declares the column {name!r}, which is not a plain "
+                "identifier (a letter or underscore, then letters, digits and underscores). "
+                "sample and query_sql read only the columns contract.schema declares, each "
+                "by its plain name: rename the column, or expose it through a view."
+            ) from None
+    if not declared:
+        raise QueryValidationError(
+            "This expose declares no column in contract.schema, so sample and query_sql "
+            "have nothing they may read: they read only the columns the contract declares. "
+            "Declare the expose's columns in contract.schema."
+        )
+    return _allowed_names(declared, restricted)
+
+
+def _projected_name(name: str, read: Optional[str]) -> str:
+    """``name`` as a projection selects it on the sqlglot dialect ``read``: folded to
+    the case the engine gives an unquoted name, then quoted. It reads the column the
+    bare name reads, also when the engine reserves the word (``order``, or ``user``,
+    which Postgres reads as the current role). Bare when the engine is unknown."""
+    if read is None:
+        return name
+    from sqlglot import exp
+    from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
+
+    dialect = Dialect.get_or_raise(read)
+    if dialect.normalization_strategy is NormalizationStrategy.LOWERCASE:
+        name = name.lower()
+    elif dialect.normalization_strategy is NormalizationStrategy.UPPERCASE:
+        name = name.upper()
+    rendered: str = exp.to_identifier(name, quoted=True).sql(dialect=dialect)
+    return rendered
+
+
+def projection_columns(names: Iterable[str], dialect: Optional[str]) -> str:
+    """The select list of a projection of ``names`` on the engine a driver's
+    ``dialect`` token names, each column as :func:`_projected_name` renders it."""
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    return ", ".join(_projected_name(name, read) for name in names)
 
 
 def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
@@ -3590,7 +3642,8 @@ def _project_exposed_table(
         if predicate is None
         else f" AS {ROW_FILTER_ALIAS} WHERE {predicate}{_postgres_fence(dialect)}"
     )
-    projection = f"(SELECT {', '.join(allowed)} FROM {table_reference}{row_filter})"
+    columns = ", ".join(_projected_name(name, read) for name in allowed)
+    projection = f"(SELECT {columns} FROM {table_reference}{row_filter})"
     rewritten = _splice_projection(sql, tables, exposed, projection)
     try:
         checked = sqlglot.parse_one(rewritten, read=read)
@@ -3678,17 +3731,20 @@ def compile_free_form_sql(
       here. It fails closed: a caller no filter or reader names raises
       :class:`RowFilterIdentityMissing`, and a filter that cannot be applied (or
       the old ``policy.rowFilters`` key) :class:`RowFilterUnavailable`.
+    * **The expose is the boundary.** When ``expose`` is passed (the MCP ``query_sql``
+      handler always passes it), every read of the exposed table is rewritten to a
+      projection of the columns ``contract.schema`` declares (:func:`readable_columns`),
+      for every caller: a reader no filter narrows reads every row of that projection,
+      and a filtered caller the rows above. The statement reads nothing else: only the
+      exposed table, its own CTEs, ``VALUES`` and ``UNNEST``, so no other table, view,
+      catalog view, table function or file. It may not use the ``TABLE`` keyword, and
+      on DuckDB the engine's own parser checks the rewritten statement too, the row
+      filter included. Without an ``expose`` only the checks above apply.
     * **Column restrictions.** When ``restricted_columns`` is non-empty, ``expose``
       is required (it declares the columns to project; without it the call is
-      refused). Every read of the exposed table is then rewritten to a projection
-      of the allowed columns, filtered as above when a row filter applies. The
-      statement may not use the ``TABLE`` keyword, and every source in it must be a
-      plain table, a subquery, ``UNNEST`` or ``VALUES``; on DuckDB the engine's own
-      parser checks the rewritten statement too, the row filter included.
-    * ``FROM`` references are NOT rewritten otherwise — the caller must
-      reference the bound table by its fully-qualified name from the contract.
-      Phase-2 may add an AST-level rewrite so consumers can reference the expose
-      by exposeId rather than the underlying binding.
+      refused), and the restricted columns are left out of the projection.
+    * The caller names the exposed table as the binding names it: bare, or with the
+      binding's schema and catalog.
     """
     if not isinstance(sql, str):
         raise QueryValidationError("sql must be a string")
@@ -3752,14 +3808,16 @@ def compile_free_form_sql(
                     f"rules as the sample / query tools — aliasing the "
                     f"column does not bypass them."
                 )
-    # Column restrictions and row filters are enforced by structure, not only by the
-    # name scan above: every read of the exposed table is rewritten to a projection of
-    # the allowed columns, limited to the caller's rows, so a spelling the scan cannot
-    # see (``COLUMNS('..')``, ``*``, ``t.*``, the whole row, a quoted name) has no
-    # restricted column to reach, and no form of the statement (a subquery, a CTE, a
-    # set operation, a second reference) a filtered row. Callers that pass no
-    # ``expose`` have no declared columns to project, so they are refused when
-    # columns are restricted (the MCP ``query_sql`` handler always passes one).
+    # The expose is enforced by structure, not only by the name scan above: every read
+    # of the exposed table is rewritten to a projection of the declared columns, less
+    # the restricted ones, limited to the caller's rows when a row filter applies. A
+    # column the contract does not declare or restricts is then in no relation the
+    # statement can see, whatever its spelling (``COLUMNS('..')``, ``*``, ``t.*``, the
+    # whole row, a quoted name), no form of the statement (a subquery, a CTE, a set
+    # operation, a second reference) reaches a filtered row, and the statement reads no
+    # other relation. Callers that pass no ``expose`` have no declared columns to
+    # project, so they are refused when columns are restricted (the MCP ``query_sql``
+    # handler always passes one).
     restricted = _clean_column_names(restricted_columns)
     if restricted and expose is None:
         raise QueryValidationError(
@@ -3771,11 +3829,11 @@ def compile_free_form_sql(
         if expose is None or row_predicate is None
         else _column_types(expose, dialect, physical_types)
     )
-    if expose is not None and (restricted or row_predicate is not None):
+    if expose is not None:
         candidate = _project_exposed_table(
             candidate,
             table_reference=table_reference,
-            allowed=_allowed_names(_declared_column_names(expose), restricted),
+            allowed=readable_columns(expose, restricted),
             dialect=dialect,
             predicate=row_predicate,
             catalog=duckdb_catalog(expose),

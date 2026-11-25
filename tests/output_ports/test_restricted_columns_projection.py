@@ -703,7 +703,10 @@ def test_free_form_with_no_declared_readable_column_fails_closed():
         )
 
 
-def test_free_form_without_restrictions_keeps_the_callers_statement():
+def test_free_form_without_restrictions_still_reads_the_declared_columns():
+    """The expose is the boundary on every expose: with nothing restricted, the
+    statement still reads the table through a projection of the declared columns, and
+    the caller's own text around the table stays as written."""
     compiled = compile_free_form_sql(
         sql="SELECT  region FROM customers",
         table_reference="customers",
@@ -711,7 +714,8 @@ def test_free_form_without_restrictions_keeps_the_callers_statement():
         restricted_columns=(),
         expose=_expose(),
     )
-    assert compiled.sql == "SELECT  region FROM customers\nLIMIT 5"
+    assert compiled.sql.startswith("SELECT  region FROM (SELECT ")
+    assert compiled.sql.endswith(" FROM customers) AS customers\nLIMIT 5")
 
 
 @pytest.mark.parametrize("dialect,read,table", _DIALECTS, ids=[d[0] for d in _DIALECTS])
@@ -731,7 +735,7 @@ def test_free_form_rewrite_parses_in_every_dialect(dialect, read, table):
     subqueries = [s for s in tree.find_all(exp.Subquery)]
     assert len(subqueries) == 2
     for sub in subqueries:
-        assert [c.name for c in sub.this.expressions] == ["id", "segment", "amount"]
+        assert [c.name.casefold() for c in sub.this.expressions] == ["id", "segment", "amount"]
     assert not {c.name.lower() for c in tree.find_all(exp.Column)} & {"region", "tenant_id"}
     assert compiled.sql.rstrip().endswith("LIMIT 5")
 
@@ -815,7 +819,7 @@ def test_free_form_keeps_the_callers_text_outside_the_table_reference(con):
         expose=_expose(),
         dialect="duckdb",
     )
-    assert compiled.sql.startswith("select approx_top_k(segment, 2) AS x\nfrom\n  (SELECT id,")
+    assert compiled.sql.startswith('select approx_top_k(segment, 2) AS x\nfrom\n  (SELECT "id",')
     guard_against_injection_markers(compiled.sql)
     assert con.execute(compiled.sql).fetchall() == [(["retail", "wholesale"],)]
 
@@ -918,7 +922,7 @@ def test_a_quoted_table_identifier_is_not_the_table_keyword():
         expose=_expose(),
         dialect="duckdb",
     )
-    assert compiled.sql.startswith('SELECT "TABLE" FROM (SELECT id, segment')
+    assert compiled.sql.startswith('SELECT "TABLE" FROM (SELECT "id", "segment"')
 
 
 def test_a_table_name_that_merely_contains_the_word_is_not_the_keyword(con):
@@ -1058,7 +1062,8 @@ def test_the_engine_parser_cross_check_runs_on_the_rewritten_statement(monkeypat
         expose=_expose(),
         dialect="duckdb",
     )
-    assert len(seen) == 1 and "(SELECT id, segment, amount, tenant_id FROM customers)" in seen[0]
+    projection = '(SELECT "id", "segment", "amount", "tenant_id" FROM customers)'
+    assert len(seen) == 1 and projection in seen[0]
     seen.clear()
     compile_free_form_sql(
         sql="SELECT id FROM customers",

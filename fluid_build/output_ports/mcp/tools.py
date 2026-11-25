@@ -153,11 +153,14 @@ _QUERY_SQL_SCHEMA: Dict[str, Any] = {
         "sql": {
             "type": "string",
             "description": (
-                "SELECT statement against the bound expose. Reference the table "
-                "by the fully-qualified name shown in describe.binding."
-                "tableReference (the server does NOT rewrite the FROM clause). "
-                "The server runs sql_safety.validate_sql_expression_allowlist on "
-                "the body, rejects references to restricted/PII columns, and, "
+                "SELECT statement against the bound expose. Name the table as "
+                "describe.binding.tableReference shows it, bare or qualified. The "
+                "statement reads only that table (with its own CTEs, VALUES and "
+                "UNNEST) and only the columns contract.schema declares: the server "
+                "reads the table through a projection of those columns wherever "
+                "the statement reads it. The server runs "
+                "sql_safety.validate_sql_expression_allowlist on the body, rejects "
+                "references to restricted/PII columns, and, "
                 "when the contract declares row filters (policy.authz.rowFilters), "
                 "reads the table only through the rows your verified principal "
                 "may read, wherever the statement reads it. A caller the row "
@@ -217,7 +220,8 @@ OUTPUT_PORT_TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
         description=(
             "Run caller-supplied SELECT SQL against the bound expose. "
             "Available only when the server is started with --allow-sql. "
-            "Refuses any statement that references a restricted column; on an "
+            "Reads only the exposed table and the columns contract.schema "
+            "declares. Refuses any statement that references a restricted column; on an "
             "expose with row filters, a narrowed caller's functions and "
             "conditions are limited (see the sql argument)."
         ),

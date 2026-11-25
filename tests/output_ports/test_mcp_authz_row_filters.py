@@ -483,9 +483,13 @@ def test_every_read_of_the_exposed_table_carries_the_filter():
         assert select.args["where"].this.sql(dialect="duckdb") == "((_fluid_rows.region = 'EU'))"
 
 
-def test_an_unfiltered_reader_keeps_the_callers_statement():
-    sql = "SELECT id FROM customers"
-    assert _compile_for(sql, EVERYONE).sql.startswith(sql)
+def test_an_unfiltered_reader_reads_every_row_of_the_declared_projection():
+    """A reader no filter narrows reads the table through the declared columns, with
+    no row filter: every row, but nothing the contract does not declare."""
+    compiled = _compile_for("SELECT id FROM customers", EVERYONE)
+    assert compiled.sql.startswith("SELECT id FROM (SELECT ")
+    assert compiled.sql.endswith(" FROM customers) AS customers\nLIMIT 10")
+    assert "_fluid_rows" not in compiled.sql and compiled.row_filter is None
 
 
 def test_the_engine_parser_refuses_a_projection_whose_filter_was_changed():
@@ -926,7 +930,7 @@ def test_a_cte_name_is_matched_the_way_postgres_folds_it(sql, refused):
         with pytest.raises(query_compiler.QueryValidationError, match="sql reads"):
             project()
     else:
-        assert "(SELECT id FROM customers) AS customers" in project()
+        assert '(SELECT "id" FROM customers) AS customers' in project()
 
 
 @pytest.mark.parametrize(
