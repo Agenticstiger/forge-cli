@@ -108,9 +108,11 @@ units over that table, not with a column's level histogram, ``nullCount`` or row
 it (facts have the same limit). A counted entity population is checked apart from the parent
 table's own facts and queries: two sets over the same rows, never crossed with each other, so a
 query over the parent's rows and one over its entities are not differenced together; a query
-and a published histogram cell differ only at the rounding precision. The cost is bounded and public: at most :data:`MOST_QUERIES` queries, each
-statement limited in time and memory, run in a locked process. A request from a source that is
-not trusted belongs in a container.
+and a published histogram cell differ only at the rounding precision. Where the parent table
+repeats a key (records that break its declared key), an entity is counted once for each parent
+row that holds its key, and so is its unit's ``k``. The cost is bounded and public: at most
+:data:`MOST_QUERIES` queries, each statement limited in time and memory, run in a locked
+process. A request from a source that is not trusted belongs in a container.
 
 Nothing printed, logged or written names a count of records: a reason names a query, a table, a
 column or a bound.
