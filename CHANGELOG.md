@@ -725,12 +725,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `query_sql` caller is held to the function list.** This holds for every caller on every expose,
   readers no row filter narrows included:
   - `sample` returns only declared columns. It refuses an expose that declares no column, or
-    whose declared columns are all restricted.
+    whose declared columns are all restricted. The `source-aligned-postgres-duckdb` example now
+    declares the columns it lands, which it used to leave to discovery.
   - A `query_sql` statement that joins another table or reads a catalog view is refused, and one
     that names an undeclared column fails on that column.
   - Readers are now held to the function list too, so a `query_sql` statement that calls a
-    function the list does not name is refused for them. So is a Postgres cast to an object
-    identifier type (`regclass`, `regproc` and the like).
+    function the list does not name is refused for them: to_json, COLUMNS and hash, for example.
+    So is a Postgres cast to an object identifier type (`regclass`, `regproc` and the like).
   - A declared column whose name is not a plain identifier (a letter or underscore, then
     letters, digits and underscores) refuses `query_sql` on that expose for everyone, unless the
     column is restricted.
