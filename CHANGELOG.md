@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that none lies beyond it, as a date span's outer edge does. A profile or a request answer names
   each rounded end and its unit per table under Rounded extremes; a column whose ends pass
   exactly is unchanged.
+
+- **`fluid profile` can check a consumer query and run it in a locked process.** A query a profile
+  request lists is untrusted text. It is parsed with sqlglot and refused, naming the construct,
+  unless it is one `SELECT` (or a non-recursive `WITH` before one) built only from listed
+  expression classes and functions over the tables the request lists, with a total order wherever
+  `LIMIT`, `OFFSET` or a window depends on one. The canonical text is read back and checked a
+  second time. It then runs in a DuckDB process of its own: a bare environment, no inherited
+  descriptors, file-size, CPU and memory limits set before DuckDB loads, an in-memory database
+  with external access, extension loading and configuration changes locked, one `SELECT` per
+  statement, and only whole numbers, group keys and bits back. A statement that times out or runs
+  out of memory takes that status and the others still run; a process that dies is replaced.
+
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
   active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
   histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed
