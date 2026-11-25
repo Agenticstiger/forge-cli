@@ -210,7 +210,13 @@ def test_without_a_declared_range_a_number_gets_quantiles_on_its_types_ladder(tm
 
 
 def test_the_bins_never_depend_on_the_records(tmp_path):
-    contract = _contract([("age", "int", {}), ("joined", "date", {})])
+    # A date with no declared range is binned on the months its records span (and so on the
+    # records, which the disclosure rule makes public: tests/profiler/test_date_spans.py), so a
+    # date here declares its range.
+    window = {
+        "validationRules": [{"type": "range", "constraint": ">= '1990-01-01' and <= '2030-12-31'"}]
+    }
+    contract = _contract([("age", "int", {}), ("joined", "date", window)])
     young = _profile(tmp_path, contract, [{"age": "3", "joined": "1999-05-01"}] * 40)
     old = _profile(tmp_path, contract, [{"age": "90", "joined": "2026-11-19"}] * 3)
     for column in ("age", "joined"):
@@ -221,6 +227,8 @@ def test_the_bins_never_depend_on_the_records(tmp_path):
 
 def test_a_date_gets_quantiles_on_a_ladder_of_years(tmp_path):
     rows = [{"joined": f"20{10 + n % 15}-0{1 + n % 9}-1{n % 10}"} for n in range(300)]
+    # five records in a first year of their own: no span (its first month and year are sparse)
+    rows += [{"joined": "1999-05-01"}] * 5
     result = _profile(tmp_path, _contract([("joined", "date", {})]), rows)
     quantile = _one(result, "joined", "quantile/2", level="0.5")
     assert len(quantile["bins"]) == 2 + 201  # the range's two ends and 1900 to 2100
@@ -378,7 +386,7 @@ def test_a_timestamp_with_a_declared_range_is_binned_on_it_not_on_the_ladder(tmp
     rows = [
         {"placed_at": f"2024-0{1 + n % 9}-1{n % 10}T10:00:00Z", "joined": "2021-03-04"}
         for n in range(300)
-    ]
+    ] + [{"placed_at": "2024-02-02T10:00:00Z", "joined": "1999-05-01"}] * 5
     result = _profile(tmp_path, contract, rows)
     low, high = _stamp("2024-01-01"), _stamp("2024-12-31")
     for level in defaults.QUANTILE_LEVELS:
@@ -388,7 +396,7 @@ def test_a_timestamp_with_a_declared_range_is_binned_on_it_not_on_the_ladder(tmp
         assert all(low <= each <= high for each in edges)
         assert edges == sorted(set(edges))
         assert len(bins) <= defaults.RANGE_BINS + 1
-    # a date with no declared range keeps the ladder
+    # a date with no declared range keeps the ladder when its ends are sparse
     assert len(_one(result, "joined", "quantile/2", level="0.5")["bins"]) == 2 + 201
 
 

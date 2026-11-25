@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` states how far apart two dates lie, and how many children a parent has per
+  active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
+  histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed
+  to the bins from the first holding a record to the last, and the order of the two (after,
+  before, same), checked together in one pass on the same outer edges. The days are published
+  only when each of those two end bins holds at least `minimumCell` records, so no single record
+  places an outer edge, as for a date span; an order level wholly outside the outer edges is
+  published as zero, and with no day histogram the order is checked alone. Each declared relationship
+  gets the same for every parent and child DATE pair, and an `exposure`: the child rows whose
+  parent's start is known and the days those parents are active inside a window, taken from the
+  start column's published date span or the range the contract declares for it. The document
+  names format 1-3-0. A cell that a contract rule empties, as `closed IS NULL OR closed >=
+  opened` empties "before", is published as a zero only when the records leave it empty; the rule
+  never makes a zero out of data, and a rule the records break changes nothing. A relationship
+  states `structural: ["childless"]` only when its children per parent are counted, the
+  disclosure rule treats zeros as disclosive, the contract derives the parent's count of the
+  children and checks it is at least 1, and no parent lacks a child. A pair with a timestamp
+  column, a value that is not a whole day, and an exposure with no window are named under Not
+  measured with the reason (`--strict` refuses a pair with a timestamp column before any record is
+  read). A table holds at most 1024 date pairs, and a relationship at most 1024 dates and 1024
+  exposures; the rest are named under Not measured. A pair no record holds both dates of is written like a small one, its
+  order withheld whole, so the list of pairs says nothing about it. A parent table publishes the
+  exposure of one lifetime, the same under every relationship into it: the first lifetime with an
+  end, else the first DATE column alone, in the schema's order. Every other lifetime's exposure is
+  written withheld whole (`D`), since sums over the same parents can be added and subtracted to give
+  one parent's date back. A private release forms none of these and names them as before.
+- **`fluid profile` publishes a table's calendar, its monthly periods and statistics counted per
+  entity.** Each DATE and timestamp column (a request lists the columns it wants) gets `month`,
+  `dayOfWeek` and, on a timestamp only, `hourOfWeek` as level histograms read in UTC, counted in
+  one integer pass. The hours and the days of the week are checked in one call, since a day is
+  24 hours. A calendar histogram is published only when no statistic on the column (its own
+  histogram and quantiles, any statistic grouped by its bins, and a relationship's children per
+  parent grouped by them) withholds a group or a cell and each cuts its records only at the start
+  of its unit (a month, a day, an hour): the instants where a published count of the records below
+  lies strictly between 0 and its `k`, so a ladder's outer edges, which cut nothing, do not count.
+  Else it is withheld whole, and a declared range's quantile edges, which fall mid-month, withhold
+  the month.
+  Without `--request`, a table that declares `semantics.defaultAggTimeDimension` gets the mean of
+  each number column that is not a key and has no histogram over a declared range, in each
+  calendar month from the first to the last of the time column's published
+  span or declared range, every month a group, checked with the rows that have no time as one more
+  group, and withheld whole unless the time column's edge statistics all cut at month starts
+  and withhold nothing. A column a `dependency` sets from
+  an entity key gets its histogram counted per entity, each entity at the value its rows most
+  often hold, checked in a call of its own, and withheld whole when the cells it withholds are
+  not the cells the column's row-level histogram withholds, or when no entity holds a known value. The calendar
+  and the per-entity statistics name format
+  1-3-0. A table's calendar holds at most 1024 columns; the rest are named under Not measured. A
+  private release forms none of these.
+- **`fluid profile --timings` says where a profile spends its time.** After the report it prints,
+  for each table in profile order, `Timings for <exposeId>: read X s, measure Y s, check Z s.`,
+  then `Timings for the document: write W s; total T s.`. Read is the source read, measure forms
+  the table's metrics, statistics, date spans, children per parent, facts and rank correlations,
+  and check is the output checks across a column's statistics and a relationship's counts; a
+  check made metric by metric counts as measure. Work that spans tables (facts, groupings) is
+  shared equally among the tables it names. The document's bytes are the same with and without
+  the flag. A private release refuses `--timings` before any record is read, since a duration
+  follows the row count.
+- **`fluid profile` bins a date or timestamp with no declared range on the months it spans.** Such
+  a column got only quartiles on a 1900 to 2100 ladder of years, so `fluxsim init` had no run
+  window to read. It now publishes a `marginalHistogram/1` over calendar months, or over calendar
+  years when the span is longer than 240 months, from the start of the month holding the earliest
+  record to the start of the month after the latest. The grain needs its first and last bin to
+  each hold at least the disclosure rule's minimum cell (10 under ACRO), and the span at most 240
+  bins; with neither the column keeps the ladder's quartiles and the report says why. A column
+  with both ends of a range declared, a column a request groups by or is grouped by, and a key of
+  a counted relationship are unchanged.
 - **Rules can read a versioned table through a relationship (0.7.7 preview).** A type II slowly
   changing dimension's window now states its conventions: `validityParams.openEnd` (what an open
   version's end holds) and `chain` (`nextStart`, `dayBefore` or `none`), and the natural entity's
@@ -110,6 +177,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid profile --request` names every ask it does not form.** A profile request can ask for a
+  table's date pairs and calendar, a workload, a relationship's dates and exposure, and the
+  consumers' queries. The request was read whole and the asks it did not form were dropped without a
+  word: the profile held none of them and the report did not say so. An ask the profile does not
+  form is now named under "Not measured" (and "Not released" for `--privacy-unit`), with its reason.
+  `--strict` refuses the request before any record is read, naming each ask, when the request or the
+  contract alone shows that an ask cannot be formed: a workload or a consumer query; a metric,
+  statistic, rank correlation, grouping, date pair, calendar, relationship date or exposure over a
+  column the profile does not read, a key of a counted relationship, or a column whose type rules it
+  out; a fact whose rule fluid profile cannot measure; more entries than a profile holds; any ask of
+  a relationship the contract does not declare or the profile does not read. With `--privacy-unit`,
+  `--strict` refuses instead the asks of a kind a private release does not form: a workload, a
+  consumer query, date pairs, a calendar, relationship dates and exposure. An ask that only the
+  records leave unanswered (a small cell, a column with no published span, a value that is not a
+  whole day) is named under Not measured and never refused. Without `--request`, `--strict` is
+  refused. A query is named, never printed: its text is not kept.
 - **A contract's digest covers its `$ref` fragments.** `fluid contract digest` and the federation
   gate's git backend hashed the root file alone, so editing a fragment of a split contract
   (`fragments/exposes/*.yaml`, written by `fluid split`) left the digest, and so every
@@ -436,6 +519,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- **A default `fluid profile` of a table with a DATE or timestamp column now names format 1-3-0,
+  and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
+  the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so
+  the document moves from format 1-1-0 to 1-3-0 even with no date pair or relationship in it.
+  `fluxsim` 0.10.0 and later read format 1-3-0; 0.9 and older refuse the document. Re-profile
+  after upgrading, and pin the new digest wherever the old one was pinned.
 - **An unset or empty `{{ env.NAME }}` now stops the command.** A contract that relied on a
   variable rendering as nothing (an optional prefix, a path whose variable was never exported) now
   fails naming it: export the variable, or delete the placeholder. That includes a region written

@@ -66,10 +66,11 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 __all__ = [
     "DeclaredRange",
@@ -172,8 +173,11 @@ class DefaultPlan:
     block: Optional[Dict[str, Any]]
     uncovered: Tuple[Tuple[str, str], ...] = ()
     ranges: Mapping[str, DeclaredRange] = field(default_factory=dict)
-    #: The date and timestamp columns the block holds, whose bins are a ladder.
+    #: The date and timestamp columns the block holds, whose bins are a ladder or a span.
     timestamps: Tuple[str, ...] = ()
+    #: The columns of ``timestamps`` that hold a histogram on a span of the records' months
+    #: or years (:func:`date_span`) instead of the ladder's quantiles.
+    spanned: Tuple[str, ...] = ()
 
 
 def declared_range(column: Mapping[str, Any]) -> Tuple[Optional[Fraction], Optional[Fraction]]:
@@ -449,17 +453,105 @@ def _dimension_columns(expose: Mapping[str, Any], names: Sequence[str]) -> List[
     return found
 
 
+#: The most bins a date span has, in months or in years.
+MOST_SPAN_BINS = 240
+
+_MS_PER_DAY = 86_400_000
+
+
+def _month_start(index: int) -> int:
+    """Seconds since the epoch of the first instant of month *index* (``year * 12 + month - 1``)."""
+    year, month = divmod(index, 12)
+    return (datetime(year, month + 1, 1, tzinfo=timezone.utc) - _EPOCH).days * 86_400
+
+
+def _year_start(year: int) -> int:
+    return (datetime(year, 1, 1, tzinfo=timezone.utc) - _EPOCH).days * 86_400
+
+
+def date_span(
+    milliseconds: Iterable[int], minimum_cell: int
+) -> Tuple[Optional[Tuple[str, ...]], Optional[str]]:
+    """The calendar bins that span a date or timestamp column's records: ``(edges, reason)``.
+
+    *milliseconds* are the column's non-null values as the registry reads a timestamp. The
+    span runs from the start of the month (UTC) holding the earliest to the start of the month
+    after the one holding the latest, in calendar months when both end months each hold at
+    least *minimum_cell* records and there are at most :data:`MOST_SPAN_BINS` of them; else in
+    calendar years on the same two rules. Every edge is a month or a year start, spelled as
+    :func:`timestamp_bins` spells one. With no such span the edges are ``None`` and the
+    reason says why, in words that hold no count of the records.
+    """
+    days = Counter(value // _MS_PER_DAY for value in milliseconds)
+    held = f"its first or last month and year hold fewer than {minimum_cell} records"
+    if not days:
+        return None, "no record holds a value"
+    months: Counter[int] = Counter()
+    years: Counter[int] = Counter()
+    try:
+        for day, count in days.items():
+            moment = _EPOCH + timedelta(days=day)
+            months[moment.year * 12 + moment.month - 1] += count
+            years[moment.year] += count
+    except OverflowError:
+        return None, f"its span is longer than {MOST_SPAN_BINS} years"
+    first, last = min(months), max(months)
+    if (
+        months[first] >= minimum_cell
+        and months[last] >= minimum_cell
+        and last - first + 1 <= MOST_SPAN_BINS
+        and last < 9999 * 12 + 11  # the month after December 9999 is no instant
+    ):
+        return tuple(_spell(_month_start(index)) for index in range(first, last + 2)), None
+    first, last = min(years), max(years)
+    if years[first] < minimum_cell or years[last] < minimum_cell:
+        return None, held
+    if last - first + 1 > MOST_SPAN_BINS:
+        return None, f"its span is longer than {MOST_SPAN_BINS} years"
+    if last >= 9999:  # the year after it is no instant a bin edge can be spelled at
+        return None, "its last year is the last the calendar spells"
+    return tuple(_spell(_year_start(year)) for year in range(first, last + 2)), None
+
+
+def ladder_timestamps(
+    expose: Mapping[str, Any], columns: Sequence[Any], keep: Optional[Set[str]] = None
+) -> List[str]:
+    """The date and timestamp columns of *columns* whose bins are the type's ladder.
+
+    That is each whose ``validationRules`` do not declare both ends of a range
+    (:func:`declared_instants`). With *keep*, only those it names.
+    """
+    contract = expose.get("contract")
+    entries = contract.get("schema") if isinstance(contract, Mapping) else None
+    schema = {
+        entry["name"]: entry
+        for entry in (entries if isinstance(entries, list) else ())
+        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str)
+    }
+    return [
+        column.name
+        for column in columns
+        if column.domain == "timestamp"
+        and declared_instants(schema.get(column.name, {})) is None
+        and (keep is None or column.name in keep)
+    ]
+
+
 def default_plan(
     expose: Mapping[str, Any],
     columns: Sequence[Any],
     enum_levels: Callable[[str], Sequence[str]],
     fractional_bits: int,
+    spans: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> DefaultPlan:
     """The fidelity block the contract's declarations give *expose*, on the profile's grid.
 
     *columns* are the expose's profiled columns (``runner.ColumnPlan``: name and domain)
     and *enum_levels* reads the levels a FLUID ``enum(...)`` type declares, as the
-    registry reads them (:meth:`StatisticsBackend.enum_levels`).
+    registry reads them (:meth:`StatisticsBackend.enum_levels`). A date or timestamp column
+    with no declared range that *spans* names gets a histogram on those bins (:func:`date_span`)
+    in place of the ladder's quantiles: a column has a histogram or quantiles, never both on
+    one set of bins.
     """
     contract = expose.get("contract")
     entries = contract.get("schema") if isinstance(contract, Mapping) else None
@@ -474,6 +566,7 @@ def default_plan(
     uncovered: List[Tuple[str, str]] = []
     levels: Dict[str, int] = {}
     timestamps: List[str] = []
+    spanned: List[str] = []
     for column in columns:
         entry = schema.get(column.name, {})
         declared_type = entry.get("type")
@@ -498,6 +591,20 @@ def default_plan(
             stamped = declared_instants(entry)
             if stamped is not None:  # the contract's own range, public, never the records'
                 edges = list(timestamp_bins(*stamped))
+            elif spans is not None and column.name in spans:
+                edges = list(spans[column.name])
+                declared[column.name] = {"range": {"min": edges[0], "max": edges[-1]}}
+                properties.append(
+                    {
+                        "property": "marginalHistogram",
+                        "column": column.name,
+                        "bins": edges,
+                        "tolerance": dict(_DISTANCE),
+                    }
+                )
+                timestamps.append(column.name)
+                spanned.append(column.name)
+                continue
             else:
                 edges = [_FIRST_INSTANT, *(_instant(year) for year in _LADDER_YEARS), _LAST_INSTANT]
             declared[column.name] = {"range": {"min": edges[0], "max": edges[-1]}}
@@ -583,7 +690,11 @@ def default_plan(
         "properties": properties,
     }
     return DefaultPlan(
-        block=block, uncovered=tuple(uncovered), ranges=ranges, timestamps=tuple(timestamps)
+        block=block,
+        uncovered=tuple(uncovered),
+        ranges=ranges,
+        timestamps=tuple(timestamps),
+        spanned=tuple(spanned),
     )
 
 
@@ -613,7 +724,7 @@ def with_timestamp_histograms(plan: DefaultPlan) -> Dict[str, Any]:
     properties = list(plan.block["properties"])
     bins = public_bins(plan.block)
     for name in plan.timestamps:
-        if name not in bins:
+        if name not in bins or name in plan.spanned:  # a span is the column's own histogram
             continue
         properties.append(
             {

@@ -251,6 +251,40 @@ def test_a_rho_of_one_is_not_warned_of(workspace, registry, selected, capsys):
     assert "a large privacy loss" not in _out(capsys)
 
 
+def _ask_a_query(workspace):
+    """The fixture request in format 1-1-0, also asking the rate of one consumer query."""
+    request = workspace / "orders.profile-request.yml"
+    text = request.read_text(encoding="utf-8")
+    request.write_text(
+        text.replace("/profile-request/1-0-0/", "/profile-request/1-1-0/") + '"queries":\n'
+        '  - "name": "big_orders"\n'
+        '    "sql": "SELECT order_id FROM orders"\n'
+        '    "unit":\n'
+        '      "table": "orders"\n',
+        encoding="utf-8",
+    )
+
+
+def test_a_release_names_an_ask_fluid_profile_does_not_form(workspace, registry, selected, capsys):
+    _ask_a_query(workspace)
+    assert main(_argv()) == 0
+    out = " ".join(_out(capsys).split())
+    assert "Not released (fluid profile runs no consumer query): query big_orders." in out
+    assert "SELECT" not in out
+
+
+def test_strict_refuses_a_release_whose_request_asks_what_fluid_profile_does_not_form(
+    workspace, registry, selected, capsys
+):
+    _ask_a_query(workspace)
+    (workspace / "orders.csv").unlink()  # a read would be a different refusal
+    assert main([*_argv(), "--strict"]) == 1
+    out = _out(capsys)
+    assert "profile_request_not_formed" in out and "query big_orders" in out
+    assert "SELECT" not in out
+    assert not (workspace / "rec.json").exists() and selected == []
+
+
 # ---- nothing data-dependent leaves outside the noise ---------------------------------------------
 
 
