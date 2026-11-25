@@ -57,6 +57,7 @@ from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, Decimal, localcontext
 from fractions import Fraction
 from typing import (
+    AbstractSet,
     Any,
     Callable,
     Dict,
@@ -871,22 +872,29 @@ def _rank_pairs(
                     if (ask.definition, first, second) not in kept:
                         kept.append((ask.definition, first, second))
                     continue
-                name = missing[0]
-                reason = why_not.get(name) or skipped.get(name)
-                if reason is None and name in nullable:
-                    reason = (
-                        "the contract does not declare it required, and a rank correlation is "
-                        "formed over every record"
-                    )
-                if reason is None:
-                    reason = (
-                        "the release holds the rank correlation of released number or timestamp "
-                        "columns only"
-                    )
+                reason = _rank_left_out_reason(missing[0], nullable, why_not, skipped)
                 left_out.append(
                     (f"{ask.definition} of {asked.expose_id}.{first} and {second}", reason)
                 )
     return tuple(kept), left_out
+
+
+def _rank_left_out_reason(
+    name: str,
+    nullable: AbstractSet[str],
+    why_not: Mapping[str, str],
+    skipped: Mapping[str, str],
+) -> str:
+    """Why a rank correlation over the column *name* is not released."""
+    reason = why_not.get(name) or skipped.get(name)
+    if reason is not None:
+        return reason
+    if name in nullable:
+        return (
+            "the contract does not declare it required, and a rank correlation is "
+            "formed over every record"
+        )
+    return "the release holds the rank correlation of released number or timestamp columns only"
 
 
 def _table_not_released(
@@ -1050,26 +1058,36 @@ def _row_error(
     )
 
 
+@dataclass(frozen=True)
+class Placement:
+    """Where the values of one column sit, for the row a refusal names.
+
+    *table* is named in a refusal when the release holds more than one table. *rows* are the rows
+    of the table the values are, when they are not all of them (a column that may hold a null is
+    placed over the rows that hold a value).
+    """
+
+    table: Optional[str] = None
+    rows: Optional[Sequence[int]] = None
+
+    def row(self, index: int) -> int:
+        """The row of the table that the *index*-th value is."""
+        return index if self.rows is None else self.rows[index]
+
+
 def place_values(
     name: str,
     column: ReleasedColumn,
     found: Sequence[Any],
     backend: StatisticsBackend,
     fractional_bits: int,
-    *,
-    rows: Optional[Sequence[int]] = None,
-    table: Optional[str] = None,
+    where: Placement = Placement(),
 ) -> List[int]:
     """The level or bin each value of *column* falls in, no value being ``None``.
 
     A value outside the levels or the range the column declares refuses, naming the column and
-    the row and never the value. *rows* are the rows of the table the values are, when they are
-    not all of them (a column that may hold a null is placed over the rows that hold a value).
+    the row and never the value.
     """
-
-    def at(index: int) -> int:
-        return index if rows is None else rows[index]
-
     if column.categorical:
         position = {level: place for place, level in enumerate(column.levels)}
         placed = []
@@ -1078,9 +1096,9 @@ def place_values(
                 raise _row_error(
                     _OUTSIDE,
                     name,
-                    at(index),
+                    where.row(index),
                     "a value outside the levels its type declares",
-                    table,
+                    where.table,
                 )
             placed.append(position[value])
         return placed
@@ -1090,9 +1108,9 @@ def place_values(
             raise _row_error(
                 _OUTSIDE,
                 name,
-                at(index),
+                where.row(index),
                 "a value outside the range its type or validationRules declare",
-                table,
+                where.table,
             )
     return backend.bin_cells(found, column.edges, fractional_bits)
 
@@ -1128,8 +1146,7 @@ def place_known(
         [found[index] for index in known],
         backend,
         fractional_bits,
-        rows=known,
-        table=table,
+        Placement(table, known),
     )
     cells = [NO_CELL] * len(found)
     for index, cell in zip(known, placed, strict=True):
@@ -1733,6 +1750,64 @@ def measure_counts(
     return found
 
 
+def _add_noise(
+    plan: ReleasePlan,
+    counted: Sequence[ReleasedTable],
+    exact: Mapping[str, Sequence[int]],
+    seed: bytes,
+) -> Tuple[List[Tuple[Fraction, ...]], List[consistency.CountTable]]:
+    """The noisy cells of each counted table, and the tables that are made to agree."""
+    noisy: List[Tuple[Fraction, ...]] = []
+    together: List[consistency.CountTable] = []
+    for table in counted:
+        sigma2 = Fraction(table.scale_units**2, 10 ** (2 * _SCALE_PLACES))
+        source = SeededSource(seed, table.label)
+        values = tuple(
+            Fraction(count + sample_discrete_gaussian(sigma2, source))
+            for count in exact[table.label]
+        )
+        noisy.append(values)
+        if agrees(plan, table):
+            together.append(
+                consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
+            )
+    return noisy, together
+
+
+def _agreed_values(
+    plan: ReleasePlan,
+    counted: Sequence[ReleasedTable],
+    noisy: Sequence[Tuple[Fraction, ...]],
+    together: Sequence[consistency.CountTable],
+) -> Tuple[Dict[str, Tuple[str, ...]], Dict[str, Tuple[Fraction, ...]]]:
+    """The text and the value of each counted table's cells, the agreeing ones made to agree.
+
+    A table that does not agree (a column that may hold a null) is released as it was noised.
+    """
+    values_of: Dict[str, Tuple[str, ...]] = {}
+    agreed_of: Dict[str, Tuple[Fraction, ...]] = {}
+    if together:
+        try:
+            forest = consistency.junction_forest(together)
+            agreed = consistency.make_consistent(together)
+            texts = consistency.to_decimal_text(together, agreed, forest)
+        except ValueError as error:
+            raise ReleaseRefused(
+                "profile_release_not_a_forest",
+                f"the tables of the release cannot be made to agree: {error}",
+                {"next": "report it with your forge-cli version"},
+            ) from None
+        agreeing = [each for each in counted if agrees(plan, each)]
+        _agree(agreeing, texts)
+        values_of.update({table.label: cells for table, cells in zip(agreeing, texts, strict=True)})
+        agreed_of.update({table.label: each for table, each in zip(agreeing, agreed, strict=True)})
+    for table, values in zip(counted, noisy, strict=True):
+        if table.label not in values_of:
+            values_of[table.label] = tuple(decimal_text(value) for value in values)
+            agreed_of[table.label] = values
+    return values_of, agreed_of
+
+
 def draw(
     plan: ReleasePlan,
     rows: EncodedRows,
@@ -1802,41 +1877,8 @@ def draw(
         ) from None
     counted = [each for each in tables if each.kind != RANK]
     exact = measure_counts(plan, rows, kept, tables)
-    noisy: List[Tuple[Fraction, ...]] = []
-    together: List[consistency.CountTable] = []
-    for table in counted:
-        sigma2 = Fraction(table.scale_units**2, 10 ** (2 * _SCALE_PLACES))
-        source = SeededSource(seed, table.label)
-        values = tuple(
-            Fraction(count + sample_discrete_gaussian(sigma2, source))
-            for count in exact[table.label]
-        )
-        noisy.append(values)
-        if agrees(plan, table):
-            together.append(
-                consistency.CountTable(table.label, table.columns, table.sizes, values, sigma2)
-            )
-    values_of: Dict[str, Tuple[str, ...]] = {}
-    agreed_of: Dict[str, Tuple[Fraction, ...]] = {}
-    if together:
-        try:
-            forest = consistency.junction_forest(together)
-            agreed = consistency.make_consistent(together)
-            texts = consistency.to_decimal_text(together, agreed, forest)
-        except ValueError as error:
-            raise ReleaseRefused(
-                "profile_release_not_a_forest",
-                f"the tables of the release cannot be made to agree: {error}",
-                {"next": "report it with your forge-cli version"},
-            ) from None
-        agreeing = [each for each in counted if agrees(plan, each)]
-        _agree(agreeing, texts)
-        values_of.update({table.label: cells for table, cells in zip(agreeing, texts, strict=True)})
-        agreed_of.update({table.label: each for table, each in zip(agreeing, agreed, strict=True)})
-    for table, values in zip(counted, noisy, strict=True):
-        if table.label not in values_of:
-            values_of[table.label] = tuple(decimal_text(value) for value in values)
-            agreed_of[table.label] = values
+    noisy, together = _add_noise(plan, counted, exact, seed)
+    values_of, agreed_of = _agreed_values(plan, counted, noisy, together)
     for table in tables:
         if table.kind == RANK:
             first, second = table.columns
@@ -1881,6 +1923,75 @@ def _opendp_uri(version: Optional[str]) -> str:
     return f"{base}/{version}/" if version else f"{base}/"
 
 
+def _clique_entry(plan: ReleasePlan, table: ReleasedTable, cells: Sequence[str]) -> Dict[str, Any]:
+    """The document's entry for one clique: by levels when its columns are all categorical."""
+    members = [plan.column(name) for name in table.columns]
+    if all(each.categorical for each in members):
+        return {
+            "definition": "cliqueMarginal/1",
+            "columns": list(table.columns),
+            "levels": [list(each.levels) for each in members],
+            "noisyCounts": list(cells),
+            "noise": _noise_block(table),
+        }
+    return {
+        "definition": "cliqueMarginal/2",
+        "columns": list(table.columns),
+        "domains": [
+            ({"levels": list(each.levels)} if each.categorical else {"bins": list(each.edge_texts)})
+            for each in members
+        ],
+        "noisyCounts": list(cells),
+        "noise": _noise_block(table),
+    }
+
+
+def _pair_statistic(table: ReleasedTable, cells: Sequence[str]) -> Dict[str, Any]:
+    """The statistic of a date pair's days or order."""
+    statistic: Dict[str, Any] = {
+        "sampleSize": {"min": 0},
+        "disclosure": RULE_NAME,
+        "groups": [{"group": "", "status": "F", "noisyCounts": list(cells)}],
+        "noise": _noise_block(table),
+    }
+    if table.kind == PAIR_DAYS:
+        statistic["definition"] = "marginalHistogram/1"
+        statistic["bins"] = [str(edge) for edge in dates.DAY_LADDER]
+    else:
+        statistic["definition"] = "levelHistogram/1"
+        statistic["levels"] = list(dates.ORDER_LEVELS)
+    return statistic
+
+
+def _column_pairs_block(pairs: Mapping[Tuple[str, str], List[Dict[str, Any]]]) -> List[Any]:
+    """The ``columnPairs`` of a table: each pair's rank correlations, in the order of the spec."""
+    return [
+        {
+            "columns": [first, second],
+            "statistics": sorted(
+                statistics, key=lambda each: RANK_DEFINITIONS.index(each["definition"])
+            ),
+        }
+        for (first, second), statistics in pairs.items()
+    ]
+
+
+def _date_pairs_block(
+    plan: ReleasePlan, dated: Mapping[Tuple[str, str], Mapping[str, Dict[str, Any]]]
+) -> List[Any]:
+    """The ``datePairs`` of a table, in the order the plan lists them, for those it holds."""
+    return [
+        {
+            "start": start,
+            "end": end,
+            "statistics": [dated[(start, end)][PAIR_DAYS]],
+            "order": dated[(start, end)][PAIR_ORDER],
+        }
+        for start, end in plan.date_pairs
+        if (start, end) in dated
+    ]
+
+
 def _table_block(
     plan: ReleasePlan,
     tables: Sequence[ReleasedTable],
@@ -1904,35 +2015,9 @@ def _table_block(
     for table in tables:
         cells = values_of[table.label]
         if table.kind == CLIQUE:
-            members = [plan.column(name) for name in table.columns]
-            if all(each.categorical for each in members):
-                cliques.append(
-                    {
-                        "definition": "cliqueMarginal/1",
-                        "columns": list(table.columns),
-                        "levels": [list(each.levels) for each in members],
-                        "noisyCounts": list(cells),
-                        "noise": _noise_block(table),
-                    }
-                )
-            else:
-                binned = True
-                cliques.append(
-                    {
-                        "definition": "cliqueMarginal/2",
-                        "columns": list(table.columns),
-                        "domains": [
-                            (
-                                {"levels": list(each.levels)}
-                                if each.categorical
-                                else {"bins": list(each.edge_texts)}
-                            )
-                            for each in members
-                        ],
-                        "noisyCounts": list(cells),
-                        "noise": _noise_block(table),
-                    }
-                )
+            entry = _clique_entry(plan, table, cells)
+            binned = binned or entry["definition"] == "cliqueMarginal/2"
+            cliques.append(entry)
             continue
         if table.kind == RANK:
             first, second = table.columns
@@ -1948,18 +2033,7 @@ def _table_block(
             )
             continue
         if table.kind in PAIRS:
-            statistic: Dict[str, Any] = {
-                "sampleSize": {"min": 0},
-                "disclosure": RULE_NAME,
-                "groups": [{"group": "", "status": "F", "noisyCounts": list(cells)}],
-                "noise": _noise_block(table),
-            }
-            if table.kind == PAIR_DAYS:
-                statistic["definition"] = "marginalHistogram/1"
-                statistic["bins"] = [str(edge) for edge in dates.DAY_LADDER]
-            else:
-                statistic["definition"] = "levelHistogram/1"
-                statistic["levels"] = list(dates.ORDER_LEVELS)
+            statistic = _pair_statistic(table, cells)
             dated.setdefault((table.columns[0], table.columns[1]), {})[table.kind] = statistic
             continue
         column = plan.column(table.columns[0])
@@ -1979,26 +2053,9 @@ def _table_block(
     if cliques:
         released["cliques"] = cliques
     if pairs:
-        released["columnPairs"] = [
-            {
-                "columns": [first, second],
-                "statistics": sorted(
-                    statistics, key=lambda each: RANK_DEFINITIONS.index(each["definition"])
-                ),
-            }
-            for (first, second), statistics in pairs.items()
-        ]
+        released["columnPairs"] = _column_pairs_block(pairs)
     if dated:
-        released["datePairs"] = [
-            {
-                "start": start,
-                "end": end,
-                "statistics": [dated[(start, end)][PAIR_DAYS]],
-                "order": dated[(start, end)][PAIR_ORDER],
-            }
-            for start, end in plan.date_pairs
-            if (start, end) in dated
-        ]
+        released["datePairs"] = _date_pairs_block(plan, dated)
     # A release of format 1-2-0 states no selection, and the loss of choosing the cliques is
     # slack below its total. One that holds a 1-4-0 form, or names MST, states it.
     if plan.selects and (pairs or binned or plan.clique_method != "aim" or states_selection):

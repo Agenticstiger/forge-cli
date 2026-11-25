@@ -85,6 +85,7 @@ from fluid_build.profiler.dp.release import (
     WORKLOAD_UNUSED,
     EncodedRows,
     Part,
+    Placement,
     PublicStructures,
     ReleasedColumn,
     ReleasedTable,
@@ -1259,8 +1260,7 @@ def encode_follow_rows(
             [found[i] for i in at],
             backend,
             plan.fractional_bits,
-            rows=at,
-            table=table,
+            Placement(table, at),
         )
         full: List[Optional[int]] = [None] * len(found)
         for index, cell in zip(at, cells, strict=True):
