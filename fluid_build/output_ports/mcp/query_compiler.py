@@ -2344,6 +2344,22 @@ def _declared_column_kinds(expose: Mapping[str, Any]) -> Dict[str, Optional[str]
     return found
 
 
+def _refuse_untrue_declared_types(
+    expose: Optional[Mapping[str, Any]],
+    row_predicate: Optional[str],
+    physical_kinds: Optional[Callable[[], Mapping[str, Optional[str]]]],
+) -> None:
+    """For a filtered caller, refuse declared types the table does not hold: the
+    caller's comparisons are typed by them. ``physical_kinds`` reads the table's own
+    types from the engine's catalog, once per driver, and only when a column declares
+    a type."""
+    if expose is None or row_predicate is None or physical_kinds is None:
+        return
+    declared = _declared_column_kinds(expose)
+    if any(kind is not None for kind in declared.values()):
+        _refuse_types_the_table_does_not_hold(declared, physical_kinds())
+
+
 def _refuse_types_the_table_does_not_hold(
     declared: Mapping[str, Optional[str]], physical: Mapping[str, Optional[str]]
 ) -> None:
@@ -2486,29 +2502,35 @@ def _source_kind(
         if position >= len(expression.expressions):
             return None
         item = expression.expressions[position]
-        value = item.this if isinstance(item, exp.Alias) else item
-        if isinstance(value, exp.Column):
-            if id(value) in kinds:
-                return kinds[id(value)]
-            return _name_kind(
-                source, value.name, value.table, declared, exposed_name, kinds, depth + 1
-            )
-        return _constant_kind(value)
+        return _output_kind(item, source, declared, exposed_name, kinds, depth)
     for item in expression.expressions:
         if isinstance(item, exp.Star) or (isinstance(item, exp.Column) and item.is_star):
             continue
         if item.alias_or_name.casefold() == folded:
-            value = item.this if isinstance(item, exp.Alias) else item
-            if isinstance(value, exp.Column):
-                if id(value) in kinds:
-                    return kinds[id(value)]
-                return _name_kind(
-                    source, value.name, value.table, declared, exposed_name, kinds, depth + 1
-                )
-            return _constant_kind(value)
+            return _output_kind(item, source, declared, exposed_name, kinds, depth)
     if _star_select(expression):
         return _name_kind(source, folded, "", declared, exposed_name, kinds, depth + 1)
     return None
+
+
+def _output_kind(
+    item: Any,
+    source: Any,
+    declared: Mapping[str, Optional[str]],
+    exposed_name: str,
+    kinds: Mapping[int, Optional[str]],
+    depth: int,
+) -> Optional[str]:
+    """The kind of one output of a CTE or derived table: a column it selects unchanged
+    keeps that column's kind, a constant has its own, anything computed has none."""
+    from sqlglot import exp
+
+    value = item.this if isinstance(item, exp.Alias) else item
+    if isinstance(value, exp.Column):
+        if id(value) in kinds:
+            return kinds[id(value)]
+        return _name_kind(source, value.name, value.table, declared, exposed_name, kinds, depth + 1)
+    return _constant_kind(value)
 
 
 def _constant_kind(value: Any) -> Optional[str]:
@@ -3032,11 +3054,7 @@ def _refuse_another_schemas_table(
         "db": exposed.text("db") or _DEFAULT_SCHEMA.get(read or "", ""),
         "catalog": exposed.text("catalog") or (catalog if read == "duckdb" else ""),
     }
-    accepted = [exposed.name]
-    if expected["db"]:
-        accepted.append(f"{expected['db']}.{exposed.name}")
-        if expected["catalog"]:
-            accepted.append(f"{expected['catalog']}.{expected['db']}.{exposed.name}")
+    accepted = _accepted_spellings(exposed.name, expected["db"], expected["catalog"])
     for table in tables:
         if table.name.casefold() != exposed_name:
             continue
@@ -3048,6 +3066,17 @@ def _refuse_another_schemas_table(
                     "schema or catalog than the exposed table's; name the exposed table as "
                     f"{' or '.join(accepted)}."
                 )
+
+
+def _accepted_spellings(name: str, db: str, catalog: str) -> List[str]:
+    """How a statement may name the exposed table: bare, with its schema, and with its
+    catalog and schema, where the binding or the engine's default gives them."""
+    spellings = [name]
+    if db:
+        spellings.append(f"{db}.{name}")
+        if catalog:
+            spellings.append(f"{catalog}.{db}.{name}")
+    return spellings
 
 
 def _splice_projection(sql: str, tables: List[Any], exposed: Any, projection: str) -> str:
@@ -3364,12 +3393,7 @@ def compile_free_form_sql(
             "sql cannot be compiled on an expose that restricts columns without the expose "
             "itself: the columns it declares are what the statement is limited to."
         )
-    if expose is not None and row_predicate is not None and physical_kinds is not None:
-        # A filtered caller's comparisons are typed by the declared types: they must be
-        # the table's own. ``physical_kinds`` reads them from the engine's catalog once.
-        declared_kinds = _declared_column_kinds(expose)
-        if any(kind is not None for kind in declared_kinds.values()):
-            _refuse_types_the_table_does_not_hold(declared_kinds, physical_kinds())
+    _refuse_untrue_declared_types(expose, row_predicate, physical_kinds)
     if expose is not None and (restricted or row_predicate is not None):
         candidate = _project_exposed_table(
             candidate,
