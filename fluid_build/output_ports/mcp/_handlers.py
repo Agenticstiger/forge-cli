@@ -211,6 +211,7 @@ def tool_query_sql(
         # state for legacy callers that don't pass the kwarg).
         expose=state.expose,
         caller_attributes=attrs,
+        dialect=descriptor.dialect,
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)

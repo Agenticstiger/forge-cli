@@ -79,7 +79,7 @@ def test_semantic_query_with_filter_uses_parameter_binding():
         limit=5,
         table_reference="customer_profiles",
     )
-    assert "WHERE signup_date = :p_0" in compiled.sql
+    assert "WHERE ((signup_date) = :p_0)" in compiled.sql
     assert compiled.params == ["2024-02-10"]
 
 
@@ -455,6 +455,10 @@ def test_free_form_sql_allows_string_literal_matching_restricted_name():
         table_reference="customer_profiles",
         limit=10,
         restricted_columns=("email",),
+        expose={
+            "exposeId": "customer_profiles",
+            "contract": {"schema": [{"name": "customer_id"}, {"name": "label"}, {"name": "email"}]},
+        },
     )
     assert "LIMIT 10" in compiled.sql
 
@@ -539,7 +543,7 @@ def test_metric_filter_composes_with_dimension_filters_and_binding():
         table_reference="orders",
     )
     assert "(status = 'completed')" in compiled.sql
-    assert "region = :p_0" in compiled.sql
+    assert "((region) = :p_0)" in compiled.sql
     assert compiled.params == ["emea"]
 
 
@@ -697,7 +701,7 @@ def test_balanced_or_filter_stays_contained_next_to_row_filters():
         table_reference="orders",
         caller_attributes={"tenant_id": "t-1"},
     )
-    assert "(status = 'completed' OR status = 'shipped') AND \"tenant_id\" = :p_0" in compiled.sql
+    assert "(status = 'completed' OR status = 'shipped') AND (\"tenant_id\" = :p_0)" in compiled.sql
     assert compiled.params == ["t-1"]
 
 
@@ -837,7 +841,7 @@ def test_filters_use_the_same_truncated_expression_as_the_projection():
         table_reference="orders",
         dialect="snowflake",
     )
-    assert "WHERE DATE_TRUNC('day', order_ts) = :p_0" in compiled.sql
+    assert "WHERE ((DATE_TRUNC('day', order_ts)) = :p_0)" in compiled.sql
 
 
 def test_bigquery_picks_the_typed_truncation_function():
@@ -1252,3 +1256,138 @@ def test_describe_returns_relationships_as_information():
     )
     payload = _handlers.tool_describe(state)
     assert payload["semantics"]["relationships"] == [_RELATIONSHIP]
+
+
+# ---------------------------------------------------------------------
+# Functions that return a whole table or query result as XML
+# ---------------------------------------------------------------------
+
+_XML_DUMP_FUNCTIONS = [
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
+]
+
+# A column that only shares a name is not a call, in any spelling of the call.
+_XML_DUMP_CALLS = [
+    "{name}('public.customers', true, false, '')",
+    "{NAME}('public.customers', true, false, '')",
+    "{name} ('public.customers', true, false, '')",
+    "pg_catalog.\"{name}\"('public.customers', true, false, '')",
+    "public.\"{NAME}\" ('public.customers', true, false, '')",
+    "pg_catalog.{name}('public.customers', true, false, '')",
+    "pg_catalog.`{name}`('public.customers', true, false, '')",
+]
+
+
+def _xml_dump_statements():
+    return [
+        f"SELECT {form.format(name=name, NAME=name.upper())} AS x"
+        for name in _XML_DUMP_FUNCTIONS
+        for form in _XML_DUMP_CALLS
+    ]
+
+
+@pytest.mark.parametrize("dialect", ["postgres", None])
+@pytest.mark.parametrize("sql", _xml_dump_statements())
+def test_query_sql_refuses_a_function_that_dumps_a_table_as_xml(sql, dialect):
+    with pytest.raises(QueryValidationError, match="as XML"):
+        compile_free_form_sql(
+            sql=sql, table_reference="public.customers", limit=10, dialect=dialect
+        )
+
+
+@pytest.mark.parametrize("name", _XML_DUMP_FUNCTIONS)
+def test_query_sql_refuses_the_xml_dump_inside_a_larger_statement(name):
+    for sql in (
+        f"SELECT id, {name}('public.customers', true, false, '') AS x FROM public.customers",
+        f"SELECT length({name}('public.customers', true, false, '')::text) AS n",
+        f"SELECT id FROM public.customers WHERE {name}('x', true, false, '') IS NOT NULL",
+    ):
+        with pytest.raises(QueryValidationError, match="as XML"):
+            compile_free_form_sql(sql=sql, table_reference="public.customers", limit=10)
+
+
+@pytest.mark.parametrize("sql", _xml_dump_statements())
+def test_expression_allowlist_refuses_a_function_that_dumps_a_table_as_xml(sql):
+    from fluid_build.providers._sql_safety import validate_sql_expression_allowlist
+
+    with pytest.raises(ValueError):
+        validate_sql_expression_allowlist(sql.split(None, 1)[1])
+
+
+@pytest.mark.parametrize("sql", _xml_dump_statements())
+def test_driver_statement_guard_refuses_a_function_that_dumps_a_table_as_xml(sql):
+    from fluid_build.output_ports.mcp.drivers.base import guard_against_injection_markers
+
+    with pytest.raises(ValueError):
+        guard_against_injection_markers(sql)
+
+
+def test_a_column_that_only_shares_a_name_with_an_xml_dump_function_is_not_a_call():
+    from fluid_build.providers._sql_safety import validate_sql_expression_allowlist
+
+    names = ", ".join(_XML_DUMP_FUNCTIONS)
+    validate_sql_expression_allowlist(f"{names} FROM t WHERE table_to_xml = 1")
+    compile_free_form_sql(
+        sql=f"SELECT {names} FROM public.customers",
+        table_reference="public.customers",
+        limit=10,
+        dialect="postgres",
+    )
+
+
+def _xml_dump_expose(*, measure=None, dimension=None, metric_filter=None):
+    metric = {"name": "mt", "type": "simple", "measure": "m"}
+    if metric_filter is not None:
+        metric["filter"] = metric_filter
+    dimensions = [{"name": "d", "type": "categorical"}]
+    if dimension is not None:
+        dimensions = [{"name": "d", "type": "categorical", "expr": dimension}]
+    return make_expose(
+        semantics={
+            "name": "customer_profiles",
+            "measures": [{"name": "m", "agg": "max", "expr": measure or "lifetime_value_usd"}],
+            "dimensions": dimensions,
+            "metrics": [metric],
+        },
+    )
+
+
+_XML_DUMP_EXPRESSIONS = [
+    f"{name}('public.customers', true, false, '')" for name in _XML_DUMP_FUNCTIONS
+]
+
+
+@pytest.mark.parametrize("dialect", ["postgres", None])
+@pytest.mark.parametrize("expression", _XML_DUMP_EXPRESSIONS)
+@pytest.mark.parametrize("where", ["measure", "dimension", "metric_filter"])
+def test_a_contract_expression_cannot_dump_a_table_as_xml(where, expression, dialect):
+    if where == "measure":
+        expose = _xml_dump_expose(measure=expression)
+        kwargs = {"measure": "m"}
+    elif where == "dimension":
+        expose = _xml_dump_expose(dimension=expression)
+        kwargs = {"measure": "m", "dimensions": ["d"]}
+    else:
+        expose = _xml_dump_expose(metric_filter=f"{expression} IS NOT NULL")
+        kwargs = {"metric": "mt"}
+    with pytest.raises(ValueError):
+        compile_semantic_query(
+            expose=expose,
+            limit=10,
+            table_reference="public.customers",
+            dialect=dialect,
+            **kwargs,
+        )

@@ -76,7 +76,7 @@ class TestSemanticQueryRowFilter:
             caller_attributes={"tenant_id": "acme"},
             table_reference="db.t",
         )
-        assert "region = :p_0" in compiled.sql
+        assert "(region) = :p_0" in compiled.sql
         assert '"tenant_id" = :p_1' in compiled.sql
         assert compiled.params == ["us", "acme"]
 
@@ -250,3 +250,100 @@ class TestHandlerWiring:
         with pytest.raises(RowFilterIdentityMissing):
             tool_query_sql(state, {"sql": "SELECT id FROM db.t", "limit": 10})
         assert driver.captured is None
+
+
+# ---------------------------------------------------------------------------
+# A row filter that cannot be applied is refused, never skipped
+# ---------------------------------------------------------------------------
+
+_MALFORMED_ROW_FILTERS = [
+    pytest.param({"column": "tenant_id", "like": "acme%"}, id="unknown-operator"),
+    pytest.param({"column": "tenant_id", "equal": "acme"}, id="misspelt-operator"),
+    pytest.param({"column": "tenant_id"}, id="no-operator"),
+    pytest.param({"column": "tenant_id", "equals": "acme", "in": ["a", "b"]}, id="two-operators"),
+    pytest.param({"column": 7, "equals": "acme"}, id="non-string-column"),
+    pytest.param({"column": ["tenant_id"], "equals": "acme"}, id="list-column"),
+    pytest.param({"column": "", "equals": "acme"}, id="empty-column"),
+    pytest.param({"equals": "acme"}, id="no-column"),
+    pytest.param("tenant_id", id="not-a-mapping"),
+]
+
+
+def _expose_with_row_filter(entry):
+    return {
+        "exposeId": "demo",
+        "semantics": {"measures": _MEASURES},
+        "policy": {"rowFilters": [entry]},
+    }
+
+
+class TestMalformedRowFilterIsRefused:
+    @pytest.mark.parametrize("entry", _MALFORMED_ROW_FILTERS)
+    def test_semantic_query(self, entry):
+        with pytest.raises(QueryValidationError, match="rowFilters"):
+            compile_semantic_query(
+                expose=_expose_with_row_filter(entry),
+                measure="row_count",
+                limit=10,
+                table_reference="db.t",
+            )
+
+    @pytest.mark.parametrize("entry", _MALFORMED_ROW_FILTERS)
+    def test_free_form_query(self, entry):
+        with pytest.raises(QueryValidationError, match="rowFilters"):
+            compile_free_form_sql(
+                sql="SELECT id FROM db.t",
+                table_reference="db.t",
+                limit=10,
+                expose=_expose_with_row_filter(entry),
+            )
+
+    @pytest.mark.parametrize("entry", _MALFORMED_ROW_FILTERS)
+    def test_sample_predicate(self, entry):
+        from fluid_build.output_ports.mcp.drivers.base import EngineDriver
+
+        with pytest.raises(QueryValidationError, match="rowFilters"):
+            EngineDriver.compile_row_filter_predicate(
+                _expose_with_row_filter(entry), caller_attributes={}
+            )
+
+    def test_a_valid_entry_beside_a_malformed_one_does_not_hide_it(self):
+        expose = {
+            "exposeId": "demo",
+            "semantics": {"measures": _MEASURES},
+            "policy": {
+                "rowFilters": [
+                    {"column": "tenant_id", "equals": "${caller.tenant_id}"},
+                    {"column": "region", "starts_with": "eu"},
+                ]
+            },
+        }
+        with pytest.raises(QueryValidationError, match="rowFilters"):
+            compile_semantic_query(
+                expose=expose,
+                measure="row_count",
+                limit=10,
+                caller_attributes={"tenant_id": "acme"},
+                table_reference="db.t",
+            )
+
+    def test_the_message_names_the_entry_position_and_the_supported_operators(self):
+        with pytest.raises(QueryValidationError) as caught:
+            compile_semantic_query(
+                expose=_expose_with_row_filter({"column": "tenant_id", "like": "x"}),
+                measure="row_count",
+                limit=10,
+                table_reference="db.t",
+            )
+        message = str(caught.value)
+        assert "rowFilters[0]" in message and "equals" in message and "in" in message
+
+    def test_no_row_filter_and_an_empty_list_are_not_malformed(self):
+        for policy in ({}, {"rowFilters": []}, {"rowFilters": None}):
+            compiled = compile_semantic_query(
+                expose={"exposeId": "d", "semantics": {"measures": _MEASURES}, "policy": policy},
+                measure="row_count",
+                limit=10,
+                table_reference="db.t",
+            )
+            assert "WHERE" not in compiled.sql

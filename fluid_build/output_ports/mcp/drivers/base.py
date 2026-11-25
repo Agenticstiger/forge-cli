@@ -27,9 +27,12 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
-from fluid_build.providers._sql_safety import names_refused_duckdb_function
+from fluid_build.providers._sql_safety import (
+    names_refused_duckdb_function,
+    names_refused_postgres_function,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pathlib import Path
@@ -43,7 +46,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # Imported (and thus re-exported from this module) so ``sample`` and existing
 # ``from ...drivers.base import RowFilterIdentityMissing`` call sites are
 # unchanged.
-from ..query_compiler import RowFilterIdentityMissing, compile_row_filter_clauses
+from ..query_compiler import (
+    RowFilterIdentityMissing as RowFilterIdentityMissing,
+)
+from ..query_compiler import (
+    compile_row_filter_clauses,
+    strip_projection_open,
+)
 
 
 class UnsupportedBindingError(RuntimeError):
@@ -86,7 +95,14 @@ def guard_against_injection_markers(sql: str) -> None:
             "Refusing to execute statement that calls a DuckDB logging function, reads a "
             "log view or runs a statement given as text"
         )
-    if len(parts) >= 2 and _TAIL_BLOCKED_TOKENS.search(parts[1]):
+    if names_refused_postgres_function(sql):
+        raise ValueError(
+            "Refusing to execute statement that calls a function which returns a whole "
+            "table, schema, database or query result as XML"
+        )
+    # The one body SELECT the compiler writes itself: the allowed-column projection
+    # an expose with column restrictions is read through.
+    if len(parts) >= 2 and _TAIL_BLOCKED_TOKENS.search(strip_projection_open(parts[1])):
         raise ValueError(
             "Refusing to execute statement: rendered SQL body contains a "
             f"banned keyword (compiler safety regression). sql={sql!r}"

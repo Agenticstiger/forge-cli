@@ -67,6 +67,7 @@ from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
 from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
 from fluid_build.providers._sql_safety import (
     names_refused_duckdb_function,
+    names_refused_postgres_function,
     validate_ident,
     validate_sql_expression_allowlist,
 )
@@ -127,20 +128,54 @@ def _restricted_name_pattern(name: str) -> "re.Pattern[str]":
     return pattern
 
 
-# String literals stripped before scanning for restricted column
-# references. ``'…'`` (single-quoted) and ``"…"`` (double-quoted)
-# both removed; embedded escaped quotes are tolerated. Comments are
-# already blocked by ``_sql_safety``'s ``--`` / ``/*`` / ``*/``
-# rejection.
-_STRING_LITERAL_RE = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"")
+# Quoted spans an expression can carry, in the order the engine reads them. One
+# left-to-right pass so an apostrophe inside a quoted identifier (or a double quote
+# inside a string) cannot be mistaken for the opening of a span. Comments are already
+# blocked by ``_sql_safety``'s ``--`` / ``/*`` / ``*/`` rejection, and the expression
+# allowlist refuses a backslash and ``$``, so no escape form other than a doubled quote
+# can reach this scan.
+_QUOTED_SPAN_RE = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`")
+
+# Dialects where ``"..."`` is a STRING literal. Every other dialect the compiler
+# targets (DuckDB, Postgres, Snowflake, Athena/Trino, ANSI) reads ``"..."`` as a
+# quoted IDENTIFIER, which is a column reference and must stay visible to the scan.
+# An unknown dialect (``None``) takes the conservative reading: identifier.
+_DOUBLE_QUOTE_IS_STRING_DIALECTS = frozenset({"bigquery", "databricks", "mysql", "spark"})
+
+# Driver dialect token -> sqlglot dialect. An unknown token parses and prints as
+# generic ANSI SQL.
+_SQLGLOT_DIALECTS = {
+    "athena": "trino",
+    "bigquery": "bigquery",
+    "databricks": "spark",
+    "duckdb": "duckdb",
+    "postgres": "postgres",
+    "postgresql": "postgres",
+    "snowflake": "snowflake",
+    "spark": "spark",
+    "trino": "trino",
+}
 
 
-def _strip_string_literals(sql: str) -> str:
-    """Replace every quoted string literal in ``sql`` with a single
-    space so subsequent identifier scans don't false-positive on
-    quoted occurrences of restricted column names (e.g. ``WHERE name
-    = 'email'``)."""
-    return _STRING_LITERAL_RE.sub(" ", sql)
+def _strip_string_literals(sql: str, dialect: Optional[str] = None) -> str:
+    """Replace every string literal in ``sql`` with a single space so subsequent
+    identifier scans don't false-positive on quoted occurrences of restricted column
+    names (e.g. ``WHERE name = 'email'``).
+
+    ``'...'`` is a string literal in every dialect. ``"..."`` is one only where
+    ``dialect`` says so (BigQuery, Spark / Databricks, MySQL); everywhere else it is a
+    quoted identifier and is left in place, so ``"region"`` is still seen as a
+    reference to ``region``. Backtick spans are identifiers and are always kept.
+    """
+    double_is_string = (dialect or "").strip().lower() in _DOUBLE_QUOTE_IS_STRING_DIALECTS
+
+    def _replace(match: "re.Match[str]") -> str:
+        span = match.group(0)
+        if span[0] == "'" or (span[0] == '"' and double_is_string):
+            return " "
+        return span
+
+    return _QUOTED_SPAN_RE.sub(_replace, sql)
 
 
 def _clean_column_names(columns: Optional[Iterable[str]]) -> Tuple[str, ...]:
@@ -150,7 +185,9 @@ def _clean_column_names(columns: Optional[Iterable[str]]) -> Tuple[str, ...]:
     return tuple(c for c in (columns or ()) if isinstance(c, str) and c)
 
 
-def _first_referenced_column(expression: str, columns: Iterable[str]) -> Optional[str]:
+def _first_referenced_column(
+    expression: str, columns: Iterable[str], dialect: Optional[str] = None
+) -> Optional[str]:
     """Return the first name in ``columns`` that ``expression``
     references as an identifier, or ``None``.
 
@@ -161,7 +198,7 @@ def _first_referenced_column(expression: str, columns: Iterable[str]) -> Optiona
     ``query`` path enforces the identical rule against contract-declared
     measure / dimension / filter expressions.
     """
-    scanned = _strip_string_literals(expression)
+    scanned = _strip_string_literals(expression, dialect)
     for column in columns:
         if _restricted_name_pattern(column).search(scanned):
             return column
@@ -169,7 +206,11 @@ def _first_referenced_column(expression: str, columns: Iterable[str]) -> Optiona
 
 
 def _reject_restricted_reference(
-    expression: str, restricted_columns: Iterable[str], *, subject: str
+    expression: str,
+    restricted_columns: Iterable[str],
+    *,
+    subject: str,
+    dialect: Optional[str] = None,
 ) -> None:
     """Raise when ``expression`` references a denied column.
 
@@ -181,7 +222,7 @@ def _reject_restricted_reference(
     it is a :class:`QueryValidationError` (surfaced verbatim) rather
     than a sanitised engine error.
     """
-    hit = _first_referenced_column(expression, restricted_columns)
+    hit = _first_referenced_column(expression, restricted_columns, dialect)
     if hit is None:
         return
     raise QueryValidationError(
@@ -192,6 +233,227 @@ def _reject_restricted_reference(
         f"naming a measure, dimension or filter differently from its column "
         f"does not bypass them."
     )
+
+
+# Alias of the projection every expression is evaluated over when the expose
+# restricts columns (see :func:`_allowed_columns`).
+_PROJECTION_ALIAS = "_fluid_allowed"
+
+# The opening of a subquery: a parenthesis followed by a keyword that starts a query.
+# ``SELECT`` is already refused by the expression allowlist, but DuckDB also reads a
+# query that begins with ``FROM`` / ``TABLE`` / ``SUMMARIZE`` (``EXISTS(FROM t WHERE ..)``),
+# and that names the base table directly, bypassing the projection below. The standard
+# function forms that contain ``FROM`` (``EXTRACT(year FROM d)``, ``SUBSTRING(s FROM 2)``,
+# ``IS DISTINCT FROM``) never open a parenthesis with it.
+_SUBQUERY_OPEN_RE = re.compile(
+    r"\(\s*(?:from|table|with|values|summarize|describe|pivot|unpivot|explain)\b",
+    re.IGNORECASE,
+)
+
+
+def _reject_subquery(expression: str, *, subject: str, dialect: Optional[str] = None) -> None:
+    """Raise when ``expression`` embeds a subquery.
+
+    On an expose that restricts columns or filters rows, a subquery would name the
+    base table directly and read it without the projection and row filter the
+    outer statement applies. Expressions there may only use the exposed table's own
+    columns.
+    """
+    if _SUBQUERY_OPEN_RE.search(_strip_string_literals(expression, dialect)):
+        raise QueryValidationError(
+            f"{subject} contains a subquery. On an expose with column restrictions or "
+            f"row filters, expressions may only use the exposed table's own columns."
+        )
+
+
+def _require_balanced_parentheses(expression: str, *, subject: str) -> None:
+    """Raise when ``expression`` closes a parenthesis it did not open.
+
+    An expression is wrapped in parentheses where it joins a WHERE; unbalanced text
+    could close that wrapper early. A parenthesis inside a quoted span (a string
+    literal or a quoted identifier) does not count.
+    """
+    if not _parens_balanced(expression):
+        raise QueryValidationError(
+            f"{subject} has an expression with unbalanced parentheses; the governed "
+            "query path cannot apply it."
+        )
+
+
+# Forms that select a column without naming it, or hand over a whole row. On an expose
+# that redacts columns they would return a redacted column's values under a name the
+# redaction never matches (the compiler redacts by the columns an expression NAMES), so
+# they are refused there: a column selector, an ``IDENTIFIER(...)`` that builds a name
+# from text, a star, and the table (or the compiler's projection of it) used as a value.
+_COLUMN_SELECTOR_RE = re.compile(r"(?i)(?<![\w$])[\"`]?(?:columns|identifier)[\"`]?\s*\(")
+_COUNT_STAR_RE = re.compile(r"(?i)(?<![\w$])count\s*\(\s*\*\s*\)")
+# Words after which a ``*`` is a star, not a multiplication.
+_STAR_KEYWORDS = frozenset({"distinct", "all", "exclude", "replace", "rename", "ilike", "like"})
+
+
+def _mask_string_literals(expression: str, dialect: Optional[str]) -> str:
+    """``expression`` with every string literal replaced by the number ``0``, so what
+    remains is the SQL the engine reads as names and operators and a literal still
+    counts as an operand."""
+    double_is_string = (dialect or "").strip().lower() in _DOUBLE_QUOTE_IS_STRING_DIALECTS
+
+    def _replace(match: "re.Match[str]") -> str:
+        span = match.group(0)
+        return "0" if span[0] == "'" or (span[0] == '"' and double_is_string) else span
+
+    return _QUOTED_SPAN_RE.sub(_replace, expression)
+
+
+def _has_star_value(masked: str) -> bool:
+    """True when ``masked`` holds a ``*`` that stands for columns rather than the
+    multiplication operator: after ``(``, ``,``, ``.``, ``[``, an operator, a keyword
+    such as ``DISTINCT``, or at the start. ``a * b``, ``f(x) * 2`` and ``a ** b`` are
+    arithmetic and stay allowed."""
+    text = masked.replace("**", "^")
+    for match in re.finditer(r"\*", text):
+        before = text[: match.start()].rstrip()
+        if not before:
+            return True
+        previous = before[-1]
+        if previous in "(,.[":
+            return True
+        if previous.isalnum() or previous in '_)]"`':
+            word = re.search(r"([A-Za-z_]+)$", before)
+            if word is not None and word.group(1).lower() in _STAR_KEYWORDS:
+                return True
+            continue
+        return True
+    return False
+
+
+_QUOTE_CHARS_RE = re.compile(r"[\"'`]")
+
+
+def _table_last_identifier(table_reference: str, dialect: Optional[str] = None) -> Optional[str]:
+    """The name a table reference ends in, or ``None`` when it ends in anything else
+    (a function call, for one): ``customers`` for ``db.public."customers"``, and for
+    BigQuery's `` `proj.ds.customers` `` too, where one pair of backticks wraps every
+    part and the engine's implicit alias is still the last one."""
+    reference = table_reference.strip()
+    try:
+        from sqlglot import exp
+
+        table = exp.to_table(reference, dialect=_SQLGLOT_DIALECTS.get((dialect or "").lower()))
+        # A dialect that does not know the quote (backticks under the default one)
+        # leaves it in the name: that is not an answer, the text scan below is.
+        if (
+            isinstance(table.this, exp.Identifier)
+            and table.name
+            and not _QUOTE_CHARS_RE.search(table.name)
+        ):
+            return table.name
+    except Exception:  # noqa: BLE001 - any parser failure falls back to the text scan
+        pass
+    match = re.search(r'(?:"([^"]+)"|`([^`]+)`|([A-Za-z_][\w$]*))\s*$', reference)
+    if match is None:
+        return None
+    last = next(group for group in match.groups() if group)
+    return last.rsplit(".", 1)[-1] or None
+
+
+def _reject_unnamed_column_access(
+    expression: str,
+    *,
+    subject: str,
+    table_reference: str,
+    dialect: Optional[str] = None,
+    allow_count_star: bool = False,
+) -> None:
+    """On an expose that redacts columns, refuse an expression that could read one
+    without naming it.
+
+    Refused: ``COLUMNS(...)``, ``IDENTIFIER(...)``, a ``*`` that stands for columns
+    (``count(*)`` is fine, and ``allow_count_star`` lets a ``count`` measure's own
+    ``*`` through; multiplication is fine), and the table itself, or the compiler's
+    projection of it, used as a value (``to_json(customers)``). A qualified column
+    (``customers.amount``) names a column and is checked as one elsewhere.
+    """
+    masked = _mask_string_literals(expression, dialect)
+    scanned = _COUNT_STAR_RE.sub("0", masked)
+    if allow_count_star and scanned.strip() == "*":
+        scanned = "0"
+    names = [_PROJECTION_ALIAS]
+    last = _table_last_identifier(table_reference, dialect)
+    if last:
+        names.append(last)
+    whole_row = re.compile(
+        r"(?i)(?<![\w$])(?:"
+        + "|".join(rf'"{re.escape(n)}"|`{re.escape(n)}`|{re.escape(n)}' for n in names)
+        + r")(?![\w$\"`])(?!\s*\.)"
+    )
+    if _COLUMN_SELECTOR_RE.search(scanned) or _has_star_value(scanned) or whole_row.search(scanned):
+        raise QueryValidationError(
+            f"{subject} selects columns without naming them (a column selector, "
+            f"IDENTIFIER(...), a star, or the whole row). This expose redacts columns "
+            f"(contract.schema[].sensitivity), and a redaction applies to the columns an "
+            f"expression names, so name the columns it reads."
+        )
+
+
+def _allowed_columns(index: "_SemanticIndex", restricted: Iterable[str]) -> List[str]:
+    """The ``contract.schema`` columns that are NOT restricted, in schema order.
+
+    This is an allowlist on purpose: a column the contract does not declare is not
+    projected either, so a column added to the table later is never readable by
+    default. Fails closed when nothing readable is declared.
+    """
+    return _allowed_names(list(index.columns), restricted)
+
+
+def _allowed_names(declared: Iterable[str], restricted: Iterable[str]) -> List[str]:
+    denied = {name.casefold() for name in restricted}
+    allowed: List[str] = []
+    seen: Set[str] = set()
+    for name in declared:
+        folded = name.casefold()
+        if folded in denied or folded in seen:
+            continue
+        seen.add(folded)
+        allowed.append(name)
+    if not allowed:
+        raise QueryValidationError(
+            "This expose restricts columns, but contract.schema declares no readable "
+            "column to project, so the governed query path cannot evaluate an "
+            "expression without risking a restricted one. Declare the readable "
+            "columns in contract.schema."
+        )
+    return allowed
+
+
+# The projection's opening, as the compiler renders it: ``(SELECT a, b FROM``. The
+# driver's statement guard refuses a body ``SELECT`` (a union / exfiltration marker);
+# this is the one body ``SELECT`` the compiler itself writes. It is recognised at any
+# position, so a caller's own layout around the table reference (a parenthesis, a
+# DuckDB prefix alias ``c: customers``, a keyword before it) does not turn the
+# compiler's output into a refusal. That is safe because a caller's SQL, a contract
+# expression and the table reference all pass ``validate_sql_expression_allowlist``,
+# which refuses the word ``select`` anywhere in them, so this shape can only be the
+# compiler's. Every column is a bare or quoted identifier, never an expression or a
+# nested query.
+_PROJECTION_COLUMN = (
+    r"""(?:[A-Za-z_][A-Za-z0-9_]*|"[A-Za-z_][A-Za-z0-9_]*"|`[A-Za-z_][A-Za-z0-9_]*`)"""
+)
+_PROJECTION_OPEN_RE = re.compile(
+    r"\(SELECT " + _PROJECTION_COLUMN + r"(?:, " + _PROJECTION_COLUMN + r")* FROM "
+)
+
+
+def strip_projection_open(sql_body: str) -> str:
+    """Remove the compiler's own projection ``(SELECT <columns> FROM`` opening from a
+    rendered statement body, so a driver's body-keyword guard sees only the rest.
+
+    The remainder (table reference, row-filter predicate, alias, outer clauses) is
+    still scanned in full: only the opening goes, so a ``SELECT`` anywhere else in the
+    statement (a union branch, a scalar subquery over another column list) is still
+    refused. The shape removed is the one :func:`compile_semantic_query` and
+    :func:`compile_free_form_sql` render for an expose that restricts columns.
+    """
+    return _PROJECTION_OPEN_RE.sub("(", sql_body)
 
 
 def _resolve_measure_alias(
@@ -372,23 +634,44 @@ def compile_row_filter_clauses(
     :class:`RowFilterIdentityMissing` — the gateway prefers no rows to wrong
     rows. Column identifiers route through ``validate_ident``; filter values are
     always bound parameters, never interpolated.
+
+    An entry the compiler cannot read (not an object, no string ``column``, no
+    ``equals`` / ``in`` operator, an operator it does not know, or two operators)
+    raises :class:`QueryValidationError` instead of being skipped. A skipped entry
+    would silently widen the rows served, and every read path, ``sample`` included,
+    runs through here.
     """
     policy = expose.get("policy") or {}
     filters = policy.get("rowFilters") or []
+    if not isinstance(filters, (list, tuple)):
+        raise QueryValidationError(_row_filter_refusal("policy.rowFilters", "is not a list"))
     clauses: List[str] = []
     params: List[Any] = []
-    for entry in filters:
+    for position, entry in enumerate(filters):
+        where = f"policy.rowFilters[{position}]"
         if not isinstance(entry, Mapping):
-            continue
+            raise QueryValidationError(_row_filter_refusal(where, "is not an object"))
         column_raw = entry.get("column")
         if not isinstance(column_raw, str) or not column_raw:
-            continue
+            raise QueryValidationError(_row_filter_refusal(where, "has no string 'column'"))
+        operators = [name for name in _ROW_FILTER_OPERATORS if name in entry]
+        if len(operators) != 1:
+            raise QueryValidationError(
+                _row_filter_refusal(
+                    where,
+                    (
+                        "has no 'equals' or 'in' operator"
+                        if not operators
+                        else "names more than one operator"
+                    ),
+                )
+            )
         column = _quote_filter_identifier(validate_ident(column_raw), dialect)
-        if "equals" in entry:
+        if operators[0] == "equals":
             value = _resolve_caller_placeholder(entry["equals"], caller_attributes)
             clauses.append(f"{column} = :p_{offset + len(params)}")
             params.append(value)
-        elif "in" in entry:
+        else:
             raw_list = _resolve_caller_placeholder(entry["in"], caller_attributes)
             if not isinstance(raw_list, (list, tuple)) or not raw_list:
                 raise RowFilterIdentityMissing(
@@ -398,9 +681,21 @@ def compile_row_filter_clauses(
             placeholders = ", ".join(f":p_{offset + len(params) + i}" for i in range(len(raw_list)))
             clauses.append(f"{column} IN ({placeholders})")
             params.extend(raw_list)
-        else:
-            continue  # unknown operator — silently skip
     return clauses, params
+
+
+# The operators a ``policy.rowFilters[]`` entry may carry, one per entry.
+_ROW_FILTER_OPERATORS = ("equals", "in")
+
+
+def _row_filter_refusal(where: str, problem: str) -> str:
+    """The message for a row filter that cannot be applied. An entry the compiler
+    cannot read is refused rather than skipped: skipping it would serve the rows the
+    filter was written to withhold. Only contract-declared names appear."""
+    return (
+        f"{where} {problem}, so the row filter cannot be applied and the request is refused. "
+        "Each entry needs a string 'column' and exactly one operator, 'equals' or 'in'."
+    )
 
 
 @dataclass(frozen=True)
@@ -627,9 +922,14 @@ def _resolve_metric(
 
 
 def _parens_balanced(expr: str) -> bool:
-    """True when every ``(`` closes in order and none closes early."""
+    """True when every ``(`` closes in order and none closes early.
+
+    A parenthesis inside a quoted span (a string literal, a quoted identifier) is part
+    of a name or a value, so the spans are taken out first: an ``"(("`` in one place
+    and an ``"))"`` in another must not cancel a parenthesis the statement really
+    closes. A quote that never closes leaves its text in place and is counted."""
     depth = 0
-    for ch in expr:
+    for ch in _QUOTED_SPAN_RE.sub(" ", expr):
         if ch == "(":
             depth += 1
         elif ch == ")":
@@ -894,6 +1194,17 @@ def compile_semantic_query(
     expression rather than by output name. Without that, a dimension
     ``{name: seg_alias, expr: MARKET_SEGMENT}`` returned raw PII while
     the identically-sourced ``{name: market_segment}`` was redacted.
+
+    Redaction follows the columns an expression NAMES, so on an expose that
+    redacts columns an expression that would read one without naming it is
+    refused (see :func:`_reject_unnamed_column_access`): a column selector,
+    ``IDENTIFIER(...)``, a ``*`` that stands for columns, and the table itself or
+    the compiler's projection of it used as a value. ``count(*)``, multiplication
+    and aggregates over a sensitive column (``count(DISTINCT email)``,
+    ``sum(salary)``) are unaffected.
+
+    Every term of the WHERE is parenthesised, so a measure-, dimension- or
+    filter-expression with an ``OR`` in it cannot widen the row filter ANDed to it.
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
@@ -923,11 +1234,37 @@ def compile_semantic_query(
         validate_ident(metric)
         measure_name, measure_definition, metric_filter = _resolve_metric(metric, index)
 
+    # Expressions are free SQL, so naming a restricted column is only the FRIENDLY
+    # refusal. The boundary is structural: with restrictions, every expression below
+    # is evaluated over a projection that does not contain them (``source`` below),
+    # so a spelling this scan does not recognise still fails at the engine. A
+    # subquery would name the base table directly and skip that projection (and the
+    # row filter), so it is refused outright on a policy-bearing expose.
+    row_filters_declared = bool((expose.get("policy") or {}).get("rowFilters"))
+    guard_subqueries = bool(restricted) or row_filters_declared or bool(redacted)
+
+    def _check_expression(expression: str, subject: str, *, allow_count_star: bool = False) -> None:
+        _reject_restricted_reference(expression, restricted, subject=subject, dialect=dialect)
+        if guard_subqueries:
+            _reject_subquery(expression, subject=subject, dialect=dialect)
+        if redacted:
+            _reject_unnamed_column_access(
+                expression,
+                subject=subject,
+                table_reference=table_reference,
+                dialect=dialect,
+                allow_count_star=allow_count_star,
+            )
+
     measure_expr = measure_definition.get("expr") or measure_name
     if isinstance(measure_expr, str):
-        _reject_restricted_reference(measure_expr, restricted, subject=f"Measure {measure_name!r}")
+        _check_expression(
+            measure_expr,
+            f"Measure {measure_name!r}",
+            allow_count_star=str(measure_definition.get("agg") or "").lower() == "count",
+        )
     if metric_filter is not None:
-        _reject_restricted_reference(metric_filter, restricted, subject=f"Metric {metric!r} filter")
+        _check_expression(metric_filter, f"Metric {metric!r} filter")
 
     select_parts: List[str] = []
     group_columns: List[str] = []
@@ -941,7 +1278,7 @@ def compile_semantic_query(
         if not isinstance(dimension_name, str):
             raise QueryValidationError("Dimension names must be strings")
         alias, expr = _resolve_dimension(dimension_name, index, dialect=dialect)
-        _reject_restricted_reference(expr, restricted, subject=f"Dimension {dimension_name!r}")
+        _check_expression(expr, f"Dimension {dimension_name!r}")
         already = dimension_aliases.get(alias.casefold())
         if already is not None:
             if already == expr:
@@ -963,7 +1300,7 @@ def compile_semantic_query(
         projection_aliases.append(alias)
         # A dimension projects raw column values, so a PII source column
         # must be redacted under WHATEVER alias it is projected as.
-        if _first_referenced_column(expr, redacted) is not None:
+        if _first_referenced_column(expr, redacted, dialect) is not None:
             redacted_aliases.append(alias)
 
     # The projection is aliased to the METRIC name when the caller asked
@@ -986,7 +1323,7 @@ def compile_semantic_query(
     if (
         isinstance(measure_expr, str)
         and str(measure_definition.get("agg") or "").lower() in _VALUE_REVEALING_AGGS
-        and _first_referenced_column(measure_expr, redacted) is not None
+        and _first_referenced_column(measure_expr, redacted, dialect) is not None
     ):
         redacted_aliases.append(measure_alias)
 
@@ -1026,11 +1363,12 @@ def compile_semantic_query(
         # oracle even though the column never appears in the projection:
         # ``filters: {ACCOUNT_BALANCE: 9999.99}`` returns the revenue of
         # exactly the rows carrying that balance. Reject the reference.
-        _reject_restricted_reference(
-            dimension_expr, restricted, subject=f"Filter key {filter_key!r}"
-        )
+        _check_expression(dimension_expr, f"Filter key {filter_key!r}")
+        # The dimension's expression is free SQL, so it is parenthesised: an ``OR`` in
+        # it must not become the top-level operator of the WHERE it is ANDed into.
+        _require_balanced_parentheses(dimension_expr, subject=f"Filter key {filter_key!r}")
         placeholder_index = len(params)
-        where_clauses.append(f"{dimension_expr} = :p_{placeholder_index}")
+        where_clauses.append(f"(({dimension_expr}) = :p_{placeholder_index})")
         params.append(filter_value)
 
     # Row-level security: merge policy.rowFilters[] into the WHERE so the
@@ -1042,15 +1380,35 @@ def compile_semantic_query(
     rf_clauses, rf_params = compile_row_filter_clauses(
         expose, caller_attributes or {}, offset=len(params), dialect=dialect
     )
-    where_clauses.extend(rf_clauses)
     params.extend(rf_params)
 
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
         raise QueryValidationError("limit must be an integer in [1, 1_000_000]")
 
+    # Every term is parenthesised, so ``AND`` joins whole predicates however a term is
+    # written. The row filter is policy: it must not be one disjunct of a caller-shaped
+    # ``a OR b AND tenant = ...``.
+    rf_clauses = [f"({clause})" for clause in rf_clauses]
+
+    # With restrictions the expressions read ``(SELECT <allowed columns> FROM <table>)``
+    # rather than the table: a restricted column is not in that relation, so no
+    # spelling of it (quoted, selected by pattern, or as part of the whole row) can
+    # reach it. The row filter is applied INSIDE the projection. It is policy rather
+    # than caller input, so it may name a column the agent is denied, and nothing in
+    # the outer statement can see rows it removed.
+    source = table_reference
+    if restricted:
+        allowed = _allowed_columns(index, restricted)
+        inner = f"SELECT {', '.join(allowed)} FROM {table_reference}"
+        if rf_clauses:
+            inner += " WHERE " + " AND ".join(rf_clauses)
+        source = f"({inner}) AS {_PROJECTION_ALIAS}"
+    else:
+        where_clauses.extend(rf_clauses)
+
     sql_lines: List[str] = [
         "SELECT " + ", ".join(select_parts),
-        f"FROM {table_reference}",
+        f"FROM {source}",
     ]
     if where_clauses:
         sql_lines.append("WHERE " + " AND ".join(where_clauses))
@@ -1109,6 +1467,276 @@ def _validate_rendered_statement(sql: str) -> None:
         raise ValueError(f"Rendered statement contains forbidden marker: {sql!r}")
 
 
+# A table name that is really a file, a glob or a URL (DuckDB reads ``FROM 'x.csv'`` as
+# a file scan). None of these is a catalog table, and one that names the bound file
+# would read it without the projection.
+_FILE_LIKE_TABLE_RE = re.compile(r"[./\\*:]")
+
+
+def _declared_column_names(expose: Mapping[str, Any]) -> List[str]:
+    names: List[str] = []
+    for column in (expose.get("contract") or {}).get("schema") or []:
+        if isinstance(column, Mapping) and isinstance(column.get("name"), str):
+            names.append(validate_ident(column["name"]))
+    return names
+
+
+def _refuse_table_keyword(sql: str, read: Optional[str]) -> None:
+    """Refuse a caller statement that uses the ``TABLE`` keyword.
+
+    ``TABLE <name>`` reads a whole table in the engines that accept it (DuckDB,
+    Postgres, Trino), and ``TABLE(...)`` is a table function in Snowflake. Parsers
+    disagree on both, so the statement is checked at the token level, before it is
+    parsed: no reading of the tree can skip it. A quoted ``"TABLE"`` is an identifier
+    token, not the keyword, and stays allowed.
+    """
+    from sqlglot import TokenType
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.errors import SqlglotError
+
+    try:
+        tokens = Dialect.get_or_raise(read).tokenize(sql)
+    except SqlglotError:
+        raise _unreadable_sql() from None
+    if any(token.token_type == TokenType.TABLE for token in tokens):
+        raise QueryValidationError(
+            "sql may not use the TABLE keyword on an expose that restricts columns; "
+            "select from the exposed table by name."
+        )
+
+
+def _unreadable_sql() -> QueryValidationError:
+    return QueryValidationError(
+        "sql could not be rewritten to read only the columns this expose allows; write "
+        "one plain SELECT over the exposed table."
+    )
+
+
+def _is_plain_source(source: Any, *, allow_lateral: bool) -> bool:
+    from sqlglot import exp
+
+    if isinstance(source, exp.Table):
+        return isinstance(source.this, exp.Identifier)
+    if isinstance(source, (exp.Subquery, exp.Unnest, exp.Values)):
+        return True
+    return allow_lateral and isinstance(source, exp.Lateral)
+
+
+def _require_plain_sources(tree: Any) -> None:
+    """Refuse a statement with a source the rewrite does not know how to project.
+
+    Everything in a ``FROM``, a ``JOIN`` or a ``LATERAL`` must be a table named by a
+    plain identifier, a subquery, an ``UNNEST`` or a ``VALUES`` list. Anything else
+    (a table function, ``TABLE(...)``, ``ROWS FROM``, or a node a later parser adds)
+    could read the exposed table without being a table reference the rewrite sees, so
+    it is refused by what it is, not by a list of the forms known today.
+    """
+    from sqlglot import exp
+
+    for node in tree.find_all(exp.From, exp.Join, exp.Lateral):
+        if not _is_plain_source(node.this, allow_lateral=isinstance(node, (exp.From, exp.Join))):
+            raise QueryValidationError(
+                "sql may only read from tables named in the usual way, subqueries, UNNEST "
+                "and VALUES on an expose that restricts columns; query the exposed table "
+                "directly."
+            )
+
+
+def _crosscheck_duckdb_projection(sql: str, exposed_name: str, allowed: Iterable[str]) -> None:
+    """Have DuckDB's own parser confirm the rewritten statement.
+
+    The rewrite is checked with sqlglot, and sqlglot is not the engine: the two can
+    read one statement differently. DuckDB serialises the statement it will run
+    (``json_serialize_sql``, a parse with no execution), and every read of the exposed
+    table in that tree must be the only source of a projection of bare allowed
+    columns. A statement DuckDB cannot serialise is refused.
+    """
+    import json
+
+    try:
+        import duckdb
+    except ImportError:  # pragma: no cover - a duckdb dialect implies duckdb
+        return
+    from fluid_build.providers._duckdb_compat import first_row
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+
+    refusal = QueryValidationError(
+        "sql could not be checked against the columns this expose allows; write one "
+        "plain SELECT over the exposed table."
+    )
+    permitted = {name.casefold() for name in allowed}
+    # A parse with no execution, on a sandboxed in-memory connection with no file
+    # or network access.
+    connection = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none())
+    try:
+        raw = first_row(connection.execute("SELECT json_serialize_sql(?)", [sql]))
+        document = json.loads(raw[0]) if raw else {}
+    except (duckdb.Error, ValueError):
+        raise refusal from None
+    finally:
+        connection.close()
+    if document.get("error") or not document.get("statements"):
+        raise refusal
+    nodes: List[Dict[str, Any]] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, dict):
+            nodes.append(value)
+            for child in value.values():
+                _collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                _collect(child)
+
+    _collect(document)
+
+    def _reads_exposed(node: Any) -> bool:
+        return (
+            isinstance(node, dict)
+            and node.get("type") == "BASE_TABLE"
+            and str(node.get("table_name") or "").casefold() == exposed_name
+        )
+
+    def _bare_projection(node: Dict[str, Any]) -> bool:
+        source = node["from_table"]
+        return (
+            not node.get("modifiers")
+            and not node.get("where_clause")
+            and not node.get("group_expressions")
+            and not node.get("group_sets")
+            and not node.get("having")
+            and not node.get("qualify")
+            and not node.get("sample")
+            and not source.get("sample")
+            and not source.get("at_clause")
+            and not (node.get("cte_map") or {}).get("map")
+            and bool(node.get("select_list"))
+            and all(
+                item.get("class") == "COLUMN_REF"
+                and len(item.get("column_names") or []) == 1
+                and str(item["column_names"][0]).casefold() in permitted
+                for item in node["select_list"]
+            )
+        )
+
+    sanctioned = {
+        id(node["from_table"])
+        for node in nodes
+        if node.get("type") == "SELECT_NODE"
+        and _reads_exposed(node.get("from_table"))
+        and _bare_projection(node)
+    }
+    if any(_reads_exposed(node) and id(node) not in sanctioned for node in nodes):
+        raise refusal
+
+
+def _project_exposed_table(
+    sql: str,
+    *,
+    table_reference: str,
+    allowed: List[str],
+    dialect: Optional[str],
+) -> str:
+    """Rewrite caller SQL so every read of the exposed table goes through a projection
+    of the ``allowed`` columns.
+
+    Each reference to the table, wherever it sits (the outer ``FROM``, a join, a
+    self-join, a subquery, a CTE body), becomes
+    ``(SELECT <allowed columns> FROM <table_reference>) AS <the caller's alias>``. A
+    restricted column is then not part of any relation the statement can see, whether
+    it is written as a name, a quoted name, ``COLUMNS(...)``, ``*``, ``alias.*`` or the
+    whole row. A table function or a file path as a table is refused, because it
+    would read the data without the projection. The rewritten statement is parsed
+    again and checked, so a printing quirk cannot leave a bare reference behind.
+
+    ``sqlglot`` is imported here, not at module scope, to keep it off the cold path.
+    """
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.errors import SqlglotError
+
+    read = _SQLGLOT_DIALECTS.get((dialect or "").strip().lower())
+    unreadable = _unreadable_sql()
+    # Before anything is parsed: no reading of the statement can skip this.
+    _refuse_table_keyword(sql, read)
+    try:
+        statements = sqlglot.parse(sql, read=read)
+        exposed = exp.to_table(table_reference, dialect=read)
+    except SqlglotError:
+        raise unreadable from None
+    if len(statements) != 1 or statements[0] is None or not exposed.name:
+        raise unreadable
+    tree = statements[0]
+    _require_plain_sources(tree)
+    exposed_name = exposed.name.casefold()
+    allowed_names = {name.casefold() for name in allowed}
+
+    for cte in tree.find_all(exp.CTE):
+        if cte.alias_or_name.casefold() == exposed_name:
+            raise QueryValidationError(
+                f"sql defines a CTE named {cte.alias_or_name!r}, the name of the exposed "
+                "table; use another name."
+            )
+    tables = list(tree.find_all(exp.Table))
+    for table in tables:
+        if not isinstance(table.this, exp.Identifier) or _FILE_LIKE_TABLE_RE.search(table.name):
+            raise QueryValidationError(
+                "sql may not read from a table function or a file path on an expose that "
+                "restricts columns; query the exposed table directly."
+            )
+    # Splice the projection into the caller's own text, at the source span of each
+    # reference, so everything else in the statement reaches the engine exactly as
+    # written (sqlglot cannot print every engine function it can parse).
+    projection = f"(SELECT {', '.join(allowed)} FROM {table_reference})"
+    splices: List[Tuple[int, int, str]] = []
+    for table in tables:
+        if table.name.casefold() != exposed_name:
+            continue
+        spans = [part.meta for part in table.parts]
+        if any("start" not in span or "end" not in span for span in spans):
+            raise unreadable
+        replacement = projection if table.args.get("alias") else f"{projection} AS {exposed.name}"
+        splices.append((min(m["start"] for m in spans), max(m["end"] for m in spans), replacement))
+    rewritten = sql
+    for begin, finish, replacement in sorted(splices, reverse=True):
+        rewritten = rewritten[:begin] + replacement + rewritten[finish + 1 :]
+    try:
+        checked = sqlglot.parse_one(rewritten, read=read)
+    except SqlglotError:
+        raise unreadable from None
+    _require_plain_sources(checked)
+
+    for table in checked.find_all(exp.Table):
+        if table.name.casefold() != exposed_name:
+            continue
+        select = table.parent.parent if isinstance(table.parent, exp.From) else None
+        # The only place the exposed table may appear is as the sole source of a
+        # projection that selects bare allowed columns and nothing else.
+        if (
+            not isinstance(select, exp.Select)
+            or not isinstance(select.parent, exp.Subquery)
+            or any(
+                select.args.get(key)
+                for key in ("where", "joins", "group", "having", "order", "limit", "distinct")
+            )
+            or not all(
+                isinstance(item, exp.Column)
+                and not item.table
+                and item.name.casefold() in allowed_names
+                for item in select.expressions
+            )
+        ):
+            raise QueryValidationError(
+                "sql reads the exposed table in a form that cannot be limited to the columns "
+                "this expose allows; write one plain SELECT over the exposed table."
+            )
+    if any(marker in rewritten for marker in (";", "--", "/*", "*/")):
+        raise ValueError("Rewritten statement contains a forbidden marker")
+    if read == "duckdb":
+        _crosscheck_duckdb_projection(rewritten, exposed_name, allowed)
+    return rewritten
+
+
 # A caller statement that already ends in ``LIMIT <n>`` (case-insensitive,
 # trailing whitespace tolerated). Used so the server-side ``LIMIT`` is not
 # appended a second time — two trailing LIMITs is a syntax error on most
@@ -1127,8 +1755,14 @@ def compile_free_form_sql(
     restricted_columns: Iterable[str] = (),
     expose: Optional[Mapping[str, Any]] = None,
     caller_attributes: Optional[Mapping[str, Any]] = None,
+    dialect: Optional[str] = None,
 ) -> CompiledQuery:
     """Compile a caller-supplied SQL ``query_sql`` payload.
+
+    ``dialect`` is the driver's dialect token. It only decides whether ``"..."`` in the
+    caller's text is a string literal (BigQuery, Spark) or a quoted identifier (every
+    other engine), for the restricted-column scan below. ``None`` reads it as an
+    identifier, the stricter choice.
 
     Phase-1 rules — deliberately strict:
 
@@ -1166,10 +1800,17 @@ def compile_free_form_sql(
       missing ``${caller.*}`` attribute still raises
       :class:`RowFilterIdentityMissing` (fail-closed) before the
       rejection check completes.
-    * ``FROM`` references are NOT rewritten — the caller must reference the
-      bound table by its fully-qualified name from the contract. Phase-2 may
-      add an AST-level rewrite so consumers can reference the expose by
-      exposeId rather than the underlying binding.
+    * **Column restrictions.** When ``restricted_columns`` is non-empty, ``expose``
+      is required (it declares the columns to project; without it the call is
+      refused). Every read of the exposed table is then rewritten to a projection
+      of the allowed columns. The statement may not use the ``TABLE`` keyword,
+      and every source in it must be a plain table, a subquery, ``UNNEST`` or
+      ``VALUES``; on DuckDB the engine's own parser checks the rewritten
+      statement too.
+    * ``FROM`` references are NOT rewritten otherwise — the caller must
+      reference the bound table by its fully-qualified name from the contract.
+      Phase-2 may add an AST-level rewrite so consumers can reference the expose
+      by exposeId rather than the underlying binding.
     """
     if not isinstance(sql, str):
         raise QueryValidationError("sql must be a string")
@@ -1195,6 +1836,13 @@ def compile_free_form_sql(
             "(query, query_table, json_execute_serialized_sql). Remove the reference and "
             "query the exposed table directly."
         )
+    if names_refused_postgres_function(candidate):
+        raise QueryValidationError(
+            "sql may not call a function that returns a whole table, schema, database or "
+            "query result as XML (table_to_xml, query_to_xml, cursor_to_xml, "
+            "schema_to_xml, database_to_xml and their variants). Select the columns of the "
+            "exposed table directly."
+        )
     body = parts[1]
     validate_sql_expression_allowlist(body)
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
@@ -1207,7 +1855,7 @@ def compile_free_form_sql(
     # ``WHERE label = 'email'`` doesn't false-positive when ``email``
     # is itself a restricted column.
     if restricted_columns:
-        scanned = _strip_string_literals(candidate)
+        scanned = _strip_string_literals(candidate, dialect)
         for column in restricted_columns:
             if not isinstance(column, str) or not column:
                 continue
@@ -1241,6 +1889,25 @@ def compile_free_form_sql(
             "Free-form query_sql is not permitted on an expose that declares "
             "row filters (policy.rowFilters): row-level security cannot be "
             "enforced on arbitrary SQL — use the semantic 'query' tool instead."
+        )
+    # Column restrictions are enforced by structure, not only by the name scan above:
+    # every read of the exposed table is rewritten to a projection of the allowed
+    # columns, so a spelling the scan cannot see (``COLUMNS('..')``, ``*``, ``t.*``,
+    # the whole row, a quoted name) has no restricted column to reach. Callers that
+    # pass no ``expose`` have no declared columns to project, so they are refused (the
+    # MCP ``query_sql`` handler always passes one).
+    restricted = _clean_column_names(restricted_columns)
+    if restricted and expose is None:
+        raise QueryValidationError(
+            "sql cannot be compiled on an expose that restricts columns without the expose "
+            "itself: the columns it declares are what the statement is limited to."
+        )
+    if restricted and expose is not None:
+        candidate = _project_exposed_table(
+            candidate,
+            table_reference=table_reference,
+            allowed=_allowed_names(_declared_column_names(expose), restricted),
+            dialect=dialect,
         )
     # No row filters: append the server-side cap, but only when the caller
     # didn't already supply a trailing ``LIMIT <n>`` (a second one is a syntax
