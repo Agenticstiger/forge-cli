@@ -18,6 +18,8 @@ control plane comparing a contract to a plan, CI tooling, editors) use
 
 A release ``fluid ship --release-dir`` sealed, on disk or where ``--release-to`` published it
 in S3, is checked read-only by :func:`verify_release` from ``.release`` (added in 1.3).
+A ``fluid verify --out`` report is judged by :func:`report_verdict` from ``.verify_report``
+(added in 1.4), the check ``fluid runs receipt record`` makes.
 """
 
 from __future__ import annotations
@@ -48,8 +50,9 @@ from .source import (
     SourceSpec,
 )
 from .state import Cursor, RunLock, StateStore, Watermark
+from .verify_report import report_verdict
 
-__api_version__ = "1.3"
+__api_version__ = "1.4"
 
 __all__ = [
     "__api_version__",
@@ -113,4 +116,6 @@ __all__ = [
     # release verification (1.3)
     "ReleaseVerification",
     "verify_release",
+    # verify report verdict (1.4)
+    "report_verdict",
 ]

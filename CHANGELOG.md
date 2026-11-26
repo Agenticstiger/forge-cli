@@ -129,6 +129,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
   `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
   environment sealed from one commit and one lock, and absent without a source commit.
+- **`fluid_build.api.report_verdict` is public** (API 1.4): whether a `fluid verify --out`
+  report is a pass, and why not, the rule `fluid datamesh-manager promote --verify-report`
+  already used.
 - **The MCP `query` tool reads a column of the version an as-of relationship reaches.** A
   dimension or a filter key `<relationship>.<column>` on a `semantics.relationships[]` entry that
   declares `asOf` reads `column` of the version of the target valid on the row's `asOf` value
