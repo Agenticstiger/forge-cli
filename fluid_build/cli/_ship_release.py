@@ -176,7 +176,12 @@ def refusal(
 ) -> Optional[str]:
     """Why a run cannot build a release in ``release_dir``, or ``None``. A lock of external
     files (``--artifacts``) is read here, before any stage, and refused when the release
-    could not seal it."""
+    could not seal it. ``--release-to`` is checked too (``_release_publish.refusal``)."""
+    from . import _release_publish
+
+    remote = _release_publish.refusal(opts.release_to, release_dir, opts.release_to_require)
+    if remote:
+        return remote
     if release_dir is None:
         if opts.artifacts:
             return (

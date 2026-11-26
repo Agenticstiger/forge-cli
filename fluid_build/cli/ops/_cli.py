@@ -134,10 +134,10 @@ def _add_release_flags(p: argparse.ArgumentParser) -> None:
 
 
 def register_runs(subparsers: argparse._SubParsersAction) -> None:
-    """Register ``fluid runs {status,logs,diff}``."""
+    """Register ``fluid runs {status,verify-release,logs,diff}``."""
     p = subparsers.add_parser(
         "runs",
-        help="Inspect acquisition run history (status / logs / diff)",
+        help="Inspect run history and sealed releases (status / verify-release / logs / diff)",
     )
     sub = p.add_subparsers(dest="runs_subcmd", required=True)
 
@@ -151,6 +151,24 @@ def register_runs(subparsers: argparse._SubParsersAction) -> None:
     _add_release_flags(s)
     _add_common_flags(s)
     s.set_defaults(func=_run_runs_status)
+
+    v = sub.add_parser(
+        "verify-release",
+        help="Check a sealed release (a directory or s3://) against its release.json",
+        description=(
+            "Read-only. Checks that release.json is a fluid-release/1 record, that its "
+            "identity_digest is the digest of its identity, and that every file it lists has the "
+            "sha256 it names. Exit 0 intact, 1 not intact, 2 cannot decide (unreadable, access "
+            "denied, or boto3 missing for s3://)."
+        ),
+    )
+    v.add_argument(
+        "source",
+        metavar="SRC",
+        help="A release directory, or the s3://bucket/prefix/ fluid ship --release-to wrote",
+    )
+    v.add_argument("--json", action="store_true", help="Emit JSON")
+    v.set_defaults(func=_run_verify_release)
 
     lg = sub.add_parser("logs", help="Fetch component logs for a product/run")
     lg.add_argument("product_id", help="Product id")
@@ -242,6 +260,31 @@ def _run_release_status(args: argparse.Namespace, logger: logging.Logger) -> int
             # soft_wrap: piped (a CI log), the console is 80 columns and would cut a digest
             cprint_literal(line, soft_wrap=True)
     return 0 if any(a.at_start or a.during for a in answers) else 1
+
+
+def _run_verify_release(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """``fluid runs verify-release SRC``: 0 intact, 1 not intact, 2 cannot decide."""
+    from fluid_build.api.release import INTACT, NOT_INTACT, verify_release
+
+    result = verify_release(args.source)
+    if getattr(args, "json", False):
+        json.dump(result.as_dict(), sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return result.exit_code
+    head = {INTACT: "intact", NOT_INTACT: "NOT INTACT"}.get(result.status, "cannot decide")
+    cprint_literal(f"{result.source}: {head}", soft_wrap=True)
+    for key, value in (
+        ("release", result.identity_digest),
+        ("product", result.product_id),
+        ("env", result.environment),
+    ):
+        if value:
+            cprint_literal(f"  {key:<8} {value}", soft_wrap=True)
+    if result.identity_digest:
+        cprint_literal(f"  files    {result.files_checked} checked", soft_wrap=True)
+    for problem in result.problems:
+        cprint_literal(f"  - {problem}", soft_wrap=True)
+    return result.exit_code
 
 
 def _run_runs_status(args: argparse.Namespace, logger: logging.Logger) -> int:

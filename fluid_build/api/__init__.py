@@ -15,6 +15,9 @@ control plane comparing a contract to a plan, CI tooling, editors) use
 :func:`load_contract` and its in-memory siblings from ``.contract``
 (added in 1.1; ``overlay_dir=`` on the in-memory forms and
 ``LoadedContract.origin_of`` in 1.2).
+
+A release ``fluid ship --release-dir`` sealed, on disk or where ``--release-to`` published it
+in S3, is checked read-only by :func:`verify_release` from ``.release`` (added in 1.3).
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from .hooks import HookChain, HookResult, PreLandHook
 from .lineage import DatasetFacet, LineageEmitter, RunEvent
 from .provider import ApplyResult, PlanAction, Provider
 from .quality import AnomalyResult, AnomalySignal, QualityGate, QualityResult, QualityRule
+from .release import ReleaseVerification, verify_release
 from .runner import RunContext, Runner, RunnerCapability, RunPlan, RunResult, RunState
 from .schema import SchemaEvolutionDecision, SchemaFingerprint, SchemaPolicy
 from .security import ImageSignatureVerifier, SovereigntyChecker
@@ -45,7 +49,7 @@ from .source import (
 )
 from .state import Cursor, RunLock, StateStore, Watermark
 
-__api_version__ = "1.2"
+__api_version__ = "1.3"
 
 __all__ = [
     "__api_version__",
@@ -106,4 +110,7 @@ __all__ = [
     "load_contract",
     "load_contract_from_text",
     "load_contract_from_dict",
+    # release verification (1.3)
+    "ReleaseVerification",
+    "verify_release",
 ]

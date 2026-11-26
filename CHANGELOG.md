@@ -21,6 +21,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$RELEASE_ARTIFACTS` names the lock when the flag is absent, read only by a run that seals a
   release; the flag without `--release-dir` is refused. `fluid runs status --release-dir` names
   each external file and its source.
+- **`fluid ship --release-dir DIR --release-to s3://bucket/prefix/` publishes the sealed release
+  to S3, write-once.** After the local seal, every file goes under
+  `<prefix>/<product>/<env>/<identity hex>/` as one single-part PutObject with `ChecksumSHA256`
+  and `If-None-Match: *`, read back with `HeadObject` (`ChecksumMode=ENABLED`), and
+  `release.json` goes last. An object already at a key counts as published only when its
+  SHA-256 is ours, so a re-run of the same release finishes or repeats the upload; other bytes,
+  a `release.json` another run sealed for the same identity, a denied write or a bad read-back
+  refuse the run (exit 1, or 3 after an apply) and the sealed directory stays as it is. Files
+  over 5 GiB are refused before any write. `--release-to-require versioning,object-lock` refuses
+  a bucket without them. The run report's `release.remote` says where the release went, or why
+  not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
+  boto3 is refused before stage 1 (exit 2).
+- **`fluid runs verify-release SRC` checks a sealed release, read-only.** SRC is a release
+  directory or the `s3://` prefix `--release-to` wrote. It checks that `release.json` is a
+  `fluid-release/1` record whose `identity_digest` is the digest of its `identity`, that an S3 key
+  ending in an identity's hex is this one's, and that every file listed has the sha256 named.
+  Exit 0 intact, 1 not intact, 2 cannot decide (unreadable, access denied, or boto3 missing for
+  `s3://`); `--json` prints the result. The check is public as `fluid_build.api.verify_release`
+  (API 1.3), and `fluid runs status --release-dir` shares its identity check.
+
+### Changed
+
+- **The `aws` extra needs boto3 and botocore 1.35.2 or later**, the first release whose PutObject
+  takes `IfNoneMatch`.
+- **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
+  and behaviour.
 
 ### Fixed
 

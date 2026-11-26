@@ -206,10 +206,9 @@ def _release(shown: str, index: Mapping[str, Any]) -> Optional[Release]:
     product, digest = identity.get("product_id"), index.get("identity_digest")
     if sealed is None or not isinstance(product, str) or not isinstance(digest, str):
         return None
-    try:
-        intact = ship_release.identity_digest(identity) == digest
-    except (TypeError, ValueError, RecursionError):
-        intact = False
+    from fluid_build.api.release import identity_intact
+
+    intact = identity_intact(index)  # the identity check fluid runs verify-release makes too
     versions = {
         clean(k, 80): clean(v, 80)
         for k, v in _mapping(identity.get("expose_versions")).items()

@@ -1257,7 +1257,7 @@ def test_the_exit_status_is_documented_in_help(capsys: pytest.CaptureFixture[str
         parse(["--help"])
     text = " ".join(capsys.readouterr().out.split())
     assert "Exit status: 0 every selected stage passed or was skipped; 1 a stage failed;" in text
-    assert "3 a stage failed after apply changed something, so those changes are live" in text
+    assert "3 a stage failed after apply changed something (the change is live)" in text
 
 
 def test_publish_and_schedule_sync_add_their_stage_under_an_explicit_stage_set() -> None:

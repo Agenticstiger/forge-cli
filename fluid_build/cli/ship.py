@@ -70,8 +70,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "validate-artifacts, diff, plan, apply, policy-apply (policy), verify, publish, "
             "schedule-sync.\n\n"
             "Exit status: 0 every selected stage passed or was skipped; 1 a stage failed; "
-            "2 ship refused its arguments; 3 a stage failed after apply changed something, "
-            "so those changes are live; 130 interrupted.\n\n"
+            "2 ship refused its arguments; 3 a stage failed after apply changed something "
+            "(the change is live); 130 interrupted.\n\n"
             "Variables read when the flag is absent: FLUID_ENV, APPLY_MODE, "
             "APPLY_BUILD_ID, ALLOW_DATA_LOSS, NO_VERIFY_DIGEST, PUBLISH_TARGETS, SCHEDULER, "
             "SCHEDULER_DESTINATION, SCHEDULER_ENVIRONMENT_NAME, SCHEDULER_LOCATION, "
@@ -321,6 +321,19 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         help="Also seal the external files LOCK lists (with --release-dir).",
     )
     g.add_argument(
+        "--release-to",
+        default=None,
+        metavar="S3URI",
+        help="Then publish the release, write-once, under s3://bucket/prefix/.",
+    )
+    g.add_argument(
+        "--release-to-require",
+        action="append",
+        default=None,
+        metavar="CHECK",
+        help="Refuse a --release-to bucket without versioning or object-lock.",
+    )
+    g.add_argument(
         "--journal-dir",
         default=None,
         metavar="DIR",
@@ -330,8 +343,8 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         "--acknowledge-inspected",
         action="append",
         default=None,
-        metavar="STAGE",
-        help="Rerun STAGE whose unknown outcome you inspected.",
+        metavar="N",
+        help="Rerun stage N (or name) whose unknown outcome you inspected.",
     )
 
 
@@ -359,6 +372,7 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
     acknowledged = _acknowledged(args, journal_dir or release_dir)
     opts, selected, not_selected, project_dir = _prepare(args)
     opts.artifacts = _artifacts_lock(args, release_dir)
+    opts.release_to, opts.release_to_require = _release_to(args)
     with _working_directory(project_dir):
         anchor = None  # an explicit --journal-dir is the operator's, links and all
         if journal_dir is None and release_dir is not None:
@@ -389,6 +403,25 @@ def _artifacts_lock(args: argparse.Namespace, release_dir: Optional[Path]) -> st
     value = flag if flag is not None else os.environ.get(_release_lock.LOCK_ENV, "")
     value = value.strip() if flag is not None or release_dir is not None else ""
     return os.path.abspath(value) if value else ""
+
+
+def _release_to(args: argparse.Namespace) -> Tuple[str, Tuple[str, ...]]:
+    """``--release-to`` and the ``--release-to-require`` checks (repeatable, comma-separated).
+    The target itself is checked with the rest of the release (``_ship_release.refusal``)."""
+    from . import _release_publish
+
+    target = getattr(args, "release_to", None)
+    if target is not None and not target.strip():  # `--release-to "$URI"` with URI unset
+        raise st.ShipUsageError("--release-to needs s3://bucket/prefix/")
+    given = getattr(args, "release_to_require", None) or []
+    checks = [c.strip() for v in given for c in str(v).split(",") if c.strip()]
+    unknown = sorted(set(checks) - set(_release_publish.REQUIREMENTS))
+    if unknown:
+        raise st.ShipUsageError(
+            f"--release-to-require: unknown check(s) {', '.join(unknown)}: use "
+            f"{' or '.join(_release_publish.REQUIREMENTS)}"
+        )
+    return (target or "").strip(), tuple(dict.fromkeys(checks))
 
 
 def _acknowledged(args: argparse.Namespace, journal_on: Optional[Path]) -> Set[int]:
@@ -1172,6 +1205,54 @@ def _close_release(
         _say_why_not(ctx, why)
         return failed
     ctx.ci.info(f"Release published: {ctx.release_dir} ({release.identity_digest(identity)})")
+    if ctx.opts.release_to:
+        return _publish_remote(ctx, ordered, merged, identity, exit_code)
+    return exit_code
+
+
+def _publish_remote(
+    ctx: _Context,
+    ordered: List[report.StageRecord],
+    merged: List[report.StageRecord],
+    identity: Dict[str, object],
+    exit_code: int,
+) -> int:
+    """Publish the sealed release to ``--release-to``; the run's report says where, or why
+    not. A failure leaves the sealed directory as it is. Returns the exit status."""
+    from . import _release_publish as remote
+
+    assert ctx.release_dir is not None
+    target = ctx.opts.release_to
+    block = _release_block(ctx, identity, None) or {}
+    try:
+        done = remote.publish_release(ctx.release_dir, target, require=ctx.opts.release_to_require)
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - any failure is reported
+        if isinstance(exc, KeyboardInterrupt):
+            why, failed = "interrupted while publishing", report.EXIT_INTERRUPTED
+        else:
+            why = str(exc) if isinstance(exc, remote.PublishError) else type(exc).__name__
+            failed = _failed_code(ordered, st.applies_changes(ctx.opts))
+        block["remote"] = {"uri": target, "status": "not-published", "reason": why}
+        _write_reports(ctx, merged, failed, block)
+        with ctx.ci.fenced():
+            ctx.ci.info(f"fluid ship: release not published to {target}: {why}")
+        ctx.logger.error(
+            "fluid ship: the release is sealed in %s and is not published to %s",
+            ctx.release_dir,
+            target,
+        )
+        return failed
+    block["remote"] = {
+        "uri": done.uri,
+        "status": "published",
+        "written": done.written,
+        "already_there": done.already,
+    }
+    _write_reports(ctx, merged, exit_code, block)
+    ctx.ci.info(
+        f"Release published to {done.uri} ({done.written} object(s) written, "
+        f"{done.already} already there)"
+    )
     return exit_code
 
 
@@ -1233,6 +1314,13 @@ def _explain(
         )
         if opts.artifacts:
             _out(f"external: the files {opts.artifacts} lists, sealed under external/<name>/")
+        if opts.release_to:
+            from . import _release_publish
+
+            where = _release_publish.parse_target(opts.release_to).uri
+            _out(
+                f"remote: then published, write-once, under {where}<product>/<env>/<identity hex>/"
+            )
     if problem:
         _out(f"warning: a real run would stop: {problem}")
     return 0

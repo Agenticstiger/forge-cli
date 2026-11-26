@@ -217,9 +217,10 @@ snowflake = [
 # provider; this extra is the explicit install target so `.[aws]` actually
 # pulls the SDK — the integration workflows install `.[dev,aws]`.
 aws = [
-  "boto3>=1.34",
+  # 1.35.2: PutObject takes IfNoneMatch (`fluid ship --release-to` writes once).
+  "boto3>=1.35.2",
   # Imported directly (ClientError, the bundled endpoint data); boto3 pulls it.
-  "botocore>=1.34",
+  "botocore>=1.35.2",
 ]
 
 # Visualizations (plan graph, HTML)
@@ -602,7 +603,7 @@ test-emulators-heavy = [
   "google-cloud-bigquery>=3.20",
   "google-cloud-storage>=2.16",
   "google-cloud-pubsub>=2.38",
-  "boto3>=1.34",
+  "boto3>=1.35.2",
 ]
 
 # One-shot install for contributors
@@ -1066,6 +1067,11 @@ module = [
     "fluid_build.maintenance.spec",
     "fluid_build.maintenance.statements",
     "fluid_build.build_runners.spark._maintenance",
+    # A sealed release published to S3 and verified back: whether an object is taken as
+    # ours, and whether a release reads as intact, so a silent Any is a silent overwrite.
+    "fluid_build.api.release",
+    "fluid_build.cli._release_publish",
+    "fluid_build.util.s3",
 ]
 strict = true
 
