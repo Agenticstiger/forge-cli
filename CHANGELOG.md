@@ -204,7 +204,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid runs deploy SRC --env E` copies a sealed release's external files to its targets.**
   It verifies the release and its environment, optionally passes `--require-receipt ENV` (as
   `fluid runs receipt check`, with `--require-locked` and `--require-signed`), and checks that
-  the credentials are the release's account (STS). Then each target, every DAG last: one that
+  the credentials are the release's account (STS). A release in S3 must sit in a versioned
+  bucket (exit 2 otherwise: no version to pin a copy to) and its `release.json` must have one
+  version and no delete marker (exit 1 otherwise: targets rewritten after the seal keep the code
+  digest), so the release prefix's writers must not hold `s3:DeleteObjectVersion`; `--sign` is
+  checked before any copy. Then each target, every DAG last: one that
   already has the file's full-object SHA-256 is left alone; otherwise CopyObject copies the
   release object at the version that was verified (`CopySourceIfMatch` its ETag) with `If-Match`
   the target's ETag, or `If-None-Match: *` for a new key, `ExpectedBucketOwner` on every call to

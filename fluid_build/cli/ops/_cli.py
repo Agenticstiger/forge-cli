@@ -317,7 +317,8 @@ def _register_deploy(sub: argparse._SubParsersAction) -> None:
         help="Copy a sealed release's external files to its deploy targets, then record it",
         description=(
             "Verifies SRC, that it is the release of --env, and that the credentials are the "
-            "account its deploy targets (fluid ship --deploy-targets) belong to. Then copies "
+            "account its deploy targets (fluid ship --deploy-targets) belong to; in S3 also "
+            "that the bucket is versioned and release.json has one version. Then copies "
             "each target, every Airflow DAG last: a target that already has the file's SHA-256 "
             "is left alone; otherwise the release object at its verified version is copied "
             "with If-Match the target's ETag, or If-None-Match * for a new one, and read back. "

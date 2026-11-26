@@ -727,18 +727,7 @@ def record_receipt(
 
     parsed = [parse_target(t) for t in targets]
     if sign:
-        from fluid_build._contract_loader import CLIError
-        from fluid_build.cli import _signing
-
-        if not _signing.cosign_available():
-            raise ReceiptError("--sign needs cosign on PATH (https://docs.sigstore.dev)", UNDECIDED)
-        if key_ref is not None:
-            try:
-                _signing._validate_key_ref(key_ref)
-            except CLIError:
-                raise ReceiptError(
-                    "--sign-key: not a key path or a KMS URI cosign takes", UNDECIDED
-                ) from None
+        sign_ready(key_ref)
     factory = _clients(clients)
     checked = _verified(source, factory, region)
     if environment is not None and environment != checked.environment:
@@ -785,6 +774,27 @@ def record_receipt(
         region=region,
         now=now,
     )
+
+
+def sign_ready(key_ref: Optional[str]) -> None:
+    """``--sign`` can sign: cosign is on PATH and ``key_ref``, when given, is one it takes.
+    Asked before any write, so a signing failure never follows a change.
+
+    Raises:
+        ReceiptError: (exit 2) it cannot.
+    """
+    from fluid_build._contract_loader import CLIError
+    from fluid_build.cli import _signing
+
+    if not _signing.cosign_available():
+        raise ReceiptError("--sign needs cosign on PATH (https://docs.sigstore.dev)", UNDECIDED)
+    if key_ref is not None:
+        try:
+            _signing._validate_key_ref(key_ref)
+        except CLIError:
+            raise ReceiptError(
+                "--sign-key: not a key path or a KMS URI cosign takes", UNDECIDED
+            ) from None
 
 
 def write_receipt(

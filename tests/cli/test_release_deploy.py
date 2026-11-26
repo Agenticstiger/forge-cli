@@ -339,6 +339,8 @@ class DeployS3(FakeS3):
         return self.vids.get((bucket, key)) or self.version_of(key)
 
     def write(self, bucket: str, key: str, data: bytes) -> None:
+        if (bucket, key) in self.objects:  # a versioned bucket keeps the older version
+            self.overwritten.add(key)
         self.put(bucket, key, data)
         self.vids[(bucket, key)] = f"v{len(self.writes) + 1}"
         self.writes.append(key)
@@ -348,7 +350,9 @@ class DeployS3(FakeS3):
             return super().put_object(**kw)
         self.calls.append("put_object")
         self.puts.append({k: v for k, v in kw.items() if k != "Body"})
-        bucket, key, data = kw["Bucket"], kw["Key"], kw["Body"]
+        body = kw["Body"]
+        bucket, key = kw["Bucket"], kw["Key"]
+        data = body if isinstance(body, bytes) else body.read()
         self._owner_check(bucket, kw.get("ExpectedBucketOwner"))
         self._conditions(bucket, key, kw)
         assert kw["ChecksumSHA256"] == b64(data)
@@ -365,6 +369,12 @@ class DeployS3(FakeS3):
             raise S3Error("PreconditionFailed", 412)
         if "IfMatch" in kw and (not there or self.etag(bucket, key) != kw["IfMatch"]):
             raise S3Error("PreconditionFailed", 412)
+
+    def get_object(self, *, Bucket: str, Key: str, VersionId: str = "") -> Dict[str, Any]:
+        got = super().get_object(Bucket=Bucket, Key=Key, VersionId=VersionId)
+        if "VersionId" in got:
+            got["VersionId"] = self.version(Bucket, Key)
+        return got
 
     def copy_object(self, **kw: Any) -> Dict[str, Any]:
         self.calls.append("copy_object")
@@ -545,7 +555,7 @@ def test_a_target_changed_meanwhile_is_refused_and_the_dag_is_left_alone(
     # another writer creates the package's key between the HEAD and the copy
     s3.changed_before_copy = ("acme-jobs", "jobs/orders_jobs.zip", b"someone else's")
     done = _deploy(uri, s3)
-    assert done.exit_code == 1 and "was written meanwhile (412)" in done.reason
+    assert done.exit_code == 1 and "was written meanwhile, or the release object" in done.reason
     assert s3.objects[("acme-airflow", "dags/orders_dag.py")] == b"the old dag"
     assert [t["action"] for t in done.targets] == ["failed", "not reached"]
     stored = json.loads(s3.objects[("acme-releases", str(done.receipt).split("/", 3)[3])])
@@ -632,6 +642,63 @@ def test_a_dry_run_writes_nothing(tmp_path: Path, s3: DeployS3) -> None:
     done = _deploy(uri, s3, dry_run=True)
     assert done.exit_code == 0 and done.receipt is None and s3.writes == written
     assert [t["action"] for t in done.targets] == ["would copy", "would copy"]
+    assert done.as_dict()["status"] == "dry-run"
+
+
+def test_a_release_in_a_bucket_without_versioning_is_not_copied(
+    tmp_path: Path, s3: DeployS3
+) -> None:
+    """No version to pin: an object swapped after the check would be what is copied."""
+    s3.versions, s3.versioning = False, None
+    uri = _published(tmp_path, s3)
+    done = _deploy(uri, s3)
+    assert done.exit_code == 2 and "bucket without versioning" in done.reason
+    assert _target_writes(s3) == [] and s3.copies == [] and done.receipt is None
+
+
+def test_a_release_json_written_twice_is_refused(tmp_path: Path, s3: DeployS3) -> None:
+    """Targets rewritten after the seal keep the code digest: a second version of release.json
+    (or a delete marker) is what shows it, so the deploy takes none."""
+    uri = _published(tmp_path, s3)
+    key = uri.split("/", 3)[3] + "release.json"
+    s3.overwritten.add(key)
+    done = _deploy(uri, s3)
+    assert done.exit_code == 1 and "written more than once" in done.reason
+    assert _target_writes(s3) == [] and done.receipt is None
+    s3.overwritten.clear()
+    s3.deleted.add(key)
+    assert _deploy(uri, s3).exit_code == 1
+
+
+def test_sign_without_cosign_refuses_before_any_copy(
+    tmp_path: Path, s3: DeployS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import _signing
+
+    monkeypatch.setattr(_signing, "cosign_available", lambda: False)
+    uri = _published(tmp_path, s3)
+    done = _deploy(uri, s3, sign=True)
+    assert done.exit_code == 2 and "--sign needs cosign" in done.reason
+    assert _target_writes(s3) == [] and s3.copies == []
+
+
+def test_a_file_on_disk_changed_since_the_check_is_refused_by_name(
+    tmp_path: Path, s3: DeployS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _sealed_release(tmp_path / "prod", "prod", _deploy_block())
+    real = receipts._verified
+
+    def then_changed(*a: Any, **kw: Any) -> Any:
+        checked = real(*a, **kw)
+        (tmp_path / "prod" / "external/orders-jobs/orders_jobs-1.4.0.zip").write_bytes(b"EVIL")
+        return checked
+
+    monkeypatch.setattr(receipts, "_verified", then_changed)
+    done = _deploy(str(tmp_path / "prod"), s3)
+    assert done.exit_code == 1 and "its bytes changed since the release was verified" in (
+        done.reason
+    )
+    assert s3.puts == []
 
 
 def test_a_release_on_disk_is_put_with_its_checksum_and_the_same_conditions(

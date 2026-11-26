@@ -12,8 +12,9 @@ account the release names. Then, every target but an Airflow DAG first and the D
 DAG folder never picks up a DAG before the files it runs:
 
 - a target whose object already has the file's full-object SHA-256 is left as it is;
-- otherwise the file is copied from the release object at the version that was verified
-  (``CopySourceIfMatch`` its ETag), with ``If-Match`` the target's ETag when it exists or
+- otherwise the file is copied from the release object at the version that was verified (a
+  release in S3 must sit in a versioned bucket, and its release.json have one version), with
+  ``CopySourceIfMatch`` that version's ETag, ``If-Match`` the target's ETag when it exists or
   ``If-None-Match: *`` when it does not, so a target changed meanwhile is never overwritten,
   and ``ExpectedBucketOwner`` the release's account on every call to it;
 - each copy is read back and must have the SHA-256 the release names; its VersionId is kept.
@@ -77,7 +78,8 @@ class Deployed:
 
     def as_dict(self) -> Dict[str, Any]:
         out = asdict(self)
-        out["status"] = {PASS: "deployed", FAIL: "failed"}.get(self.exit_code, "undecided")
+        done = "dry-run" if self.dry_run else "deployed"
+        out["status"] = {PASS: done, FAIL: "failed"}.get(self.exit_code, "undecided")
         return out
 
 
@@ -111,8 +113,12 @@ def deploy_release(
                 "was sealed for",
                 UNDECIDED,
             )
+        if source.startswith("s3://"):
+            _pinned(source, checked, factory, region)
         deploy = _deploy_block(source, checked, factory, region)
         out.account = deploy["account"]
+        if sign:
+            receipts.sign_ready(key_ref)
         if require_receipt is not None:
             gate = receipts.check_receipt(
                 source,
@@ -279,6 +285,53 @@ def _deploy_block(
     return dict(deploy)
 
 
+def _pinned(
+    source: str, checked: Any, factory: receipts.ClientFactory, region: Optional[str]
+) -> None:
+    """In S3, the release's objects can be copied only as the versions that were verified, and
+    its release.json has never been rewritten. A bucket without versioning gives no version to
+    pin, so a swapped object would be copied; a second version of release.json (or a delete
+    marker) would let deploy targets changed after the seal stand, since they sit outside the
+    code digest. Both are refused, so the release prefix's writers must not hold
+    s3:DeleteObjectVersion either, as for receipts.
+
+    Raises:
+        DeployError: (exit 2) no versions to pin; (exit 1) release.json was rewritten.
+    """
+    from fluid_build.util import s3
+
+    if any(not o.get("version_id") for o in checked.objects):
+        raise DeployError(
+            f"{checked.source} sits in a bucket without versioning, so a copy cannot be pinned "
+            "to the bytes that were verified: publish releases to a versioned bucket "
+            "(fluid ship --release-to-require versioning)",
+            UNDECIDED,
+        )
+    bucket, key = s3.split_uri(source.rstrip("/") + "/release.json")
+    try:
+        got = factory("s3", region).list_object_versions(Bucket=bucket, Prefix=key)
+    except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
+        code = s3.error_code(exc)
+        raise DeployError(
+            f"{checked.source}release.json: its versions cannot be listed "
+            f"({code or type(exc).__name__}; s3:ListBucketVersions is needed)",
+            UNDECIDED,
+        ) from None
+    entries = [
+        e
+        for kind in ("Versions", "DeleteMarkers")
+        for e in got.get(kind) or []
+        if isinstance(e, dict) and e.get("Key") == key
+    ]
+    verified = next(o["version_id"] for o in checked.objects if o.get("path") == "release.json")
+    if got.get("IsTruncated") or [e.get("VersionId") for e in entries] != [verified]:
+        raise DeployError(
+            f"{checked.source}release.json has been written more than once (versions or a "
+            "delete marker beside the one verified): a release is written once, so its deploy "
+            "targets cannot be taken"
+        )
+
+
 def _read_regular(path: Path, limit: int) -> bytes:
     """Up to ``limit`` bytes of a regular file, never through a link."""
     import stat
@@ -383,6 +436,8 @@ class _Copier:
             try:
                 written = self._write(target, bucket, key, conditions)
                 break
+            except DeployError:
+                raise
             except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
                 code = s3.error_code(exc)
                 status = s3.http_status(exc)
@@ -450,14 +505,25 @@ class _Copier:
                 **common,
             )
             return copied
-        data = _read_regular(Path(self.source) / rel, 5 * 1024**3 + 1)
-        if hashlib.sha256(data).hexdigest() != str(target["digest"]["sha256"]):
-            raise DeployError(f"{rel}: its bytes changed since the release was verified")
-        put: Dict[str, Any] = self.dest.put_object(
-            Body=data,
-            ChecksumSHA256=s3.sha256_b64(str(target["digest"]["sha256"])),
-            **common,
-        )
+        import stat
+
+        fd = os.open(Path(self.source) / rel, receipts._READ_FLAGS)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise DeployError(f"{rel} is not a regular file", UNDECIDED)
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+            if digest.hexdigest() != str(target["digest"]["sha256"]):
+                raise DeployError(f"{rel}: its bytes changed since the release was verified")
+            handle.seek(0)
+            # S3 checks the body against the checksum, so bytes that change after the hash above
+            # are refused (BadDigest), never stored
+            put: Dict[str, Any] = self.dest.put_object(
+                Body=handle,
+                ChecksumSHA256=s3.sha256_b64(str(target["digest"]["sha256"])),
+                **common,
+            )
         return put
 
 
@@ -469,8 +535,8 @@ def _write_error(
     if code in s3.PRECONDITION_CODES:
         changed = "was written meanwhile" if "IfNoneMatch" in conditions else "changed meanwhile"
         return DeployError(
-            f"{shown} {changed} (412), so it was not overwritten; deploy again to copy over what "
-            "is there now"
+            f"{shown} {changed}, or the release object is no longer the verified one (412); "
+            "nothing was written. Deploy again to copy over what is there now"
         )
     if code == "NotImplemented" or status == 501:
         return DeployError(
