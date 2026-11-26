@@ -274,9 +274,6 @@ def connect_settings(memory: int) -> Dict[str, Any]:
     }
 
 
-#: Where the sandbox may make its spill directory (an empty directory: nothing spills into it).
-_TEMP_DIRS = ("/tmp", "/var/tmp")
-
 #: The settings passed when the connection opens; the sandbox sets the others, then locks them.
 _START_UP = (
     "allow_unsigned_extensions",
@@ -680,6 +677,10 @@ def main(*, select_only: bool = True) -> int:
     if asked is None:
         return 2
     seconds, memory, cpu = asked
+    # The sandbox makes its spill directory with tempfile, whose first call finds the directory
+    # by writing a file in each candidate. Once the limits are down no file this process writes
+    # may grow past zero bytes, so tempfile finds it now and keeps it.
+    tempfile.gettempdir()
     limits = _lower_before_imports(memory, cpu)
     sys.dont_write_bytecode = True  # a file this process writes may not grow past zero bytes
     try:
@@ -689,9 +690,6 @@ def main(*, select_only: bool = True) -> int:
         _reply(stdout, {"op": "missing", "module": error.name or ""})
         return 3
     settings = connect_settings(memory)
-    # The sandbox makes its spill directory with tempfile, which would probe each candidate by
-    # writing a file there; no file this process writes may grow past zero bytes, so name it.
-    tempfile.tempdir = next((each for each in _TEMP_DIRS if os.path.isdir(each)), None)
     # The repo's one way to open DuckDB (no file or network access: an empty allowlist), with
     # the start-up options the sandbox does not set itself passed when the connection opens.
     connection = sandbox.secure_duckdb_connect(
