@@ -881,7 +881,7 @@ def test_the_docker_job_builds_the_image_around_this_release_s_wheel() -> None:
     names = [s.get("name") for s in _steps("docker")]
     download = next(s for s in _steps("docker") if s.get("name") == "Download wheel")
     assert download["with"] == {"name": "dist", "path": "dist/"}, download
-    check = names.index("Check the image holds this release's wheel")
+    check = names.index("Check the scanned image holds this release's wheel")
     assert names.index("Download wheel") < names.index("Build image for scanning (no push)") < check
     assert check < names.index("Build and push Docker image"), names
     step = _steps("docker")[check]
@@ -957,6 +957,138 @@ def test_the_attest_job_signs_only_the_files_the_build_recorded(tmp_path, tamper
     signing = [i for i, s in enumerate(attest) if "attest-build-provenance" in s.get("uses", "")]
     assert attest[check]["env"]["SHA256"] == "${{ needs.build.outputs.sha256 }}"
     assert signing and check < min(signing), attest
+
+
+_DIST_CHECK = "Check the files are the ones the build job made"
+
+
+def test_every_job_that_takes_dist_checks_it_against_the_build_job() -> None:
+    """The artifact store can be written by code fetched later in the same run
+    (the TestPyPI smoke install, the image build), so each job that uploads,
+    installs or signs dist/ re-checks it before any step that uses it."""
+    takers = {}
+    for name, job in _jobs().items():
+        steps = job["steps"]
+        for i, step in enumerate(steps):
+            if (
+                step.get("uses", "").startswith("actions/download-artifact")
+                and step.get("with", {}).get("name") == "dist"
+            ):
+                takers[name] = (job, i)
+    assert set(takers) == {
+        "attest",
+        "publish-testpypi",
+        "publish-pypi",
+        "github-release",
+        "docker",
+    }, set(takers)
+    for name, (job, i) in takers.items():
+        assert "build" in job["needs"], name
+        later = job["steps"][i + 1 :]
+        check = next((j for j, s in enumerate(later) if s.get("name") == _DIST_CHECK), None)
+        assert check is not None, name
+        assert later[check]["env"]["SHA256"] == "${{ needs.build.outputs.sha256 }}", name
+        assert "sha256sum --check --strict" in later[check]["run"], name
+        # No action (upload, publish, sign, push) comes between them.
+        assert not [x for x in later[:check] if "uses" in x], name
+
+
+@pytest.mark.parametrize("change", ["none", "swap", "extra", "missing"])
+def test_the_dist_check_refuses_a_changed_file_set(tmp_path, change: str) -> None:
+    record = next(s for s in _steps("build") if s.get("id") == "digests")["run"]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+    out = tmp_path / "out"
+    env = {**os.environ, "GITHUB_OUTPUT": str(out)}
+    subprocess.run(["bash", "-c", record], cwd=tmp_path, env=env, check=True, capture_output=True)
+    (line,) = [ln for ln in out.read_text().splitlines() if ln.startswith("sha256=")]
+    env["SHA256"] = line.removeprefix("sha256=")
+    if change == "swap":
+        (dist / "pkg-1.0.tar.gz").write_bytes(b"other")
+    elif change == "extra":
+        (dist / "extra.txt").write_bytes(b"x")
+    elif change == "missing":
+        (dist / "pkg-1.0.tar.gz").unlink()
+    for name in ("attest", "publish-testpypi", "publish-pypi", "github-release", "docker"):
+        check = next(s for s in _steps(name) if s.get("name") == _DIST_CHECK)["run"]
+        got = subprocess.run(
+            ["bash", "-c", check], cwd=tmp_path, env=env, capture_output=True, text=True
+        )
+        assert (got.returncode != 0) is (change != "none"), (name, got.stdout + got.stderr)
+
+
+def test_the_testpypi_install_takes_the_package_from_testpypi_and_the_rest_from_pypi() -> None:
+    """With both indexes in one resolution, a dependency name that exists on
+    TestPyPI is taken from whichever index has the higher version."""
+    run = next(s for s in _steps("verify-testpypi") if s.get("name") == "Install from TestPyPI")[
+        "run"
+    ]
+    assert "--extra-index-url" not in run
+    installs = [ln.strip() for ln in run.replace("\\\n", " ").splitlines() if "pip install" in ln]
+    assert len(installs) == 2, installs
+    first, second = installs
+    assert "--no-deps" in first and "https://test.pypi.org/simple/" in first, first
+    assert "--no-deps" not in second and "https://pypi.org/simple/" in second, second
+    assert "test.pypi.org" not in second, second
+
+
+def _push_check(tmp_path: Path, *, digest: str, held: str, version: str = "1.2.0") -> tuple:
+    """Run the pushed-image check under bash with a fake `docker`."""
+    step = next(
+        s
+        for s in _steps("docker")
+        if s.get("name") == "Check the pushed image holds this release's wheel"
+    )
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "docker.log"
+    fake = bindir / "docker"
+    fake.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\necho "{held}"\n', encoding="utf-8")
+    fake.chmod(0o700)
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "IMAGE": "ghcr.io/Some-Owner/forge-cli",
+        "DIGEST": digest,
+        "VERSION": version,
+    }
+    got = subprocess.run(
+        ["bash", "-c", step["run"]], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    return got, (log.read_text() if log.exists() else "")
+
+
+_DIGEST = "sha256:" + "ab" * 32
+
+
+def test_the_pushed_image_is_asked_what_it_holds(tmp_path) -> None:
+    """The push is a second build; the scan build's check says nothing about it."""
+    got, log = _push_check(tmp_path, digest=_DIGEST, held="1.2.0")
+    assert got.returncode == 0, got.stdout + got.stderr
+    assert f"ghcr.io/some-owner/forge-cli@{_DIGEST}" in log, log
+
+
+def test_a_pushed_image_with_another_version_fails_the_job(tmp_path) -> None:
+    got, _ = _push_check(tmp_path, digest=_DIGEST, held="0.0.0+unknown")
+    assert got.returncode != 0 and "::error::" in got.stdout, got.stdout
+
+
+def test_a_push_without_a_digest_fails_before_anything_runs(tmp_path) -> None:
+    got, log = _push_check(tmp_path, digest="", held="1.2.0")
+    assert got.returncode != 0 and log == "", (got.stdout, log)
+
+
+def test_the_pushed_image_is_checked_after_the_push_and_before_it_is_signed() -> None:
+    names = [s.get("name") for s in _steps("docker")]
+    push = names.index("Build and push Docker image")
+    check = names.index("Check the pushed image holds this release's wheel")
+    assert push < check
+    step = _steps("docker")[check]
+    assert step["if"] == "needs.quality-gate.outputs.publish == 'true'"
+    assert step["env"]["DIGEST"] == "${{ steps.push.outputs.digest }}"
+    assert _jobs()["attest-image"]["needs"] == ["quality-gate", "docker"]
 
 
 def test_the_image_attestation_signs_the_digest_the_docker_job_pushed() -> None:

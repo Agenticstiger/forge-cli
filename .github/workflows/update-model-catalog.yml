@@ -107,11 +107,21 @@ jobs:
           path: proposed
 
       # The artifact is data produced by a job that ran fetched code. Only a
-      # JSON object is allowed to replace the file; anything else stops here.
+      # JSON object with exactly the catalog's top-level keys is allowed to
+      # replace the file; anything else stops here.
       - name: Check and place the proposed catalog
         run: |
           set -euo pipefail
-          python3 -c 'import json, sys; assert isinstance(json.load(open(sys.argv[1], encoding="utf-8")), dict)' proposed/llm_models.json
+          python3 - proposed/llm_models.json <<'PY'
+          import json
+          import sys
+
+          keys = {"schema_version", "updated_at", "source", "default_provider", "tiers", "providers"}
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              catalog = json.load(handle)
+          if not isinstance(catalog, dict) or set(catalog) != keys:
+              sys.exit("the proposed catalog is not a JSON object with the catalog's top-level keys")
+          PY
           cp proposed/llm_models.json fluid_build/cli/llm_models.json
           rm -r proposed
 

@@ -15,6 +15,9 @@ and an install share a runner.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -99,3 +102,43 @@ def test_the_token_reaches_only_the_pushing_step_and_not_argv(doc):
     assert holders[0]["env"] == {"GH_TOKEN": "${{ github.token }}"}
     assert "GIT_CONFIG_VALUE_0" in run
     assert "-c http" not in run and "https://x-access-token" not in run
+
+
+def _place(tmp_path: Path, proposed: object) -> subprocess.CompletedProcess:
+    """Run the push job's check-and-place step under bash in a scratch tree."""
+    step = next(
+        s
+        for s in _steps(yaml.safe_load(WORKFLOW.read_text())["jobs"]["push-proposal"])
+        if s.get("name") == "Check and place the proposed catalog"
+    )
+    (tmp_path / "proposed").mkdir()
+    (tmp_path / "fluid_build" / "cli").mkdir(parents=True)
+    (tmp_path / "fluid_build" / "cli" / "llm_models.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "proposed" / "llm_models.json").write_text(json.dumps(proposed), encoding="utf-8")
+    return subprocess.run(
+        ["bash", "-c", step["run"]], cwd=tmp_path, env=os.environ, capture_output=True, text=True
+    )
+
+
+_REAL = Path(__file__).resolve().parents[1] / "fluid_build" / "cli" / "llm_models.json"
+
+
+def test_the_shipped_catalog_passes_the_check_and_is_placed(tmp_path) -> None:
+    catalog = json.loads(_REAL.read_text(encoding="utf-8"))
+    got = _place(tmp_path, catalog)
+    assert got.returncode == 0, got.stdout + got.stderr
+    placed = json.loads((tmp_path / "fluid_build/cli/llm_models.json").read_text("utf-8"))
+    assert placed == catalog
+
+
+@pytest.mark.parametrize("shape", ["list", "missing-key", "extra-key"])
+def test_a_proposal_that_is_not_the_catalog_s_shape_replaces_nothing(tmp_path, shape) -> None:
+    catalog = json.loads(_REAL.read_text(encoding="utf-8"))
+    proposed: object = {
+        "list": [catalog],
+        "missing-key": {k: v for k, v in catalog.items() if k != "tiers"},
+        "extra-key": {**catalog, "run": "x"},
+    }[shape]
+    got = _place(tmp_path, proposed)
+    assert got.returncode != 0, got.stdout
+    assert (tmp_path / "fluid_build/cli/llm_models.json").read_text("utf-8") == "{}"
