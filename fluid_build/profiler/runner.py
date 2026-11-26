@@ -33,6 +33,7 @@ domain, as the levels ``false`` and ``true``, which is how flux-stats reads one.
 
 from __future__ import annotations
 
+import bisect
 import re
 import time
 from collections import Counter
@@ -67,6 +68,7 @@ from fluid_build.profiler import (
     facts,
     grouped,
     history,
+    query_rates,
     ranks,
     sources,
 )
@@ -91,6 +93,7 @@ from fluid_build.profiler._stats import (
 )
 from fluid_build.profiler.bundle import BundleBlock
 from fluid_build.profiler.document import DEFAULT_FRACTIONAL_BITS
+from fluid_build.profiler.query_rates import QueryResult
 
 __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
@@ -101,6 +104,7 @@ __all__ = [
     "ExposeSource",
     "ProfileError",
     "ProfileResult",
+    "QueryResult",
     "Relationship",
     "RelationshipResult",
     "TableResult",
@@ -258,6 +262,10 @@ class ColumnPlan:
     domain: str
     #: The contract types the column ``date``: a ``YYYY-MM-DD`` text in it is that day.
     date: bool = False
+    #: A date or timestamp's ``(floor, ceiling)`` in milliseconds since the epoch, from the
+    #: contract's range rules: ``None`` for a bound it does not declare. ``None`` as a whole
+    #: when the contract states a range this does not read, and the ends are then not rounded.
+    extreme_bounds: Optional[Tuple[Optional[int], Optional[int]]] = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +313,9 @@ class TableResult:
     #: Each date or timestamp column with no declared range that has no date span, with why:
     #: it keeps the ladder's quantiles (:func:`_date_spans`).
     no_span: Tuple[Tuple[str, str], ...] = ()
+    #: Each end of a date or timestamp column published rounded to a calendar unit:
+    #: ``(column, "min" or "max", unit)``.
+    rounded_extremes: Tuple[Tuple[str, str, str], ...] = ()
 
 
 #: The bins a parent's number of children is counted in: 0, 1, 2, 3 to 4, 5 to 9, 10 to 19,
@@ -344,6 +355,8 @@ class RelationshipResult:
     #: The cells published, of the histogram's cells; 0 when it is withheld whole.
     published: int
     cells: int
+    #: Which bins of the histogram publish their cell (all ``False`` when it is withheld whole).
+    shown: Tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -382,6 +395,8 @@ class ProfileResult:
     not_measured: Tuple[Tuple[str, str], ...] = ()
     #: Answering a request: each fact measured, published or withheld.
     facts: Tuple[FactResult, ...] = ()
+    #: Answering a request: each consumer query measured, and what became of it.
+    queries: Tuple[QueryResult, ...] = ()
 
 
 def _base_type(type_name: Any) -> str:
@@ -464,8 +479,44 @@ def plan_expose(contract: Mapping[str, Any], expose_id: str) -> ExposePlan:
             skipped.append((name, reason or ""))
         else:
             is_date = _base_type(entry.get("type")) == "date"
-            columns.append(ColumnPlan(name=name, domain=domain, date=is_date))
+            columns.append(
+                ColumnPlan(
+                    name=name,
+                    domain=domain,
+                    date=is_date,
+                    extreme_bounds=_extreme_bounds(entry, is_date) if domain == TIMESTAMP else None,
+                )
+            )
     return ExposePlan(expose_id=expose_id, columns=tuple(columns), skipped=tuple(skipped))
+
+
+_MS_PER_DAY = 86_400_000
+
+
+def _extreme_bounds(
+    entry: Mapping[str, Any], date: bool
+) -> Optional[Tuple[Optional[int], Optional[int]]]:
+    """The floor and ceiling in milliseconds a rounded end of the column is clipped to.
+
+    From the ``range`` rules, as :func:`defaults.declared_instant_sides` reads them: a strict
+    bound is one step inside (a day for a DATE, a millisecond for a timestamp), and a DATE's
+    bounds are taken to whole days inside the range. ``None`` when a range rule is not read.
+    """
+    sides = defaults.declared_instant_sides(entry)
+    if sides is None:
+        return None
+    step = _MS_PER_DAY if date else 1
+    low, high = sides
+    floor = ceiling = None
+    if low is not None:
+        floor = low[0] * 1000 + (step if low[1] else 0)
+        if date:
+            floor = -(-floor // _MS_PER_DAY) * _MS_PER_DAY
+    if high is not None:
+        ceiling = high[0] * 1000 - (step if high[1] else 0)
+        if date:
+            ceiling = ceiling // _MS_PER_DAY * _MS_PER_DAY
+    return floor, ceiling
 
 
 def _empty(value: Any) -> bool:
@@ -483,8 +534,12 @@ def _column(
     declares_mean: bool = False,
     withhold: FrozenSet[str] = frozenset(),
     asked: Optional[RequestColumn] = None,
+    rounded: Optional[List[Tuple[str, str, str]]] = None,
 ) -> Dict[str, Any]:
     """One column of the table: its domain, then its checked metrics and statistics.
+
+    *rounded* collects each end of the column published rounded to a calendar unit, as
+    ``(column, "min" or "max", unit)`` (:func:`_check_described`).
 
     *asked* is the request's entry for the column: only the metrics and the ``mean/1`` it lists.
 
@@ -507,6 +562,7 @@ def _column(
             tally,
             withhold,
             None if asked is None else frozenset(asked.metrics),
+            rounded,
         ),
     }
     statistics = (
@@ -528,6 +584,7 @@ def _column_metrics(
     tally: "Counter[str]",
     withhold: FrozenSet[str] = frozenset(),
     listed: Optional[FrozenSet[str]] = None,
+    rounded: Optional[List[Tuple[str, str, str]]] = None,
 ) -> Dict[str, Any]:
     """The checked ``metrics`` object of one column, from its values as read.
 
@@ -562,6 +619,10 @@ def _column_metrics(
             verdict, shown = counted, value
             if counted.published:
                 verdict, shown = _check_described(name, value, present, holders, rule)
+                if name in ("min", "max") and not verdict.published and name not in withhold:
+                    verdict, shown = _round_end(
+                        column, name, verdict, shown, holders, rule, rounded
+                    )
         if name in withhold:
             verdict = disclosure.Verdict(disclosure.SECONDARY, "counts what a histogram withholds")
         entry: Dict[str, Any] = {
@@ -602,6 +663,32 @@ def _check_described(
                 return verdict, value
         return disclosure.PUBLISHED, value
     raise AssertionError(f"no disclosure rule for metric {name!r}")
+
+
+def _round_end(
+    column: ColumnPlan,
+    name: str,
+    verdict: disclosure.Verdict,
+    value: Any,
+    holders: "Counter[Any]",
+    rule: disclosure.DisclosureRule,
+    rounded: Optional[List[Tuple[str, str, str]]],
+) -> Tuple[disclosure.Verdict, Any]:
+    """A date or timestamp end too few records hold, rounded to the finest unit enough share.
+
+    :func:`disclosure.round_extreme` decides; an end it cannot round keeps its verdict.
+    """
+    if column.extreme_bounds is None or verdict.status != disclosure.SMALL_COUNT:
+        return verdict, value
+    floor, ceiling = column.extreme_bounds
+    found = disclosure.round_extreme(
+        name, holders, rule, date=column.date, floor=floor, ceiling=ceiling
+    )
+    if found is None:
+        return verdict, value
+    if rounded is not None:
+        rounded.append((column.name, name, found[1]))
+    return disclosure.PUBLISHED, found[0]
 
 
 #: PROFILE-SPEC §3: an ungrouped statistic has one group, keyed by the empty string.
@@ -701,6 +788,7 @@ class _Planned:
     """What a profile settles before it reads a record: its plans, blocks and relationships."""
 
     fact_plans: List["facts.FactPlan"]
+    query_plans: "query_rates.QueryPlans"
     plans: List[ExposePlan]
     asked: Dict[str, RequestTable]
     blocks: Mapping[str, BundleBlock]
@@ -745,6 +833,7 @@ def _plan_profile(
     from fluid_build.profiler import request as asked_for
 
     fact_plans: List[facts.FactPlan] = []
+    query_plans = query_rates.QueryPlans()
     if request is not None:
         if bundles:
             raise ProfileError(
@@ -766,6 +855,7 @@ def _plan_profile(
         asked_for.check_tables(request, contract)
         asked_for.check_sources(request, [each.expose_id for each in exposes])
         fact_plans = _plan_facts(contract, request)
+        query_plans = query_rates.plan_queries(contract, request, backend.enum_levels)
     if fractional_bits is not None:
         document.check_fractional_bits(fractional_bits)
     if not exposes:
@@ -834,11 +924,13 @@ def _plan_profile(
             keys,
             matched,
             fact_plans,
+            query_plans,
             backend,
             fractional_bits,
         )
     return _Planned(
         fact_plans=fact_plans,
+        query_plans=query_plans,
         plans=plans,
         asked=asked,
         blocks=blocks,
@@ -910,6 +1002,7 @@ def profile_exposes(
         planned.asked,
         planned.blocks,
     )
+    query_plans = planned.query_plans
     declared, uncovered, matched = planned.declared, planned.uncovered, planned.matched
     relationships, held, unfiltered = planned.relationships, planned.held, planned.unfiltered
     keys, fractional_bits = planned.keys, planned.fractional_bits
@@ -922,7 +1015,7 @@ def profile_exposes(
                     plan,
                     sources.read_columns(
                         exposed.source,
-                        _read_names(plan, fact_plans),
+                        _read_names(plan, fact_plans, query_plans),
                         table=exposed.table,
                         cwd=cwd,
                     ),
@@ -1059,15 +1152,24 @@ def profile_exposes(
         )
     fact_results: Tuple[FactResult, ...] = ()
     invariants: List[Dict[str, Any]] = []
+    queries: List[Dict[str, Any]] = []
+    query_results: Tuple[QueryResult, ...] = ()
     if request is not None:
-        invariants, fact_results, more = _measured_for_request(
+        links = (
+            _counted_links(relationships, counted_entries, by_expose, backend)
+            if query_plans.needs_links()
+            else []
+        )
+        invariants, fact_results, more, queries, query_results = _measured_for_request(
             contract,
             fact_plans,
+            query_plans,
             plans,
             reads,
             asked,
             answered,
             tables_doc,
+            links,
             backend=backend,
             rule=rule,
             tallies=tallies,
@@ -1092,6 +1194,7 @@ def profile_exposes(
             fractional_bits=fractional_bits,
             relationships=relationship_docs,
             invariants=invariants,
+            queries=queries,
         )
         canonical = document.canonical_bytes(built)
         backend.check_document(canonical.decode("utf-8"))
@@ -1110,17 +1213,47 @@ def profile_exposes(
         relationships_left_out=tuple(relationships_left_out),
         not_measured=unanswered,
         facts=fact_results,
+        queries=query_results,
     )
+
+
+def _hold_published_cells(
+    rates: "query_rates.Measured",
+    query_plans: "query_rates.QueryPlans",
+    fact_plans: Sequence["facts.FactPlan"],
+    tables_doc: Mapping[str, Mapping[str, Any]],
+    by_table: Mapping[str, sources.SourceColumns],
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> None:
+    """Hold each queried table's published column cells beside the facts and queries reading them.
+
+    A column's cells join its table's set check only beside the parts whose texts read it
+    (:func:`fluid_build.profiler.query_rates.published_cells`).
+    """
+    for table in rates.tables:
+        named = set(query_plans.columns_of(table)) | {
+            column
+            for each in fact_plans
+            if each.reason is None and each.table == table
+            for column in each.columns
+        }
+        cells = query_rates.published_cells(
+            tables_doc.get(table, {}), by_table[table], backend, named, fractional_bits
+        )
+        rates.fold(table, cells)
 
 
 def _measured_for_request(
     contract: Mapping[str, Any],
     fact_plans: Sequence["facts.FactPlan"],
+    query_plans: "query_rates.QueryPlans",
     plans: Sequence[ExposePlan],
     reads: Sequence[sources.SourceColumns],
     asked: Mapping[str, RequestTable],
     answered: "_Groupings",
     tables_doc: Dict[str, Dict[str, Any]],
+    links: Sequence["query_rates.CountedLink"],
     *,
     backend: StatisticsBackend,
     rule: disclosure.DisclosureRule,
@@ -1129,22 +1262,44 @@ def _measured_for_request(
     row_floor: Optional[int],
     held: Mapping[str, FrozenSet[str]],
     timings: Optional[StageTimings],
-) -> Tuple[List[Dict[str, Any]], Tuple[FactResult, ...], Tuple[Tuple[str, str], ...]]:
-    """What only a request measures once the tables are: its facts and its column pairs.
+) -> Tuple[
+    List[Dict[str, Any]],
+    Tuple[FactResult, ...],
+    Tuple[Tuple[str, str], ...],
+    List[Dict[str, Any]],
+    Tuple[QueryResult, ...],
+]:
+    """What only a request measures once the tables are: its facts, queries and column pairs.
 
     The keyword arguments are what the tables were measured with. Writes each table's ``columnPairs`` into *tables_doc*;
-    returns the invariants, the fact results and the lines this adds under Not measured.
+    returns the invariants, the fact results, the lines this adds under Not measured, the
+    ``queries`` entries and what became of each query.
+
+    The consumer queries run once, over the one read of each table; a table's queries and facts
+    are then checked as one set (:func:`_fact_entries`).
     """
     by_table = {plan.expose_id: read for plan, read in zip(plans, reads, strict=True)}
     with _shared(
         timings,
         "measure",
-        lambda: list(dict.fromkeys(each.table for each in fact_plans if each.reason is None)),
+        lambda: list(
+            dict.fromkeys(
+                [
+                    *(each.table for each in fact_plans if each.reason is None),
+                    *(table for table in by_table if query_plans.columns_of(table)),
+                ]
+            )
+        ),
     ):
-        invariants, fact_results, unmeasured = _fact_entries(
-            contract, fact_plans, by_table, rule, tallies[0]
+        rates = query_rates.measure(query_plans, by_table, backend, rule, links)
+        _hold_published_cells(
+            rates, query_plans, fact_plans, tables_doc, by_table, backend, fractional_bits
         )
-    left: Tuple[Tuple[str, str], ...] = (*unmeasured, *answered.not_measured)
+        invariants, fact_results, unmeasured = _fact_entries(
+            contract, fact_plans, by_table, rule, tallies[0], rates
+        )
+        query_docs, query_results, query_left = rates.entries(rule, tallies[0])
+    left: Tuple[Tuple[str, str], ...] = (*unmeasured, *query_left, *answered.not_measured)
     for plan, read in zip(plans, reads, strict=True):
         table = asked[plan.expose_id]
         with _timed(timings, "measure", plan.expose_id):
@@ -1162,7 +1317,7 @@ def _measured_for_request(
         if pairs:
             tables_doc[plan.expose_id]["columnPairs"] = pairs
         left = (*left, *missing_pairs)
-    return invariants, fact_results, left
+    return invariants, fact_results, left, query_docs, query_results
 
 
 def _metric_domains(backend: StatisticsBackend) -> Dict[str, FrozenSet[str]]:
@@ -1240,6 +1395,7 @@ def _refuse_unformable(
     keys: Mapping[str, FrozenSet[str]],
     matched: Set[int],
     fact_plans: Sequence["facts.FactPlan"],
+    query_plans: "query_rates.QueryPlans",
     backend: StatisticsBackend,
     fractional_bits: int,
 ) -> None:
@@ -1287,6 +1443,7 @@ def _refuse_unformable(
                 contract, request, relationships, relationships_left_out, matched
             ),
             metric_domains=_metric_domains(backend),
+            queries=query_plans,
         )
     )
     found.extend(answered.not_measured)
@@ -1704,15 +1861,25 @@ def _fact_refusal(exc: "facts.FactRefused") -> ProfileError:
     )
 
 
-def _read_names(plan: ExposePlan, fact_plans: Sequence["facts.FactPlan"]) -> List[str]:
-    """The columns of a table to read: those profiled, then those only a fact's rule reads.
+def _read_names(
+    plan: ExposePlan,
+    fact_plans: Sequence["facts.FactPlan"],
+    query_plans: "query_rates.QueryPlans",
+) -> List[str]:
+    """The columns of a table to read: those profiled, then those only a fact or a query reads.
 
-    A column read for a fact alone is read and never profiled: reading is not publishing.
+    A column read for a fact or a query alone is read and never profiled: reading is not
+    publishing.
     """
     names = [column.name for column in plan.columns]
     for each in fact_plans:
         if each.table == plan.expose_id:
             names.extend(name for name in each.columns if name not in names)
+    names.extend(name for name in query_plans.columns_of(plan.expose_id) if name not in names)
+    if not names and plan.expose_id in query_plans.schema:
+        # a table listed with no column and no answerable query is still read for its records'
+        # number: one column, never profiled
+        names = [name for name, _ in query_plans.schema[plan.expose_id].columns[:1]]
     return names
 
 
@@ -1726,6 +1893,7 @@ def _fact_entries(
     reads: Mapping[str, sources.SourceColumns],
     rule: disclosure.DisclosureRule,
     tally: "Counter[str]",
+    rates: Optional["query_rates.Measured"] = None,
 ) -> Tuple[List[Dict[str, Any]], Tuple[FactResult, ...], List[Tuple[str, str]]]:
     """The ``invariants`` entries of the facts measured, how each fared, and those not measured.
 
@@ -1767,12 +1935,26 @@ def _fact_entries(
         verdicts = [_checked_cell(count, rule) for count in cells[each.name]]
         refused[each.name] = next((verdict for verdict in verdicts if not verdict.published), None)
     covers_all: Dict[str, bool] = {}
-    for table in dict.fromkeys(each.table for each in measured):
+    queried = list(rates.tables) if rates is not None else []
+    for table in dict.fromkeys([*(each.table for each in measured), *queried]):
         on_table = [each for each in measured if each.table == table]
-        together = facts.states_together(contract, on_table)
+        together = facts.states_together(contract, on_table) if on_table else None
         for each in on_table:
+            assert together is not None
             covers_all[each.name] = not together({each.name: facts.NOT_COVERED})
-        for name in _differenced(on_table, states, refused, rule, together):
+        withheld: Iterable[str]
+        if rates is not None and rates.has_table(table):
+            # the table's queries are members of the same set as its facts
+            names = [each.name for each in on_table]
+            passed = {name for name in names if refused[name] is None}
+            columns = {each.name: frozenset(each.columns) for each in on_table}
+            withheld = rates.check_table(table, names, states, passed, together, rule, columns)
+        elif on_table:
+            assert together is not None
+            withheld = _differenced(on_table, states, refused, rule, together)
+        else:
+            withheld = []
+        for name in withheld:
             refused[name] = disclosure.Verdict(
                 disclosure.SECONDARY,
                 "with the other facts of its table it would give back a small cell",
@@ -2155,29 +2337,21 @@ def _children_counted(
     through the one call, so the output check sees the partition the groups share, and the
     audit of withheld cells runs group by group, on the parents and children of each.
     """
-    parents = _keys(tables[relationship.parent], relationship.parent_columns, backend)
+    parents, counts = _parent_counts(relationship, tables, backend)
     if relationship.entity:
-        # One parent per entity: each distinct key the table holds, in the order first read.
-        # A row with a null key names no entity. A grouping by a parent column is placed by the
-        # entity's versions: a group when they all agree, none when they do not.
-        entities = list(dict.fromkeys(key for key in parents if None not in key))
+        # A grouping by a parent column is placed by the entity's versions: a group when they
+        # all agree, none when they do not.
+        rows = _keys(tables[relationship.parent], relationship.parent_columns, backend)
         groupings = [
             (
                 name,
                 replace(
                     grouping,
-                    assigned=grouped.link_assignment(entities, parents, grouping.assigned),
+                    assigned=grouped.link_assignment(parents, rows, grouping.assigned),
                 ),
             )
             for name, grouping in groupings
         ]
-        parents = entities
-    children = Counter(
-        key
-        for key in _keys(tables[relationship.child], relationship.child_columns, backend)
-        if None not in key
-    )
-    counts = [0 if None in key else children.get(key, 0) for key in parents]
     encode = backend.encoder(fractional_bits)
     statistic = DeclaredStatistic(
         identifier="marginalHistogram/1",
@@ -2242,19 +2416,77 @@ def _children_counted(
             )
         )
     (group,) = entries[0]["groups"]
-    published = (
-        sum(1 for count in group["binCounts"] if count is not None)
-        if group["status"] == disclosure.FREE
-        else 0
-    )
+    if group["status"] == disclosure.FREE:
+        shown = tuple(count is not None for count in group["binCounts"])
+    else:
+        shown = (False,) * (len(CHILDREN_EDGES) - 1)
+    published = sum(shown)
     document_entry = {
         "parent": {"table": relationship.parent, "columns": list(relationship.parent_columns)},
         "child": {"table": relationship.child, "columns": list(relationship.child_columns)},
         "statistics": entries,
     }
     return document_entry, RelationshipResult(
-        relationship, published=published, cells=len(CHILDREN_EDGES) - 1
+        relationship, published=published, cells=len(CHILDREN_EDGES) - 1, shown=shown
     )
+
+
+def _parent_counts(
+    relationship: Relationship,
+    tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
+    backend: StatisticsBackend,
+) -> Tuple[List[Tuple[Any, ...]], List[int]]:
+    """Each parent's key and its number of children, in the order the parent's rows were read.
+
+    A parent is a row, or, where the relationship reaches an entity of a versioned table, an
+    entity: each distinct key the table holds, in the order first read (a row with a null key
+    names no entity).
+    """
+    rows = _keys(tables[relationship.parent], relationship.parent_columns, backend)
+    parents = (
+        list(dict.fromkeys(key for key in rows if None not in key)) if relationship.entity else rows
+    )
+    children = Counter(
+        key
+        for key in _keys(tables[relationship.child], relationship.child_columns, backend)
+        if None not in key
+    )
+    return parents, [0 if None in key else children.get(key, 0) for key in parents]
+
+
+def _counted_links(
+    relationships: Sequence[Relationship],
+    counted: Mapping[int, Tuple[Dict[str, Any], RelationshipResult]],
+    tables: Mapping[str, Tuple[ExposePlan, sources.SourceColumns]],
+    backend: StatisticsBackend,
+) -> List["query_rates.CountedLink"]:
+    """The counted relationships of one key column each, with each parent's bin of its histogram.
+
+    A consumer query whose unit groups the child's rows by that column counts the parents, so it
+    is checked with the bin each parent is in and with which bins the histogram publishes. Held
+    for the run's checks, never written.
+    """
+    found: List["query_rates.CountedLink"] = []
+    for position, (_, result) in counted.items():
+        each = relationships[position]
+        if each.entity or len(each.child_columns) != 1 or len(each.parent_columns) != 1:
+            continue
+        _, counts = _parent_counts(each, tables, backend)
+        bins = tuple(
+            min(bisect.bisect_right(CHILDREN_EDGES, count) - 1, len(CHILDREN_EDGES) - 2)
+            for count in counts
+        )
+        found.append(
+            query_rates.CountedLink(
+                each.child,
+                each.parent,
+                each.child_columns[0],
+                each.parent_columns[0],
+                bins,
+                result.shown,
+            )
+        )
+    return found
 
 
 def _members(grouping: Grouping) -> Dict[str, List[int]]:
@@ -2608,6 +2840,7 @@ def _profile_table(
         | keys
         | {name for name in grouped_by if domains.get(name) != NUMBER}
     )
+    rounded: List[Tuple[str, str, str]] = []
     columns_doc = {
         column.name: _column(
             column,
@@ -2621,6 +2854,7 @@ def _profile_table(
             (frozenset({"distinctCount"}) if column.name in counted else frozenset())
             | (_BINNED_WITHHELD if column.name in binned else frozenset()),
             None if asked is None else asked.column(column.name),
+            rounded,
         )
         for column in plan.columns
     }
@@ -2651,6 +2885,7 @@ def _profile_table(
         withheld_statistics=none_published,
         partly_withheld_statistics=some_published,
         left_out=tuple(left_out),
+        rounded_extremes=tuple(rounded),
     )
 
 

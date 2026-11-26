@@ -201,10 +201,11 @@ def report(
         " The guarantee covers data that meets the contract (required columns hold a value, "
         "values lie in their declared levels and ranges, and each followed parent key names one "
         "row, except that a followed relationship out of a versioned table by its natural entity "
-        "repeats its key by design and then needs an entity's versions to follow one parent row, "
-        "refused as profile_release_entity_units otherwise); data that does not is refused, releases nothing, and the refusal is for the data "
-        "owner (it names a table, a column and a row): a refusal is not covered by the "
-        "guarantee."
+        "repeats its key by design; where the release publishes children per entity of such a "
+        "table, or a statistic grouped through a link into it, an entity's versions must follow "
+        "one parent row, refused as profile_release_entity_units otherwise); data that does not "
+        "is refused, releases nothing, and the refusal is for the data owner (it names a table, "
+        "a column and a row): a refusal is not covered by the guarantee."
     )
     say(rests, soft_wrap=True)
     for table in drawn.tables:

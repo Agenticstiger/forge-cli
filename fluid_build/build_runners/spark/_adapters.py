@@ -18,7 +18,8 @@ it on every runtime. States are normalised to :data:`PENDING`, :data:`RUNNING`,
 the state sets follow Apache Airflow's Amazon provider (``EmrServerlessHook.JOB_*_STATES``,
 ``EmrContainerHook``; Apache-2.0) and the AWS API references.
 
-boto3 is the ``[aws]`` extra and is imported only by :func:`default_clients`.
+boto3 is the ``[aws]`` extra and is imported only by :func:`default_clients`, through
+:mod:`fluid_build.util.s3`, which holds the S3 helpers these share with other commands.
 """
 
 from __future__ import annotations
@@ -30,6 +31,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build.build_runners.spark._desired import RESTART_FLAG, STOP_KEY_FLAG, DesiredRun
 from fluid_build.spark import names as _names
+from fluid_build.util import s3 as _s3
+from fluid_build.util.s3 import error_code as _error_code
+from fluid_build.util.s3 import is_denied_code, is_missing_code
 
 PENDING, RUNNING, CANCELLING = "PENDING", "RUNNING", "CANCELLING"
 SUCCEEDED, FAILED, CANCELLED = "SUCCEEDED", "FAILED", "CANCELLED"
@@ -112,23 +116,6 @@ class MarkerReadDenied(SparkRunError):
         self.job_config_readable = job_config_readable
 
 
-#: The S3 codes for a request the identity may not make (a missing key reads as one without
-#: ``s3:ListBucket``).
-_DENIED = ("AccessDenied", "403", "Forbidden")
-#: The S3 codes for a key that is not there.
-_MISSING = ("NoSuchKey", "404", "NotFound")
-
-
-def is_denied_code(code: str) -> bool:
-    """Whether an S3 error code is a refused request (:data:`_DENIED`)."""
-    return code in _DENIED
-
-
-def is_missing_code(code: str) -> bool:
-    """Whether an S3 error code is a key that is not there (:data:`_MISSING`)."""
-    return code in _MISSING
-
-
 _WARNED_PREFIXES: set = set()
 
 
@@ -196,14 +183,14 @@ class RunInfo:
 
 def default_clients(service: str, region: str, *, config: Any = None) -> Any:
     """A boto3 client, from the default credential chain (``AWS_ENDPOINT_URL`` included);
-    ``config``, a ``botocore.config.Config``, bounds its calls (the posture check's)."""
+    ``config``, a ``botocore.config.Config``, bounds its calls (the posture check's). The client
+    is :func:`fluid_build.util.s3.default_clients`'; a missing boto3 is a :class:`SparkRunError`."""
     try:
-        import boto3
-    except ImportError as exc:  # pragma: no cover - the [aws] extra is missing
+        return _s3.default_clients(service, region, config=config)
+    except _s3.S3Unavailable as exc:  # pragma: no cover - the [aws] extra is missing
         raise SparkRunError(
             "Spark job runs need boto3: pip install 'data-product-forge[aws]'"
         ) from exc
-    return boto3.client(service, region_name=region, config=config)
 
 
 def _ts(value: Any) -> float:
@@ -394,18 +381,7 @@ def _checked(r: DesiredRun, clients: ClientFactory) -> "tuple[DesiredRun, bytes]
 def _read_back(clients: ClientFactory, region: str, uri: str) -> bytes:
     """An object's bytes from S3, at most one more than :data:`MAX_ARTIFACT_BYTES` (more
     is no artifact forge wrote). Raises what boto3 raises."""
-    bucket, _, key = uri.removeprefix("s3://").partition("/")
-    data: bytes = (
-        clients("s3", region)
-        .get_object(Bucket=bucket, Key=key)["Body"]
-        .read(MAX_ARTIFACT_BYTES + 1)
-    )
-    return data
-
-
-def _error_code(exc: BaseException) -> str:
-    """The S3 error code botocore's error carries, or ""."""
-    return str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+    return _s3.read_back(clients, region, uri, MAX_ARTIFACT_BYTES + 1)
 
 
 def _artifact(run: DesiredRun, clients: ClientFactory, uri: str) -> bytes:

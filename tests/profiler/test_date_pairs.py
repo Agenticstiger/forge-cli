@@ -334,6 +334,66 @@ def test_a_few_records_on_the_same_day_withhold_the_same_level_and_not_before(tm
     assert all(count is not None for count in _published(whole["order"]).values())
 
 
+def _small_runs_a_reader_forms(
+    days: Dict[str, Any], order: Dict[str, Any], offsets: Dict[int, int]
+) -> List[tuple]:
+    """Each run of days a reader can count from a pair's published counts that is small.
+
+    Every published count, a day cell, a level of the order or a total, gives the records
+    between two edges, so it ties those edges together, and a reader counts the records between
+    any two tied edges. Zeros are disclosive here, so a run of no records is small too.
+    """
+    edges = [int(edge) for edge in days["bins"]]
+    low, high = edges[0], edges[-1]
+    (group,) = days["groups"]
+    known = [(low, high)]
+    state = group.get("cellStatus", ["F"] * (len(edges) - 1))
+    known += [(edges[at], edges[at + 1]) for at, shown in enumerate(state) if shown == "F"]
+    spans = {"before": (low, 0), "same": (0, 1), "after": (1, high)}
+    for level, count in _published(order).items():
+        start, end = max(spans[level][0], low), min(spans[level][1], high)
+        if count is not None and start < end:
+            known.append((start, end))
+    tied = {edge: edge for pair in known for edge in pair}
+
+    def root(edge: int) -> int:
+        while tied[edge] != edge:
+            edge = tied[edge]
+        return edge
+
+    for start, end in known:
+        tied[root(start)] = root(end)
+    runs: Dict[int, List[int]] = {}
+    for edge in tied:
+        runs.setdefault(root(edge), []).append(edge)
+    small = []
+    for members in runs.values():
+        members.sort()
+        for start, end in zip(members, members[1:], strict=False):
+            count = sum(each for offset, each in offsets.items() if start <= offset < end)
+            if count < disclosure.ACRO_DEFAULT.minimum_cell:
+                small.append((start, end, count))
+    return small
+
+
+def test_a_level_a_reader_gives_back_by_subtraction_is_never_small(tmp_path):
+    # The days between 1 and 3653 hold no record. The check withholds one count at a time to
+    # keep that run from being counted, and a level it withholds for that may be one the total
+    # less the other two levels gives back. Such a level holds at least the least cell, and no
+    # small run of days can be counted from what the pair's two statistics publish.
+    offsets = {-40000: 254, -10: 356, 0: 407, 5000: 458}
+    result = _profile_loans(tmp_path, _loans_contract(), _by_offset(offsets))
+    (pair,) = _pairs(result).values()
+    (days,) = pair["statistics"]
+    assert "C" in days["groups"][0]["cellStatus"]  # the check withholds the empty days
+    held = {"before": 254 + 356, "same": 407, "after": 458}
+    withheld = [level for level, count in _published(pair["order"]).items() if count is None]
+    if len(withheld) == 1:
+        assert held[withheld[0]] >= disclosure.ACRO_DEFAULT.minimum_cell
+    assert _small_runs_a_reader_forms(days, pair["order"], offsets) == []
+    load_profile_text(result.canonical.decode("utf-8"))
+
+
 def test_with_no_record_before_the_start_before_is_an_implied_zero_and_the_others_are_published(
     tmp_path,
 ):

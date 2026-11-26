@@ -31,7 +31,6 @@ Pure functions and the standard library: compiled by forge-cli, never by the run
 
 from __future__ import annotations
 
-import base64
 import os
 import re
 from dataclasses import dataclass
@@ -89,7 +88,9 @@ class PackageSpec:
     @property
     def sha256_b64(self) -> str:
         """The digest as S3 reports ``checksum_sha256``: the base64 of its bytes."""
-        return base64.b64encode(bytes.fromhex(self.sha256)).decode("ascii")
+        from fluid_build.util.s3 import sha256_b64
+
+        return sha256_b64(self.sha256)
 
 
 def declared(build: Mapping[str, Any]) -> Optional[Any]:

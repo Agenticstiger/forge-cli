@@ -27,6 +27,7 @@ Standard library only at module scope (``fluid --help`` imports ``ship``).
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -34,17 +35,23 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import tarfile
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
+
+from fluid_build.util.release_record import (  # the record's names, which callers read here too
+    RELEASE_INDEX,
+    RELEASE_SCHEMA,
+    code_digest,
+    identity_digest,
+)
 
 from . import _ship_report as report
 from . import _ship_stages as st
 
 LOG = logging.getLogger(__name__)
 
-RELEASE_SCHEMA = "fluid-release/1"
-RELEASE_INDEX = "release.json"
 #: The stages whose output a release holds: they run in the invocation that builds it.
 REQUIRED_STAGES = (1, 2, 3, 4)
 
@@ -174,7 +181,12 @@ def refusal(
 ) -> Optional[str]:
     """Why a run cannot build a release in ``release_dir``, or ``None``. A lock of external
     files (``--artifacts``) is read here, before any stage, and refused when the release
-    could not seal it."""
+    could not seal it. ``--release-to`` is checked too (``_release_publish.refusal``)."""
+    from . import _release_publish
+
+    remote = _release_publish.refusal(opts.release_to, release_dir, opts.release_to_require)
+    if remote:
+        return remote
     if release_dir is None:
         if opts.artifacts:
             return (
@@ -242,10 +254,6 @@ def _sha256(path: Path) -> str:
     from fluid_build.cli._attestation import _sha256_file
 
     return "sha256:" + _sha256_file(path)
-
-
-def _canonical(data: Any) -> bytes:
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
 def _regular_file(path: Path) -> Path:
@@ -359,11 +367,26 @@ def build_identity(
         identity["apply_mode"] = opts.mode
     if external:
         identity["external"] = [a.entry.identity() for a in external]
+    source = source_identity(os.environ)
+    if source:
+        identity["source"] = source
     return identity
 
 
-def identity_digest(identity: Mapping[str, Any]) -> str:
-    return "sha256:" + hashlib.sha256(_canonical(identity)).hexdigest()
+def source_identity(env: Mapping[str, str]) -> Optional[Dict[str, Any]]:
+    """The commit the CI built, as ``identity`` records it, or ``None`` with no commit: shaped
+    as a SLSA ``resolvedDependencies`` entry, as each external file's source is
+    (``{"uri": "git+<repo>", "digest": {"gitCommit": <commit>}}``). The ref is left out, so a
+    branch build and a tag build of one commit name the same source."""
+    found = source_revision(env)
+    # A full commit only: a CI names it in full, and a short one would give one commit two
+    # code digests.
+    if not found or len(found.get("revision", "")) not in (40, 64):
+        return None
+    source: Dict[str, Any] = {"digest": {"gitCommit": found["revision"]}}
+    if "repository" in found:
+        source["uri"] = f"git+{found['repository']}"
+    return source
 
 
 def _copy(src: Path, dest: Path) -> None:
@@ -391,19 +414,50 @@ def _copy_artifacts(root: Path, staging: Path) -> None:
 def _copy_external(staging: Path, identity: Mapping[str, Any], external: Sequence[Any]) -> None:
     """Each external file to ``external/<name>/<file>``, hashed again once copied: the release
     holds the bytes its identity names, or nothing is published."""
-    from fluid_build.cli._attestation import _sha256_file
-
     if list(identity.get("external") or []) != [a.entry.identity() for a in external]:
         raise ReleaseError("the release's identity names other external files than it copies")
     for artifact in external:
         entry = artifact.entry
         dest = staging / entry.release_path
-        _copy(artifact.local, dest)
-        if _sha256_file(dest) != entry.sha256:
+        if _copy_hashed(artifact.local, dest) != entry.sha256:
+            with contextlib.suppress(OSError):
+                dest.unlink()
+                dest.parent.rmdir()
             raise ReleaseError(
                 f"{entry.path} ({entry.name}) changed while the run ran: its bytes are no longer "
                 f"the sha256 {entry.sha256} the lock names"
             )
+
+
+def _copy_hashed(src: Path, dest: Path) -> str:
+    """Copy ``src`` to ``dest`` (new) and return the sha256 of the bytes copied.
+
+    One descriptor, opened without following a link, is both read and hashed, so the copy holds
+    the bytes hashed even if ``src`` is swapped meanwhile. A hard link is a regular file and is
+    copied. On any error ``dest`` is removed."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(src, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # O_NOFOLLOW met a link
+            raise ReleaseError(f"{src} is not a regular file") from None
+        raise
+    digest = hashlib.sha256()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with os.fdopen(fd, "rb") as reader:
+            if not stat.S_ISREG(os.fstat(reader.fileno()).st_mode):
+                raise ReleaseError(f"{src} is not a regular file")
+            with open(dest, "xb") as writer:
+                for chunk in iter(lambda: reader.read(1 << 20), b""):
+                    digest.update(chunk)
+                    writer.write(chunk)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            dest.unlink()
+        raise
+    return digest.hexdigest()
 
 
 def copy_reports(staging: Path, report_dir: Path, root: Path, passed: Collection[int]) -> None:
@@ -499,6 +553,7 @@ def publish(
             "schema": RELEASE_SCHEMA,
             "identity": identity,
             "identity_digest": identity_digest(identity),
+            **({"code_digest": code} if (code := code_digest(identity)) else {}),
             "gates": gates,
             "files": _files(staging),
             "provenance": provenance,
