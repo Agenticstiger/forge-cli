@@ -68,6 +68,7 @@ def test_ship_writes_the_sealed_release_as_one_archive_and_prints_its_sha256(
 
 
 def test_the_archive_is_reproducible(tmp_path: Path) -> None:
+    from fluid_build.forge.core import bundle
     from tests.cli._fake_s3 import sealed
 
     sealed(
@@ -88,7 +89,7 @@ def test_the_archive_is_reproducible(tmp_path: Path) -> None:
     assert files == sorted(files) and "release.json" in files
     for member in members:
         assert (member.uid, member.gid, member.uname, member.gname) == (0, 0, "", "")
-        assert member.mtime == 0
+        assert member.mtime == bundle._DEFAULT_MTIME  # SOURCE_DATE_EPOCH, else 0
         assert member.mode == (0o755 if member.isdir() else 0o644)
 
 
