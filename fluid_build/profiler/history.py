@@ -618,9 +618,6 @@ def _year_ladder() -> List[int]:
 #: give the third.
 _TRIOS = (("S", "F", "L"), ("N", "L", "C"))
 
-#: Why a cell of the first starts is withheld beside the start and end columns.
-_LINKED_CELL = "the start and end columns' published counts beside it would give a small cell back"
-
 
 @dataclass(frozen=True)
 class _Published:
