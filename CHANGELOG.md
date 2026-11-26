@@ -163,7 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the verifier's own identity, or sign receipts and pass `--require-signed` with the signer
   (`--verify-key REF`, or `--certificate-identity` and `--certificate-oidc-issuer` for keyless;
   a signer the build code cannot reach, such as a separate job or a key only the verifier can
-  use), which then also needs the Statement to verify with cosign and to name the receipt's own
+  use) and a bucket that keeps versions, which then also needs the Statement to verify with cosign and to name the receipt's own
   sha256, environment, code and identity and the `release.json` it was read at. It reports
   whether each object of both releases and of the receipt carries an Object Lock in force, read
   at the version it checked, and `--require-locked` fails the check when one does not. Exit 0

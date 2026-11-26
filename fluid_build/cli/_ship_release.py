@@ -238,7 +238,13 @@ def checkout_head(directory: Path) -> Optional[str]:
             text=True,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOG.warning(
+            "release_checkout_unknown: git cannot run to tell which commit %s is at (%s); the "
+            "release names the commit the CI names, unchecked",
+            clean(directory, keep_end=True),
+            type(exc).__name__,
+        )
         return None
     out = done.stdout if isinstance(done.stdout, str) else ""
     head = out.strip().lower()

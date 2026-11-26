@@ -49,7 +49,7 @@ def _report(
 def s3() -> FakeS3:
     """A versioned bucket the releases are published to."""
     bucket = FakeS3()
-    bucket.versions = True
+    bucket.versions, bucket.versioning = True, "Enabled"
     return bucket
 
 
@@ -1041,3 +1041,29 @@ def test_require_signed_flags(
     ):
         code, _ = _run(capsys, "check", str(tmp_path / "prod"), "--env", "nonprod", *extra)
         assert code == 2 and problem in caplog.text
+
+
+def test_require_signed_needs_a_bucket_that_keeps_versions(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    s3.versioning = None
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 1 and "does not keep versions" in found.reason
+
+
+def test_a_listing_whose_pages_do_not_advance_decides_nothing(
+    tmp_path: Path, s3: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    _record(tmp_path, s3, uris["nonprod"], T0)
+    _record(tmp_path, s3, uris["nonprod"], T0 + timedelta(hours=1))
+
+    def stuck(**kw: Any) -> Dict[str, Any]:
+        return {"Versions": [], "DeleteMarkers": [], "IsTruncated": True}
+
+    monkeypatch.setattr(s3, "list_object_versions", stuck)
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
+    assert found.exit_code == 2 and "cannot be listed to its end" in found.reason

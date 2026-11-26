@@ -365,10 +365,16 @@ class _S3Store(_Store):
             _within_cap(self.shown, list(seen) + markers)
             if not page.get("IsTruncated"):
                 break
-            extra = {
+            following = {
                 "KeyMarker": str(page.get("NextKeyMarker") or ""),
                 "VersionIdMarker": str(page.get("NextVersionIdMarker") or ""),
             }
+            if not following["KeyMarker"] or following == extra:
+                raise ReceiptError(
+                    f"{self.shown} cannot be listed to its end (a page with no next marker)",
+                    UNDECIDED,
+                )
+            extra = following
         changed = sorted(set(markers) | {n for n, v in seen.items() if len(v) > 1})
         if changed:
             raise ReceiptError(
@@ -910,13 +916,13 @@ class Checked:
 def _newest_receipt(
     store: _Store, code_digest: str, ignored: List[str]
 ) -> Tuple[str, Dict[str, Any], bytes]:
+    """The newest receipt in ``store`` for ``code_digest``, with its bytes. Fail closed: when
+    the newest file that may be a receipt does not parse, that is the answer, not an older one.
+    A receipt of this code named later than now (past a few minutes of clock skew) decides
+    nothing; another entry named so is passed over and noted."""
     # ``<code hex>/receipts/`` in S3 holds one code's receipts only; on disk one ``receipts/``
     # beside several releases holds several codes' receipts.
     shared = isinstance(store, _DirStore)
-    """The newest receipt in ``store`` for ``code_digest``, with its bytes. Fail closed: when
-    the newest file that may be a receipt does not parse, that is the answer, not an older one.
-    A name later than now (past a few minutes of clock skew) is passed over and noted: it would
-    otherwise stand as the newest over every receipt written until then."""
     latest = rr.receipt_name(
         datetime.now(timezone.utc) + timedelta(seconds=_CLOCK_SKEW_S), "sha256:" + "f" * 64
     )
@@ -981,7 +987,9 @@ def check_receipt(
         name, receipt, data = _newest_receipt(store, code, ignored)
         reason, there = _receipt_problem(store, name, receipt, environment, place, factory, region)
         if reason is None and signer is not None:
-            reason = _signature_problem(store, name, receipt, data, there, signer)
+            reason = _versioned_problem(place) or _signature_problem(
+                store, name, receipt, data, there, signer
+            )
         locks = (
             _locks(place, checked, there, environment, store, name)
             if place.client is not None
@@ -1089,6 +1097,29 @@ def _receipt_problem(
     if not isinstance(block, Mapping) or block.get("identity_digest") != receipt["identity_digest"]:
         return ("the report the newest receipt names is not a report on its release"), there
     return None, there
+
+
+def _versioned_problem(place: _Place) -> Optional[str]:
+    """With ``--require-signed``: the receipts bucket keeps every version. Without versioning a
+    deleted receipt leaves no trace, so an older signed one could decide."""
+    if place.client is None:
+        return None
+    from fluid_build.util import s3
+
+    try:
+        status = place.client.get_bucket_versioning(Bucket=place.bucket).get("Status")
+    except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
+        raise ReceiptError(
+            f"--require-signed: the versioning of {place.bucket} cannot be read "
+            f"({s3.error_code(exc) or type(exc).__name__})",
+            UNDECIDED,
+        ) from None
+    if status != "Enabled":
+        return (
+            f"--require-signed: the bucket {place.bucket} does not keep versions, so a deleted "
+            "receipt leaves no trace"
+        )
+    return None
 
 
 def _signature_problem(

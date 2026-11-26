@@ -636,3 +636,18 @@ def test_a_checkout_git_cannot_read_is_named_and_not_refused(
         ),
     )
     assert _ship_release.checkout_head(tmp_path) is None and caplog.text == ""
+
+
+def test_a_checkout_without_git_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    import subprocess
+
+    from fluid_build.cli import _ship_release
+
+    def no_git(argv: Any, **kw: Any) -> Any:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", no_git)
+    assert _ship_release.checkout_head(tmp_path) is None
+    assert "release_checkout_unknown: git cannot run" in caplog.text
