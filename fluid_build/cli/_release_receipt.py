@@ -326,31 +326,59 @@ class _S3Store(_Store):
         self.versions = {}
 
     def names(self) -> List[str]:
+        """The entries, each pinned to its one version. Listed with every version and delete
+        marker: Object Lock keeps versions, not keys, so a receipt overwritten or deleted after
+        it was written would otherwise drop out of the listing and let an older one decide.
+        Any entry with a second version or a delete marker fails the check."""
         from fluid_build.util import s3
 
-        out: List[str] = []
-        token: Optional[str] = None
+        seen: Dict[str, List[Optional[str]]] = {}
+        markers: List[str] = []
+        extra: Dict[str, str] = {}
         while True:
-            extra = {"ContinuationToken": token} if token else {}
             try:
-                page = self.client.list_objects_v2(Bucket=self.bucket, Prefix=self.prefix, **extra)
+                page = self.client.list_object_versions(
+                    Bucket=self.bucket, Prefix=self.prefix, **extra
+                )
             except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
                 code = s3.error_code(exc)
                 raise ReceiptError(
-                    f"{self.shown} cannot be listed ({code or type(exc).__name__})", UNDECIDED
+                    f"{self.shown} cannot be listed ({code or type(exc).__name__}): reading "
+                    "receipts needs s3:ListBucketVersions",
+                    UNDECIDED,
                 ) from None
-            for item in page.get("Contents") or []:
-                key = item.get("Key")
-                if (
-                    isinstance(key, str)
-                    and key.startswith(self.prefix)
-                    and "/" not in key[len(self.prefix) :]
-                ):
-                    out.append(key[len(self.prefix) :])
-            token = page.get("NextContinuationToken") if page.get("IsTruncated") else None
-            _within_cap(self.shown, out)
-            if not token:
-                return out
+            for kind, sink in (("Versions", None), ("DeleteMarkers", markers)):
+                for item in page.get(kind) or []:
+                    key = item.get("Key")
+                    if not isinstance(key, str) or not key.startswith(self.prefix):
+                        continue
+                    name = key[len(self.prefix) :]
+                    if "/" in name:
+                        continue
+                    if sink is not None:
+                        sink.append(name)
+                    else:
+                        version = item.get("VersionId")
+                        seen.setdefault(name, []).append(
+                            version if isinstance(version, str) and version != "null" else None
+                        )
+            _within_cap(self.shown, list(seen) + markers)
+            if not page.get("IsTruncated"):
+                break
+            extra = {
+                "KeyMarker": str(page.get("NextKeyMarker") or ""),
+                "VersionIdMarker": str(page.get("NextVersionIdMarker") or ""),
+            }
+        changed = sorted(set(markers) | {n for n, v in seen.items() if len(v) > 1})
+        if changed:
+            raise ReceiptError(
+                f"{len(changed)} entr(ies) under {self.shown} were overwritten or deleted after "
+                f"they were written ({clean(changed[0], 120)} first): a receipt is written once, "
+                "so these receipts decide nothing"
+            )
+        for name, versions in seen.items():
+            self.versions[name] = versions[0]
+        return list(seen)
 
     def read(self, name: str, limit: int) -> bytes:
         from fluid_build.api.release import _close
@@ -839,10 +867,16 @@ def _signed(
             raise ReceiptError(f"--sign: {exc.event}; nothing was written", UNDECIDED) from None
         if result.get("exit_code") != 0:
             raise ReceiptError("cosign could not sign the receipt; nothing was written", UNDECIDED)
-        out = [(f"{stem}.intoto.jsonl", path.read_bytes())]
-        out.append((f"{stem}.intoto.jsonl.sig", Path(result["sig_path"]).read_bytes()))
-        if result.get("pem_path"):
-            out.append((f"{stem}.intoto.jsonl.pem", Path(result["pem_path"]).read_bytes()))
+        try:
+            out = [(f"{stem}.intoto.jsonl", path.read_bytes())]
+            out.append((f"{stem}.intoto.jsonl.sig", Path(result["sig_path"]).read_bytes()))
+            if result.get("pem_path"):
+                out.append((f"{stem}.intoto.jsonl.pem", Path(result["pem_path"]).read_bytes()))
+        except (OSError, KeyError, TypeError):
+            raise ReceiptError(
+                "cosign wrote no signature file where it was asked to; nothing was written",
+                UNDECIDED,
+            ) from None
     return out
 
 
@@ -876,6 +910,9 @@ class Checked:
 def _newest_receipt(
     store: _Store, code_digest: str, ignored: List[str]
 ) -> Tuple[str, Dict[str, Any], bytes]:
+    # ``<code hex>/receipts/`` in S3 holds one code's receipts only; on disk one ``receipts/``
+    # beside several releases holds several codes' receipts.
+    shared = isinstance(store, _DirStore)
     """The newest receipt in ``store`` for ``code_digest``, with its bytes. Fail closed: when
     the newest file that may be a receipt does not parse, that is the answer, not an older one.
     A name later than now (past a few minutes of clock skew) is passed over and noted: it would
@@ -884,14 +921,26 @@ def _newest_receipt(
         datetime.now(timezone.utc) + timedelta(seconds=_CLOCK_SKEW_S), "sha256:" + "f" * 64
     )
     for name in rr.newest_first(store.names()):
-        if name > latest:
-            ignored.append(f"{name}: named later than now")
-            continue
         data = store.read(name, rr.MAX_RECEIPT_BYTES)
         receipt, problem = rr.parse_receipt(name, data)
+        if name > latest:
+            if receipt is not None and receipt["code_digest"] == code_digest:
+                # a recorder whose clock runs ahead, or a forgery: either way not decidable
+                raise ReceiptError(
+                    f"the newest receipt, {store.shown}{name}, is named later than now: a "
+                    "recorder's clock runs ahead, or the name is not its own",
+                    UNDECIDED,
+                )
+            ignored.append(f"{name}: named later than now")
+            continue
         if receipt is None:
             raise ReceiptError(f"the newest receipt, {store.shown}{name}, is not one: {problem}")
         if receipt["code_digest"] != code_digest:
+            if not shared:
+                raise ReceiptError(
+                    f"{store.shown}{name} names other code than the folder it is in: the "
+                    "receipts there decide nothing"
+                )
             ignored.append(f"{name}: a receipt of other code")
             continue
         return name, receipt, data

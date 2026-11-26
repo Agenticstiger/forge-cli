@@ -242,7 +242,18 @@ def checkout_head(directory: Path) -> Optional[str]:
         return None
     out = done.stdout if isinstance(done.stdout, str) else ""
     head = out.strip().lower()
-    return head if done.returncode == 0 and _REVISION.fullmatch(head) else None
+    if done.returncode == 0 and _REVISION.fullmatch(head):
+        return head
+    err = done.stderr if isinstance(done.stderr, str) else ""
+    if done.returncode not in (0, None) and "not a git repository" not in err:
+        # e.g. "dubious ownership" in a container: the check cannot run, say so
+        LOG.warning(
+            "release_checkout_unknown: git cannot tell which commit %s is at (%s); the "
+            "release names the commit the CI names, unchecked",
+            clean(directory, keep_end=True),
+            clean(err.strip().splitlines()[-1] if err.strip() else done.returncode, 160),
+        )
+    return None
 
 
 def _checkout_problem(contract_dir: Path) -> Optional[str]:

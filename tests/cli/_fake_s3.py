@@ -53,6 +53,8 @@ class FakeS3:
         self.lock_rule = True  # with object_lock: a Rule.DefaultRetention is set
         self.unlocked: Set[str] = set()  # keys that read back with no lock fields
         self.expired: Set[str] = set()  # keys whose retention ran out yesterday
+        self.overwritten: Set[str] = set()  # keys with a second version (listed)
+        self.deleted: Set[str] = set()  # keys hidden by a delete marker (listed)
         #: Lock fields as some other store answers them: replace the mode, the retain-until
         #: date, or the default rule's period (``{"Days": True}``).
         self.head_lock: Dict[str, Any] = {}
@@ -132,6 +134,29 @@ class FakeS3:
     def version_of(key: str) -> str:
         """The VersionId the fake gives ``key``'s one version."""
         return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+    def list_object_versions(
+        self, *, Bucket: str, Prefix: str, KeyMarker: str = "", VersionIdMarker: str = ""
+    ) -> Dict[str, Any]:
+        """Each key's one version (plus ``overwritten`` keys' older one, and ``deleted`` keys'
+        delete marker), two keys a page, so a listing that does not follow the markers misses
+        some."""
+        self.calls.append("list_object_versions")
+        keys = sorted(k for b, k in self.objects if b == Bucket and k.startswith(Prefix))
+        keys += sorted(k for k in self.deleted if k.startswith(Prefix))
+        start = keys.index(KeyMarker) + 1 if KeyMarker else 0
+        page = keys[start : start + 2]
+        out: Dict[str, Any] = {"Versions": [], "DeleteMarkers": []}
+        for key in page:
+            if key in self.deleted:
+                out["DeleteMarkers"].append({"Key": key, "VersionId": "marker", "IsLatest": True})
+                continue
+            out["Versions"].append({"Key": key, "VersionId": self.version_of(key)})
+            if key in self.overwritten:
+                out["Versions"].append({"Key": key, "VersionId": "older"})
+        if start + 2 < len(keys):
+            out.update(IsTruncated=True, NextKeyMarker=page[-1], NextVersionIdMarker="x")
+        return out
 
     def list_objects_v2(
         self, *, Bucket: str, Prefix: str, ContinuationToken: str = ""

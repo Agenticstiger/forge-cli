@@ -772,14 +772,74 @@ def test_a_linked_receipts_folder_is_never_written_or_read(tmp_path: Path) -> No
     assert found.exit_code == 1 and "reached through a link" in found.reason
 
 
-def test_a_receipt_named_in_the_future_is_passed_over(tmp_path: Path, s3: FakeS3) -> None:
+def test_a_receipt_named_in_the_future_decides_nothing(tmp_path: Path, s3: FakeS3) -> None:
     uris = _published(tmp_path, s3, "nonprod", "prod")
-    failing = {"total": 1, "match": 0, "mismatch": 1, "error": 0}
-    _record(tmp_path, s3, uris["nonprod"], T0, failing)
-    forged = _record(tmp_path, s3, uris["nonprod"], datetime(2099, 1, 1, tzinfo=timezone.utc))
+    _record(tmp_path, s3, uris["nonprod"], T0)
+    future = _record(tmp_path, s3, uris["nonprod"], datetime(2099, 1, 1, tzinfo=timezone.utc))
     found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
-    assert found.exit_code == 1 and "receipt for this code failed" in found.reason
-    assert found.ignored == [forged.uri.rsplit("/", 1)[1] + ": named later than now"]
+    assert found.exit_code == 2 and "is named later than now" in found.reason
+    # a future name that is no receipt is passed over
+    key = future.uri.split("/", 3)[3]
+    s3.objects.pop(("acme-releases", key))
+    s3.objects.pop(("acme-releases", key.removesuffix(".json") + ".report.json"))
+    s3.put("acme-releases", key, b"junk")
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
+    assert found.exit_code == 0 and found.ignored == [
+        future.uri.rsplit("/", 1)[1] + ": named later than now"
+    ]
+
+
+@pytest.mark.parametrize("how", ["overwritten", "deleted"])
+def test_a_receipt_overwritten_or_deleted_after_it_was_written_fails(
+    tmp_path: Path, s3: FakeS3, how: str
+) -> None:
+    """Object Lock keeps versions, not keys: a newer FAILED receipt hidden by a new version or a
+    delete marker must not let an older PASSED one decide."""
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    _record(tmp_path, s3, uris["nonprod"], T0)
+    failing = {"total": 1, "match": 0, "mismatch": 1, "error": 0}
+    newer = _record(tmp_path, s3, uris["nonprod"], T0 + timedelta(hours=1), failing)
+    key = newer.uri.split("/", 3)[3]
+    if how == "deleted":
+        s3.objects.pop(("acme-releases", key))
+        s3.deleted.add(key)
+    else:
+        s3.overwritten.add(key)
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
+    assert found.exit_code == 1 and "were overwritten or deleted after they were written" in (
+        found.reason
+    )
+
+
+def test_in_s3_a_receipt_of_other_code_under_this_code_fails(tmp_path: Path, s3: FakeS3) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    _record(tmp_path, s3, uris["nonprod"], T0)
+    failing = {"total": 1, "match": 0, "mismatch": 1, "error": 0}
+    newer = _record(tmp_path, s3, uris["nonprod"], T0 + timedelta(hours=1), failing)
+    key = newer.uri.split("/", 3)[3]
+    s3.objects[("acme-releases", key)] = json.dumps(
+        dict(newer.receipt, code_digest="sha256:" + "0" * 64)
+    ).encode()
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
+    assert found.exit_code == 1 and "names other code than the folder it is in" in found.reason
+
+
+def test_a_cosign_that_writes_no_signature_file_writes_nothing(
+    tmp_path: Path, s3: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import _signing
+
+    monkeypatch.setattr(_signing, "cosign_available", lambda: True)
+    monkeypatch.setattr(
+        _signing,
+        "sign_blob",
+        lambda path, key_ref=None: {"exit_code": 0, "sig_path": path + ".sig", "pem_path": None},
+    )
+    uris = _published(tmp_path, s3, "nonprod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    with pytest.raises(receipts.ReceiptError, match="wrote no signature file"):
+        receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    assert _names(s3, "nonprod") == []
 
 
 def test_an_environment_that_cannot_name_a_folder_is_refused(tmp_path: Path) -> None:

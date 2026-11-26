@@ -610,3 +610,29 @@ def test_ship_refuses_a_checkout_at_another_commit_than_the_ci_names(
     assert fake.calls == []
     monkeypatch.setattr("fluid_build.cli._ship_release.checkout_head", lambda _d: COMMIT)
     assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+
+
+def test_a_checkout_git_cannot_read_is_named_and_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    import subprocess
+
+    from fluid_build.cli import _ship_release
+
+    def dubious(argv: Any, **kw: Any) -> Any:
+        return subprocess.CompletedProcess(
+            argv, 128, "", "fatal: detected dubious ownership in repository at '/w'\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", dubious)
+    assert _ship_release.checkout_head(tmp_path) is None
+    assert "release_checkout_unknown" in caplog.text and "dubious ownership" in caplog.text
+    caplog.clear()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kw: subprocess.CompletedProcess(
+            argv, 128, "", "fatal: not a git repository (or any parent)\n"
+        ),
+    )
+    assert _ship_release.checkout_head(tmp_path) is None and caplog.text == ""

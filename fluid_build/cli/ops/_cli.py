@@ -264,7 +264,8 @@ def _register_receipt(sub: argparse._SubParsersAction) -> None:
             "names is there and intact. Never reads a release's gates or provenance. Reports "
             "whether each object carries an Object Lock. A receipt is only as trusted as who "
             "can write receipts/<env>/: keep that to the verifier's identity, or sign receipts "
-            "and pass --require-signed. Exit 0 passes, 1 does not, 2 cannot decide."
+            "with a signer build code cannot reach and pass --require-signed. Exit 0 passes, 1 "
+            "does not, 2 cannot decide."
         ),
     )
     chk.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")
