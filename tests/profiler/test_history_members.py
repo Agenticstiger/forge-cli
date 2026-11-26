@@ -392,7 +392,11 @@ def _column_edges(entry: Dict[str, Any]) -> Tuple[set, Optional[int], Optional[i
 
 
 def _small_cells_the_first_starts_open(result: Any, rows: Sequence[Dict[str, Any]]) -> List[str]:
-    """Every small cell a reader forms with the first starts and cannot form without them."""
+    """Every small cell a reader forms with the first starts and cannot form without them.
+
+    The series are the start column S, the end column N, the first starts F, the later versions'
+    starts L = S - F and the closed last ends C = N - S + F.
+    """
     table = _table(result)
     first = table["history"]["firstStart"]
     f_edges = [int(each) for each in first["bins"]]
@@ -423,6 +427,7 @@ def _small_cells_the_first_starts_open(result: Any, rows: Sequence[Dict[str, Any
         "N": [below(ends, at) for at in range(width)],
         "F": [below(list(firsts.values()), at) for at in range(width)],
     }
+    value["L"] = [s - f for s, f in zip(value["S"], value["F"], strict=True)]
     value["C"] = [n - s + f for n, s, f in zip(value["N"], value["S"], value["F"], strict=True)]
     offset = {"S": 0, "N": width, "F": 2 * width}
 
@@ -432,6 +437,9 @@ def _small_cells_the_first_starts_open(result: Any, rows: Sequence[Dict[str, Any
             row[offset["N"] + at] += 1
             row[offset["S"] + at] -= 1
             row[offset["F"] + at] += 1
+        elif name == "L":
+            row[offset["S"] + at] += 1
+            row[offset["F"] + at] -= 1
         else:
             row[offset[name] + at] += 1
         return row
@@ -448,6 +456,10 @@ def _small_cells_the_first_starts_open(result: Any, rows: Sequence[Dict[str, Any
     base: List[List[Fraction]] = []
     if not any(value["C"]):  # no closed last version ends: the chain gives C everywhere
         base.extend(unit("C", at) for at in range(width))
+    versions = table["history"]["versionsPerEntity"]
+    shown = [int(each) for each in versions["bins"]]
+    if not any(value["L"]) and _group(versions)["status"] == "F" and shown[-1] <= 2:
+        base.extend(unit("L", at) for at in range(width))  # every entity shows one version
     for at in range(width):
         if knows(s_edges, s_low, s_high, at):
             base.append(unit("S", at))
@@ -472,7 +484,7 @@ def _small_cells_the_first_starts_open(result: Any, rows: Sequence[Dict[str, Any
     known, pivots = _rank(with_first)
     plain, plain_pivots = _rank(base)
     found: List[str] = []
-    for name in "SNFC":
+    for name in "SNFLC":
         for low in range(width):
             for high in range(low + 1, width):
                 target = [a - b for a, b in zip(unit(name, high), unit(name, low), strict=True)]
@@ -569,6 +581,102 @@ def test_first_starts_set_apart_only_by_their_outer_edge_are_withheld_whole(tmp_
     first = _table(result)["history"]["firstStart"]
     assert [int(each) for each in first["bins"]] == history._year_ladder()
     assert _group(first)["status"] == "C"
+    assert _small_cells_the_first_starts_open(result, rows) == []
+
+
+def _yearly_cohorts(later: Dict[int, int]) -> List[Dict[str, Any]]:
+    """Fifty members join in each of 2019 to 2022; *later* of them renew in that year's cohort."""
+    rows: List[Dict[str, Any]] = []
+    number = 0
+    for year, closed in ((2019, 20), (2020, 15), (2021, 15), (2022, 15)):
+        for i in range(50):
+            begins = date(year, 1, 1) + timedelta(days=(i * 3) % 150)
+            if i < closed:
+                rows.append(_row(number, begins.isoformat(), date(year, 12, 20).isoformat()))
+            elif i < closed + later[year]:
+                renewed = begins + timedelta(days=60 + i)
+                rows.append(_row(number, begins.isoformat(), renewed.isoformat()))
+                rows.append(_row(number, renewed.isoformat(), None))
+            else:
+                rows.append(_row(number, begins.isoformat(), None))
+            number += 1
+    return rows
+
+
+@pytest.mark.parametrize("renewed_in_2021", [3, 0])
+def test_a_small_cell_of_later_versions_starts_is_not_formed_from_the_first_starts(
+    tmp_path, renewed_in_2021
+):
+    # Fifty first starts in each year; later versions start 20, 20, N and 20 times in them. The
+    # start column's published year cells less the first starts' give the later versions' starts
+    # in a year: a few (or none) in 2021, a cell no table may publish or let a reader form.
+    rows = _yearly_cohorts({2019: 20, 2020: 20, 2021: renewed_in_2021, 2022: 20})
+    result = _profile(tmp_path, _contract(), rows)
+    table = _table(result)
+    start_edges, _, _ = _column_edges(table["columns"]["valid_from"])
+    assert _ms("2021-01-01") in start_edges and _ms("2022-01-01") in start_edges
+    first = table["history"]["firstStart"]
+    assert _group(first)["status"] != "F" or "C" in _group(first).get("cellStatus", ())
+    if _group(first)["status"] == "F":  # the first starts of 2021 are not published beside it
+        at = [int(each) for each in first["bins"]].index(_ms("2021-01-01"))
+        assert _group(first)["cellStatus"][at] != "F"
+    assert _small_cells_the_first_starts_open(result, rows) == []
+
+
+def test_the_later_versions_starts_are_a_series_the_first_starts_link():
+    # S = F + L at an edge: the start column's and the first starts' counts there give L's cells.
+    places: List[Optional[int]] = [None, 10, 20, None]
+    series = {
+        "S": [0, 40, 70, 100],
+        "N": [0, 30, 50, 90],
+        "F": [0, 35, 60, 80],
+    }
+    series["L"] = [s - f for s, f in zip(series["S"], series["F"], strict=True)]
+    series["C"] = [n - s + f for n, s, f in zip(series["N"], series["S"], series["F"], strict=True)]
+    known = {
+        "S": [True, True, True, True],
+        "N": [True, True, True, True],
+        "F": [True, True, True, True],
+        "L": [True, False, False, True],
+        "C": [True, False, False, True],
+    }
+    formed = history._formed_cells(places, series, known)
+    assert formed[("L", 0, 1)] == 5 and formed[("L", 1, 2)] == 5 and formed[("L", 2, 3)] == 10
+    # N and L at an edge give C there, as N = L + C
+    assert [formed[("C", at, at + 1)] for at in range(3)] == [25, 15, 30]
+    fewer = history._formed_cells(places, series, {**known, "F": [True, False, False, True]})
+    assert ("L", 0, 1) not in fewer and ("L", 0, 3) in fewer
+
+
+def test_first_starts_stay_published_where_every_entity_has_one_version(tmp_path, monkeypatch):
+    # With one version each, no later version starts: L is 0 at every edge, which the versions per
+    # entity already show, so a reader forms no cell of it that the first starts reveal.
+    rows = _cards({1: 300}, closed_every=3)
+    result = _profile(tmp_path, _contract(), rows)
+    table = _table(result)
+    assert table["history"]["versionsPerEntity"]["bins"] == ["1", "2"]
+    first = _group(table["history"]["firstStart"])
+    assert first["status"] == "F" and set(first.get("cellStatus", "F")) == {"F"}
+    assert _small_cells_the_first_starts_open(result, rows) == []
+    # were the one version each not known, L's zeros would withhold some of the first starts
+    monkeypatch.setattr(history, "_shows_one_version_each", lambda entry: False)
+    guarded = _group(_table(_profile(tmp_path, _contract(), rows))["history"]["firstStart"])
+    assert guarded["status"] != "F" or "C" in guarded.get("cellStatus", ())
+
+
+def test_rows_with_no_entity_make_a_negative_link_and_withhold_the_first_starts(tmp_path):
+    # Rows that start and have no entity are starts no first start or later version counts, so
+    # N - S + F goes negative. A negative count is never a cell a reader may form: it is treated
+    # as small, and the first starts beside its edge are withheld.
+    rows = _cards({1: 100, 2: 100, 3: 100, 4: 60})
+    plain = _group(_table(_profile(tmp_path, _contract(), rows))["history"]["firstStart"])
+    assert plain["status"] == "F" and set(plain.get("cellStatus", "F")) == {"F"}
+    for k in range(90):
+        day = (date(2020, 1, 1) + timedelta(days=k * 3)).isoformat()
+        rows.append(_row(None, day, None))  # type: ignore[arg-type]
+    result = _profile(tmp_path, _contract(), rows)
+    first = _group(_table(result)["history"]["firstStart"])
+    assert first["status"] != "F" or "C" in first.get("cellStatus", ())
     assert _small_cells_the_first_starts_open(result, rows) == []
 
 

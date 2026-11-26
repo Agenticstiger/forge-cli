@@ -224,9 +224,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written withheld whole, on its whole ladder, when its records together are too few or the check
   leaves none of its cells.
   `firstStart` is published (it was always withheld whole) and is also checked beside the start
-  and end columns: a cell of later versions or of closed last ends that the first starts would let
-  a reader form, and that is small, withholds the first-start cells beside it, or the member when
-  only its outer edge sets that cell apart. A declared `endMarker` writes `lastVersion`'s `closed`
+  and end columns: a cell of the later versions' starts (the start column's less the first
+  starts') or of closed last ends that the first starts would let a reader form, and that is
+  small, withholds the first-start cells beside it, or the member when only its outer edge sets
+  that cell apart. A declared `endMarker` writes `lastVersion`'s `closed`
   as 0 and the marker value's transitions as zeros, and a declared `currentFlag` its value's
   transitions, where the records leave them empty, as a declared `chain` already did; where the
   records break the statement the cells are checked as before. Where the rows with no entity and a

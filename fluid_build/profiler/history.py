@@ -40,14 +40,17 @@ withholds its group: its bins then say nothing of where records lie.
   because every entity has a version, and a trimmed top edge as a bound.
 * ``firstStart``: the entities' first starts, on the public year ladder, coded. Each end that is
   not an entity's last is the next version's start, so the start column's records below an edge,
-  less the first starts', are the later versions', and the end column's less those are the closed
-  last ends. A reader who knows the start and end columns' published counts at an edge (a
-  histogram's published cells, a quantile's bin, the extremes) and the first starts there forms
-  those, three of the four giving the fourth. So the first starts are also checked beside the two
-  columns (:func:`_linked_cells`): a small cell they let a reader form withholds the two cells of
-  the first starts beside the edge that sets it apart, until none is left; one that only an outer
-  edge sets apart withholds the member whole. A calendar's cells are not intervals of the year
-  ladder, and are not held beside them.
+  less the first starts', are the later versions' starts (L), and the end column's less those are
+  the closed last ends (C). A reader who knows the start and end columns' published counts at an
+  edge (a histogram's published cells, a quantile's bin, the extremes) and the first starts there
+  forms L and C: any two of the start column, the first starts and L give the third, and any two
+  of the end column, L and C. So the first starts are also checked beside the two columns
+  (:func:`_linked_cells`), every one of those cells as a cell of any statistic: a small cell they
+  let a reader form withholds the two cells of the first starts beside the edge that sets it
+  apart, until none is left; one that only an outer edge sets apart withholds the member whole.
+  L is 0 at every edge, known without the first starts, where the published versions per entity
+  show every entity with one version. A calendar's cells are not intervals of the year ladder,
+  and are not held beside them.
 * ``versionLength``: the whole days from a version's start to the next version's start, on the
   ladder of days from day 0, coded.
 * ``chain``: each pair of consecutive versions as ``dayBefore``, ``gap``, ``nextStart`` or
@@ -611,6 +614,10 @@ def _year_ladder() -> List[int]:
 # First starts beside the start and end columns
 # ---------------------------------------------------------------------------
 
+#: The series a reader holds beside the first starts, S = F + L and N = L + C: any two of each three
+#: give the third.
+_TRIOS = (("S", "F", "L"), ("N", "L", "C"))
+
 #: Why a cell of the first starts is withheld beside the start and end columns.
 _LINKED_CELL = "the start and end columns' published counts beside it would give a small cell back"
 
@@ -693,10 +700,11 @@ def _formed_cells(
     """Every cell a reader forms: for each series, between consecutive places it knows.
 
     *places* are the edges in order, the first and last being the ends of the line. A series'
-    counts below each place are *series*, and *knows* says where the reader knows them. At a place
-    where three of the start column (S), the end column (N), the first starts (F) and their link
-    C = N - S + F are known, the fourth is too; and where S is 0 or its total, F is 0 or its total,
-    since a first start is a start.
+    counts below each place are *series*, and *knows* says where the reader knows them. The series
+    are the start column (S), the end column (N), the first starts (F), the later versions' starts
+    L = S - F and the closed last ends C = N - L. At a place where two of S, F and L are known the
+    third is too (S = F + L), and where two of N, L and C are (N = L + C); and where S is 0 or its
+    total, F is 0 or its total, since a first start is a start.
     """
     known = {name: list(flags) for name, flags in knows.items()}
     totals = {name: values[-1] for name, values in series.items()}
@@ -707,10 +715,11 @@ def _formed_cells(
             if known["S"][at] and not known["F"][at] and series["S"][at] in (0, totals["S"]):
                 if series["F"][at] in (0, totals["F"]):
                     known["F"][at] = changed = True
-            if sum(known[name][at] for name in "SNFC") == 3:
-                for name in "SNFC":
-                    known[name][at] = True
-                changed = True
+            for trio in _TRIOS:
+                if sum(known[name][at] for name in trio) == 2:
+                    for name in trio:
+                        known[name][at] = True
+                    changed = True
     formed: Dict[Tuple[str, int, int], int] = {}
     for name, values in series.items():
         held = [at for at in range(len(places)) if known[name][at]]
@@ -725,18 +734,24 @@ def _linked_cells(
     firsts: Sequence[int],
     edges: Sequence[int],
     decision: EdgeDecision,
+    single: bool = False,
 ) -> Optional[FrozenSet[int]]:
     """The cells of the first starts to withhold so that no small cell is formed beside the columns.
 
     Each end a version holds that is not its entity's last is the next version's start, so the
-    start column's records below an edge, less the first starts', are the later versions', and the
-    end column's less those are the closed last ends (and, where the chain leaves a gap, a
-    difference of the two). A reader who knows two or three of those at one edge knows the rest
-    (:func:`_formed_cells`). Every cell they form with the first starts that they could not form
-    without them, and that is small (1 to ``minimumCell - 1``, or 0 where zeros are disclosive),
-    is protected by withholding the two cells of the first starts beside the edge that sets it
-    apart. Empty when nothing more is withheld; ``None`` when an outer edge sets it apart, which no
-    cell's withholding hides, and the member is withheld whole.
+    start column's records below an edge, less the first starts', are the later versions' starts,
+    and the end column's less those are the closed last ends (and, where the chain leaves a gap, a
+    difference of the two). A reader who knows two of the start column, the first starts and the
+    later versions' starts at one edge knows the third, and two of the end column, the later
+    versions' starts and the closed last ends likewise (:func:`_formed_cells`). Every cell they
+    form with the first starts that they could not form without them, and that is small (1 to
+    ``minimumCell - 1``, or 0 where zeros are disclosive), is protected by withholding the two
+    cells of the first starts beside the edge that sets it apart. Empty when nothing more is
+    withheld; ``None`` when an outer edge sets it apart, which no cell's withholding hides, and
+    the member is withheld whole.
+
+    With *single*, the versions per entity as published show every entity with one version: the
+    later versions' starts are then 0 at every edge, known without the first starts.
     """
     stage = context.stage
     statuses = decision.cell_status.get("", ())
@@ -773,7 +788,8 @@ def _linked_cells(
         "N": [_below(ends, edge, at == last) for at, edge in enumerate(places)],
         "F": [_below(ordered, edge, at == last) for at, edge in enumerate(places)],
     }
-    series["C"] = [n - s + f for n, s, f in zip(series["N"], series["S"], series["F"], strict=True)]
+    series["L"] = [s - f for s, f in zip(series["S"], series["F"], strict=True)]
+    series["C"] = [n - later for n, later in zip(series["N"], series["L"], strict=True)]
 
     def f_known(at: int, edge: Optional[int]) -> bool:
         return edge is None or edge <= edges[0] or edge >= edges[-1] or edge in first_known
@@ -782,10 +798,14 @@ def _linked_cells(
     # Where no closed last version ends (C is 0 at every edge), a reader who takes the chain at its
     # word knows C everywhere, without the first starts.
     linked_zero = not any(series["C"])
+    # Likewise where the published versions per entity show one version each, and no row with a
+    # start lacks an entity: L is 0 at every edge.
+    single_known = single and not any(series["L"])
     base = {
         "S": [start_known.knows(edge) for edge in places],
         "N": [end_known.knows(edge) for edge in places],
         "F": list(ends_known),
+        "L": [single_known or flag for flag in ends_known],
         "C": [linked_zero or flag for flag in ends_known],
     }
     without = _formed_cells(places, series, base)
@@ -826,16 +846,37 @@ def _own_cell(
     return below or beyond
 
 
+def _shows_one_version_each(versions_per_entity: Mapping[str, Any]) -> bool:
+    """Whether the published versions per entity show every entity with one version.
+
+    A group published on bins that end at 2: no entity holds two versions, and each holds one.
+    """
+    groups = versions_per_entity.get("groups") or ()
+    bins = [_number(each) for each in versions_per_entity.get("bins") or ()]
+    top = bins[-1] if bins else None
+    return (
+        bool(groups)
+        and all(group.get("status") == _FREE for group in groups)
+        and None not in bins
+        and len(bins) >= 2
+        and bins[0] == 1
+        and top is not None
+        and top <= 2
+    )
+
+
 def _first_start(
     context: _Context,
     window: Any,
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+    versions_per_entity: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """The first starts, on the public year ladder trimmed and coded at its ends.
 
     Checked cell by cell, and beside the start and end columns (:func:`_linked_cells`) until they
-    form no small cell with them.
+    form no small cell with them. *versions_per_entity* is the entry already written.
     """
+    single = _shows_one_version_each(versions_per_entity)
     firsts = [held[0].start for held in stations.values()]
     name = f"{context.expose_id} first start"
     ladder = _year_ladder()
@@ -852,7 +893,7 @@ def _first_start(
         )
         if coded is None:
             return _written(context, None, ladder)
-        more = _linked_cells(context, window, firsts, coded.edges, coded.decision)
+        more = _linked_cells(context, window, firsts, coded.edges, coded.decision, single)
         if more is None:
             return _written(context, None, ladder)
         if not more - withheld:
@@ -1170,7 +1211,7 @@ def _history(
         "end": window.end_column,
         "versionsPerEntity": _versions_per_entity(context, stations, versions),
     }
-    found["firstStart"] = _first_start(context, window, stations)
+    found["firstStart"] = _first_start(context, window, stations, found["versionsPerEntity"])
     found["versionLength"] = _version_length(context, window, lengths)
     found["chain"] = _chain(context, window, stations)
     found["lastVersion"] = _last_version(context, window, stations)
