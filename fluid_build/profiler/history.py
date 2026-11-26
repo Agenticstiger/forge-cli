@@ -1341,6 +1341,31 @@ def _published_floors(
     return [max(rows, changes) for rows, changes in zip(held, left, strict=True)]
 
 
+def _published_ceilings(
+    initial: Mapping[str, Any], entities: int, rest: int, rule: disclosure.DisclosureRule
+) -> List[Optional[int]]:
+    """The child rows each key's parent holds at most, read from the ``initial`` as written.
+
+    A parent's children are its entities' first versions (its cell of ``initial``) and the rows
+    that follow a first version, *rest* of them in all, wherever they fall: at most the cell
+    plus *rest*. A published cell is read at the top of its band. A withheld cell is at most the
+    group's *entities* less what the other cells hold at least. The group's size and the rows
+    that are no first version are the exact counts, which a reader holds no tighter than: a
+    ceiling of the exact count is at least as low as any a reader forms, so the guard pins at
+    least what a reader does. An entry withheld whole gives no ceiling.
+    """
+    levels = initial["levels"]
+    (group,) = initial["groups"]
+    if group["status"] != _FREE:
+        return [None] * len(levels)
+    cells = group["levelCounts"]
+    least = sum(_floor(count, rule) for count in cells if count is not None)
+    return [
+        (_ceiling(count, rule) if count is not None else max(entities - least, 0)) + rest
+        for count in cells
+    ]
+
+
 def _guarded(
     context: _Context,
     window: Any,
@@ -1389,15 +1414,16 @@ def _guarded(
         context.read,
         context.expose_id,
     )
+    entities = sum(_initial_counts(column, stations))
     for whole in (False, True):
+        initial = _initial(trial, column, stations, whole=whole)
         floors = _published_floors(
-            _initial(trial, column, stations, whole=whole),
-            _transitions(trial, window, column, stations, whole=whole),
-            rule,
+            initial, _transitions(trial, window, column, stations, whole=whole), rule
         )
+        ceilings = _published_ceilings(initial, entities, children - entities, rule)
         known = disclosure.parents_at_or_above(lower, floors)
         pinned = disclosure.pinned_children_cells(
-            lower, cells, shown, children, rule, 0, None, known, floors
+            lower, cells, shown, children, rule, 0, None, known, floors, ceilings
         )
         if not pinned - base:
             return whole
