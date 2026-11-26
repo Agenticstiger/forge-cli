@@ -201,7 +201,7 @@ def _code_problems(identity: Mapping[str, Any], stated: Any) -> List[str]:
 
     source = identity.get("source")
     if source is not None and not _is_source(source):
-        return ["its identity's source is not a commit (git+<repo> and a hex gitCommit)"]
+        return ["its identity's source is not a commit (git+<repo> and a full hex gitCommit)"]
     expected = record.code_digest(identity)
     if expected == stated:
         return []
@@ -221,7 +221,7 @@ def _is_source(source: Any) -> bool:
     uri = source.get("uri", "git+")
     return (
         isinstance(commit, str)
-        and re.fullmatch(r"[0-9a-f]{7,64}", commit) is not None
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is not None
         and isinstance(uri, str)
         and uri.startswith("git+")
     )
@@ -290,9 +290,14 @@ def _check_bound(
                 f"{_clean(rel)}: the index does not list it with the sha256 {what} names"
             )
 
+    # What every sealed release pins (``build_identity`` always writes both): a release that
+    # pins neither would have nothing to tie its files to.
     bundle = identity.get("bundle")
-    if isinstance(bundle, Mapping) and "sha256" in bundle:
-        listed("bundle.tgz", bundle.get("sha256"), "the identity's bundle")
+    listed(
+        "bundle.tgz",
+        bundle.get("sha256") if isinstance(bundle, Mapping) else None,
+        "the identity's bundle",
+    )
     external = identity.get("external", [])
     if not isinstance(external, list):
         problems.append("its identity's external entry is not a list")
@@ -314,11 +319,13 @@ def _check_bound(
         if rel.startswith("external/") and rel not in pinned_external:
             problems.append(f"{_clean(rel)}: the index lists it and the identity does not")
     artifacts = identity.get("artifacts")
-    if isinstance(artifacts, Mapping) and "manifest_digest" in artifacts:
-        _check_artifacts(reader, artifacts.get("manifest_digest"), files, problems, undecided)
+    root = artifacts.get("manifest_digest") if isinstance(artifacts, Mapping) else None
+    _check_artifacts(reader, root, files, problems, undecided)
     plan = identity.get("plan")
     if isinstance(plan, Mapping):
         _check_plan(reader, plan, files, problems, undecided)
+    elif "plan.json" in files:
+        problems.append("plan.json: the index lists it and the identity pins no plan")
 
 
 def _read_json_member(
@@ -491,7 +498,10 @@ class _DirReader(_Reader):
             raise _Undecided(f"{_clean(root)} cannot be read: {exc.strerror or exc}") from None
         if not stat.S_ISDIR(mode):
             raise _NotIntact(f"{_clean(root)} is not a directory")
-        self.real = self.root.resolve()
+        try:
+            self.real = self.root.resolve()
+        except (OSError, RuntimeError) as exc:  # RuntimeError: a link loop before Python 3.13
+            raise _NotIntact(f"{_clean(root)} cannot be resolved: {exc}") from None
 
     def _open(self, rel: str) -> int:
         path = self.root / rel
@@ -500,8 +510,9 @@ class _DirReader(_Reader):
                 raise _NotIntact("it is reached through a link")
         except ValueError:
             raise _NotIntact("it is reached through a link") from None
-        except OSError as exc:  # a link loop
-            raise _NotIntact(f"it cannot be opened: {exc.strerror or exc}") from None
+        except (OSError, RuntimeError) as exc:  # a link loop (RuntimeError before Python 3.13)
+            why = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
+            raise _NotIntact(f"it cannot be opened: {why}") from None
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             fd = os.open(path, flags | getattr(os, "O_BINARY", 0))
@@ -534,7 +545,7 @@ class _DirReader(_Reader):
     def read(self, rel: str, limit: int) -> bytes:
         fd = self._open(rel)
         try:
-            data = _read_at_most(fd, limit + 1)
+            data = _read_at_most(fd, limit + 1, "it")
         finally:
             os.close(fd)
         if len(data) > limit:
@@ -556,7 +567,7 @@ class _DirReader(_Reader):
             os.close(fd)
 
 
-def _read_at_most(fd: int, limit: int) -> bytes:
+def _read_at_most(fd: int, limit: int, what: str = "release.json") -> bytes:
     data = b""
     try:
         while len(data) < limit:
@@ -565,7 +576,7 @@ def _read_at_most(fd: int, limit: int) -> bytes:
                 break
             data += chunk
     except OSError as exc:
-        raise _Undecided(f"release.json cannot be read: {exc.strerror or exc}") from None
+        raise _Undecided(f"{what} cannot be read: {exc.strerror or exc}") from None
     return data
 
 
@@ -588,7 +599,7 @@ class _S3Reader(_Reader):
         self.bucket = bucket
         self.prefix = key.rstrip("/") + "/" if key.strip("/") else ""
         try:
-            self.client = (clients or s3.default_clients)("s3", region)
+            self.client = (clients or s3.bounded_clients)("s3", region)
         except s3.S3Unavailable:
             raise _Undecided(
                 "reading an s3:// release needs boto3: pip install 'data-product-forge[aws]'"
@@ -631,6 +642,8 @@ class _S3Reader(_Reader):
             data: bytes = body.read(MAX_INDEX_BYTES + 1)
         except Exception as exc:  # noqa: BLE001 - a broken connection
             raise _Undecided(f"{self.uri}release.json cannot be read: {type(exc).__name__}")
+        finally:
+            _close(body)
         if len(data) > MAX_INDEX_BYTES:
             raise _NotIntact(f"release.json is longer than {MAX_INDEX_BYTES:,} bytes")
         return data
@@ -641,6 +654,8 @@ class _S3Reader(_Reader):
             data: bytes = body.read(limit + 1)
         except Exception as exc:  # noqa: BLE001 - a broken connection
             raise _Undecided(f"it cannot be read: {type(exc).__name__}") from None
+        finally:
+            _close(body)
         if len(data) > limit:
             raise _NotIntact(f"it is longer than {limit:,} bytes")
         return data
@@ -656,3 +671,15 @@ class _S3Reader(_Reader):
                 digest.update(chunk)
         except Exception as exc:  # noqa: BLE001 - a broken connection
             raise _Undecided(f"it cannot be read: {type(exc).__name__}") from None
+        finally:
+            _close(body)
+
+
+def _close(body: Any) -> None:
+    """Release an S3 body's connection, whether or not it was read to the end."""
+    close = getattr(body, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001, S110 - nothing to report about a closed connection
+            pass

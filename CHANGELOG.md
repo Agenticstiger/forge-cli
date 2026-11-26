@@ -32,8 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written (`already-published`). Other bytes, a release there that does not verify, a denied
   write or a bad read-back refuse the run (exit 1, or 3 after an apply) and the sealed directory
   stays as it is. Files
-  over 5 GiB are refused before any write. `--release-to-require versioning,object-lock` refuses
-  a bucket without them. The run report's `release.remote` says where the release went, or why
+  over 5 GiB are refused before any write. `--release-to-require versioning` refuses a bucket
+  without versioning; `--release-to-require object-lock` refuses one without Object Lock and a
+  default retention (a mode and a period: an enabled lock with no rule locks nothing), and then
+  checks that every object reads back with a lock mode and a retain-until date still to come.
+  GOVERNANCE retention yields to `s3:BypassGovernanceRetention`; COMPLIANCE yields to no one. The run report's `release.remote` says where the release went, or why
   not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
   boto3 is refused before stage 1 (exit 2), and so is a run whose CI names no commit: without one
   the release has no code digest.
@@ -52,7 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A release names the commit it was built from, and the digest of its code.** `identity`
   gains `source` (`{uri: git+<repo>, digest: {gitCommit}}`), from the CI's own variables, when
-  the CI names a commit; until now the commit sat only in `provenance`, outside
+  the CI names a full commit (40 or 64 hex characters; a short one would give one commit two code
+  digests); until now the commit sat only in `provenance`, outside
   `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
   `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
   environment sealed from one commit and one lock, and absent without a source commit.

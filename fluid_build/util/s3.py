@@ -48,6 +48,17 @@ def default_clients(service: str, region: Optional[str], *, config: Any = None) 
     return boto3.client(service, region_name=region, config=config)
 
 
+def bounded_clients(service: str, region: Optional[str]) -> Any:
+    """:func:`default_clients`, bounded: an endpoint that does not answer fails in seconds, and a
+    call is tried at most three times (botocore's standard retry mode)."""
+    from botocore.config import Config
+
+    config = Config(
+        connect_timeout=10, read_timeout=120, retries={"mode": "standard", "max_attempts": 3}
+    )
+    return default_clients(service, region, config=config)
+
+
 def error_code(exc: BaseException) -> str:
     """The S3 error code botocore's error carries, or ""."""
     return str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")

@@ -35,9 +35,10 @@ from __future__ import annotations
 import os
 import re
 import stat
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: The largest object one single-part PutObject takes.
 MAX_OBJECT_BYTES = 5 * 1024**3
@@ -50,6 +51,8 @@ _KEY_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._=+-]{0,254}")
 _HEX = re.compile(r"sha256:([0-9a-f]{64})")
 #: Tries of one write that raced a delete of its key (HTTP 409).
 _CONFLICT_TRIES = 3
+#: Seconds before the next try, times the tries so far.
+_CONFLICT_BACKOFF_S = 0.5
 
 ClientFactory = Callable[[str, Optional[str]], Any]
 
@@ -80,6 +83,10 @@ class Published:
     #: Another run sealed this identity and published it, intact, before this one: nothing was
     #: written, and the published release (other run times, other reports) stands.
     by_another_run: bool = False
+    #: With ``--release-to-require object-lock``: the retention each object carries, as
+    #: "GOVERNANCE, 1 days" (GOVERNANCE yields to ``s3:BypassGovernanceRetention``; COMPLIANCE
+    #: yields to no one until it runs out).
+    retention: Optional[str] = None
 
 
 def parse_target(value: str) -> Target:
@@ -139,15 +146,10 @@ def refusal(target: str, release_dir: Optional[Path], require: Sequence[str]) ->
 
 
 def _default_clients(service: str, region: Optional[str]) -> Any:
-    """boto3's client, bounded: a bucket that does not answer fails in seconds."""
-    from botocore.config import Config
-
+    """boto3's client, bounded (``util.s3.bounded_clients``, as verify-release reads with)."""
     from fluid_build.util import s3
 
-    config = Config(
-        connect_timeout=10, read_timeout=120, retries={"mode": "standard", "max_attempts": 3}
-    )
-    return s3.default_clients(service, region, config=config)
+    return s3.bounded_clients(service, region)
 
 
 def publish_release(
@@ -175,7 +177,14 @@ def publish_release(
             f"the release in {release_dir} is not intact, so it is not published: "
             + "; ".join(checked.problems)
         )
+    checked_index = next(
+        (o["sha256"] for o in checked.objects if o["path"] == "release.json"), None
+    )
     files, product, environment, identity_hex, code_hex = _local_files(release_dir)
+    if files[-1].sha256 != checked_index:
+        raise PublishError(
+            f"{release_dir}/release.json changed after it was verified, so it is not published"
+        )
     for segment, what in ((product, "product id"), (environment, "environment")):
         if not _KEY_SEGMENT.fullmatch(segment):
             raise PublishError(
@@ -201,10 +210,13 @@ def publish_release(
     for check in require:
         upload.require(check)
     if upload.check_index(files[-1], identity_hex):
-        return Published(uri=uri, written=0, already=0, by_another_run=True)
+        for item in files:  # with object-lock required, each object there must carry its lock
+            if upload.lock and (head := upload._head(prefix + item.rel)) is not None:
+                upload._locked(head, f"{uri}{item.rel}")
+        return Published(uri=uri, written=0, already=0, by_another_run=True, retention=upload.lock)
     for item in files:
         upload.put(item)
-    return Published(uri=uri, written=upload.written, already=upload.already)
+    return Published(uri=uri, written=upload.written, already=upload.already, retention=upload.lock)
 
 
 @dataclass(frozen=True)
@@ -287,6 +299,9 @@ class _Upload:
         self.written = 0
         self.already = 0
         self.index_there = False  # release.json was already published before this run
+        #: ``--release-to-require object-lock``: the bucket's default retention ("MODE, n days"),
+        #: which every object read back must carry.
+        self.lock: Optional[str] = None
 
     def _done(self) -> str:
         """What this run left in S3, for a refusal's message."""
@@ -310,7 +325,9 @@ class _Upload:
                 ok = status == "Enabled"
             else:
                 config = self.client.get_object_lock_configuration(Bucket=self.bucket)
-                ok = config.get("ObjectLockConfiguration", {}).get("ObjectLockEnabled") == "Enabled"
+                ok = self._retention(config.get("ObjectLockConfiguration") or {})
+        except PublishError:
+            raise
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
             code = s3.error_code(exc)
             if code != "ObjectLockConfigurationNotFoundError":
@@ -325,6 +342,53 @@ class _Upload:
                 f"--release-to-require {check}: the bucket {self.bucket} does not have {label} "
                 "enabled; nothing was written"
             )
+
+    def _retention(self, config: Mapping[str, Any]) -> bool:
+        """Object Lock enabled with a default retention, which every new object then gets: an
+        enabled lock with no rule locks nothing. Records the mode and the period."""
+        if config.get("ObjectLockEnabled") != "Enabled":
+            return False
+        rule = config.get("Rule") or {}
+        default = rule.get("DefaultRetention") if isinstance(rule, Mapping) else None
+        default = default if isinstance(default, Mapping) else {}
+        mode = default.get("Mode")
+        period = [
+            f"{default[unit]} {unit.lower()}"
+            for unit in ("Days", "Years")
+            if isinstance(default.get(unit), int) and default[unit] > 0
+        ]
+        if mode not in ("GOVERNANCE", "COMPLIANCE") or not period:
+            missing = (
+                "a mode (GOVERNANCE or COMPLIANCE)"
+                if mode
+                not in (
+                    "GOVERNANCE",
+                    "COMPLIANCE",
+                )
+                else "a period of days or years"
+            )
+            raise PublishError(
+                f"--release-to-require object-lock: the bucket {self.bucket} has Object Lock "
+                f"enabled and no default retention with {missing}, so new objects are not "
+                "locked; nothing was written"
+            )
+        self.lock = f"{mode}, {period[0]}"
+        return True
+
+    def _locked(self, head: Mapping[str, Any], shown: str) -> None:
+        """With ``object-lock`` required: the object itself carries a lock that has not run out
+        (the bucket's rule is what the object should get; this is what it got)."""
+        import datetime as dt
+
+        if not self.lock:
+            return
+        until = head.get("ObjectLockRetainUntilDate")
+        if not head.get("ObjectLockMode") or not isinstance(until, dt.datetime):
+            raise self._fail(f"{shown} reads back with no Object Lock retention")
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=dt.timezone.utc)
+        if until <= dt.datetime.now(dt.timezone.utc):
+            raise self._fail(f"{shown} reads back with an Object Lock retention that has run out")
 
     def _head(self, key: str, *, denied_is_missing: bool = False) -> Optional[Dict[str, Any]]:
         """The object's metadata with its checksum, or None when there is none.
@@ -397,13 +461,14 @@ class _Upload:
                 self._write(item, key)
                 break
             except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
-                if self._after_refused_write(exc, item, key, last=attempt == _CONFLICT_TRIES):
+                if self._after_refused_write(exc, item, key, attempt=attempt):
                     return  # already there, with our bytes
         head = self._head(key)
         if head is None or not self._same(head, item):
             raise self._fail(
                 f"s3://{self.bucket}/{key} does not read back with the sha256 the release names"
             )
+        self._locked(head, f"s3://{self.bucket}/{key}")
         self.written += 1
 
     def _write(self, item: _File, key: str) -> None:
@@ -419,7 +484,7 @@ class _Upload:
                 IfNoneMatch="*",
             )
 
-    def _after_refused_write(self, exc: Exception, item: _File, key: str, *, last: bool) -> bool:
+    def _after_refused_write(self, exc: Exception, item: _File, key: str, *, attempt: int) -> bool:
         """What a refused write means: True when the object is already there with our bytes,
         False to try again (a write that raced a delete, HTTP 409, while tries are left).
 
@@ -435,11 +500,13 @@ class _Upload:
         if code in s3.PRECONDITION_CODES or status == 412:
             head = self._head(key)
             if head is not None and self._same(head, item):
+                self._locked(head, shown)
                 self.already += 1
                 return True
             raise self._fail(f"{shown} already holds other bytes; {self._why_other_bytes()}")
-        if (code in s3.CONFLICT_CODES or status == 409) and not last:
-            return False  # S3 says the write may be tried again
+        if (code in s3.CONFLICT_CODES or status == 409) and attempt < _CONFLICT_TRIES:
+            time.sleep(_CONFLICT_BACKOFF_S * attempt)  # then try again, as S3 says one may
+            return False
         if s3.is_denied_code(code):
             raise self._fail(f"writing {shown} is denied (AccessDenied)")
         if code in ("BadDigest", "InvalidDigest", "XAmzContentSHA256Mismatch"):
@@ -450,7 +517,8 @@ class _Upload:
         raise self._fail(f"{shown} cannot be written ({code or type(exc).__name__})")
 
     def _why_other_bytes(self) -> str:
-        if self.index_there:
+        if self.index_there or self._head(f"{self.prefix}release.json", denied_is_missing=True):
+            # published before this run, or by another run while this one wrote
             return "a published release never changes"
         # An earlier run stopped before its release.json.
         return (

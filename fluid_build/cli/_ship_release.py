@@ -379,7 +379,9 @@ def source_identity(env: Mapping[str, str]) -> Optional[Dict[str, Any]]:
     (``{"uri": "git+<repo>", "digest": {"gitCommit": <commit>}}``). The ref is left out, so a
     branch build and a tag build of one commit name the same source."""
     found = source_revision(env)
-    if not found or "revision" not in found:
+    # A full commit only: a CI names it in full, and a short one would give one commit two
+    # code digests.
+    if not found or len(found.get("revision", "")) not in (40, 64):
         return None
     source: Dict[str, Any] = {"digest": {"gitCommit": found["revision"]}}
     if "repository" in found:

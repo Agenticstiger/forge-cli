@@ -331,7 +331,7 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         action="append",
         default=None,
         metavar="CHECK",
-        help="Refuse a --release-to bucket without versioning or object-lock.",
+        help="Refuse a bucket without versioning, or object-lock retention.",
     )
     g.add_argument(
         "--journal-dir",
@@ -1263,6 +1263,17 @@ def _publish_remote(
             f"Release published to {done.uri} ({done.written} object(s) written, "
             f"{done.already} already there)"
         )
+    if done.retention:
+        block["remote"]["retention"] = done.retention
+        ctx.ci.info(
+            f"Each object carries Object Lock retention: {done.retention}"
+            + (
+                " (s3:BypassGovernanceRetention can still delete it)"
+                if done.retention.startswith("GOVERNANCE")
+                else ""
+            )
+        )
+        _write_reports(ctx, merged, exit_code, block)
     return exit_code
 
 

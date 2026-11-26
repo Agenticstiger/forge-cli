@@ -45,7 +45,7 @@ def _key(uri: str, rel: str) -> Any:
 def test_an_untouched_release_is_intact(tmp_path: Path) -> None:
     index = sealed(tmp_path / "rel")
     result = verify_release(tmp_path / "rel")
-    assert (result.status, result.exit_code, result.files_checked) == ("intact", 0, 2)
+    assert (result.status, result.exit_code, result.files_checked) == ("intact", 0, 3)
     assert result.identity_digest == index["identity_digest"]
     assert (result.product_id, result.environment) == ("acme.orders", "dev")
 
@@ -133,7 +133,7 @@ def test_a_published_release_is_intact_and_read_only(tmp_path: Path) -> None:
     index, s3, uri = _published(tmp_path)
     s3.calls.clear()
     result = verify_release(uri, clients=s3)
-    assert (result.status, result.files_checked) == ("intact", 2)
+    assert (result.status, result.files_checked) == ("intact", 3)
     assert uri.endswith(f"/{hex_of(index)}/dev/")
     assert set(s3.calls) == {"get_object"}
 
@@ -215,7 +215,12 @@ def test_json_names_each_object_and_its_version(tmp_path: Path) -> None:
     s3.versions = True
     result = verify_release(uri, clients=s3)
     paths = [o["path"] for o in result.objects]
-    assert paths == ["release.json", "bundle.tgz", "reports/ship-report.json"]
+    assert paths == [
+        "release.json",
+        "artifacts/MANIFEST.json",
+        "bundle.tgz",
+        "reports/ship-report.json",
+    ]
     assert all(o["version_id"] and len(str(o["sha256"])) == 64 for o in result.objects)
     assert result.code_digest == index["code_digest"]
     local = verify_release(tmp_path / "rel")
@@ -508,3 +513,41 @@ def test_a_second_read_takes_the_version_the_first_did(tmp_path: Path) -> None:
     assert verify_release(uri, clients=s3).intact
     manifest_reads = [v for k, v in asked if k == "MANIFEST.json"]
     assert len(manifest_reads) == 2 and manifest_reads[0] is None and manifest_reads[1]
+
+
+def test_a_link_loop_is_not_intact(tmp_path: Path) -> None:
+    sealed(tmp_path / "rel")
+    os.symlink("a", tmp_path / "rel" / "a")  # a -> a
+    _swap_entry = json.loads((tmp_path / "rel" / "release.json").read_text(encoding="utf-8"))
+    _swap_entry["files"]["a/x"] = "sha256:" + "0" * 64
+    (tmp_path / "rel" / "release.json").write_text(json.dumps(_swap_entry), encoding="utf-8")
+    result = verify_release(tmp_path / "rel")
+    assert result.exit_code == 1 and result.problems[0].startswith("a/x: ")
+
+
+@pytest.mark.parametrize("drop", ["bundle", "artifacts"])
+def test_an_identity_that_pins_no_bundle_or_artifacts_is_not_intact(
+    tmp_path: Path, drop: str
+) -> None:
+    sealed(tmp_path / "rel")
+    path = tmp_path / "rel" / "release.json"
+    index = json.loads(path.read_text(encoding="utf-8"))
+    del index["identity"][drop]
+    path.write_text(json.dumps(index), encoding="utf-8")
+    _reseal(tmp_path / "rel")
+    assert verify_release(tmp_path / "rel").exit_code == 1
+
+
+def test_a_plan_the_identity_does_not_pin_is_not_intact(tmp_path: Path) -> None:
+    sealed(tmp_path / "rel", {"reports/ship-report.json": b"{}", "plan.json": b"{}"})
+    result = verify_release(tmp_path / "rel")
+    assert result.problems == ("plan.json: the index lists it and the identity pins no plan",)
+
+
+def test_a_short_commit_is_no_source(tmp_path: Path) -> None:
+    from fluid_build.cli import _ship_release as release
+
+    assert release.source_identity({"GITHUB_RUN_ID": "1", "GITHUB_SHA": "a" * 12}) is None
+    sealed(tmp_path / "rel")
+    _reseal(tmp_path / "rel", source={"digest": {"gitCommit": "a" * 12}})
+    assert verify_release(tmp_path / "rel").exit_code == 1

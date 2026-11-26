@@ -114,8 +114,9 @@ def test_every_file_goes_up_with_its_checksum_and_the_index_last(tmp_path: Path)
     s3 = FakeS3()
     done = publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
     prefix = _prefix(index)
-    assert done == publish.Published(f"s3://acme-releases/{prefix}", written=3, already=0)
+    assert done == publish.Published(f"s3://acme-releases/{prefix}", written=4, already=0)
     assert s3.writes == [
+        f"{prefix}artifacts/MANIFEST.json",
         f"{prefix}bundle.tgz",
         f"{prefix}reports/ship-report.json",
         f"{prefix}release.json",
@@ -131,8 +132,8 @@ def test_a_rerun_of_the_same_release_writes_nothing_and_succeeds(tmp_path: Path)
     s3 = FakeS3()
     publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
     again = publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
-    assert (again.written, again.already) == (0, 3)
-    assert len(s3.writes) == 3
+    assert (again.written, again.already) == (0, 4)
+    assert len(s3.writes) == 4
 
 
 def test_a_rerun_finishes_a_publish_that_stopped_halfway(tmp_path: Path) -> None:
@@ -140,7 +141,7 @@ def test_a_rerun_finishes_a_publish_that_stopped_halfway(tmp_path: Path) -> None
     s3 = FakeS3()
     s3.put("acme-releases", f"{_prefix(index)}bundle.tgz", b"bundle")
     done = publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
-    assert (done.written, done.already) == (2, 1)
+    assert (done.written, done.already) == (3, 1)
 
 
 def test_an_object_with_other_bytes_is_refused(tmp_path: Path) -> None:
@@ -153,7 +154,7 @@ def test_an_object_with_other_bytes_is_refused(tmp_path: Path) -> None:
     assert "reports/ship-report.json already holds other bytes" in message
     assert "holds no release.json, so no reader takes it as a release" in message
     assert "Delete the objects under it and run again" in message
-    assert "1 object(s) were written" in message and "release.json is written last" in message
+    assert "2 object(s) were written" in message and "release.json is written last" in message
     assert not any(k.endswith("release.json") for k in s3.writes)
 
 
@@ -236,14 +237,14 @@ def test_a_denied_write_is_refused_and_says_what_was_written(tmp_path: Path) -> 
     with pytest.raises(publish.PublishError) as raised:
         publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
     assert "is denied (AccessDenied)" in str(raised.value)
-    assert "1 object(s) were written" in str(raised.value)
+    assert "2 object(s) were written" in str(raised.value)
 
 
 def test_a_write_that_raced_a_delete_is_tried_again(tmp_path: Path) -> None:
     sealed(tmp_path / "rel")
     s3 = FakeS3()
     s3.conflicts = 2
-    assert publish.publish_release(tmp_path / "rel", TARGET, clients=s3).written == 3
+    assert publish.publish_release(tmp_path / "rel", TARGET, clients=s3).written == 4
     s3 = FakeS3()
     s3.conflicts = 3
     with pytest.raises(publish.PublishError, match="ConditionalRequestConflict"):
@@ -301,7 +302,7 @@ def test_a_first_publish_needs_no_list_bucket(tmp_path: Path) -> None:
         return real_head(**kw)
 
     s3.head_object = head  # type: ignore[method-assign]
-    assert publish.publish_release(tmp_path / "rel", TARGET, clients=s3).written == 3
+    assert publish.publish_release(tmp_path / "rel", TARGET, clients=s3).written == 4
     assert s3.writes[-1] == f"{_prefix(index)}release.json"
 
 
@@ -323,11 +324,65 @@ def test_the_bucket_checks_run_before_any_write(tmp_path: Path) -> None:
     with pytest.raises(publish.PublishError, match="does not have Object Lock enabled"):
         publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
     assert s3.writes == []
-    s3.versioning, s3.object_lock = "Enabled", True
+    s3.versioning, s3.object_lock, s3.retention = "Enabled", True, ("GOVERNANCE", 1)
     done = publish.publish_release(
         tmp_path / "rel", TARGET, clients=s3, require=("versioning", "object-lock")
     )
-    assert done.written == 3
+    assert (done.written, done.retention) == (4, "GOVERNANCE, 1 days")
+
+
+def test_object_lock_with_no_default_retention_is_refused(tmp_path: Path) -> None:
+    sealed(tmp_path / "rel")
+    s3 = FakeS3()
+    s3.object_lock, s3.lock_rule = True, False  # enabled, and nothing locks a new object
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
+    assert "Object Lock enabled and no default retention with a mode" in str(raised.value)
+    assert s3.writes == []
+
+
+def test_an_object_that_reads_back_unlocked_is_refused(tmp_path: Path) -> None:
+    index = sealed(tmp_path / "rel")
+    s3 = FakeS3()
+    s3.object_lock, s3.retention = True, ("COMPLIANCE", 1)
+    s3.unlocked.add(f"{_prefix(index)}bundle.tgz")
+    with pytest.raises(publish.PublishError, match="bundle.tgz reads back with no Object Lock"):
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
+
+
+def test_a_release_json_changed_after_verify_is_not_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sealed(tmp_path / "rel")
+    real = publish._read_regular
+
+    def swapped(path: Path) -> bytes:  # the second read of the index sees other bytes
+        data = real(path)
+        return data.replace(b"run-1", b"run-9") if path.name == "release.json" else data
+
+    monkeypatch.setattr(publish, "_read_regular", swapped)
+    with pytest.raises(publish.PublishError, match="changed after it was verified"):
+        publish.publish_release(tmp_path / "rel", TARGET, clients=FakeS3())
+
+
+def test_a_release_json_another_run_committed_meanwhile_is_not_called_partial(
+    tmp_path: Path,
+) -> None:
+    index = sealed(tmp_path / "rel")
+    s3 = FakeS3()
+    prefix = _prefix(index)
+    s3.put("acme-releases", f"{prefix}bundle.tgz", b"theirs")
+    real_put = s3.put_object
+
+    def put_object(**kw: Any) -> Any:  # their release.json lands while ours uploads
+        s3.put("acme-releases", f"{prefix}release.json", b"{}")
+        return real_put(**kw)
+
+    s3.put_object = put_object  # type: ignore[method-assign]
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
+    assert "a published release never changes" in str(raised.value)
+    assert "Delete the objects" not in str(raised.value)
 
 
 # ---------------------------------------------------------------------------

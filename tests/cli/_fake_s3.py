@@ -48,6 +48,10 @@ class FakeS3:
         self.object_lock = False
         self.misreport: Set[str] = set()  # keys whose read-back checksum is wrong
         self.versions = False  # a versioned bucket: GetObject answers a VersionId
+        #: Object Lock's default retention, ``(mode, days)``: each object then carries it.
+        self.retention: Optional[Tuple[str, int]] = None
+        self.lock_rule = True  # with object_lock: a Rule.DefaultRetention is set
+        self.unlocked: Set[str] = set()  # keys that read back with no lock fields
 
     def __call__(self, service: str, region: Optional[str]) -> "FakeS3":
         assert service == "s3"
@@ -95,6 +99,11 @@ class FakeS3:
             checksum = b64(b"other")
         if checksum is not None:
             head.update(ChecksumSHA256=checksum, ChecksumType="FULL_OBJECT")
+        if self.retention and Key not in self.unlocked:
+            import datetime as dt
+
+            until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=self.retention[1])
+            head.update(ObjectLockMode=self.retention[0], ObjectLockRetainUntilDate=until)
         return head
 
     def get_object(self, *, Bucket: str, Key: str, VersionId: str = "") -> Dict[str, Any]:
@@ -116,7 +125,11 @@ class FakeS3:
         self.calls.append("get_object_lock_configuration")
         if not self.object_lock:
             raise S3Error("ObjectLockConfigurationNotFoundError", 404)
-        return {"ObjectLockConfiguration": {"ObjectLockEnabled": "Enabled"}}
+        config: Dict[str, Any] = {"ObjectLockEnabled": "Enabled"}
+        if self.lock_rule:
+            mode, days = self.retention or ("GOVERNANCE", 1)
+            config["Rule"] = {"DefaultRetention": {"Mode": mode, "Days": days}}
+        return {"ObjectLockConfiguration": config}
 
 
 def sealed(
@@ -127,8 +140,15 @@ def sealed(
     environment: str = "dev",
     run_id: str = "run-1",
 ) -> Dict[str, Any]:
-    """A sealed ``fluid-release/1`` directory, as ``_ship_release.publish`` writes one."""
-    files = {"bundle.tgz": b"bundle", "reports/ship-report.json": b"{}"} if files is None else files
+    """A sealed ``fluid-release/1`` directory, as ``_ship_release.publish`` writes one: its
+    identity pins the bundle and the artifacts MANIFEST (here one that lists no file), as
+    ``build_identity`` always does."""
+    from fluid_build.forge.core.bundle import merkle_root
+
+    files = {"reports/ship-report.json": b"{}"} if files is None else dict(files)
+    files.setdefault("bundle.tgz", b"bundle")
+    manifest = {"digest": merkle_root({}), "files": {}}
+    files.setdefault("artifacts/MANIFEST.json", json.dumps(manifest).encode())
     directory.mkdir(parents=True)
     for rel, data in files.items():
         (directory / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +158,8 @@ def sealed(
         "environment": environment,
         "fluid_version": "0.7.7",
         "source": SOURCE,
+        "bundle": {"sha256": "sha256:" + hashlib.sha256(files["bundle.tgz"]).hexdigest()},
+        "artifacts": {"manifest_digest": manifest["digest"]},
     }
     index = {
         "schema": release.RELEASE_SCHEMA,
