@@ -9,8 +9,9 @@ no run record here. What it leaves is the sealed release ``fluid ship --release-
 publishes at each deploy: ``release.json`` (``fluid-release/1``), written last into a directory
 that is renamed into place and never changed. This reads those records and answers "which release
 of this product was in force on that date": its version(s), the revision of the code the CI built
-it from, the run that sealed it. Each environment is answered on its own: a dev release sealed
-between two prod ones is not what was in force in prod.
+it from, the external files it sealed (``fluid ship --artifacts``) and their sources, the run that
+sealed it. Each environment is answered on its own: a dev release sealed between two prod ones
+is not what was in force in prod.
 
 The records are the reader's own files, not trusted input: a directory is read one level deep,
 a link is never followed (the index is opened with ``O_NOFOLLOW`` and checked on the open handle),
@@ -38,6 +39,8 @@ MAX_ENTRIES = 2_000
 MAX_INDEX_BYTES = 1_048_576
 #: Characters of any text taken from a record.
 _TEXT = 200
+#: External files read from one record: as many as a lock may list.
+MAX_EXTERNAL = 256
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 #: What a reader of a record is told about it, once, under an answer.
 NOT_AUTHENTICATED = (
@@ -71,6 +74,9 @@ class Release:
     run_id: Optional[str] = None
     source: Dict[str, str] = field(default_factory=dict)
     bundle_digest: Optional[str] = None
+    #: The external files the release sealed (``fluid ship --artifacts``), each as
+    #: ``{"name", "kind", "sha256", "source", "commit"}`` (what the record holds of them).
+    external: List[Dict[str, str]] = field(default_factory=list)
     #: False when ``identity_digest`` is not the digest of ``identity``: the record was changed
     #: after it was sealed, or was never one. True proves little: whoever writes a record can
     #: compute the digest, and the sealed time and the source are outside it.
@@ -79,7 +85,7 @@ class Release:
     def as_dict(self) -> Dict[str, Any]:
         out = asdict(self)
         out["sealed_at"] = self.sealed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-        return {k: v for k, v in out.items() if v not in (None, {}, "")}
+        return {k: v for k, v in out.items() if v not in (None, {}, "", [])}
 
 
 @dataclass
@@ -168,6 +174,27 @@ def _read_index(directory: Path) -> Optional[Dict[str, Any]]:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _external(identity: Mapping[str, Any]) -> List[Dict[str, str]]:
+    """The external files ``identity`` names, cleaned: at most :data:`MAX_EXTERNAL`, as many as
+    a lock may list (``_release_lock.MAX_ENTRIES``)."""
+    items = identity.get("external")
+    out: List[Dict[str, str]] = []
+    for item in items[:MAX_EXTERNAL] if isinstance(items, list) else []:
+        item = _mapping(item)
+        source = _mapping(item.get("source"))
+        found = {
+            "name": _text(item.get("name"), 100),
+            "kind": _text(item.get("kind"), 40),
+            "sha256": _text(_mapping(item.get("digest")).get("sha256"), 80),
+            "source": _text(source.get("uri"), 256),
+            "commit": _text(_mapping(source.get("digest")).get("gitCommit"), 80),
+        }
+        entry = {k: v for k, v in found.items() if v}
+        if entry:
+            out.append(entry)
+    return out
+
+
 def _release(shown: str, index: Mapping[str, Any]) -> Optional[Release]:
     """The release ``index`` describes, or None when it is not a release record."""
     from fluid_build.cli import _ship_release as ship_release
@@ -204,6 +231,7 @@ def _release(shown: str, index: Mapping[str, Any]) -> Optional[Release]:
         run_id=_text(provenance.get("run_id"), 80),
         source=source,
         bundle_digest=_text(_mapping(identity.get("bundle")).get("manifest_digest"), 80),
+        external=_external(identity),
         intact=intact,
     )
 
@@ -392,6 +420,13 @@ def describe(release: Release) -> List[str]:
     if release.bundle_digest:
         # what the Spark runner stamps on each commit as fluid.bundle-digest
         lines.append(f"  bundle   {release.bundle_digest}")
+    for item in release.external:
+        built = " ".join(v for v in (item.get("source"), item.get("commit")) if v)
+        lines.append(
+            f"  external {item.get('name', '?')} ({item.get('kind', '?')})"
+            f" sha256:{item.get('sha256', '?')}"
+            + (f"  from {built}" if built else "  (the record names no source)")
+        )
     if not release.intact:
         lines.append(
             "  NOT INTACT: its identity_digest is not the digest of its identity; the record "

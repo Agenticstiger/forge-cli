@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid ship --release-dir DIR --artifacts LOCK.yaml` seals external files into the release.**
+  A lock lists the files a product runs that Forge does not build (a Spark package, an Airflow
+  DAG, any other file), each with its sha256 and the repository, commit and optional ref it was
+  built from. Before any stage runs, ship refuses a lock it cannot seal: an unknown field or kind,
+  a path that is absolute, hidden or leads out of the lock's directory (by `..` or a linked
+  directory), a link, or bytes that are not the sha256 named (the message never shows the digest
+  the file has). The release copies each file to `external/<name>/<file>`, hashes the copy again
+  and records the entries in its `identity`, sorted by name and with no path on the machine that
+  ran it, so two clean runs give one identity and changed bytes give a new one.
+  `$RELEASE_ARTIFACTS` names the lock when the flag is absent, read only by a run that seals a
+  release; the flag without `--release-dir` is refused. `fluid runs status --release-dir` names
+  each external file and its source.
+- **The MCP `query` tool reads a column of the version an as-of relationship reaches.** A
+  dimension or a filter key `<relationship>.<column>` on a `semantics.relationships[]` entry that
+  declares `asOf` reads `column` of the version of the target valid on the row's `asOf` value
+  (`joinType: inner` drops rows that reach none; a row that reaches none reads NULL). The target is
+  read only through its own governed projection: its declared columns that no policy restricts and
+  the rows its `policy.authz.rowFilters` leave the same caller, so a version the caller may not read
+  never bounds a visible one; a caller its filters do not name is refused. A restricted target
+  column cannot be read, filtered on or joined on, and a PII column is redacted under its
+  `<relationship>_<column>` name. It works where the gateway reads the target in the same statement:
+  DuckDB (the same database; the target's file must be inside `--readable-paths`), BigQuery (the
+  same project), Snowflake (the same database and schema), PostgreSQL (the same connection
+  settings and database) and Athena (the same workgroup, region and output location). A target
+  with another `agentPolicy`, on another platform, outside the readable paths or whose table name
+  another file holds is refused, and a relationship that is not a well-formed as-of reading is
+  refused with the reason.
+
+### Fixed
+
+- **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through
+  `runpy` and marks a run FAILED on any `SystemExit`, code 0 included, so a build that wrote its
+  rows still ended `FAILED: SystemExit: 0` and `fluid apply --mode amend-and-build` reported it
+  failed. The runner now returns normally on success and exits only with a failure's code. EMR
+  runs are unchanged.
+
+## [0.41.0] — 2026-11-25
+
+### Added
+
 - **A private release fits its added parts within the cells it may measure.** With
   `--privacy-unit`, a date pair's days and order, a column the contract does not declare required
   and a link statistic over such a column are fitted into the 65,536 cells a release may measure
@@ -33,7 +73,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1-3-0 with a date pair, and `--rederive` recomputes both. The help and the report now say that a
   followed relationship out of a versioned table by its natural entity repeats its key by design,
   with the entity-versions precondition, instead of that every followed parent key names one row.
-
 - **`fluid profile` publishes the history of a table with a validity window.** A table whose
   contract declares a slowly changing dimension (one natural entity and a start and an end
   dimension, both DATE or both timestamp columns) gets a `history` in a default profile: the
@@ -48,7 +87,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window's own start and end under `datePairs`: the pair is named under Not measured, since its
   days and the history's version lengths would give each other's withheld cells back. A table
   without a validity window keeps the same bytes.
-
 - **A private release counts children per entity of a versioned table.** With `--privacy-unit`
   and `--follow`, a relationship into a table with a validity window, whose `toColumns` are its
   natural entity, is released as children per entity: the parents are the distinct entity keys of
@@ -59,7 +97,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with that reason. Records that put one entity's versions in two units are refused with
   `profile_release_entity_units`, naming the table and the columns only. A grouping by a parent
   column needs a column stable per entity, and the release never writes a `history` member.
-
 - **`fluid profile` counts children per entity through a relationship into a versioned table.**
   A relationship whose `toColumns` are exactly the natural entity of a table that declares a
   validity window is counted one parent per entity, not one per version: the parents are the
@@ -70,7 +107,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disagree on any other. Dates and exposure are not formed through such a relationship, and say
   so. A relationship into a window by any other columns stays left out, with its reason, and
   `--strict` refuses an ask of it before any record is read.
-
 - **`fluid profile` states how far apart two dates lie, and how many children a parent has per
   active day.** Each pair of DATE columns of a table (a request lists the pairs it wants) gets a
   histogram of the whole days from the earlier to the later on one fixed ladder of bins, trimmed
@@ -161,21 +197,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`.hql`, `.ddl`, `.cql`, `.j2`, `.jinja` and `.sh` are text suffixes:** a `$ref` to such a file
   becomes its text. Before, `q.hql` holding `SELECT 'a: b' FROM t` was parsed as YAML and became
   the mapping `{"SELECT 'a": "b' FROM t"}`.
-- **The MCP `query` tool reads a column of the version an as-of relationship reaches.** A
-  dimension or a filter key `<relationship>.<column>` on a `semantics.relationships[]` entry that
-  declares `asOf` reads `column` of the version of the target valid on the row's `asOf` value
-  (`joinType: inner` drops rows that reach none; a row that reaches none reads NULL). The target is
-  read only through its own governed projection: its declared columns that no policy restricts and
-  the rows its `policy.authz.rowFilters` leave the same caller, so a version the caller may not read
-  never bounds a visible one; a caller its filters do not name is refused. A restricted target
-  column cannot be read, filtered on or joined on, and a PII column is redacted under its
-  `<relationship>_<column>` name. It works where the gateway reads the target in the same statement:
-  DuckDB (the same database; the target's file must be inside `--readable-paths`), BigQuery (the
-  same project), Snowflake (the same database and schema), PostgreSQL (the same connection
-  settings and database) and Athena (the same workgroup, region and output location). A target
-  with another `agentPolicy`, on another platform, outside the readable paths or whose table name
-  another file holds is refused, and a relationship that is not a well-formed as-of reading is
-  refused with the reason.
 
 ### Changed
 
@@ -243,6 +264,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names no endpoint and no such field (a local file source), has nothing to judge. The refusal
   (`EnvTemplateHostError`, reason `unpaired`) names the variable, the field that writes it and the
   host as written, never a rendered value.
+- **The examples move past their known advisories.** The Flink and Iceberg example's runtime
+  takes Flink 1.20.5, Iceberg 1.12.0, the Hadoop client 3.5.0 and newer Maven and its jar plugin,
+  with its base images pinned by digest; the bitcoin price example raises its Python dependency
+  floors. Dependabot now watches the example manifests.
+- **The release image's Python base is pinned by digest**, and the release tools install from a
+  hash-locked file. The GHCR image is attested, and the GitHub Release carries a provenance
+  bundle for each file it attaches.
+- **CI:** tool installs are hash-locked, the Helm download is verified, the write token is scoped
+  to the one job that needs it, and the docs reminder checks out the base branch. Routine tool
+  bumps: black 26.10.1 (the source is reformatted, with no change in behaviour), semgrep 1.186.0
+  and uv 0.13.9. Two test fixtures changed: the Debezium launch fixtures name the expose their
+  outputs land in, and the Gemini key fixture is built at runtime.
+- **The versioned-relationships RFC** (`RFC-versioned-relationships.md`) describes the design
+  behind versioned tables and as-of relationships.
 
 ### Deprecated
 
@@ -836,8 +871,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its digest changes.** Such a column's quartiles on a ladder of years become a histogram over
   the calendar months or years it spans, and each DATE and timestamp column gains a calendar, so
   the document moves from format 1-1-0 to 1-3-0 even with no date pair or relationship in it.
-  `fluxsim` 0.10.0 and later read format 1-3-0; 0.9 and older refuse the document. Re-profile
-  after upgrading, and pin the new digest wherever the old one was pinned.
+  `fluxsim` 0.10.0 and later read format 1-3-0; 0.9 and older refuse the document. A table with a
+  validity window also gains a `history`, and its window's own start and end leave `datePairs`.
+  Re-profile after upgrading, and pin the new digest wherever the old one was pinned.
 - **An unset or empty `{{ env.NAME }}` now stops the command.** A contract that relied on a
   variable rendering as nothing (an optional prefix, a path whose variable was never exported) now
   fails naming it: export the variable, or delete the placeholder. That includes a region written

@@ -2495,4 +2495,8 @@ def run_maintenance(spark, config: dict, stamps: dict | None = None, now=None) -
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Glue runs this script through runpy and marks a run FAILED on any SystemExit, code 0
+    # too: return normally on success and exit only with a failure's code.
+    code = main()
+    if code:
+        sys.exit(code)
