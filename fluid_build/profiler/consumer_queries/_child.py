@@ -466,11 +466,14 @@ def _is_memory(error: BaseException) -> bool:
     """Whether DuckDB ran out of memory or room to spill (read here; the message never leaves)."""
     text = str(error).lower()
     # With no temporary directory allowed, a statement that must spill reports that it cannot
-    # make one (an IO error) where one that may spill reports the memory error.
+    # make one (an IO error) where one that may spill reports the memory error. DuckDB 1.5 writes
+    # its temporary storage (``duckdb_temp_storage...``, ``duckdb_temp_block...``) before it
+    # weighs the limit on its size, and this process's file-size limit refuses the write.
     return (
         "out of memory" in text
         or "max_temp_directory_size" in text
         or ("failed to create directory" in text and ".tmp" in text)
+        or "duckdb_temp_" in text
     )
 
 

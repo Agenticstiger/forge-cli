@@ -537,6 +537,29 @@ def test_a_statement_past_the_memory_budget_takes_out_of_memory_and_the_next_one
     assert (after.status, after.count) == ("ok", 200_000)
 
 
+@pytest.mark.parametrize(
+    ("message", "memory"),
+    [
+        # DuckDB 1.5 writes its temporary storage before it weighs the limit on its size, and
+        # this process's file-size limit refuses the write: it ran out of room to spill.
+        (
+            'IO Error: Could not write file "/tmp/fluid-duckdb-spill-ab12/'
+            'duckdb_temp_storage_DEFAULT-0.tmp": File too large',
+            True,
+        ),
+        (
+            'IO Error: Could not open file "/tmp/s/duckdb_temp_block-4611686018427388032.block"',
+            True,
+        ),
+        ("Out of Memory Error: could not allocate block of size 256.0 KiB", True),
+        ('IO Error: Could not write file "/tmp/s/readings.csv": File too large', False),
+        ("Binder Error: Referenced column x not found", False),
+    ],
+)
+def test_an_engine_error_on_its_temporary_storage_is_out_of_memory(message, memory) -> None:
+    assert _child._is_memory(RuntimeError(message)) is memory
+
+
 def test_tables_past_the_memory_budget_give_every_statement_out_of_memory() -> None:
     big = {"t": [("s", "VARCHAR", ["x" * 1000] * 400_000)]}
     done = run(
