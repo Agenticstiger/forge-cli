@@ -27,6 +27,8 @@ pytestmark = pytest.mark.unit
 TARGET = "s3://acme-releases/handoff/"
 PASSING = {"total": 1, "match": 1, "mismatch": 0, "error": 0}
 T0 = datetime(2026, 11, 26, 9, 0, 0, 123456, tzinfo=timezone.utc)
+#: The password in the URLs that must never reach a receipt or a message.
+PW = "secret"
 
 
 @pytest.fixture(autouse=True)
@@ -594,7 +596,10 @@ def test_verify_has_the_release_flag() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ["git+https://user:secret@git.example.com/ops/dags", "s3://user:secret@bucket/key"],
+    [
+        f"git+https://user:{PW}@git.example.com/ops/dags",
+        f"s3://user:{PW}@bucket/key",
+    ],
 )
 def test_a_refused_target_never_echoes_a_password(value: str) -> None:
     with pytest.raises(receipts.ReceiptError) as raised:
@@ -745,7 +750,7 @@ def test_an_object_path_over_200_characters_is_kept_whole(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     "url",
     [
-        "git+https://user:secret@git.example.com/ops/dags",
+        f"git+https://user:{PW}@git.example.com/ops/dags",
         "git+https://ghp_secret@github.com/ops/dags",
         "git+https://gitlab.com/ops/dags?private_token=glpat-secret",
         "git+https://gitlab.com/ops/dags#secret",
@@ -857,7 +862,7 @@ def test_the_ci_metadata_carries_no_userinfo(
     monkeypatch.setattr(
         _attestation,
         "_collect_run_metadata",
-        lambda: {"builder": {"id": "https://bot:hunter2@ci.example.com/job/1"}},
+        lambda: {"builder": {"id": f"https://bot:{PW}@ci.example.com/job/1"}},
     )
     sealed(tmp_path / "nonprod", environment="nonprod")
     report = _report(tmp_path / "verify.json", tmp_path / "nonprod")
