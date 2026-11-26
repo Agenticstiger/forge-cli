@@ -127,6 +127,8 @@ def test_a_source_is_normalized_as_the_ci_source_is() -> None:
         ({"artifacts": [_entry(path="\ud800/x.zip")]}, "has characters a release"),
         ({"artifacts": [_entry(path="my dist/x.zip")]}, "has characters a release"),
         ({"artifacts": [_entry(path="../dist/x.zip")]}, "leads out of its directory"),
+        ({"artifacts": [_entry(kind="file", path=".")]}, "names no file"),
+        ({"artifacts": [_entry(kind="file", path="./")]}, "names no file"),
         ({"artifacts": [_entry(path="dist\\x.zip")]}, "expected / between directories"),
         ({"artifacts": [_entry(path="dist/my package.zip")]}, "has characters a release"),
         ({"artifacts": [_entry(path="dist/x.tar")]}, "a spark-package is a .whl or .zip file"),
@@ -200,6 +202,23 @@ def test_a_linked_directory_that_leads_out_is_refused(tmp_path: Path) -> None:
     os.symlink(tmp_path / "outside" / "dist", project / "dist")
     with pytest.raises(lock.LockError, match="leads out of the lock's directory"):
         lock.load(str(_write_lock(project, _entry())))
+
+
+def test_a_link_inside_the_directory_to_a_hidden_one_is_refused(tmp_path: Path) -> None:
+    # cfg -> .git: every segment of cfg/config is a plain name, and the link stays inside.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_bytes(b"token")
+    os.symlink(tmp_path / ".git", tmp_path / "cfg")
+    entry = _entry(kind="file", path="cfg/config", sha256=_sha(b"token"))
+    with pytest.raises(lock.LockError, match="goes through a linked directory"):
+        lock.load(str(_write_lock(tmp_path, entry)))
+
+
+def test_any_linked_directory_inside_is_refused(tmp_path: Path) -> None:
+    _package(tmp_path)
+    os.symlink(tmp_path / "dist", tmp_path / "build")
+    with pytest.raises(lock.LockError, match="goes through a linked directory"):
+        lock.load(str(_write_lock(tmp_path, _entry(path="build/orders_jobs-1.4.0.zip"))))
 
 
 def test_a_directory_is_not_a_file(tmp_path: Path) -> None:
@@ -357,8 +376,19 @@ def test_the_copy_is_hashed_again_before_the_release_is_published(tmp_path: Path
     source.write_bytes(b"changed after it was checked")
     with pytest.raises(release.ReleaseError, match="changed while the run ran"):
         release._copy_external(staging, {"external": [entry.identity()]}, [artifact])
+    assert not (staging / "external").exists() or not any((staging / "external").rglob("*"))
     with pytest.raises(release.ReleaseError, match="names other external files"):
         release._copy_external(staging, {}, [artifact])
+
+
+def test_the_copy_reads_no_link_and_leaves_nothing_behind(tmp_path: Path) -> None:
+    source = _package(tmp_path / "src")
+    os.symlink(source, tmp_path / "link.zip")
+    with pytest.raises(release.ReleaseError, match="is not a regular file"):
+        release._copy_hashed(tmp_path / "link.zip", tmp_path / "out" / "x.zip")
+    assert not (tmp_path / "out" / "x.zip").exists()
+    assert release._copy_hashed(source, tmp_path / "out" / "x.zip") == _sha(b"package")
+    assert (tmp_path / "out" / "x.zip").read_bytes() == b"package"
 
 
 def test_an_external_file_named_like_the_index_is_listed(tmp_path: Path) -> None:
