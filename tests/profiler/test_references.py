@@ -216,6 +216,12 @@ def _cases() -> Dict[str, Dict[str, Any]]:
         {"sensitivity": "high"},
         {"Sensitivity": "Restricted"},
         {"team": "library", "kind": "pii"},
+        {"contains-pii": "true"},
+        {"kind": "personal-data"},
+        {"kind": "Personal_Data"},
+        {"data.class": "PII_email"},
+        {"containsPII": "yes"},
+        {"pii-level": "x"},
     ):
         cases[f"labels {labels}"] = {**labelled_column(labels=labels), "expect": False}
     for labels in (
@@ -224,6 +230,8 @@ def _cases() -> Dict[str, Dict[str, Any]]:
         {"Sensitivity": "NONE"},
         {"data-class": "reference"},
         {"note": "no personal data"},
+        {"note": "pipeline", "owner": "alphi"},
+        {"kind": "personal", "other": "data"},
     ):
         cases[f"harmless labels {labels}"] = {**labelled_column(labels=labels), "expect": True}
     cases["labels as a list that names pii"] = {
@@ -234,6 +242,17 @@ def _cases() -> Dict[str, Dict[str, Any]]:
         **labelled_column(labels=["geo", "reference"]),
         "expect": True,
     }
+    # a tag split on its separators, as forge's own classifier writes them (pii-email)
+    for tag in ("pii-email", "pii-ip-address", "contains-pii", "has.phi", "personal-data"):
+        cases[f"column tag {tag}"] = {**labelled_column(tags=[tag]), "expect": False}
+    cases["column tag personal_data"] = {
+        **labelled_column(tags=["geo", "personal_data"]),
+        "expect": False,
+    }
+    cases["harmless column tags"] = {
+        **labelled_column(tags=["reference", "pipeline", "company-wide", "piiless", "personal"]),
+        "expect": True,
+    }
     for semantic in (
         "email",
         "Phone",
@@ -241,6 +260,16 @@ def _cases() -> Dict[str, Dict[str, Any]]:
         "date-of-birth",
         "IP Address",
         "EmailAddress",
+        "US_SSN",
+        "IPAddress",
+        "MACAddress",
+        "e-mail",
+        "UserName",
+        "CreditCardNumber",
+        "USA_PASSPORT_NUMBER",
+        "pii",
+        "personal-data",
+        "confidential",
     ):
         cases[f"semantic type {semantic}"] = {
             **labelled_column(semanticType=semantic),
@@ -253,21 +282,49 @@ def _cases() -> Dict[str, Dict[str, Any]]:
         "currency",
         "category",
         "location",
+        "postal_code",
+        "country_name",
     ):
         cases[f"harmless semantic type {semantic}"] = {
             **labelled_column(semanticType=semantic),
             "expect": True,
         }
-    for where, built in {
+    tag_builders = {
         "expose": lambda tags: {"expose": {"tags": tags}},
         "policy": lambda tags: {"policy": {"tags": tags}},
         "authz": lambda tags: {"policy": {"authz": {"tags": tags}}},
         "privacy": lambda tags: {"policy": {"privacy": {"tags": tags}}},
-    }.items():
+    }
+
+    def built_tags(where: str, tags: Any) -> Dict[str, Any]:
+        return tag_builders[where](tags)
+
+    for where, built in tag_builders.items():
         for tag in ("pii", "PHI", "Sensitive"):
             cases[f"{where} tag {tag}"] = {"contract": built([tag]), "expect": False}
         cases[f"{where} tag as a plain string"] = {"contract": built("pii"), "expect": False}
         cases[f"harmless {where} tags"] = {"contract": built(["reference", "geo"]), "expect": True}
+    for where, built in {
+        "expose": lambda labels: {"expose": {"labels": labels}},
+        "policy": lambda labels: {"policy": {"labels": labels}},
+        "authz": lambda labels: {"policy": {"authz": {"labels": labels}}},
+        "privacy": lambda labels: {"policy": {"privacy": {"labels": labels}}},
+    }.items():
+        for labels in (
+            {"pii": "true"},
+            {"data-class": "PHI"},
+            {"sensitivity": "high"},
+            {"contains-pii": "yes"},
+            {"kind": "personal-data"},
+        ):
+            cases[f"{where} labels {labels}"] = {"contract": built(labels), "expect": False}
+        for labels in ({"team": "library"}, {"sensitivity": "none"}):
+            cases[f"harmless {where} labels {labels}"] = {
+                "contract": built(labels),
+                "expect": True,
+            }
+        for tag in ("pii-email", "contains-pii", "personal-data"):
+            cases[f"{where} tag {tag}"] = {"contract": built_tags(where, [tag]), "expect": False}
     cases["expose tags beside a sensitive one"] = {
         "contract": {"expose": {"tags": ["reference", "Pii"]}},
         "expect": False,
@@ -538,18 +595,16 @@ def _differs(tmp_path: Path, only: Tuple[str, ...] = ()) -> bool:
     return _outcomes(tmp_path, only) != _expected(only)
 
 
-#: The cases of the labels, the semantic types and the expose-level tags: a mutant of one of the
-#: three checks need only run its own.
+#: The cases of the labels, the semantic types and the expose-level tags and labels: a mutant of
+#: one of those checks need only run its own.
 _LABEL_CASES = ("labels", "harmless labels")
 _SEMANTIC_CASES = ("semantic type", "harmless semantic type")
-_EXPOSE_TAG_CASES = (
-    "expose tag",
-    "policy tag",
-    "authz tag",
-    "privacy tag",
-    "harmless",
-    "expose tags",
-)
+_EXPOSE_CASES = tuple(
+    f"{prefix}{where} {kind}"
+    for where in ("expose", "policy", "authz", "privacy")
+    for kind in ("tag", "labels")
+    for prefix in ("", "harmless ")
+) + ("expose tags",)
 
 
 def test_mutant_every_expose_counts_as_public(tmp_path, monkeypatch):
@@ -780,16 +835,6 @@ def test_mutant_no_semantic_type_is_personal(tmp_path, monkeypatch):
     assert _differs(tmp_path, _SEMANTIC_CASES)
 
 
-def test_mutant_a_semantic_type_is_read_without_folding_its_spelling(tmp_path, monkeypatch):
-    monkeypatch.setattr(references, "_semantic_name", lambda value: value)
-    assert _differs(tmp_path, _SEMANTIC_CASES)
-
-
-def test_mutant_a_semantic_type_is_read_without_its_separators(tmp_path, monkeypatch):
-    monkeypatch.setattr(references, "_semantic_name", lambda value: value.strip().casefold())
-    assert _differs(tmp_path, _SEMANTIC_CASES)
-
-
 def test_mutant_every_semantic_type_is_personal(tmp_path, monkeypatch):
     monkeypatch.setattr(references, "_typed_personal", lambda entry: "semanticType" in entry)
     assert _differs(tmp_path, _SEMANTIC_CASES)
@@ -797,7 +842,7 @@ def test_mutant_every_semantic_type_is_personal(tmp_path, monkeypatch):
 
 def test_mutant_no_expose_tag_marks_the_table(tmp_path, monkeypatch):
     monkeypatch.setattr(references, "_exposed_as_personal", lambda expose: False)
-    assert _differs(tmp_path, _EXPOSE_TAG_CASES)
+    assert _differs(tmp_path, _EXPOSE_CASES)
 
 
 def test_mutant_an_expose_tag_is_read_without_folding_its_case(tmp_path, monkeypatch):
@@ -811,7 +856,7 @@ def test_mutant_an_expose_tag_is_read_without_folding_its_case(tmp_path, monkeyp
         )
 
     monkeypatch.setattr(references, "_exposed_as_personal", exact)
-    assert _differs(tmp_path, _EXPOSE_TAG_CASES)
+    assert _differs(tmp_path, _EXPOSE_CASES)
 
 
 @pytest.mark.parametrize("where", ["expose", "policy", "authz", "privacy"])
@@ -828,7 +873,7 @@ def test_mutant_an_expose_tag_is_not_read_at_one_place(tmp_path, monkeypatch, wh
         return any(references._tagged_sensitive(each) for each in holders.values())
 
     monkeypatch.setattr(references, "_exposed_as_personal", missing)
-    assert _differs(tmp_path, _EXPOSE_TAG_CASES)
+    assert _differs(tmp_path, _EXPOSE_CASES)
 
 
 def test_mutant_a_versioned_target_is_published(tmp_path, monkeypatch):
@@ -889,6 +934,246 @@ def test_each_personal_semantic_type_is_refused_in_any_spelling(kind):
 def test_a_harmless_or_malformed_semantic_type_is_no_personal_data(kind):
     assert not references._typed_personal({"semanticType": kind})
     assert not references._typed_personal({})
+
+
+#: Spellings of personal data as Presidio, Google Cloud Sensitive Data Protection and Amazon Macie
+#: write them, and as contracts write them, listed by hand: not derived from the set under test.
+REAL_WORLD_PERSONAL_TYPES = (
+    # Presidio entity names
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "PERSON",
+    "IP_ADDRESS",
+    "MAC_ADDRESS",
+    "US_SSN",
+    "US_PASSPORT",
+    "US_DRIVER_LICENSE",
+    "US_ITIN",
+    "US_BANK_NUMBER",
+    "CREDIT_CARD",
+    "IBAN_CODE",
+    "MEDICAL_LICENSE",
+    "NRP",
+    # Google Cloud Sensitive Data Protection infoTypes
+    "PERSON_NAME",
+    "FIRST_NAME",
+    "LAST_NAME",
+    "STREET_ADDRESS",
+    "DATE_OF_BIRTH",
+    "CREDIT_CARD_NUMBER",
+    "PASSPORT",
+    "DRIVERS_LICENSE_NUMBER",
+    "USER_NAME",
+    "AGE",
+    "GENDER",
+    "ETHNIC_GROUP",
+    "MARITAL_STATUS",
+    "MEDICAL_RECORD_NUMBER",
+    "FINANCIAL_ACCOUNT_NUMBER",
+    "TAX_IDENTIFICATION_NUMBER",
+    # Amazon Macie managed data identifiers
+    "NAME",
+    "ADDRESS",
+    "LATITUDE_LONGITUDE",
+    "BANK_ACCOUNT_NUMBER",
+    "USA_SOCIAL_SECURITY_NUMBER",
+    "USA_PASSPORT_NUMBER",
+    "UK_PASSPORT_NUMBER",
+    "UK_NATIONAL_INSURANCE_NUMBER",
+    "UK_NHS_NUMBER",
+    "GERMANY_DRIVERS_LICENSE",
+    "CANADA_SOCIAL_INSURANCE_NUMBER",
+    "GERMANY_TAX_IDENTIFICATION_NUMBER",
+    "USA_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER",
+    "USA_HEALTH_INSURANCE_CLAIM_NUMBER",
+    "VEHICLE_IDENTIFICATION_NUMBER",
+    # as people write them in a contract
+    "e-mail",
+    "E-mail",
+    "e_mail",
+    "eMail",
+    "email",
+    "Email Address",
+    "emailAddress",
+    "UserName",
+    "user_name",
+    "CreditCardNumber",
+    "card_number",
+    "IPAddress",
+    "MACAddress",
+    "ip",
+    "phone_no",
+    "mobile",
+    "surname",
+    "given_name",
+    "family_name",
+    "tax_id",
+    "national_insurance_number",
+    "customer_email",
+    "date-of-birth",
+    "birthDate",
+    # a label where a kind of data belongs
+    "pii",
+    "PII",
+    "phi",
+    "sensitive",
+    "personal",
+    "personal_data",
+    "personal-data",
+    "confidential",
+)
+
+HARMLESS_TYPES = (
+    "country",
+    "currency",
+    "category",
+    "postal_code",
+    "location",
+    "identifier",
+    "uuid",
+    "date",
+    "timestamp",
+    "status",
+    "code",
+    "country_code",
+    "country_name",
+    "branch_name",
+    "currency_code",
+    "primary_key",
+    "zip_code",
+    "city",
+    "region",
+    "url",
+    "version",
+    "iban_prefix",
+)
+
+
+def _spelling_mismatches() -> Any:
+    """The hand-written spellings read wrongly: a personal one let through, a harmless one refused."""
+    wrong = [
+        each
+        for each in REAL_WORLD_PERSONAL_TYPES
+        if not references._typed_personal({"semanticType": each})
+    ]
+    wrong += [each for each in HARMLESS_TYPES if references._typed_personal({"semanticType": each})]
+    return wrong
+
+
+def test_the_hand_written_real_world_spellings_are_refused_and_the_harmless_types_are_not():
+    assert len(REAL_WORLD_PERSONAL_TYPES) >= 40 and len(HARMLESS_TYPES) >= 10
+    assert _spelling_mismatches() == []
+
+
+def test_the_label_like_semantic_types_are_in_the_set():
+    assert references._LABEL_LIKE_TYPES <= references.PERSONAL_SEMANTIC_TYPES
+    assert {"pii", "phi", "sensitive", "personal", "personal_data", "confidential"} == set(
+        references._LABEL_LIKE_TYPES
+    )
+
+
+def test_a_tag_or_label_is_read_by_its_parts():
+    for text in ("pii-email", "contains-pii", "has.phi", "x_sensitive_y", "ContainsPII", "PII"):
+        assert references._marks_sensitive(text), text
+    for text in ("personal-data", "Personal_Data", "personal data"):
+        assert references._marks_sensitive(text), text
+    for text in ("piiless", "pipeline", "sensitivity", "personal", "data", "alphi", ""):
+        assert not references._marks_sensitive(text), text
+
+
+def test_the_tags_forge_writes_for_a_personal_column_are_each_refused():
+    from fluid_build.copilot import pii
+
+    tags = [f"pii-{each}".replace("_", "-") for each in pii.PII_SENSITIVITY_MAP]
+    assert tags and all(references._tagged_sensitive({"tags": [tag]}) for tag in tags)
+
+
+def _mutant_hand_list_differs(monkeypatch: Any, name: str, value: Any) -> bool:
+    monkeypatch.setattr(references, name, value)
+    return bool(_spelling_mismatches())
+
+
+def test_mutant_an_acronym_before_a_word_is_not_split(monkeypatch):
+    import re
+
+    assert _mutant_hand_list_differs(monkeypatch, "_ACRONYM_JOINT", re.compile(r"(?!)"))
+
+
+def test_mutant_a_camel_case_joint_is_not_split(monkeypatch):
+    import re
+
+    assert _mutant_hand_list_differs(monkeypatch, "_CAMEL_JOINT", re.compile(r"(?!)"))
+
+
+def test_mutant_only_a_space_separates_the_parts_of_a_type(monkeypatch):
+    import re
+
+    assert _mutant_hand_list_differs(monkeypatch, "_NAME_SEPARATORS", re.compile(r"\s+"))
+
+
+def test_mutant_the_label_like_words_are_no_personal_type(monkeypatch):
+    held = references.PERSONAL_SEMANTIC_TYPES - references._LABEL_LIKE_TYPES
+    assert _mutant_hand_list_differs(monkeypatch, "PERSONAL_SEMANTIC_TYPES", held)
+
+
+def test_mutant_a_type_is_read_whole_only(monkeypatch):
+    def whole(entry: Any) -> bool:
+        semantic = entry.get("semanticType")
+        return (
+            isinstance(semantic, str)
+            and references._semantic_name(semantic) in references.PERSONAL_SEMANTIC_TYPES
+        )
+
+    monkeypatch.setattr(references, "_typed_personal", whole)
+    assert _spelling_mismatches()
+
+
+def test_mutant_a_type_that_ends_a_longer_one_counts_whatever_it_is(monkeypatch):
+    assert _mutant_hand_list_differs(monkeypatch, "_WHOLE_VALUE_ONLY", frozenset())
+
+
+def test_mutant_a_tag_is_read_whole_not_by_its_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        references,
+        "_marks_sensitive",
+        lambda value: value.strip().casefold() in ("pii", "phi", "sensitive", "personal-data"),
+    )
+    assert _differs(tmp_path)
+
+
+def test_mutant_personal_data_is_no_phrase(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_PERSONAL_PHRASES", frozenset())
+    assert _differs(tmp_path)
+
+
+def test_mutant_the_labels_of_an_expose_are_not_read(tmp_path, monkeypatch):
+    def tags_only(expose: Any) -> bool:
+        policy = expose.get("policy") or {}
+        holders = [expose, policy, policy.get("authz") or {}, policy.get("privacy") or {}]
+        return any(references._tagged_sensitive(each) for each in holders)
+
+    monkeypatch.setattr(references, "_exposed_as_personal", tags_only)
+    assert _differs(tmp_path, _EXPOSE_CASES)
+
+
+@pytest.mark.parametrize("where", ["expose", "policy", "authz", "privacy"])
+def test_mutant_the_labels_of_an_expose_are_not_read_at_one_place(tmp_path, monkeypatch, where):
+    def missing(expose: Any) -> bool:
+        policy = expose.get("policy") or {}
+        holders = {
+            "expose": expose,
+            "policy": policy,
+            "authz": policy.get("authz") or {},
+            "privacy": policy.get("privacy") or {},
+        }
+        return any(
+            references._tagged_sensitive(each)
+            or (name != where and references._labels_name_sensitive(each))
+            for name, each in holders.items()
+        )
+
+    monkeypatch.setattr(references, "_exposed_as_personal", missing)
+    assert _differs(tmp_path, _EXPOSE_CASES)
 
 
 def test_the_unmutated_gate_matches_its_expected_outcomes(tmp_path):

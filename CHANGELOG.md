@@ -365,14 +365,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sensitive` tag, a column restriction or a masking, but not for a column `labels` entry, a
   column `semanticType` or an expose-level tag, so a table with an email column typed
   `semanticType: email`, or tagged `pii` in its `policy.tags`, was still written under
-  `references`. It is now left out, and named under Not measured without a value, when a column
-  label's key or value is `pii`, `phi` or `sensitive` or its `sensitivity` is not `none`, when a
-  column's `semanticType` is one of a short list of personal data (email, phone, person and name
-  spellings, national and passport ids, address, date of birth, IP and MAC address, payment card,
-  username, credentials, medical, the classes `fluid forge` writes and their common spellings; a
-  key such as `identifier` or a place such as `location` is not), or when the expose's `tags`,
-  `policy.tags`, `policy.authz.tags` or `policy.privacy.tags` hold `pii`, `phi` or `sensitive`
-  (any case).
+  `references`. It is now left out, and named under Not measured without a value, when:
+  - a tag, or a label's key or value, of a column has a part that is `pii`, `phi` or `sensitive`
+    (split on `-`, `_` and `.`, and between a lower-case letter and a capital, any case, so
+    `pii-email`, which `fluid forge` writes, and `contains-pii` count), or is `personal-data` or
+    `personal_data` as a whole, or a column label `sensitivity` is not `none`;
+  - a column's `semanticType` is one of a list of personal data, read in any case and with any of
+    those separators (`e-mail`, `eMail`, `IPAddress` and `US_SSN` are read), or ends in one
+    (`USA_PASSPORT_NUMBER`, `customer_email`): the classes `fluid forge` writes (email, phone,
+    ssn, national_id, payment_card, dob, address, geo, name, ip_address, mac_address, credentials,
+    username, medical, special_category) and the names Presidio, Google Cloud Sensitive Data
+    Protection and Amazon Macie use for names, contact details, identity documents, tax and
+    insurance numbers, bank and card numbers, health records, dates of birth, age, gender and
+    similar; or the words `pii`, `phi`, `sensitive`, `personal`, `personal_data` and
+    `confidential`. A key such as `identifier`, a place such as `location` or `postal_code`, and
+    `country_name` are not refused;
+  - the expose's `tags` or `labels`, or those of its `policy`, `policy.authz` or
+    `policy.privacy`, say so as above.
+  A tag or label that only looks alike (`piiless`, `pipeline`) does not refuse.
 
 ## [0.41.0] — 2026-11-25
 
