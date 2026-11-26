@@ -73,6 +73,17 @@
 #
 # verify-pypi (install + smoke from real PyPI) still runs; it is the only
 # index install check on that path.
+#
+# Dry run: a pull request that changes the release path (the paths under
+# `pull_request:` below) runs this workflow with no tag, and the gate outputs
+# publish=false. build, docker (the image build, its version check and the
+# Grype gate) and release-notes run as they would for a release, the notes
+# reading the newest tag's CHANGELOG section. attest, the TestPyPI and PyPI
+# jobs, attest-image and github-release are skipped, and so are docker's login,
+# metadata and push steps: nothing is uploaded, signed, pushed or announced,
+# and no job that runs holds a signing token. To rehearse main as it is, open
+# a pull request that touches one of those paths. Never dispatch this workflow
+# to try it out: a manual run is a release.
 
 name: Release
 
@@ -80,6 +91,20 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # A dry run (see the header): a pull request that changes the release path
+  # runs every job up to the point where it would upload, sign, push or
+  # announce, and stops there.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - requirements/release-tools.in
+      - requirements/release-tools.txt
+      - requirements/release-image.in
+      - requirements/release-image.txt
+      - Dockerfile
+      - .grype.yaml
+      - pyproject.toml
+      - MANIFEST.in
   workflow_dispatch:
     inputs:
       tag:
@@ -92,10 +117,13 @@ on:
         type: boolean
         default: false
 
-# Don't let two simultaneous tag pushes race PyPI uploads.
+# Don't let two simultaneous tag pushes race PyPI uploads. A dry run has a group
+# of its own per pull request, so it never queues behind or ahead of a release
+# (a group keeps one pending run and cancels the one before it), and a newer
+# push to the pull request cancels the dry run of the older one.
 concurrency:
-  group: release
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('release-dry-run-{0}', github.ref) || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}  # Job-level permissions only — least privilege
 
@@ -121,6 +149,7 @@ jobs:
       contents: read
       actions: read            # read the matching ci.yml run status
     outputs:
+      publish: ${{ steps.meta.outputs.publish }}
       version: ${{ steps.meta.outputs.version }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
       profile: ${{ steps.meta.outputs.profile }}
@@ -131,9 +160,24 @@ jobs:
       - name: Parse & validate tag shape
         id: meta
         env:
+          EVENT_NAME: ${{ github.event_name }}
           TAG_INPUT: ${{ github.event.inputs.tag || github.ref_name }}
           SKIP_TESTPYPI_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_testpypi }}
         run: |
+          # A pull request is a dry run: no tag, nothing published. It
+          # rehearses a stable release.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            {
+              echo "publish=false"
+              echo "version="
+              echo "is_prerelease=false"
+              echo "profile=stable"
+              echo "tag="
+              echo "skip_testpypi=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::Dry run of the release: nothing is uploaded, signed, pushed or released."
+            exit 0
+          fi
           TAG="$TAG_INPUT"
           # Strict PEP 440 / semver-compatible shape with optional
           # pre-release suffix (a / b / rc / .dev).
@@ -155,6 +199,7 @@ jobs:
             echo "::warning::skip_testpypi: ${GITHUB_ACTOR} skipped TestPyPI for $TAG. It is published straight to PyPI; verify-pypi is the only index install check."
           fi
           {
+            echo "publish=true"
             echo "version=$VERSION"
             echo "is_prerelease=$PRE"
             echo "profile=$PROFILE"
@@ -165,6 +210,7 @@ jobs:
 
       - name: Assert tag points at a commit whose ci.yml is green
         id: commit
+        if: steps.meta.outputs.publish == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           TAG: ${{ steps.meta.outputs.tag }}
@@ -379,7 +425,8 @@ jobs:
   # ──────────────────────────────────────────────────────────────
   attest:
     name: Attest Build Provenance
-    needs: build
+    needs: [quality-gate, build]
+    if: needs.quality-gate.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write          # Sigstore / OIDC
@@ -461,7 +508,7 @@ jobs:
   publish-testpypi:
     name: Publish to TestPyPI
     needs: [quality-gate, attest]
-    if: needs.quality-gate.outputs.skip_testpypi != 'true'
+    if: needs.quality-gate.outputs.publish == 'true' && needs.quality-gate.outputs.skip_testpypi != 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -571,6 +618,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.quality-gate.result == 'success'
+      && needs.quality-gate.outputs.publish == 'true'
       && needs.build.result == 'success'
       && needs.attest.result == 'success'
       && (needs.verify-testpypi.result == 'success'
@@ -648,44 +696,42 @@ jobs:
           echo "PyPI package verified successfully"
 
   # ──────────────────────────────────────────────────────────────
-  # 4. GitHub Release with changelog and artifacts (after PyPI accepted it).
+  # 4a. Release notes from CHANGELOG.md. Read-only, so a dry run runs it;
+  #     github-release posts what it wrote.
   # ──────────────────────────────────────────────────────────────
-  github-release:
-    name: GitHub Release
-    needs: [quality-gate, build, publish-pypi]
-    # Announces only what PyPI accepted: a rejected upload (for example "file
-    # already exists" on a re-dispatched tag) must not cut a release.
-    # publish-pypi's own condition already requires the TestPyPI install check,
-    # or the outage path. The status functions are spelled out because the
-    # implicit success() is false when any ancestor was skipped, and on the
-    # outage path the TestPyPI jobs are.
-    if: ${{ !cancelled() && needs.quality-gate.result == 'success' && needs.build.result == 'success' && needs.publish-pypi.result == 'success' }}
+  release-notes:
+    name: Release Notes
+    needs: quality-gate
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ needs.quality-gate.outputs.sha }}
           fetch-depth: 0
-
-      - name: Download artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
-        with:
-          name: dist
-          path: dist/
+          persist-credentials: false
 
       - name: Generate release notes from CHANGELOG.md
-        id: notes
         # Extracts the '## [X.Y.Z] — date' section body from CHANGELOG.md.
         # Pre-release suffixes are stripped for lookup: v0.7.11a1 reads the
         # [0.7.11] section. If no matching section exists, falls back to a
         # git log since the previous tag (emitted as a workflow warning).
+        # A dry run reads the newest tag's section instead and fails if it is
+        # not found.
+        env:
+          PUBLISH: ${{ needs.quality-gate.outputs.publish }}
+          VERSION: ${{ needs.quality-gate.outputs.version }}
+          PROFILE: ${{ needs.quality-gate.outputs.profile }}
+          IS_PRE: ${{ needs.quality-gate.outputs.is_prerelease }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.quality-gate.outputs.version }}"
-          PROFILE="${{ needs.quality-gate.outputs.profile }}"
-          IS_PRE="${{ needs.quality-gate.outputs.is_prerelease }}"
+          if [ "$PUBLISH" != "true" ]; then
+            # A dry run has no tag: read the section of the newest tag this
+            # commit contains. That section exists, so it must be found.
+            VERSION=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)
+            VERSION="${VERSION#v}"
+          fi
 
           # Strip pre-release suffix for CHANGELOG lookup.
           BASE=$(echo "$VERSION" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
@@ -703,6 +749,10 @@ jobs:
           ' CHANGELOG.md || true)
 
           if [ -z "${NOTES// }" ]; then
+            if [ "$PUBLISH" != "true" ]; then
+              echo "::error::No CHANGELOG section found for [$BASE], the newest tag's version: the notes extractor is broken"
+              exit 1
+            fi
             echo "::warning::No CHANGELOG entry for [$BASE]; falling back to git log"
             PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
             if [ -n "$PREV_TAG" ]; then
@@ -753,6 +803,56 @@ jobs:
             echo "$NOTES"
           } > release-notes.md
 
+          if [ "$PUBLISH" != "true" ]; then
+            {
+              echo "## Release notes a release of $VERSION would carry (dry run)"
+              echo
+              cat release-notes.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────
+  # 4b. GitHub Release with changelog and artifacts (after PyPI accepted it).
+  # ──────────────────────────────────────────────────────────────
+  github-release:
+    name: GitHub Release
+    needs: [quality-gate, build, publish-pypi, release-notes]
+    # Announces only what PyPI accepted: a rejected upload (for example "file
+    # already exists" on a re-dispatched tag) must not cut a release.
+    # publish-pypi's own condition already requires the TestPyPI install check,
+    # or the outage path. The status functions are spelled out because the
+    # implicit success() is false when any ancestor was skipped, and on the
+    # outage path the TestPyPI jobs are.
+    if: >-
+      ${{ !cancelled()
+      && needs.quality-gate.result == 'success'
+      && needs.quality-gate.outputs.publish == 'true'
+      && needs.build.result == 'success'
+      && needs.publish-pypi.result == 'success'
+      && needs.release-notes.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: release-notes
+
       - name: Download SBOM
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -784,7 +884,12 @@ jobs:
     needs: [quality-gate, build, publish-pypi]
     # Moves the GHCR X.Y.Z, X.Y, <profile>-latest and latest tags only for a
     # version PyPI accepted. Gated like github-release, for the same reasons.
-    if: ${{ !cancelled() && needs.quality-gate.result == 'success' && needs.build.result == 'success' && needs.publish-pypi.result == 'success' }}
+    # A dry run builds, checks and scans the image, and pushes nothing.
+    if: >-
+      ${{ !cancelled()
+      && needs.quality-gate.result == 'success'
+      && needs.build.result == 'success'
+      && (needs.publish-pypi.result == 'success' || needs.quality-gate.outputs.publish == 'false') }}
     runs-on: ubuntu-latest
     # No signing token here: this job runs code from outside the repository's
     # locks (the image build installs the package's dependencies, and the
@@ -816,6 +921,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       - name: Log in to GHCR
+        if: needs.quality-gate.outputs.publish == 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0
         with:
           registry: ghcr.io
@@ -824,6 +930,7 @@ jobs:
 
       - name: Docker metadata
         id: docker-meta
+        if: needs.quality-gate.outputs.publish == 'true'
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -858,9 +965,17 @@ jobs:
       # the source tree, as before, it reported 0.0.0+unknown.
       - name: Check the image holds this release's wheel
         env:
+          PUBLISH: ${{ needs.quality-gate.outputs.publish }}
           VERSION: ${{ needs.quality-gate.outputs.version }}
         run: |
           set -euo pipefail
+          if [ "${PUBLISH}" != "true" ]; then
+            # A dry run has no tag: the version is the one the wheel was given.
+            wheels=(dist/*.whl)
+            VERSION="$(basename "${wheels[0]}" .whl)"
+            VERSION="${VERSION#*-}"
+            VERSION="${VERSION%%-*}"
+          fi
           got=$(docker run --rm --entrypoint python forge-cli:scan -I -c \
             'import fluid_build; print(fluid_build.__version__)')
           if [ "${got}" != "${VERSION}" ]; then
@@ -891,6 +1006,7 @@ jobs:
 
       - name: Build and push Docker image
         id: push
+        if: needs.quality-gate.outputs.publish == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
@@ -909,10 +1025,10 @@ jobs:
   # ──────────────────────────────────────────────────────────────
   attest-image:
     name: Attest Image Provenance
-    needs: docker
+    needs: [quality-gate, docker]
     # Explicit: on the outage path the TestPyPI jobs, ancestors through docker,
     # are skipped, and the implicit success() is then false.
-    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    if: ${{ !cancelled() && needs.docker.result == 'success' && needs.quality-gate.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       packages: write          # store the attestation in GHCR beside the image

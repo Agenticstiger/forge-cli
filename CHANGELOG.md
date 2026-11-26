@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wheel and the sdist after checking they are the files the build recorded before any of that
   code ran, and `attest-image` signs the pushed image. Nothing is published unless `attest`
   succeeded.
+- **A pull request that changes the release path rehearses the release.** `release.yml` runs as a
+  dry run on a pull request that touches it, the release locks, the Dockerfile, `.grype.yaml`,
+  `pyproject.toml` or `MANIFEST.in`. It builds and checks the distribution files, builds, checks
+  and scans the image, and writes the release notes from the newest tag's CHANGELOG section,
+  failing if that section is not found. It uploads, signs, pushes and announces nothing, no job it
+  runs holds a signing token, and it never shares the release's concurrency group. The release
+  notes are now written by a read-only job; the GitHub Release job only posts them.
 
 ### Fixed
 

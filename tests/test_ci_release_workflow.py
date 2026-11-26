@@ -284,11 +284,16 @@ def _order(jobs: dict) -> list[str]:
     return order
 
 
-def _simulate(jobs: dict, *, dispatch: bool, skip: bool, fail: str | None = None) -> dict[str, str]:
+def _simulate(
+    jobs: dict, *, dispatch: bool, skip: bool, fail: str | None = None, dry: bool = False
+) -> dict[str, str]:
     """{job: success | failure | skipped}. `fail` names a job whose work fails
-    if the job is allowed to run."""
+    if the job is allowed to run. `dry` is a pull request's dry run."""
     result: dict[str, str] = {}
-    gate_outputs = {"skip_testpypi": "true" if dispatch and skip else "false"}
+    gate_outputs = {
+        "skip_testpypi": "true" if dispatch and skip else "false",
+        "publish": "false" if dry else "true",
+    }
     for name in _order(jobs):
         job = jobs[name]
         ancestors_ok = all(result[a] == "success" for a in _ancestors(jobs, name))
@@ -306,7 +311,7 @@ def _simulate(jobs: dict, *, dispatch: bool, skip: bool, fail: str | None = None
                 ok = result[parts[1]] == "success"
                 return gate_outputs.get(parts[3], "") if ok and parts[1] == "quality-gate" else ""
             if path == "github.event_name":
-                return "workflow_dispatch" if dispatch else "push"
+                return "pull_request" if dry else "workflow_dispatch" if dispatch else "push"
             raise AssertionError(f"{_name}: expression reads unmodelled `{path}`")
 
         ctx = {
@@ -389,16 +394,32 @@ _PATHS = {
     "tag push": dict(dispatch=False, skip=False),
     "dispatch": dict(dispatch=True, skip=False),
     "dispatch with skip_testpypi": dict(dispatch=True, skip=True),
+    "pull request dry run": dict(dispatch=False, skip=False, dry=True),
+}
+
+# What a dry run leaves out: every job that uploads, signs or announces.
+_NOT_IN_A_DRY_RUN = {
+    "attest",
+    "publish-testpypi",
+    "verify-testpypi",
+    "publish-pypi",
+    "verify-pypi",
+    "attest-image",
+    "github-release",
 }
 
 
 @pytest.mark.parametrize("path", list(_PATHS))
 def test_a_healthy_run_publishes_everything_it_should(path: str) -> None:
     """Guards against over-gating: with nothing failing, every job runs, except
-    the two TestPyPI jobs on the outage path."""
+    the two TestPyPI jobs on the outage path and the publishing jobs on a dry
+    run."""
     jobs = _jobs()
     got = _simulate(jobs, **_PATHS[path])
-    skipped_on_purpose = _TESTPYPI_JOBS if _PATHS[path]["skip"] else set()
+    if _PATHS[path].get("dry"):
+        skipped_on_purpose = _NOT_IN_A_DRY_RUN
+    else:
+        skipped_on_purpose = _TESTPYPI_JOBS if _PATHS[path]["skip"] else set()
     assert {j for j, r in got.items() if r == "skipped"} == skipped_on_purpose, got
 
 
@@ -443,7 +464,7 @@ def test_normal_path_also_waits_for_pypi(path: str, downstream: str) -> None:
     assert got[downstream] == "skipped", f"{downstream} ran although publish-pypi failed ({path})"
 
 
-@pytest.mark.parametrize("path", list(_PATHS))
+@pytest.mark.parametrize("path", [p for p in _PATHS if not _PATHS[p].get("dry")])
 def test_verify_pypi_follows_a_successful_pypi_upload(path: str) -> None:
     assert _after_pypi_failure(path)["verify-pypi"] == "skipped"
 
@@ -456,16 +477,18 @@ def _ok(got: dict[str, str], job: str) -> bool:
 # the run skips TestPyPI. A job that runs when its rule is false acts on a step
 # that failed or never ran; one skipped when its rule is true is over-gated.
 _RUNS_WHEN = {
-    "quality-gate": lambda got, skip: True,
-    "build": lambda got, skip: _ok(got, "quality-gate"),
-    "attest": lambda got, skip: _ok(got, "build"),
-    "publish-testpypi": lambda got, skip: not skip and _ok(got, "attest"),
-    "verify-testpypi": lambda got, skip: not skip and _ok(got, "publish-testpypi"),
-    "publish-pypi": lambda got, skip: _ok(got, "attest") and (skip or _ok(got, "verify-testpypi")),
-    "verify-pypi": lambda got, skip: _ok(got, "publish-pypi"),
-    "docker": lambda got, skip: _ok(got, "publish-pypi"),
-    "attest-image": lambda got, skip: _ok(got, "docker"),
-    "github-release": lambda got, skip: _ok(got, "publish-pypi"),
+    "quality-gate": lambda got, skip, dry: True,
+    "build": lambda got, skip, dry: _ok(got, "quality-gate"),
+    "attest": lambda got, skip, dry: not dry and _ok(got, "build"),
+    "publish-testpypi": lambda got, skip, dry: not skip and _ok(got, "attest"),
+    "verify-testpypi": lambda got, skip, dry: not skip and _ok(got, "publish-testpypi"),
+    "publish-pypi": lambda got, skip, dry: _ok(got, "attest")
+    and (skip or _ok(got, "verify-testpypi")),
+    "verify-pypi": lambda got, skip, dry: _ok(got, "publish-pypi"),
+    "docker": lambda got, skip, dry: _ok(got, "build") and (dry or _ok(got, "publish-pypi")),
+    "attest-image": lambda got, skip, dry: not dry and _ok(got, "docker"),
+    "release-notes": lambda got, skip, dry: _ok(got, "quality-gate"),
+    "github-release": lambda got, skip, dry: _ok(got, "publish-pypi") and _ok(got, "release-notes"),
 }
 
 
@@ -482,10 +505,11 @@ def test_every_job_runs_exactly_when_its_rule_holds(path: str, failing: str | No
     is SKIPPED, and that condition would still cut a GitHub Release and move
     GHCR `latest` for a version PyPI never received."""
     got = _simulate(_jobs(), fail=failing, **_PATHS[path])
+    skip, dry = _PATHS[path]["skip"], _PATHS[path].get("dry", False)
     wrong = [
         f"{job} {'ran' if got[job] != 'skipped' else 'was skipped'}"
         for job, rule in _RUNS_WHEN.items()
-        if (got[job] != "skipped") is not rule(got, _PATHS[path]["skip"])
+        if (got[job] != "skipped") is not rule(got, skip, dry)
     ]
     assert not wrong, f"{path}, {failing or 'nothing'} failing: {wrong} in {got}"
 
@@ -936,3 +960,210 @@ def test_the_image_attestation_signs_the_digest_the_docker_job_pushed() -> None:
     (step,) = [s for s in _steps("attest-image") if "attest-build-provenance" in s.get("uses", "")]
     assert step["with"]["subject-digest"] == "${{ needs.docker.outputs.digest }}"
     assert step["with"]["push-to-registry"] is True
+
+
+# --------------------------------------------------------------------------
+# The dry run: a pull request rehearses the release and publishes nothing.
+# --------------------------------------------------------------------------
+
+_PUBLISHING_ACTIONS = (
+    "docker/login-action",
+    "pypa/gh-action-pypi-publish",
+    "actions/attest-build-provenance",
+    "softprops/action-gh-release",
+)
+
+
+def _publishes(step: dict) -> bool:
+    """A step that logs in, uploads, signs, pushes or announces."""
+    uses = step.get("uses", "")
+    if uses.startswith(_PUBLISHING_ACTIONS):
+        return True
+    return uses.startswith("docker/build-push-action") and step.get("with", {}).get("push") is True
+
+
+def _step_runs(job: str, step: dict, *, dry: bool) -> bool:
+    cond = step.get("if")
+    if cond is None:
+        return True
+
+    def lookup(path: str) -> object:
+        if path in ("needs.quality-gate.outputs.publish", "steps.meta.outputs.publish"):
+            return "false" if dry else "true"
+        raise AssertionError(f"{job}: step condition reads unmodelled `{path}`")
+
+    fns = {"success": lambda: True, "always": lambda: True}
+    fns.update({"failure": lambda: False, "cancelled": lambda: False})
+    return _condition(str(cond), {"lookup": lookup, "fn": fns})[0]
+
+
+@pytest.mark.parametrize("path", list(_PATHS))
+def test_a_dry_run_uploads_signs_pushes_and_announces_nothing(path: str) -> None:
+    """Job conditions keep the publishing jobs out of a dry run; step conditions
+    keep docker's login and push out of it. On a real run every one runs."""
+    jobs = _jobs()
+    dry = _PATHS[path].get("dry", False)
+    ran = _simulate(jobs, **_PATHS[path])
+    steps = [
+        (name, step)
+        for name, job in jobs.items()
+        if ran[name] != "skipped"
+        for step in job.get("steps", [])
+        if _publishes(step)
+    ]
+    running = [
+        f"{n}: {s.get('name') or s.get('uses')}" for n, s in steps if _step_runs(n, s, dry=dry)
+    ]
+    if dry:
+        assert not running, running
+        # Not vacuous: the dry run reaches docker, whose login and push it skips.
+        assert ran["docker"] == "success" and [n for n, _ in steps] == ["docker", "docker"]
+    else:
+        assert len(running) == len(steps) > 0, running
+
+
+def test_no_job_in_a_dry_run_holds_a_signing_token() -> None:
+    """A same-repository pull request gets the token scopes a job asks for. The
+    only write scope a dry run hands out is docker's, whose push is skipped."""
+    jobs = _jobs()
+    ran = _simulate(jobs, **_PATHS["pull request dry run"])
+    writes = {
+        (name, scope)
+        for name, job in jobs.items()
+        if ran[name] != "skipped"
+        for scope, level in (job.get("permissions") or {}).items()
+        if level == "write"
+    }
+    assert writes == {("docker", "packages")}, writes
+
+
+def test_a_dry_run_never_shares_the_release_concurrency_group() -> None:
+    """A group keeps one pending run and cancels the one before it, so a dry run
+    in the `release` group could cancel a tag push waiting there."""
+    conc = yaml.safe_load(WORKFLOW.read_text())["concurrency"]
+    assert conc["group"] == (
+        "${{ github.event_name == 'pull_request' && "
+        "format('release-dry-run-{0}', github.ref) || 'release' }}"
+    )
+    assert conc["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+
+
+def test_a_change_to_what_builds_the_release_runs_the_dry_run() -> None:
+    on = yaml.safe_load(WORKFLOW.read_text())[True]  # PyYAML reads the `on` key as True
+    assert set(on) == {"push", "pull_request", "workflow_dispatch"}, set(on)
+    paths = set(on["pull_request"]["paths"])
+    must = {
+        ".github/workflows/release.yml",
+        "requirements/release-tools.txt",
+        "requirements/release-image.txt",
+        "Dockerfile",
+        "pyproject.toml",
+    }
+    assert must <= paths, must - paths
+    assert [p for p in paths if not (REPO / p).exists()] == []
+
+
+@pytest.mark.parametrize(
+    "event, tag, publish",
+    [
+        ("pull_request", "1234/merge", "false"),
+        ("pull_request", "v1.2.0", "false"),  # a tag-shaped ref is still a dry run
+        ("push", "v1.2.0", "true"),
+        ("workflow_dispatch", "v1.2.0rc1", "true"),
+    ],
+)
+def test_the_gate_publishes_only_outside_a_pull_request(
+    tmp_path, event: str, tag: str, publish: str
+) -> None:
+    step = next(s for s in _steps("quality-gate") if s.get("id") == "meta")
+    out = tmp_path / "out"
+    env = {
+        **os.environ,
+        "EVENT_NAME": event,
+        "TAG_INPUT": tag,
+        "SKIP_TESTPYPI_INPUT": "false",
+        "GITHUB_OUTPUT": str(out),
+        "GITHUB_ACTOR": "someone",
+    }
+    subprocess.run(["bash", "-c", step["run"]], env=env, check=True, capture_output=True)
+    outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+    assert outputs["publish"] == publish, outputs
+    if publish == "false":
+        assert outputs["tag"] == outputs["version"] == "", outputs
+    else:
+        assert outputs["tag"] == tag and outputs["version"] == tag[1:], outputs
+
+
+_CHANGELOG = """# Changelog
+
+## [Unreleased]
+
+### Added
+
+- **A greenhouse view.**
+
+## [1.2.0] — 2026-01-02
+
+### Added
+
+- **A garden planner.**
+
+## [1.1.0] — 2026-01-01
+
+### Added
+
+- **A seed list.**
+"""
+
+
+def _notes(tmp_path: Path, changelog: str, *, publish: bool, version: str = "") -> tuple:
+    """Run the release-notes step under bash on a repository tagged v1.2.0."""
+    step = next(s for s in _steps("release-notes") if s.get("name", "").startswith("Generate"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+    _git(repo, "add", "CHANGELOG.md")
+    _git(repo, "commit", "-q", "-m", "first")
+    _git(repo, "tag", "v1.2.0")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "second")
+    summary = tmp_path / "summary.md"
+    env = {
+        **os.environ,
+        "PUBLISH": "true" if publish else "false",
+        "VERSION": version,
+        "PROFILE": "stable",
+        "IS_PRE": "false",
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    proc = subprocess.run(
+        ["bash", "-c", step["run"]], cwd=repo, env=env, capture_output=True, text=True
+    )
+    notes = repo / "release-notes.md"
+    return (
+        proc,
+        notes.read_text() if notes.exists() else "",
+        summary.read_text() if summary.exists() else "",
+    )
+
+
+def test_a_dry_run_reads_the_newest_tag_s_section(tmp_path) -> None:
+    proc, notes, summary = _notes(tmp_path, _CHANGELOG, publish=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "A garden planner." in notes and "A seed list." not in notes, notes
+    assert "A greenhouse view." not in notes and "data-product-forge==1.2.0" in notes, notes
+    assert "A garden planner." in summary, summary
+
+
+def test_a_dry_run_fails_when_the_newest_tag_s_section_is_not_found(tmp_path) -> None:
+    """The extractor once matched nothing for every release and fell back to
+    git log in silence; a dry run reads a section that exists, so it says so."""
+    broken = _CHANGELOG.replace("## [1.2.0] — 2026-01-02", "## 1.2.0 - 2026-01-02")
+    proc, _, _ = _notes(tmp_path, broken, publish=False)
+    assert proc.returncode != 0 and "::error::" in proc.stdout, proc.stdout
+
+
+def test_a_release_still_falls_back_to_git_log_with_a_warning(tmp_path) -> None:
+    proc, notes, summary = _notes(tmp_path, _CHANGELOG, publish=True, version="1.3.0")
+    assert proc.returncode == 0 and "::warning::" in proc.stdout, proc.stdout + proc.stderr
+    assert "- second (" in notes and summary == "", notes
