@@ -150,16 +150,19 @@ def schema_url_for(
     *,
     invariants: bool = False,
     relationships: Sequence[Mapping[str, Any]] = (),
+    queries: Sequence[Mapping[str, Any]] = (),
 ) -> str:
-    """The least format that holds *tables*, *relationships* and any ``invariants``.
+    """The least format that holds *tables*, *relationships*, any ``invariants`` and ``queries``.
 
-    1-4-0 with a rank correlation, a ``groupByBins``, a ``rowFloor`` or a relationship's
+    1-3-0 with a ``groupBy`` on a query's statistic (a query's rate per group); 1-4-0 with a rank correlation, a ``groupByBins``, a ``rowFloor`` or a relationship's
     statistic grouped by a parent column (and with cliques of ``cliqueMarginal/2`` or a
     ``cliqueSelection``); 1-3-0 with a ``groupByLink``; 1-2-0 with ``invariants``; 1-1-0
     when any statistic is ``quantile/2``; else 1-0-0. Each format holds everything the
     ones before it do.
     """
     needed = 2 if invariants else 0
+    if any("groupBy" in statistic for each in queries for statistic in each.get("statistics", ())):
+        needed = max(needed, 3)
     for table in tables.values():
         needed = max(needed, _table_format(table))
     for relationship in relationships:
@@ -175,11 +178,13 @@ def build_document(
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS,
     relationships: Sequence[Mapping[str, Any]] = (),
     invariants: Sequence[Mapping[str, Any]] = (),
+    queries: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
     """Assemble a document from tables already checked by *rule*, in the format they need.
 
     *invariants* are PROFILE-SPEC §5's facts' shares, checked by *rule*; a document that
-    holds any names format 1-2-0.
+    holds any names format 1-2-0. *queries* are §5's consumer queries' rates, checked by
+    *rule* too; one grouped by a column (a ``groupBy``) names format 1-3-0.
 
     *relationships* are PROFILE-SPEC §5's children per parent, also checked by *rule*;
     a document without any has no ``relationships`` key, as before there were any.
@@ -190,7 +195,7 @@ def build_document(
     built: Dict[str, Any] = {
         "_producer": producer,
         "_schemaURL": schema_url_for(
-            tables, invariants=bool(invariants), relationships=relationships
+            tables, invariants=bool(invariants), relationships=relationships, queries=queries
         ),
         "encoding": {"fractionalBits": fractional_bits, "rounding": "floor"},
         "disclosureRules": {rule.name: rule.to_document()},
@@ -200,6 +205,8 @@ def build_document(
         built["relationships"] = [dict(each) for each in relationships]
     if invariants:
         built["invariants"] = [dict(each) for each in invariants]
+    if queries:
+        built["queries"] = [dict(each) for each in queries]
     return built
 
 
