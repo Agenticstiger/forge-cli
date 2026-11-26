@@ -13,6 +13,7 @@ write-once under ``<prefix>/<product>/<env>/<identity hex>/``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -188,6 +189,29 @@ def test_another_run_of_this_identity_stands_and_nothing_is_written(tmp_path: Pa
         f"s3://acme-releases/{_prefix(first)}", written=0, already=0, by_another_run=True
     )
     assert s3.writes == before
+
+
+def test_another_identity_for_this_code_and_environment_is_refused(tmp_path: Path) -> None:
+    sealed(tmp_path / "one", {"bundle.tgz": b"bundle one"})
+    sealed(tmp_path / "two", {"bundle.tgz": b"bundle two"})
+    one = json.loads((tmp_path / "one" / "release.json").read_text(encoding="utf-8"))
+    for name, data in (("one", b"bundle one"), ("two", b"bundle two")):  # pin each bundle
+        index = json.loads((tmp_path / name / "release.json").read_text(encoding="utf-8"))
+        index["identity"]["bundle"] = {"sha256": "sha256:" + hashlib.sha256(data).hexdigest()}
+        from fluid_build.cli import _ship_release as release
+
+        index["identity_digest"] = release.identity_digest(index["identity"])
+        index["code_digest"] = release.code_digest(index["identity"])
+        (tmp_path / name / "release.json").write_text(json.dumps(index), encoding="utf-8")
+    s3 = FakeS3()
+    publish.publish_release(tmp_path / "one", TARGET, clients=s3)
+    before = list(s3.writes)
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "two", TARGET, clients=s3)
+    message = str(raised.value)
+    assert "already holds the release of another identity" in message
+    assert "for this code and environment" in message and "nothing was written" in message
+    assert s3.writes == before and one["code_digest"]
 
 
 def test_another_release_there_that_is_not_intact_writes_nothing(tmp_path: Path) -> None:

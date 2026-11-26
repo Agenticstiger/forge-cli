@@ -370,7 +370,14 @@ class _Upload:
         there = api_release.verify_release(self.uri, clients=lambda _service, _region: self.client)
         if there.intact and there.identity_digest == f"sha256:{identity_hex}":
             return True
-        why = "; ".join(there.problems) or "it is another identity's"
+        if there.intact:
+            raise PublishError(
+                f"{self.uri} already holds the release of another identity "
+                f"({there.identity_digest}) for this code and environment, and this run sealed "
+                f"sha256:{identity_hex}: the bundle, the artifacts or the plan differ. A "
+                "published release never changes; nothing was written"
+            )
+        why = "; ".join(there.problems)
         if there.status == api_release.UNDECIDED:
             raise PublishError(
                 f"{self.uri}release.json already holds another release, and it cannot be checked "
