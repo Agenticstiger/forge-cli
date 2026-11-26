@@ -217,3 +217,52 @@ def test_the_flag_is_on_the_parser() -> None:
     ship.register(parser.add_subparsers())
     args = parser.parse_args(["ship", "--release-archive", "out.tgz"])
     assert args.release_archive == "out.tgz"
+
+
+def test_a_refused_or_explained_run_creates_nothing(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    fake = _install(monkeypatch, bundled)
+    argv = ["--release-dir", "../rel", "--release-archive", "../rel/sub/a.tgz"]
+    assert _ship([*_UNTIL_4, *argv]) == 2
+    assert "lies inside" in caplog.text and not (work.parent / "rel").exists()
+    assert (
+        _ship(["--explain", "--release-dir", "../rel", "--release-archive", "../new/d/a.tgz"]) == 0
+    )
+    assert not (work.parent / "new").exists() and fake.calls == []
+
+
+def test_a_path_inside_the_release_through_a_link_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "rel").mkdir()
+    (tmp_path / "into").symlink_to(tmp_path / "rel", target_is_directory=True)
+    assert "lies inside" in str(archive.refusal(str(tmp_path / "into" / "a.tgz"), tmp_path / "rel"))
+    assert "at most 200 characters" in str(
+        archive.refusal(str(tmp_path / ("a" * 201 + ".tgz")), tmp_path / "rel")
+    )
+
+
+def test_an_unreadable_folder_in_the_release_writes_no_archive(tmp_path: Path) -> None:
+    from tests.cli._fake_s3 import sealed
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads any folder")
+    sealed(tmp_path / "rel")
+    (tmp_path / "rel" / "reports").chmod(0)
+    try:
+        with pytest.raises(archive.ArchiveError, match="cannot be read whole"):
+            archive.write_archive(tmp_path / "rel", str(tmp_path / "a.tgz"))
+    finally:
+        (tmp_path / "rel" / "reports").chmod(0o755)
+    assert not (tmp_path / "a.tgz").exists()
+
+
+def test_a_leftover_of_a_killed_run_is_neither_taken_nor_removed(tmp_path: Path) -> None:
+    from tests.cli._fake_s3 import sealed
+
+    sealed(tmp_path / "rel")
+    leftover = tmp_path / f".a.tgz.{os.getpid()}.partial"
+    leftover.write_bytes(b"an earlier run's")
+    digest = archive.write_archive(tmp_path / "rel", str(tmp_path / "a.tgz"))
+    assert leftover.read_bytes() == b"an earlier run's"
+    assert hashlib.sha256((tmp_path / "a.tgz").read_bytes()).hexdigest() == digest
+    assert [p.name for p in tmp_path.glob(".a.tgz.*")] == [leftover.name]
