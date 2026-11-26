@@ -200,9 +200,6 @@ def refusal(
             f"--release-dir {release_dir} already exists: a release goes into a new "
             "directory, never one an earlier run wrote"
         )
-    checkout = _checkout_problem(Path(opts.contract).absolute().parent)
-    if checkout:
-        return checkout
     for num in REQUIRED_STAGES:
         if num not in selected:
             why = not_selected.get(num, "not selected")
@@ -260,6 +257,15 @@ def checkout_head(directory: Path) -> Optional[str]:
             clean(err.strip().splitlines()[-1] if err.strip() else done.returncode, 160),
         )
     return None
+
+
+def checkout_refusal(release_dir: Optional[Path], opts: st.ShipOptions) -> Optional[str]:
+    """Why a release run would name a commit it was not built from, or ``None``. Asked last,
+    once every other refusal passed and the journal holds the target, just before stage 1:
+    it runs git, which a refused invocation should never need."""
+    if release_dir is None:
+        return None
+    return _checkout_problem(Path(opts.contract).absolute().parent)
 
 
 def _checkout_problem(contract_dir: Path) -> Optional[str]:

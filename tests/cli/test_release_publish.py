@@ -651,3 +651,26 @@ def test_a_checkout_without_git_is_named(
     monkeypatch.setattr(subprocess, "run", no_git)
     assert _ship_release.checkout_head(tmp_path) is None
     assert "release_checkout_unknown: git cannot run" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--stage", "1-2", "--ci-output", "plain", "--release-dir", "../rel"],
+        [*_UNTIL_4, "--release-dir", "../rel", "--artifacts", "missing.lock.yaml"],
+    ],
+)
+def test_a_refused_release_run_in_ci_runs_no_git(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, in_ci: None, argv: Any
+) -> None:
+    """In a CI runner the source commit is known, and the checkout check runs git: only once
+    every other refusal passed, just before stage 1."""
+    fake = _install(monkeypatch, bundled)
+    asked = []
+    monkeypatch.setattr(
+        "fluid_build.cli._ship_release.checkout_head", lambda d: asked.append(d) or None
+    )
+    assert _ship(argv) == 2
+    assert fake.calls == [] and asked == []
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel2"]) == 0
+    assert len(asked) == 1
