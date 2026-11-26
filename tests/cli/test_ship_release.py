@@ -37,6 +37,7 @@ from fluid_build.cli import _ship_report as report
 from fluid_build.cli import _ship_stages as st
 from fluid_build.cli import ship
 from fluid_build.forge.core import bundle as bundle_mod
+from fluid_build.util import release_record
 
 LOG = logging.getLogger("test_ship_release")
 REPO_ROOT = Path(fluid_build.__file__).resolve().parent.parent
@@ -314,8 +315,9 @@ def test_a_release_records_the_versions_of_the_exposes_and_the_code_it_was_built
     assert "refs/tags" not in json.dumps(index["identity"])
     # the code digest: the same for every environment sealed from this commit and lock
     assert index["code_digest"] == release.code_digest(index["identity"])
-    code = {k: index["identity"].get(k) for k in release.CODE_KEYS}
-    assert index["code_digest"] == "sha256:" + hashlib.sha256(release._canonical(code)).hexdigest()
+    code = {k: index["identity"].get(k) for k in release_record.CODE_KEYS}
+    canonical = release_record.canonical(code)
+    assert index["code_digest"] == "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 def test_the_release_names_its_bundles_source_contract_from_where_it_sits(

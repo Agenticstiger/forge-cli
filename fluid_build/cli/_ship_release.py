@@ -40,14 +40,12 @@ import tarfile
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 
-from fluid_build.util.release_record import (  # noqa: F401 - the record's names, used here too
-    CODE_KEYS,
+from fluid_build.util.release_record import (  # the record's names, which callers read here too
     RELEASE_INDEX,
     RELEASE_SCHEMA,
     code_digest,
     identity_digest,
 )
-from fluid_build.util.release_record import canonical as _canonical
 
 from . import _ship_report as report
 from . import _ship_stages as st
