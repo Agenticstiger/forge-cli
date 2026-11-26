@@ -31,7 +31,7 @@ import json
 import os
 import re
 import stat
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
@@ -81,15 +81,9 @@ class ReleaseVerification:
         return _EXIT[self.status]
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
-            "source": self.source,
-            "status": self.status,
-            "identity_digest": self.identity_digest,
-            "product_id": self.product_id,
-            "environment": self.environment,
-            "files_checked": self.files_checked,
-            "problems": list(self.problems),
-        }
+        out = asdict(self)
+        out["problems"] = list(self.problems)
+        return out
 
 
 class _NotIntact(Exception):
@@ -165,7 +159,19 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
     match = _DIGEST.fullmatch(digest)
     if named is not None and (match is None or match.group(1) != named):
         problems.append(f"it sits under {named}, the key of another identity")
-    files = index["files"]
+    checked, undecided = _check_files(reader, index["files"], problems)
+    if problems:
+        return result(NOT_INTACT, checked, problems)
+    if undecided:
+        return result(UNDECIDED, checked, undecided)
+    return result(INTACT, checked, [])
+
+
+def _check_files(
+    reader: "_Reader", files: Mapping[str, Any], problems: List[str]
+) -> Tuple[int, List[str]]:
+    """Hash every file ``files`` lists: how many were read, and which could not be. A file
+    that is not what the index names adds to ``problems``."""
     checked = 0
     undecided: List[str] = []
     for rel in sorted(files):
@@ -187,11 +193,7 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
         checked += 1
         if "sha256:" + actual != expected:
             problems.append(f"{_clean(rel)}: its bytes are not the sha256 the index names")
-    if problems:
-        return result(NOT_INTACT, checked, problems)
-    if undecided:
-        return result(UNDECIDED, checked, undecided)
-    return result(INTACT, checked, [])
+    return checked, undecided
 
 
 def _parse_index(data: bytes) -> Dict[str, Any]:
@@ -230,9 +232,11 @@ def _path_problem(rel: Any) -> Optional[str]:
 
 
 def _clean(value: Any, limit: int = 200) -> str:
-    """Text from a record, printable and cut, so a record cannot rewrite the terminal."""
-    text = "".join(ch if ch.isprintable() else "?" for ch in str(value))
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+    """Text from a record, printable and cut, as ``fluid runs status`` shows it, so a record
+    cannot rewrite the terminal."""
+    from fluid_build.cli.ops.release_status import clean
+
+    return clean(value, limit)
 
 
 class _Reader:

@@ -342,52 +342,71 @@ class _Upload:
             )
 
     def put(self, item: _File) -> None:
-        from fluid_build.util import s3
-
+        """Write one object, or find it already there; then read it back."""
         key = self.prefix + item.rel
-        shown = f"s3://{self.bucket}/{key}"
         for attempt in range(1, _CONFLICT_TRIES + 1):
-            fd = _open(item.path)
             try:
-                with os.fdopen(fd, "rb") as body:
-                    self.client.put_object(
-                        Bucket=self.bucket,
-                        Key=key,
-                        Body=body,
-                        ContentLength=item.size,
-                        ChecksumSHA256=s3.sha256_b64(item.sha256),
-                        IfNoneMatch="*",
-                    )
+                self._write(item, key)
+                break
             except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
-                code, status = s3.error_code(exc), s3.http_status(exc)
-                if code in s3.PRECONDITION_CODES or status == 412:
-                    head = self._head(key)
-                    if head is not None and self._same(head, item):
-                        self.already += 1
-                        return
-                    if self.index_there:
-                        why = "a published release never changes"
-                    else:  # an earlier run stopped before its release.json
-                        why = (
-                            f"{self.uri} holds no release.json, so no reader takes it as a "
-                            "release: an earlier run stopped partway. Delete the objects under "
-                            "it and run again, or publish the directory that run sealed"
-                        )
-                    raise self._fail(f"{shown} already holds other bytes; {why}") from None
-                if (code in s3.CONFLICT_CODES or status == 409) and attempt < _CONFLICT_TRIES:
-                    continue  # the write raced a delete of the key: S3 says try again
-                if s3.is_denied_code(code):
-                    raise self._fail(f"writing {shown} is denied (AccessDenied)") from None
-                if code in ("BadDigest", "InvalidDigest", "XAmzContentSHA256Mismatch"):
-                    raise self._fail(
-                        f"{item.path} changed while it was uploaded: S3 refused bytes that are "
-                        "not the sha256 the release names"
-                    ) from None
-                raise self._fail(
-                    f"{shown} cannot be written ({code or type(exc).__name__})"
-                ) from None
-            break
+                if self._after_refused_write(exc, item, key, last=attempt == _CONFLICT_TRIES):
+                    return  # already there, with our bytes
         head = self._head(key)
         if head is None or not self._same(head, item):
-            raise self._fail(f"{shown} does not read back with the sha256 the release names")
+            raise self._fail(
+                f"s3://{self.bucket}/{key} does not read back with the sha256 the release names"
+            )
         self.written += 1
+
+    def _write(self, item: _File, key: str) -> None:
+        from fluid_build.util import s3
+
+        with os.fdopen(_open(item.path), "rb") as body:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=body,
+                ContentLength=item.size,
+                ChecksumSHA256=s3.sha256_b64(item.sha256),
+                IfNoneMatch="*",
+            )
+
+    def _after_refused_write(self, exc: Exception, item: _File, key: str, *, last: bool) -> bool:
+        """What a refused write means: True when the object is already there with our bytes,
+        False to try again (a write that raced a delete, HTTP 409, while tries are left).
+
+        Raises:
+            PublishError: anything else.
+        """
+        from fluid_build.util import s3
+
+        shown = f"s3://{self.bucket}/{key}"
+        code, status = s3.error_code(exc), s3.http_status(exc)
+        if isinstance(exc, PublishError):
+            raise exc
+        if code in s3.PRECONDITION_CODES or status == 412:
+            head = self._head(key)
+            if head is not None and self._same(head, item):
+                self.already += 1
+                return True
+            raise self._fail(f"{shown} already holds other bytes; {self._why_other_bytes()}")
+        if (code in s3.CONFLICT_CODES or status == 409) and not last:
+            return False  # S3 says the write may be tried again
+        if s3.is_denied_code(code):
+            raise self._fail(f"writing {shown} is denied (AccessDenied)")
+        if code in ("BadDigest", "InvalidDigest", "XAmzContentSHA256Mismatch"):
+            raise self._fail(
+                f"{item.path} changed while it was uploaded: S3 refused bytes that are not the "
+                "sha256 the release names"
+            )
+        raise self._fail(f"{shown} cannot be written ({code or type(exc).__name__})")
+
+    def _why_other_bytes(self) -> str:
+        if self.index_there:
+            return "a published release never changes"
+        # An earlier run stopped before its release.json.
+        return (
+            f"{self.uri} holds no release.json, so no reader takes it as a release: an earlier "
+            "run stopped partway. Delete the objects under it and run again, or publish the "
+            "directory that run sealed"
+        )
