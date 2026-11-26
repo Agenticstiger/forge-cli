@@ -607,9 +607,30 @@ def test_ship_refuses_a_checkout_at_another_commit_than_the_ci_names(
     assert f"the CI names commit {COMMIT}, and the contract's checkout is at {'b' * 40}" in (
         caplog.text
     )
+    # the remedy names both variables a release reads its source from
+    assert "set both GITHUB_SHA to the commit checked out and GITHUB_REPOSITORY" in caplog.text
     assert fake.calls == []
     monkeypatch.setattr("fluid_build.cli._ship_release.checkout_head", lambda _d: COMMIT)
     assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+
+
+def test_the_checkout_remedy_names_the_running_ci_s_commit_and_repository_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import _ship_release
+    from tests.cli._ci_env import clear_ci_source
+
+    clear_ci_source(monkeypatch)
+    for name, value in {
+        "CI_JOB_ID": "7",
+        "CI_COMMIT_SHA": COMMIT,
+        "CI_PROJECT_URL": "https://gitlab.example.com/data/orders",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(_ship_release, "checkout_head", lambda _d: "b" * 40)
+    problem = _ship_release._checkout_problem(tmp_path)
+    assert problem is not None
+    assert "set both CI_COMMIT_SHA to the commit checked out and CI_PROJECT_URL" in problem
 
 
 def test_a_checkout_git_cannot_read_is_named_and_not_refused(

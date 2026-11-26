@@ -1216,12 +1216,14 @@ def _signature_problem(
     if result.get("exit_code") in (124, 127):  # cosign timed out, or could not run
         raise ReceiptError("--require-signed: cosign did not answer", UNDECIDED)
     if result.get("exit_code") != 0:
-        # cosign exits 1 both for a signature that does not verify and for a log or CA it
-        # cannot reach: either way the receipt is not taken
+        # cosign exits 1 for a signature that does not verify, for a log or CA it cannot reach
+        # and for a bundle another cosign major wrote that this one does not read: either way
+        # the receipt is not taken
         return (
             "--require-signed: cosign did not verify the newest receipt's signature for that "
-            "signer (a signature that does not hold, or a transparency log or certificate "
-            "authority it could not reach)" + _cosign_tail(result)
+            "signer (a signature that does not hold, a transparency log or certificate "
+            "authority it could not reach, or a bundle signed by another cosign major, such as "
+            "cosign 2 where 3 verifies, or the reverse)" + _cosign_tail(result)
         )
     try:
         signed = json.loads(files[wanted[0]].decode("utf-8"))
