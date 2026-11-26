@@ -414,6 +414,10 @@ def _release_to(args: argparse.Namespace) -> Tuple[str, Tuple[str, ...]]:
     if target is not None and not target.strip():  # `--release-to "$URI"` with URI unset
         raise st.ShipUsageError("--release-to needs s3://bucket/prefix/")
     given = getattr(args, "release_to_require", None) or []
+    if any(not str(v).strip(",").strip() for v in given):  # `--release-to-require "$X"`, X unset
+        raise st.ShipUsageError(
+            "--release-to-require needs a check: versioning or object-lock (comma-separated)"
+        )
     checks = [c.strip() for v in given for c in str(v).split(",") if c.strip()]
     unknown = sorted(set(checks) - set(_release_publish.REQUIREMENTS))
     if unknown:

@@ -22,7 +22,7 @@ import pytest
 from fluid_build.api import release as api_release
 from fluid_build.cli import _release_publish as publish
 from fluid_build.cli import ship
-from tests.cli._fake_s3 import FakeS3, hex_of, sealed
+from tests.cli._fake_s3 import FakeS3, S3Error, hex_of, sealed
 from tests.cli.test_ship_release import (  # noqa: F401 - fixtures
     _UNTIL_4,
     _clean_env,
@@ -242,6 +242,37 @@ def test_a_key_segment_the_release_cannot_name_is_refused(tmp_path: Path) -> Non
         publish.publish_release(tmp_path / "rel", TARGET, clients=FakeS3())
 
 
+def test_a_product_id_with_a_leading_underscore_is_published(tmp_path: Path) -> None:
+    sealed(tmp_path / "rel", product="_internal.v1")
+    done = publish.publish_release(tmp_path / "rel", TARGET, clients=FakeS3())
+    assert "/_internal.v1/" in done.uri
+
+
+def test_a_first_publish_needs_no_list_bucket(tmp_path: Path) -> None:
+    index = sealed(tmp_path / "rel")
+    s3 = FakeS3()
+    real_head = s3.head_object
+
+    def head(**kw: Any) -> Any:  # without s3:ListBucket a missing key answers 403
+        if (kw["Bucket"], kw["Key"]) not in s3.objects:
+            raise S3Error("AccessDenied", 403)
+        return real_head(**kw)
+
+    s3.head_object = head  # type: ignore[method-assign]
+    assert publish.publish_release(tmp_path / "rel", TARGET, clients=s3).written == 3
+    assert s3.writes[-1] == f"{_prefix(index)}release.json"
+
+
+def test_another_release_there_that_cannot_be_read_is_not_taken(tmp_path: Path) -> None:
+    first = sealed(tmp_path / "one", run_id="run-1")
+    sealed(tmp_path / "two", run_id="run-2")
+    s3 = FakeS3()
+    publish.publish_release(tmp_path / "one", TARGET, clients=s3)
+    s3.deny_get.add(f"{_prefix(first)}bundle.tgz")
+    with pytest.raises(publish.PublishError, match="and it cannot be checked"):
+        publish.publish_release(tmp_path / "two", TARGET, clients=s3)
+
+
 def test_the_bucket_checks_run_before_any_write(tmp_path: Path) -> None:
     sealed(tmp_path / "rel")
     s3 = FakeS3()
@@ -309,6 +340,14 @@ def test_ship_exits_1_when_the_publish_fails_and_keeps_the_sealed_release(
             "unknown check(s) acl",
         ),
         (["--release-dir", "../rel", "--release-to-require", "versioning"], "add --release-to"),
+        (
+            ["--release-dir", "../rel", "--release-to", TARGET, "--release-to-require", ""],
+            "--release-to-require needs a check",
+        ),
+        (
+            ["--release-dir", "../rel", "--release-to", TARGET, "--release-to-require", ","],
+            "--release-to-require needs a check",
+        ),
     ],
 )
 def test_ship_refuses_a_target_it_cannot_publish_to_before_any_stage(

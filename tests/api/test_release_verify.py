@@ -340,3 +340,75 @@ def test_a_pinned_release_in_s3_is_bound_too(tmp_path: Path) -> None:
     index["files"]["bundle.tgz"] = "sha256:" + hashlib.sha256(b"evil").hexdigest()
     s3.objects[_key(uri, "release.json")] = json.dumps(index).encode()
     assert verify_release(uri, clients=s3).status == "not-intact"
+
+
+# ---------------------------------------------------------------------------
+# Records a release never writes
+# ---------------------------------------------------------------------------
+
+
+def _reseal(directory: Path, **identity: Any) -> None:
+    """Change ``identity`` and recompute ``identity_digest``, as a writer of the record can."""
+    from fluid_build.cli import _ship_release as release
+
+    path = directory / "release.json"
+    index = json.loads(path.read_text(encoding="utf-8"))
+    index["identity"].update(identity)
+    index["identity_digest"] = release.identity_digest(index["identity"])
+    path.write_text(json.dumps(index), encoding="utf-8")
+
+
+@pytest.mark.parametrize("external", [5, True, "x", {"a": 1}])
+def test_an_external_entry_that_is_not_a_list_is_not_intact(tmp_path: Path, external: Any) -> None:
+    sealed(tmp_path / "rel")
+    _reseal(tmp_path / "rel", external=external)
+    result = verify_release(tmp_path / "rel")
+    assert result.exit_code == 1, result.problems
+
+
+def test_a_manifest_text_utf8_cannot_encode_is_not_intact(tmp_path: Path) -> None:
+    directory = _pinned(tmp_path / "rel")
+    path = directory / "artifacts/MANIFEST.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["files"]["odcs/orders.yaml"] = "\ud800"
+    _swap(directory, "artifacts/MANIFEST.json", json.dumps(manifest).encode())
+    assert verify_release(directory).exit_code == 1
+
+
+def test_a_file_under_a_file_is_missing(tmp_path: Path) -> None:
+    sealed(tmp_path / "rel", {"a": b"x", "b/c": b"y"})
+    (tmp_path / "rel" / "b" / "c").unlink()
+    (tmp_path / "rel" / "b").rmdir()
+    (tmp_path / "rel" / "b").write_bytes(b"a file")
+    result = verify_release(tmp_path / "rel")
+    assert (result.exit_code, result.problems) == (1, ("b/c: it is missing",))
+
+
+@pytest.mark.parametrize("rel", ["artifacts/evil.sh", "external/evil/evil.sh"])
+def test_a_file_the_identity_does_not_pin_under_its_dirs_is_not_intact(
+    tmp_path: Path, rel: str
+) -> None:
+    directory = _pinned(tmp_path / "rel")
+    (directory / rel).parent.mkdir(parents=True, exist_ok=True)
+    (directory / rel).write_bytes(b"#!/bin/sh")
+    _swap(directory, rel, b"#!/bin/sh")
+    result = verify_release(directory)
+    assert result.exit_code == 1
+    assert any(p.startswith(f"{rel}: the index lists it and the") for p in result.problems)
+
+
+def test_a_large_plan_and_a_name_the_generators_may_write_verify(tmp_path: Path) -> None:
+    directory = _pinned(tmp_path / "rel")
+    plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+    from fluid_build.forge.core.plan_digest import compute_plan_digest
+
+    plan["actions"] = [{"op": "noop", "pad": "x" * 1000} for _ in range(2000)]  # ~2 MB
+    plan["planDigest"] = compute_plan_digest(plan)
+    _swap(directory, "plan.json", json.dumps(plan).encode())
+    _reseal(
+        directory, plan={"bundle_digest": plan["bundleDigest"], "plan_digest": plan["planDigest"]}
+    )
+    (directory / "reports" / "my report@1.json").parent.mkdir(exist_ok=True)
+    _swap(directory, "reports/my report@1.json", b"{}")
+    result = verify_release(directory)
+    assert result.intact, result.problems

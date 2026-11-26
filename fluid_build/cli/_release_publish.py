@@ -42,7 +42,8 @@ MAX_OBJECT_BYTES = 5 * 1024**3
 REQUIREMENTS = ("versioning", "object-lock")
 _BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 _PREFIX_SEGMENT = re.compile(r"[A-Za-z0-9._=+-]{1,255}")
-_KEY_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._=+-]{0,199}")
+#: A product id (the contract's ``$defs.identifier``: a leading ``_`` too) or an environment.
+_KEY_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._=+-]{0,254}")
 _HEX = re.compile(r"sha256:([0-9a-f]{64})")
 #: Tries of one write that raced a delete of its key (HTTP 409).
 _CONFLICT_TRIES = 3
@@ -168,7 +169,7 @@ def publish_release(
         if not _KEY_SEGMENT.fullmatch(segment):
             raise PublishError(
                 f"the release's {what} {segment!r} cannot name an S3 key (letters, digits and "
-                "._=+-, starting with a letter or digit)"
+                "._=+-, starting with a letter, digit or _, at most 255)"
             )
     prefix = f"{where.prefix}{product}/{environment}/{identity_hex}/"
     uri = f"s3://{where.bucket}/{prefix}"
@@ -308,8 +309,10 @@ class _Upload:
                 "enabled; nothing was written"
             )
 
-    def _head(self, key: str) -> Optional[Dict[str, Any]]:
-        """The object's metadata with its checksum, or None when there is none."""
+    def _head(self, key: str, *, denied_is_missing: bool = False) -> Optional[Dict[str, Any]]:
+        """The object's metadata with its checksum, or None when there is none.
+        ``denied_is_missing``: without ``s3:ListBucket``, S3 answers a missing key with 403, so
+        a check before any write takes a refusal as no object (the write is still conditional)."""
         from fluid_build.util import s3
 
         try:
@@ -319,7 +322,7 @@ class _Upload:
             return head
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
             code = s3.error_code(exc)
-            if s3.is_missing_code(code):
+            if s3.is_missing_code(code) or (denied_is_missing and s3.is_denied_code(code)):
                 return None
             raise self._fail(
                 f"s3://{self.bucket}/{key} cannot be read back ({code or type(exc).__name__})"
@@ -343,7 +346,7 @@ class _Upload:
         taken as published."""
         from fluid_build.api import release as api_release
 
-        head = self._head(self.prefix + index.rel)
+        head = self._head(self.prefix + index.rel, denied_is_missing=True)
         self.index_there = head is not None
         if head is None or self._same(head, index):
             return False
@@ -351,6 +354,12 @@ class _Upload:
         if there.intact and there.identity_digest == f"sha256:{identity_hex}":
             return True
         why = "; ".join(there.problems) or "it is another identity's"
+        if there.status == api_release.UNDECIDED:
+            raise PublishError(
+                f"{self.uri}release.json already holds another release, and it cannot be checked "
+                f"({why}); nothing was written. Run again, or check it with fluid runs "
+                "verify-release"
+            )
         raise PublishError(
             f"{self.uri}release.json already holds another release that does not verify as this "
             f"one ({why}). A published release never changes; nothing was written"

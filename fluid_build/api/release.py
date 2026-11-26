@@ -54,9 +54,10 @@ UNDECIDED = "undecided"
 MAX_INDEX_BYTES = 1_048_576
 #: Files one index may list.
 MAX_FILES = 10_000
+#: Bytes of ``artifacts/MANIFEST.json`` or ``plan.json`` read to tie them to ``identity``.
+MAX_MEMBER_BYTES = 64 * 1_048_576
 _CHUNK = 1 << 20
 _DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
-_SEGMENT = re.compile(r"[A-Za-z0-9._=+-]{1,255}")
 _EXIT = {INTACT: 0, NOT_INTACT: 1, UNDECIDED: 2}
 
 
@@ -127,7 +128,13 @@ def verify_release(
             _S3Reader(text, clients, region) if text.startswith("s3://") else _DirReader(text)
         )
         index = _parse_index(reader.index())
-        return _check(shown, reader, index)
+        try:
+            return _check(shown, reader, index)
+        except (TypeError, ValueError, AttributeError, KeyError, RecursionError) as exc:
+            # a value of a type no release writes, somewhere inside a well-formed index
+            raise _NotIntact(
+                f"release.json holds a value no release writes ({type(exc).__name__})"
+            ) from None
     except _NotIntact as exc:
         return ReleaseVerification(shown, NOT_INTACT, problems=(str(exc),))
     except _Undecided as exc:
@@ -219,16 +226,26 @@ def _check_bound(
     bundle = identity.get("bundle")
     if isinstance(bundle, Mapping) and "sha256" in bundle:
         listed("bundle.tgz", bundle.get("sha256"), "the identity's bundle")
-    for item in identity.get("external") or []:
+    external = identity.get("external", [])
+    if not isinstance(external, list):
+        problems.append("its identity's external entry is not a list")
+        external = []
+    pinned_external = set()
+    for item in external:
         item = item if isinstance(item, Mapping) else {}
         digest = item.get("digest")
         hex_digest = digest.get("sha256") if isinstance(digest, Mapping) else None
         path = item.get("path")
+        rel = str(path) if isinstance(path, str) else "external/?"
+        pinned_external.add(rel)
         listed(
-            str(path) if isinstance(path, str) else "external/?",
+            rel,
             f"sha256:{hex_digest}" if isinstance(hex_digest, str) else None,
             "the identity's external entry",
         )
+    for rel in sorted(files):
+        if rel.startswith("external/") and rel not in pinned_external:
+            problems.append(f"{_clean(rel)}: the index lists it and the identity does not")
     artifacts = identity.get("artifacts")
     if isinstance(artifacts, Mapping) and "manifest_digest" in artifacts:
         _check_artifacts(reader, artifacts.get("manifest_digest"), files, problems, undecided)
@@ -245,7 +262,7 @@ def _read_json_member(
         problems.append(f"{rel}: the identity pins it and the index does not list it")
         return None
     try:
-        data = reader.read(rel, MAX_INDEX_BYTES)
+        data = reader.read(rel, MAX_MEMBER_BYTES)
     except _NotIntact as exc:
         problems.append(f"{rel}: {exc}")
         return None
@@ -257,7 +274,7 @@ def _read_json_member(
     except (ValueError, RecursionError):
         parsed = None
     if not isinstance(parsed, dict):
-        problems.append(f"{rel}: not a JSON object of at most {MAX_INDEX_BYTES:,} bytes")
+        problems.append(f"{rel}: not a JSON object")
         return None
     return parsed
 
@@ -280,7 +297,11 @@ def _check_artifacts(
     ):
         problems.append("artifacts/MANIFEST.json: lists no files map")
         return
-    if manifest.get("digest") != root or merkle_root(listed) != root:
+    try:
+        computed = merkle_root(listed)
+    except ValueError:  # text JSON can hold and UTF-8 cannot encode (a lone surrogate)
+        computed = None
+    if manifest.get("digest") != root or computed != root:
         problems.append(
             "artifacts/MANIFEST.json: its Merkle root is not the one the identity names"
         )
@@ -290,6 +311,12 @@ def _check_artifacts(
             problems.append(
                 f"{_clean(f'artifacts/{rel}')}: the index does not list it with the sha256 the "
                 "artifacts MANIFEST names"
+            )
+    named = {f"artifacts/{rel}" for rel in listed} | {"artifacts/MANIFEST.json"}
+    for rel in sorted(files):
+        if rel.startswith("artifacts/") and rel not in named:
+            problems.append(
+                f"{_clean(rel)}: the index lists it and the artifacts MANIFEST does not"
             )
 
 
@@ -345,7 +372,7 @@ def _path_problem(rel: Any) -> Optional[str]:
     parts = PurePosixPath(rel).parts
     if rel.startswith("/") or not parts or PurePosixPath(rel).as_posix() != rel:
         return "a path that is not one"
-    if any(p in (".", "..") or not _SEGMENT.fullmatch(p) for p in parts):
+    if any(p in (".", "..") or len(p) > 255 or not p.isprintable() for p in parts):
         return "a path that leads out of the release or has characters it never writes"
     if rel == "release.json":
         return "the index's own name"
@@ -404,7 +431,7 @@ class _DirReader(_Reader):
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             fd = os.open(path, flags | getattr(os, "O_BINARY", 0))
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):  # a file where a directory should be
             raise _NotIntact("it is missing") from None
         except OSError as exc:
             if exc.errno == errno.ELOOP:  # O_NOFOLLOW met a link
