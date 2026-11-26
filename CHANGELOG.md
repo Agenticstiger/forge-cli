@@ -216,14 +216,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy before the DAGs; a race (409) is tried three times; a bucket policy that enforces
   conditional writes (501) is named and refused. A release directory is put with the same
   conditions. It writes a deploy receipt (`"check": "deploy"`) with each target's VersionId,
-  and the deploy log as its report; a failure once a target was reached writes a FAILED one.
+  and the deploy log as its report, to `<code hex>/deploys/<env>/` (`deploys/<env>/` beside a
+  release directory), never under `receipts/<env>/`, so a deployer needs no write where the gate
+  reads; a failure once a target was reached writes a FAILED one.
   `--dry-run` writes nothing. Exit 0 deployed, 1 refused or failed, 2 cannot decide.
 
 - **Only a verify receipt gates.** A receipt now states `check`, `verify` or `deploy` (absent:
-  verify). `fluid runs receipt check` takes the newest verify receipt and passes deploy receipts
-  by, while the folder's rules still hold for them; with only deploy receipts it says a verify
-  receipt is needed. `fluid runs status --release-dir` lists the newest deploy receipt as
-  `deployed`. `--require-locked` says that a reader without `s3:GetObjectRetention` sees no lock.
+  verify). `fluid runs receipt check` reads `receipts/<env>/` only, and a newest entry there that
+  records anything but a verify fails the check, as any other foreign file does. `deploys/<env>/`
+  keeps the same write-once and listing rules and never gates. `fluid runs status --release-dir`
+  lists the newest deploy receipt as `deployed`. `--require-locked` says that a reader without
+  `s3:GetObjectRetention` sees no lock.
 
 - **A release is sealed only from the commit the CI names.** When the contract sits in a git
   checkout at another commit than the CI's variable names (the contract in a second repository

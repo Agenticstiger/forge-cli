@@ -28,6 +28,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 RECEIPT_SCHEMA = "fluid-receipt/1"
 RECEIPTS_DIR = "receipts"
+#: Where deploy receipts go: a folder of their own, so a deployer never needs to write where
+#: the gate reads (``receipts/<env>/`` stays the verifier's).
+DEPLOYS_DIR = "deploys"
 PASSED = "PASSED"
 FAILED = "FAILED"
 #: What a receipt records: a ``fluid verify`` check (the gate takes only these), or a ``fluid
@@ -121,6 +124,11 @@ def parse_receipt(name: str, data: bytes) -> Tuple[Optional[Dict[str, Any]], Opt
 def check_of(receipt: Mapping[str, Any]) -> str:
     """What a parsed receipt records: :data:`VERIFY` or :data:`DEPLOY`."""
     return str(receipt.get("check", VERIFY))
+
+
+def folder_of(check: str) -> str:
+    """The folder a receipt of ``check`` goes to: ``receipts`` or ``deploys``."""
+    return DEPLOYS_DIR if check == DEPLOY else RECEIPTS_DIR
 
 
 def newest_first(names: Sequence[str]) -> List[str]:

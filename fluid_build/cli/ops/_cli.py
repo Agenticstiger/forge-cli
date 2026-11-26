@@ -322,8 +322,8 @@ def _register_deploy(sub: argparse._SubParsersAction) -> None:
             "each target, every Airflow DAG last: a target that already has the file's SHA-256 "
             "is left alone; otherwise the release object at its verified version is copied "
             "with If-Match the target's ETag, or If-None-Match * for a new one, and read back. "
-            "Records a deploy receipt beside the release, which never gates (only a verify "
-            "receipt does). Exit 0 deployed or nothing to change, 1 refused or failed, 2 cannot "
+            "Records a deploy receipt in deploys/<env>/ beside the release, which never gates "
+            "(only a verify receipt in receipts/<env>/ does). Exit 0 deployed or nothing to change, 1 refused or failed, 2 cannot "
             "decide."
         ),
     )

@@ -514,10 +514,11 @@ class _Place:
     client: Any = None
     bucket: str = ""
 
-    def store(self, environment: str) -> _Store:
+    def store(self, environment: str, folder: str = rr.RECEIPTS_DIR) -> _Store:
+        """The receipts of ``environment`` (``folder`` ``deploys``: its deploy receipts)."""
         if self.client is None:
-            return _DirStore(Path(self.parent) / rr.RECEIPTS_DIR / environment)
-        prefix = f"{self.parent}{rr.RECEIPTS_DIR}/{environment}/"
+            return _DirStore(Path(self.parent) / folder / environment)
+        prefix = f"{self.parent}{folder}/{environment}/"
         return _S3Store(self.client, self.bucket, prefix)
 
     def release_of(self, environment: str) -> str:
@@ -853,7 +854,7 @@ def write_receipt(
         "targets": [dict(t) for t in targets],
         "ci": _no_userinfo(_attestation._collect_run_metadata()),
     }
-    store = place.store(checked.environment)
+    store = place.store(checked.environment, rr.folder_of(check))
     data = json.dumps(receipt, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     # Signed before anything is written, so a signing failure leaves nothing behind. Then the
     # report, the signature files, and the receipt last: a reader takes a receipt only with
@@ -987,15 +988,13 @@ class Checked:
 
 
 def _newest_receipt(
-    store: _Store, code_digest: str, ignored: List[str], check: Optional[str] = rr.VERIFY
+    store: _Store, code_digest: str, ignored: List[str], check: str = rr.VERIFY
 ) -> Tuple[str, Dict[str, Any], bytes]:
-    """The newest receipt in ``store`` for ``code_digest`` that records ``check`` (None: any),
-    with its bytes. Fail closed: when the newest file that may be a receipt does not parse,
-    that is the answer, not an older one, and the folder rules hold for every receipt read on
-    the way, deploy receipts too. A receipt of this code named later than now (past a few
-    minutes of clock skew) decides nothing; another entry named so is passed over and noted.
-    Only a check gates: a deploy receipt records a copy, not a check of what was copied."""
-    passed_over = 0
+    """The newest receipt in ``store`` for ``code_digest``, with its bytes; the folder holds
+    receipts of ``check`` only (``receipts/``: verify, ``deploys/``: deploy). Fail closed: when
+    the newest file that may be a receipt does not parse, or records another check, that is the
+    answer, not an older one. A receipt of this code named later than now (past a few minutes
+    of clock skew) decides nothing; another entry named so is passed over and noted."""
     # ``<code hex>/receipts/`` in S3 holds one code's receipts only; on disk one ``receipts/``
     # beside several releases holds several codes' receipts.
     shared = isinstance(store, _DirStore)
@@ -1025,16 +1024,12 @@ def _newest_receipt(
                 )
             ignored.append(f"{name}: a receipt of other code")
             continue
-        if check is not None and rr.check_of(receipt) != check:
-            passed_over += 1
-            continue
+        if rr.check_of(receipt) != check:
+            raise ReceiptError(
+                f"the newest receipt, {store.shown}{name}, records a {rr.check_of(receipt)}, and "
+                f"this folder holds {check} receipts only: the receipts there decide nothing"
+            )
         return name, receipt, data
-    if passed_over and check == rr.VERIFY:
-        raise NoReceipt(
-            f"{store.shown} holds deploy receipts and no verify receipt for code {code_digest}; "
-            "a deploy is no check: a verify receipt is needed (fluid verify --release SRC --out "
-            "R, then fluid runs receipt record SRC --report R)"
-        )
     raise NoReceipt(f"{store.shown} holds no receipt for code {code_digest}")
 
 
@@ -1374,29 +1369,34 @@ def newest_by_environment(
 ) -> Dict[str, Dict[str, Any]]:
     """For ``fluid runs status``: the newest verify receipt of each environment beside a release
     on disk, for its code digest, as ``{env: {"result", "time_verified", "identity_digest"}}``,
-    picked as ``receipt check`` picks it, and under ``"deploy"`` the newest deploy receipt in the
-    same shape: when the newest file there is not a receipt, or the directory cannot be read, the
-    entry is ``{"problem": ...}``. An environment with neither receipt for the code is left
-    out."""
+    picked as ``receipt check`` picks it, and under ``"deploy"`` the newest deploy receipt (from
+    ``deploys/<env>/``) in the same shape: when the newest file there is not a receipt, or the
+    directory cannot be read, the entry is ``{"problem": ...}``. An environment with neither
+    receipt for the code is left out."""
     out: Dict[str, Dict[str, Any]] = {}
     if code_digest is None:
         return out
-    root = release_dir.absolute().parent / rr.RECEIPTS_DIR
-    try:
-        environments = sorted(os.listdir(root))[:100]
-    except OSError:
-        return out
-    for env in environments:
+    base = release_dir.absolute().parent
+    environments: List[str] = []
+    for folder in (rr.RECEIPTS_DIR, rr.DEPLOYS_DIR):
         try:
-            if env.startswith(".") or not stat.S_ISDIR(os.lstat(root / env).st_mode):
-                continue
+            listed = sorted(os.listdir(base / folder))[:100]
         except OSError:
             continue
+        for env in listed:
+            try:
+                if env.startswith(".") or not stat.S_ISDIR(os.lstat(base / folder / env).st_mode):
+                    continue
+            except OSError:
+                continue
+            if env not in environments:
+                environments.append(env)
+    for env in sorted(environments)[:100]:
         entry: Dict[str, Any] = {}
         for check in (rr.VERIFY, rr.DEPLOY):
             try:
                 _name, receipt, _data = _newest_receipt(
-                    _DirStore(root / env), code_digest, [], check
+                    _DirStore(base / rr.folder_of(check) / env), code_digest, [], check
                 )
             except NoReceipt:
                 continue

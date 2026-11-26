@@ -515,7 +515,7 @@ def test_a_deploy_copies_each_target_on_condition_dags_last_and_records_a_receip
         assert copy["ExpectedBucketOwner"] == ACCOUNT
     assert [t["action"] for t in done.targets] == ["copied", "copied"]
     assert all(t["version_id"] for t in done.targets)
-    assert done.receipt and "/receipts/prod/" in done.receipt
+    assert done.receipt and "/deploys/prod/" in done.receipt  # never where the gate reads
     stored = json.loads(s3.objects[("acme-releases", done.receipt.split("/", 3)[3])])
     assert stored["check"] == "deploy" and stored["result"] == "PASSED"
     assert [t["action"] for t in stored["targets"]] == ["copied", "copied"]
@@ -709,7 +709,7 @@ def test_a_release_on_disk_is_put_with_its_checksum_and_the_same_conditions(
     assert done.exit_code == 0, done.reason
     assert [p["Key"] for p in s3.puts] == ["jobs/orders_jobs.zip", "dags/orders_dag.py"]
     assert all(p["IfNoneMatch"] == "*" and p["ExpectedBucketOwner"] == ACCOUNT for p in s3.puts)
-    assert (tmp_path / "receipts" / "prod").is_dir()
+    assert (tmp_path / "deploys" / "prod").is_dir() and not (tmp_path / "receipts").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +734,7 @@ def test_require_receipt_needs_a_verify_receipt_and_a_deploy_receipt_is_none(
     assert done.exit_code == 1 and "holds no receipt" in done.reason
     assert _deploy(nonprod, s3, env="nonprod").exit_code == 0  # a deploy receipt in nonprod
     done = _deploy(prod, s3, require_receipt="nonprod", now=T0 + timedelta(seconds=1))
-    assert done.exit_code == 1 and "a verify receipt is needed" in done.reason
+    assert done.exit_code == 1 and "receipts/nonprod/ holds no receipt" in done.reason
     assert _target_writes(s3) == ["jobs/orders_jobs.zip", "dags/orders_dag.py"]  # nonprod's
 
 
@@ -761,15 +761,63 @@ def test_the_gate_passes_on_the_verify_receipt_whether_a_deploy_is_newer_or_olde
     assert done.exit_code == 0, done.reason
 
 
-def test_the_folder_rules_hold_over_a_deploy_receipt(tmp_path: Path, s3: DeployS3) -> None:
+def _deploys_key(receipt_uri: str) -> str:
+    return receipt_uri.split("/", 3)[3]
+
+
+def test_a_verify_receipt_a_deployer_writes_under_deploys_does_not_move_the_gate(
+    tmp_path: Path, s3: DeployS3
+) -> None:
+    """A deployer writes deploys/<env>/ only: a PASSED verify receipt it puts there (the bytes of
+    a real one) is never read by the gate."""
+    nonprod = _published(tmp_path, s3, "nonprod", block=_deploy_block())
+    prod = _published(tmp_path, s3, "prod")
+    _verify_receipt(tmp_path, s3, nonprod, T0)
+    forged = {
+        k.replace("/receipts/nonprod/", "/deploys/nonprod/"): v
+        for (b, k), v in s3.objects.items()
+        if "/receipts/nonprod/" in k
+    }
+    for b, k in [bk for bk in s3.objects if "/receipts/nonprod/" in bk[1]]:
+        del s3.objects[(b, k)]
+    for k, v in forged.items():
+        s3.put("acme-releases", k, v)
+    found = receipts.check_receipt(prod, environment="nonprod", clients=s3)
+    assert found.exit_code == 1 and "receipts/nonprod/ holds no receipt" in found.reason
+
+
+def test_a_deploy_receipt_in_the_gate_s_folder_fails_closed(tmp_path: Path, s3: DeployS3) -> None:
+    """receipts/<env>/ holds verify receipts only: anything else there decides nothing, even
+    with an older PASSED verify receipt beside it."""
     nonprod = _published(tmp_path, s3, "nonprod", block=_deploy_block())
     prod = _published(tmp_path, s3, "prod")
     _verify_receipt(tmp_path, s3, nonprod, T0)
     done = _deploy(nonprod, s3, env="nonprod", now=T0 + timedelta(seconds=1))
-    s3.deleted.add(str(done.receipt).split("/", 3)[3])  # a delete marker on the deploy receipt
-    del s3.objects[("acme-releases", str(done.receipt).split("/", 3)[3])]
+    for suffix in (".json", ".report.json"):
+        src = _deploys_key(str(done.receipt)).removesuffix(".json") + suffix
+        s3.put(
+            "acme-releases",
+            src.replace("/deploys/", "/receipts/"),
+            s3.objects[("acme-releases", src)],
+        )
     found = receipts.check_receipt(prod, environment="nonprod", clients=s3)
-    assert found.exit_code == 1
+    assert found.exit_code == 1 and "records a deploy" in found.reason
+
+
+def test_deploy_receipts_keep_the_folder_rules_and_never_gate(tmp_path: Path, s3: DeployS3) -> None:
+    nonprod = _published(tmp_path, s3, "nonprod", block=_deploy_block())
+    prod = _published(tmp_path, s3, "prod")
+    _verify_receipt(tmp_path, s3, nonprod, T0)
+    done = _deploy(nonprod, s3, env="nonprod", now=T0 + timedelta(seconds=1))
+    # a delete marker on the deploy receipt: the gate never reads deploys/, so it still passes
+    s3.deleted.add(_deploys_key(str(done.receipt)))
+    del s3.objects[("acme-releases", _deploys_key(str(done.receipt)))]
+    assert receipts.check_receipt(prod, environment="nonprod", clients=s3).exit_code == 0
+    store = receipts._place(nonprod, str(done.receipt).split("/")[-4], "nonprod", s3, None).store(
+        "nonprod", rr.DEPLOYS_DIR
+    )
+    with pytest.raises(receipts.ReceiptError, match="overwritten or deleted"):
+        receipts._newest_receipt(store, "sha256:" + str(done.receipt).split("/")[-4], [], rr.DEPLOY)
 
 
 def test_a_receipt_with_another_check_is_not_one() -> None:

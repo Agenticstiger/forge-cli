@@ -3,7 +3,8 @@
 
 """``fluid runs deploy SRC --env E``: copy the external files a sealed release names to where
 its ``identity["deploy"]`` sends them (``fluid ship --deploy-targets``), then record a deploy
-receipt beside the release.
+receipt in ``deploys/<env>/`` beside the release (never in ``receipts/<env>/``, where only
+the verifier writes).
 
 Before anything is written it verifies the release (intact, with a code digest), that it is the
 release of ``--env``, optionally that an earlier environment's verify receipt lets it on
