@@ -34,11 +34,26 @@ from tests.cli.test_ship_release import (  # noqa: F401 - fixtures
 
 pytestmark = pytest.mark.unit
 
+COMMIT = "c0ffee" * 6 + "c0ff"
+
+
+@pytest.fixture
+def in_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CI run that names its commit: the release then has a code digest."""
+    for name, value in {
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_SHA": COMMIT,
+        "GITHUB_REPOSITORY": "org/orders",
+        "GITHUB_SERVER_URL": "https://github.com",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+
 TARGET = "s3://acme-releases/handoff/"
 
 
-def _prefix(index: Any) -> str:
-    return f"handoff/acme.orders/dev/{hex_of(index)}/"
+def _prefix(index: Any, env: str = "dev") -> str:
+    return f"handoff/acme.orders/{hex_of(index)}/{env}/"
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +90,15 @@ def test_a_target_that_is_not_one_is_refused(value: str, problem: str) -> None:
         publish.parse_target(value)
 
 
-def test_the_target_needs_a_release_and_boto3(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_the_target_needs_a_release_a_ci_commit_and_boto3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, in_ci: None
 ) -> None:
     assert "add --release-dir" in str(publish.refusal(TARGET, None, ()))
     assert "add --release-to" in str(publish.refusal("", tmp_path, ("versioning",)))
     assert publish.refusal(TARGET, tmp_path, ()) is None
+    monkeypatch.delenv("GITHUB_RUN_ID")
+    assert "needs the commit the CI built" in str(publish.refusal(TARGET, tmp_path, ()))
+    monkeypatch.setenv("GITHUB_RUN_ID", "42")
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     assert "pip install 'data-product-forge[aws]'" in str(publish.refusal(TARGET, tmp_path, ()))
 
@@ -298,7 +316,7 @@ def _report(work: Path) -> Any:
 
 
 def test_ship_publishes_the_sealed_release(
-    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, in_ci: None
 ) -> None:
     _install(monkeypatch, bundled)
     s3 = FakeS3()
@@ -307,14 +325,17 @@ def test_ship_publishes_the_sealed_release(
     assert code == 0
     remote = _report(work)["release"]["remote"]
     assert remote["status"] == "published" and remote["already_there"] == 0
-    assert remote["uri"].startswith("s3://acme-releases/handoff/example.release/dev/")
+    assert remote["uri"].startswith("s3://acme-releases/handoff/example.release/")
+    sealed_index = json.loads((work.parent / "rel" / "release.json").read_text(encoding="utf-8"))
+    code_hex = sealed_index["code_digest"].split(":", 1)[1]
+    assert remote["uri"].endswith(f"/{code_hex}/dev/")
     assert s3.writes[-1].endswith("/release.json")
     assert api_release.verify_release(remote["uri"], clients=s3).intact
     assert api_release.verify_release(work.parent / "rel").intact
 
 
 def test_ship_exits_1_when_the_publish_fails_and_keeps_the_sealed_release(
-    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, in_ci: None
 ) -> None:
     _install(monkeypatch, bundled)
     s3 = FakeS3()
@@ -360,14 +381,14 @@ def test_ship_refuses_a_target_it_cannot_publish_to_before_any_stage(
 
 
 def test_explain_names_where_the_release_goes(
-    work: Path, capsys: pytest.CaptureFixture[str]
+    work: Path, capsys: pytest.CaptureFixture[str], in_ci: None
 ) -> None:
     assert (
         _ship(["--explain", "--release-dir", "../rel", "--release-to", "s3://acme-releases/h"]) == 0
     )
     assert (
         "remote: then published, write-once, under "
-        "s3://acme-releases/h/<product>/<env>/<identity hex>/"
+        "s3://acme-releases/h/<product>/<code hex>/<env>/"
     ) in capsys.readouterr().out
 
 

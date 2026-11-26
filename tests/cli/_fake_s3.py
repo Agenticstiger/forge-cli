@@ -16,6 +16,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fluid_build.cli import _ship_release as release
 
+#: The commit a test release was built from, as a CI names it.
+SOURCE = {
+    "uri": "git+https://git.example.com/data/orders",
+    "digest": {"gitCommit": "c0ffee" * 6 + "c0ff"},
+}
+
 
 class S3Error(Exception):
     """What botocore's ``ClientError`` carries that the code reads."""
@@ -41,6 +47,7 @@ class FakeS3:
         self.versioning: Optional[str] = None
         self.object_lock = False
         self.misreport: Set[str] = set()  # keys whose read-back checksum is wrong
+        self.versions = False  # a versioned bucket: GetObject answers a VersionId
 
     def __call__(self, service: str, region: Optional[str]) -> "FakeS3":
         assert service == "s3"
@@ -96,7 +103,10 @@ class FakeS3:
             raise S3Error("AccessDenied", 403)
         if (Bucket, Key) not in self.objects:
             raise S3Error("NoSuchKey", 404)
-        return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
+        got: Dict[str, Any] = {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
+        if self.versions:
+            got["VersionId"] = hashlib.sha256(Key.encode()).hexdigest()[:32]
+        return got
 
     def get_bucket_versioning(self, *, Bucket: str) -> Dict[str, Any]:
         self.calls.append("get_bucket_versioning")
@@ -123,11 +133,17 @@ def sealed(
     for rel, data in files.items():
         (directory / rel).parent.mkdir(parents=True, exist_ok=True)
         (directory / rel).write_bytes(data)
-    identity = {"product_id": product, "environment": environment, "fluid_version": "0.7.7"}
+    identity: Dict[str, Any] = {
+        "product_id": product,
+        "environment": environment,
+        "fluid_version": "0.7.7",
+        "source": SOURCE,
+    }
     index = {
         "schema": release.RELEASE_SCHEMA,
         "identity": identity,
         "identity_digest": release.identity_digest(identity),
+        "code_digest": release.code_digest(identity),
         "gates": [],
         "files": release._files(directory),
         "provenance": {"run_id": run_id, "finished_at": "2026-11-26T10:00:00Z"},
@@ -138,5 +154,5 @@ def sealed(
     return index
 
 
-def hex_of(index: Dict[str, Any]) -> str:
-    return str(index["identity_digest"]).split(":", 1)[1]
+def hex_of(index: Dict[str, Any], key: str = "code_digest") -> str:
+    return str(index[key]).split(":", 1)[1]

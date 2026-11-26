@@ -76,7 +76,7 @@ def split_uri(uri: str) -> Tuple[str, str]:
     return bucket, key
 
 
-def read_back(clients: ClientFactory, region: Optional[str], uri: str, limit: int) -> bytes:
+def read_back(clients: Callable[..., Any], region: Optional[str], uri: str, limit: int) -> bytes:
     """An object's bytes from S3, at most ``limit`` of them. Raises what boto3 raises."""
     bucket, key = split_uri(uri)
     data: bytes = clients("s3", region).get_object(Bucket=bucket, Key=key)["Body"].read(limit)

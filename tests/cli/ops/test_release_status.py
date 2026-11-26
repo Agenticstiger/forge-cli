@@ -543,12 +543,17 @@ def test_without_release_dir_the_status_reads_run_records_as_before(tmp_path, ca
 def test_the_module_imports_only_the_standard_library_when_it_is_loaded():
     import ast
 
-    body = ast.parse(Path(rs.__file__).read_text(encoding="utf-8")).body
-    names = {a.name.split(".")[0] for n in body if isinstance(n, ast.Import) for a in n.names}
-    names |= {(n.module or "").split(".")[0] for n in body if isinstance(n, ast.ImportFrom)}
-    assert names <= {
-        "__future__", "os", "re", "stat", "dataclasses", "datetime", "pathlib", "typing",
-    }  # fmt: skip
+    from fluid_build.util import release_record
+
+    def imported(module):
+        body = ast.parse(Path(module.__file__).read_text(encoding="utf-8")).body
+        names = {a.name for n in body if isinstance(n, ast.Import) for a in n.names}
+        return names | {n.module or "" for n in body if isinstance(n, ast.ImportFrom)}
+
+    stdlib = {"__future__", "os", "re", "stat", "dataclasses", "datetime", "pathlib", "typing"}
+    # the record's shared names (fluid_build.util.release_record), standard library only too
+    assert imported(rs) <= stdlib | {"fluid_build.util.release_record"}
+    assert imported(release_record) <= stdlib | {"hashlib", "json"}
 
 
 # --- a long root, a changed record, a directory that cannot be read ---------------------

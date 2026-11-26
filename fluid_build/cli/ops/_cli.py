@@ -275,6 +275,7 @@ def _run_verify_release(args: argparse.Namespace, logger: logging.Logger) -> int
     cprint_literal(f"{result.source}: {head}", soft_wrap=True)
     for key, value in (
         ("release", result.identity_digest),
+        ("code", result.code_digest),
         ("product", result.product_id),
         ("env", result.environment),
     ):

@@ -1072,6 +1072,7 @@ module = [
     "fluid_build.api.release",
     "fluid_build.cli._release_publish",
     "fluid_build.util.s3",
+    "fluid_build.util.release_record",
 ]
 strict = true
 

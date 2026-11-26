@@ -40,13 +40,20 @@ import tarfile
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 
+from fluid_build.util.release_record import (  # noqa: F401 - the record's names, used here too
+    CODE_KEYS,
+    RELEASE_INDEX,
+    RELEASE_SCHEMA,
+    code_digest,
+    identity_digest,
+)
+from fluid_build.util.release_record import canonical as _canonical
+
 from . import _ship_report as report
 from . import _ship_stages as st
 
 LOG = logging.getLogger(__name__)
 
-RELEASE_SCHEMA = "fluid-release/1"
-RELEASE_INDEX = "release.json"
 #: The stages whose output a release holds: they run in the invocation that builds it.
 REQUIRED_STAGES = (1, 2, 3, 4)
 
@@ -251,10 +258,6 @@ def _sha256(path: Path) -> str:
     return "sha256:" + _sha256_file(path)
 
 
-def _canonical(data: Any) -> bytes:
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-
-
 def _regular_file(path: Path) -> Path:
     if path.is_symlink() or not path.is_file():
         raise ReleaseError(f"{path} is not a regular file")
@@ -384,10 +387,6 @@ def source_identity(env: Mapping[str, str]) -> Optional[Dict[str, Any]]:
     if "repository" in found:
         source["uri"] = f"git+{found['repository']}"
     return source
-
-
-def identity_digest(identity: Mapping[str, Any]) -> str:
-    return "sha256:" + hashlib.sha256(_canonical(identity)).hexdigest()
 
 
 def _copy(src: Path, dest: Path) -> None:
@@ -554,6 +553,7 @@ def publish(
             "schema": RELEASE_SCHEMA,
             "identity": identity,
             "identity_digest": identity_digest(identity),
+            **({"code_digest": code} if (code := code_digest(identity)) else {}),
             "gates": gates,
             "files": _files(staging),
             "provenance": provenance,

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -311,6 +312,10 @@ def test_a_release_records_the_versions_of_the_exposes_and_the_code_it_was_built
         "digest": {"gitCommit": sha},
     }
     assert "refs/tags" not in json.dumps(index["identity"])
+    # the code digest: the same for every environment sealed from this commit and lock
+    assert index["code_digest"] == release.code_digest(index["identity"])
+    code = {k: index["identity"].get(k) for k in release.CODE_KEYS}
+    assert index["code_digest"] == "sha256:" + hashlib.sha256(release._canonical(code)).hexdigest()
 
 
 def test_the_release_names_its_bundles_source_contract_from_where_it_sits(
@@ -844,10 +849,21 @@ def test_a_plan_made_from_the_release_applies_with_its_dbt_project(tmp_path: Pat
     assert "changed models/orders.sql" in edited.stdout + edited.stderr
 
 
-def test_without_a_ci_commit_the_identity_names_no_source() -> None:
+def test_without_a_ci_commit_the_identity_names_no_source_and_no_code_digest() -> None:
     assert release.source_identity({}) is None
     assert release.source_identity({"GITHUB_RUN_ID": "1", "GITHUB_SHA": "main"}) is None
+    assert release.code_digest({"product_id": "p"}) is None
     source = release.source_identity(
         {"CI_JOB_ID": "1", "CI_COMMIT_SHA": "a" * 40, "CI_COMMIT_REF_NAME": "main"}
     )
     assert source == {"digest": {"gitCommit": "a" * 40}}  # no repository: no uri
+
+
+def test_the_code_digest_is_the_same_in_every_environment() -> None:
+    base = {"product_id": "p", "source": {"digest": {"gitCommit": "a" * 40}}, "forge_version": "1"}
+    dev = {**base, "environment": "dev", "bundle": {"sha256": "sha256:" + "1" * 64}}
+    prod = {**base, "environment": "prod", "bundle": {"sha256": "sha256:" + "2" * 64}}
+    assert release.identity_digest(dev) != release.identity_digest(prod)
+    assert release.code_digest(dev) == release.code_digest(prod)
+    changed = {**prod, "source": {"digest": {"gitCommit": "b" * 40}}}
+    assert release.code_digest(changed) != release.code_digest(prod)

@@ -1328,9 +1328,7 @@ def _explain(
             from . import _release_publish
 
             where = _release_publish.parse_target(opts.release_to).uri
-            _out(
-                f"remote: then published, write-once, under {where}<product>/<env>/<identity hex>/"
-            )
+            _out(f"remote: then published, write-once, under {where}<product>/<code hex>/<env>/")
     if problem:
         _out(f"warning: a real run would stop: {problem}")
     return 0

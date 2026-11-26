@@ -20,7 +20,7 @@ from fluid_build.api import verify_release
 from fluid_build.cli import _release_publish as publish
 from fluid_build.cli.ops import _cli as ops_cli
 from fluid_build.util import s3 as s3_util
-from tests.cli._fake_s3 import FakeS3, hex_of, sealed
+from tests.cli._fake_s3 import SOURCE, FakeS3, hex_of, sealed
 
 pytestmark = pytest.mark.unit
 
@@ -134,7 +134,7 @@ def test_a_published_release_is_intact_and_read_only(tmp_path: Path) -> None:
     s3.calls.clear()
     result = verify_release(uri, clients=s3)
     assert (result.status, result.files_checked) == ("intact", 2)
-    assert uri.endswith(f"/{hex_of(index)}/")
+    assert uri.endswith(f"/{hex_of(index)}/dev/")
     assert set(s3.calls) == {"get_object"}
 
 
@@ -155,13 +155,71 @@ def test_a_missing_object_or_index_is_not_intact(tmp_path: Path) -> None:
     assert result.exit_code == 1 and "no release is published here" in result.problems[0]
 
 
-def test_a_release_under_another_identity_key_is_not_intact(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "move, problem",
+    [
+        (lambda parts: [*parts[:-2], "a" * 64, parts[-1]], "the key of other code"),
+        (lambda parts: [*parts[:-1], "prod"], "the environment prod, and it is another's"),
+    ],
+)
+def test_a_release_under_another_code_or_environment_key_is_not_intact(
+    tmp_path: Path, move: Any, problem: str
+) -> None:
     _index, s3, uri = _published(tmp_path)
-    other = uri.rstrip("/").rsplit("/", 1)[0] + "/" + "a" * 64 + "/"
+    bucket, key = s3_util.split_uri(uri)
+    other = f"s3://{bucket}/" + "/".join(move(key.rstrip("/").split("/"))) + "/"
     for rel in ("release.json", "bundle.tgz", "reports/ship-report.json"):
         s3.objects[_key(other, rel)] = s3.objects[_key(uri, rel)]
     result = verify_release(other, clients=s3)
-    assert result.exit_code == 1 and "the key of another identity" in result.problems[0]
+    assert result.exit_code == 1 and any(problem in p for p in result.problems), result.problems
+
+
+@pytest.mark.parametrize(
+    "change, problem",
+    [
+        ({"code_digest": "sha256:" + "0" * 64}, "its code_digest is not the digest of the code"),
+        ({"code_digest": None}, "names a source commit, and it states no code_digest"),
+    ],
+)
+def test_a_code_digest_that_is_not_the_identitys_is_not_intact(
+    tmp_path: Path, change: Any, problem: str
+) -> None:
+    sealed(tmp_path / "rel")
+    path = tmp_path / "rel" / "release.json"
+    index = json.loads(path.read_text(encoding="utf-8"))
+    index.update(change)
+    if index["code_digest"] is None:
+        del index["code_digest"]
+    path.write_text(json.dumps(index), encoding="utf-8")
+    result = verify_release(tmp_path / "rel")
+    assert result.exit_code == 1 and problem in result.problems[0]
+
+
+def test_a_release_with_no_source_has_no_code_digest(tmp_path: Path) -> None:
+    sealed(tmp_path / "rel")
+    _reseal(tmp_path / "rel", source=None)  # then drop it
+    path = tmp_path / "rel" / "release.json"
+    index = json.loads(path.read_text(encoding="utf-8"))
+    del index["identity"]["source"]
+    from fluid_build.cli import _ship_release as release
+
+    index["identity_digest"] = release.identity_digest(index["identity"])
+    index.pop("code_digest", None)
+    path.write_text(json.dumps(index), encoding="utf-8")
+    result = verify_release(tmp_path / "rel")
+    assert result.intact and result.code_digest is None
+
+
+def test_json_names_each_object_and_its_version(tmp_path: Path) -> None:
+    index, s3, uri = _published(tmp_path)
+    s3.versions = True
+    result = verify_release(uri, clients=s3)
+    paths = [o["path"] for o in result.objects]
+    assert paths == ["release.json", "bundle.tgz", "reports/ship-report.json"]
+    assert all(o["version_id"] and len(str(o["sha256"])) == 64 for o in result.objects)
+    assert result.code_digest == index["code_digest"]
+    local = verify_release(tmp_path / "rel")
+    assert {o["version_id"] for o in local.objects} == {None}
 
 
 def test_a_denied_read_cannot_be_decided(tmp_path: Path) -> None:
@@ -261,6 +319,7 @@ def _pinned(directory: Path) -> Path:
     identity = {
         "product_id": "acme.orders",
         "environment": "dev",
+        "source": SOURCE,
         "bundle": {"manifest_digest": "sha256:" + "b" * 64, "sha256": sha(b"bundle")},
         "artifacts": {"manifest_digest": manifest["digest"]},
         "plan": {"bundle_digest": plan["bundleDigest"], "plan_digest": plan["planDigest"]},
@@ -277,6 +336,7 @@ def _pinned(directory: Path) -> Path:
         "schema": release.RELEASE_SCHEMA,
         "identity": identity,
         "identity_digest": release.identity_digest(identity),
+        "code_digest": release.code_digest(identity),
         "files": release._files(directory),
     }
     (directory / "release.json").write_text(json.dumps(index), encoding="utf-8")
@@ -355,6 +415,7 @@ def _reseal(directory: Path, **identity: Any) -> None:
     index = json.loads(path.read_text(encoding="utf-8"))
     index["identity"].update(identity)
     index["identity_digest"] = release.identity_digest(index["identity"])
+    index["code_digest"] = release.code_digest(index["identity"])
     path.write_text(json.dumps(index), encoding="utf-8")
 
 

@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each external file and its source.
 - **`fluid ship --release-dir DIR --release-to s3://bucket/prefix/` publishes the sealed release
   to S3, write-once.** After the local seal, every file goes under
-  `<prefix>/<product>/<env>/<identity hex>/` as one single-part PutObject with `ChecksumSHA256`
+  `<prefix>/<product>/<code hex>/<env>/`, so each environment's release of one commit and one
+  lock sits under one code digest. Each file is one single-part PutObject with `ChecksumSHA256`
   and `If-None-Match: *`, read back with `HeadObject` (`ChecksumMode=ENABLED`), and
   `release.json` goes last. An object already at a key counts as published only when its
   SHA-256 is ours, so a re-run of the same release finishes or repeats the upload. When another
@@ -34,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over 5 GiB are refused before any write. `--release-to-require versioning,object-lock` refuses
   a bucket without them. The run report's `release.remote` says where the release went, or why
   not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
-  boto3 is refused before stage 1 (exit 2).
+  boto3 is refused before stage 1 (exit 2), and so is a run whose CI names no commit: without one
+  the release has no code digest.
 - **`fluid runs verify-release SRC` checks a sealed release, read-only.** SRC is a release
   directory or the `s3://` prefix `--release-to` wrote. It checks that `release.json` is a
   `fluid-release/1` record whose `identity_digest` is the digest of its `identity`, that an S3 key
@@ -42,9 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the files `identity` pins (the bundle, each external file, the artifacts MANIFEST and what it
   lists, the plan) are listed with those digests, so a swapped file with its entry rewritten is
   not intact.
-  Exit 0 intact, 1 not intact, 2 cannot decide (unreadable, access denied, or boto3 missing for
-  `s3://`); `--json` prints the result. The check is public as `fluid_build.api.verify_release`
+  It recomputes `code_digest` and checks that an S3 key's code hex and environment are this
+  release's. Exit 0 intact, 1 not intact, 2 cannot decide (unreadable, access denied, or boto3
+  missing for `s3://`); `--json` prints the result with each object's path, sha256 and S3
+  VersionId, so a consumer can record the exact versions it checked. The check is public as `fluid_build.api.verify_release`
   (API 1.3), and `fluid runs status --release-dir` shares its identity check.
+
+- **A release names the commit it was built from, and the digest of its code.** `identity`
+  gains `source` (`{uri: git+<repo>, digest: {gitCommit}}`), from the CI's own variables, when
+  the CI names a commit; until now the commit sat only in `provenance`, outside
+  `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
+  `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
+  environment sealed from one commit and one lock, and absent without a source commit.
 
 ### Changed
 

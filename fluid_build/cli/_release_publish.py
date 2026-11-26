@@ -4,9 +4,12 @@
 """``fluid ship --release-dir DIR --release-to s3://bucket/prefix/``: publish the sealed release
 to S3, write-once.
 
-Once the run has sealed ``DIR``, its files go to ``<prefix>/<product>/<environment>/<identity
-hex>/``: a key named by what the release holds, outside what it seals. Each file is one
-single-part ``PutObject`` with ``ChecksumSHA256`` (S3 refuses bytes that are not that digest,
+Once the run has sealed ``DIR``, its files go to ``<prefix>/<product>/<code hex>/<env>/``: the
+code digest (``release.json``'s ``code_digest``, of the commit, the external files and the
+generator) is the same for every environment sealed from one commit and one lock, so each
+environment's release sits beside the others of the same code, as Kargo keeps one Freight across
+its Stages. A release that names no source commit has no code digest and is not published. Each
+file is one single-part ``PutObject`` with ``ChecksumSHA256`` (S3 refuses bytes that are not that digest,
 and a single-part upload keeps a full-object SHA-256) and ``If-None-Match: *`` (S3 refuses to
 replace an object). ``release.json`` goes last: a reader that finds it finds every file it lists.
 
@@ -124,6 +127,14 @@ def refusal(target: str, release_dir: Optional[Path], require: Sequence[str]) ->
         return str(exc)
     if importlib.util.find_spec("boto3") is None:
         return f"--release-to {target} needs boto3: pip install 'data-product-forge[aws]'"
+    from . import _ship_release
+
+    if _ship_release.source_identity(os.environ) is None:
+        return (
+            f"--release-to {target} files the release under the digest of its code, which needs "
+            "the commit the CI built, and no CI variable names one (GITHUB_SHA, CI_COMMIT_SHA, "
+            "BUILD_SOURCEVERSION, ...)"
+        )
     return None
 
 
@@ -164,14 +175,19 @@ def publish_release(
             f"the release in {release_dir} is not intact, so it is not published: "
             + "; ".join(checked.problems)
         )
-    files, product, environment, identity_hex = _local_files(release_dir)
+    files, product, environment, identity_hex, code_hex = _local_files(release_dir)
     for segment, what in ((product, "product id"), (environment, "environment")):
         if not _KEY_SEGMENT.fullmatch(segment):
             raise PublishError(
                 f"the release's {what} {segment!r} cannot name an S3 key (letters, digits and "
                 "._=+-, starting with a letter, digit or _, at most 255)"
             )
-    prefix = f"{where.prefix}{product}/{environment}/{identity_hex}/"
+    if code_hex is None:
+        raise PublishError(
+            f"the release in {release_dir} names no source commit, so it has no code digest to "
+            "publish under: seal it in a CI run that names its commit"
+        )
+    prefix = f"{where.prefix}{product}/{code_hex}/{environment}/"
     uri = f"s3://{where.bucket}/{prefix}"
     try:
         client = (clients or _default_clients)("s3", region)
@@ -199,9 +215,9 @@ class _File:
     sha256: str  # hex
 
 
-def _local_files(release_dir: Path) -> Tuple[List[_File], str, str, str]:
-    """The release's files in upload order (``release.json`` last), its product id, environment
-    and identity hex. The release was verified just before: every file is the bytes its index
+def _local_files(release_dir: Path) -> Tuple[List[_File], str, str, str, Optional[str]]:
+    """The release's files in upload order (``release.json`` last), its product id, environment,
+    identity hex and code hex (``None`` without a source commit). The release was verified just before: every file is the bytes its index
     names."""
     import hashlib
     import json
@@ -229,6 +245,7 @@ def _local_files(release_dir: Path) -> Tuple[List[_File], str, str, str]:
         str(identity.get("product_id") or ""),
         str(identity.get("environment") or ""),
         match.group(1),
+        code.group(1) if (code := _HEX.fullmatch(str(index.get("code_digest")))) else None,
     )
 
 

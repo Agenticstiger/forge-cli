@@ -71,8 +71,15 @@ class ReleaseVerification:
     identity_digest: Optional[str] = None
     product_id: Optional[str] = None
     environment: Optional[str] = None
+    #: The digest of the code the release runs, the same for every environment sealed from one
+    #: commit and one lock; ``None`` when the release names no source commit.
+    code_digest: Optional[str] = None
     files_checked: int = 0
     problems: Tuple[str, ...] = field(default_factory=tuple)
+    #: Each object read, ``release.json`` first: ``{"path", "sha256", "version_id"}`` (the S3
+    #: VersionId, ``None`` for a directory or a bucket without versioning), for a record of
+    #: exactly which versions were checked.
+    objects: Tuple[Dict[str, Optional[str]], ...] = field(default_factory=tuple)
 
     @property
     def intact(self) -> bool:
@@ -86,6 +93,7 @@ class ReleaseVerification:
     def as_dict(self) -> Dict[str, Any]:
         out = asdict(self)
         out["problems"] = list(self.problems)
+        out["objects"] = [dict(o) for o in self.objects]
         return out
 
 
@@ -100,13 +108,13 @@ class _Undecided(Exception):
 def identity_intact(index: Mapping[str, Any]) -> bool:
     """Whether ``index`` (a parsed ``release.json``) has an ``identity_digest`` that is the
     digest of its ``identity``. Says nothing about the files: :func:`verify_release` does."""
-    from fluid_build.cli import _ship_release as ship_release
+    from fluid_build.util import release_record as record
 
     identity, digest = index.get("identity"), index.get("identity_digest")
     if not isinstance(identity, Mapping) or not isinstance(digest, str):
         return False
     try:
-        return ship_release.identity_digest(identity) == digest
+        return record.identity_digest(identity) == digest
     except (TypeError, ValueError, RecursionError):
         return False
 
@@ -127,7 +135,9 @@ def verify_release(
         reader: _Reader = (
             _S3Reader(text, clients, region) if text.startswith("s3://") else _DirReader(text)
         )
-        index = _parse_index(reader.index())
+        data = reader.index()
+        index = _parse_index(data)
+        reader.hashes["release.json"] = hashlib.sha256(data).hexdigest()
         try:
             return _check(shown, reader, index)
         except (TypeError, ValueError, AttributeError, KeyError, RecursionError) as exc:
@@ -149,6 +159,8 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
     shown_digest = _clean(digest, 80)
     shown_product = _clean(product, 120) if isinstance(product, str) else None
     shown_env = _clean(environment, 40) if isinstance(environment, str) else None
+    stated = index.get("code_digest")
+    shown_code = _clean(stated, 80) if isinstance(stated, str) else None
 
     def result(status: str, checked: int, problems: List[str]) -> ReleaseVerification:
         return ReleaseVerification(
@@ -157,17 +169,20 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
             identity_digest=shown_digest,
             product_id=shown_product,
             environment=shown_env,
+            code_digest=shown_code,
             files_checked=checked,
             problems=tuple(problems),
+            objects=tuple(
+                {"path": _clean(rel), "sha256": hexd, "version_id": reader.versions.get(rel)}
+                for rel, hexd in reader.hashes.items()
+            ),
         )
 
     problems: List[str] = []
     if not identity_intact(index):
         problems.append("its identity_digest is not the digest of its identity")
-    named = reader.identity_hex()
-    match = _DIGEST.fullmatch(digest)
-    if named is not None and (match is None or match.group(1) != named):
-        problems.append(f"it sits under {named}, the key of another identity")
+    problems.extend(_code_problems(identity, stated))
+    problems.extend(_layout_problems(reader, stated, environment))
     checked, undecided = _check_files(reader, index["files"], problems)
     if not problems:
         _check_bound(reader, identity, index["files"], problems, undecided)
@@ -176,6 +191,36 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
     if undecided:
         return result(UNDECIDED, checked, undecided)
     return result(INTACT, checked, [])
+
+
+def _code_problems(identity: Mapping[str, Any], stated: Any) -> List[str]:
+    """Whether ``code_digest`` is the digest of the code ``identity`` names (none without a
+    source commit). It sits outside ``identity``, so it is recomputed, never trusted."""
+    from fluid_build.util import release_record as record
+
+    expected = record.code_digest(identity)
+    if expected == stated:
+        return []
+    if expected is None:
+        return ["it states a code_digest, and its identity names no source commit"]
+    if stated is None:
+        return ["its identity names a source commit, and it states no code_digest"]
+    return ["its code_digest is not the digest of the code its identity names"]
+
+
+def _layout_problems(reader: "_Reader", stated: Any, environment: Any) -> List[str]:
+    """Under ``<product>/<code hex>/<env>/``, the key must be this release's code and env."""
+    layout = reader.layout()
+    if layout is None:
+        return []
+    code_hex, env = layout
+    match = _DIGEST.fullmatch(stated) if isinstance(stated, str) else None
+    found: List[str] = []
+    if match is None or match.group(1) != code_hex:
+        found.append(f"it sits under {code_hex}, the key of other code")
+    if env != environment:
+        found.append(f"it sits under the environment {_clean(env, 40)}, and it is another's")
+    return found
 
 
 def _check_files(
@@ -195,6 +240,7 @@ def _check_files(
             continue
         try:
             actual = reader.sha256(rel)
+            reader.hashes[rel] = actual
         except _NotIntact as exc:
             problems.append(f"{_clean(rel)}: {exc}")
             continue
@@ -345,22 +391,20 @@ def _check_plan(
 
 
 def _parse_index(data: bytes) -> Dict[str, Any]:
-    from fluid_build.cli import _ship_release as ship_release
+    from fluid_build.util import release_record as record
 
     try:
         index = json.loads(data)
     except (ValueError, RecursionError):
-        raise _NotIntact(f"{ship_release.RELEASE_INDEX} is not JSON") from None
-    if not isinstance(index, dict) or index.get("schema") != ship_release.RELEASE_SCHEMA:
-        raise _NotIntact(
-            f"{ship_release.RELEASE_INDEX} is not a {ship_release.RELEASE_SCHEMA} record"
-        )
+        raise _NotIntact(f"{record.RELEASE_INDEX} is not JSON") from None
+    if not isinstance(index, dict) or index.get("schema") != record.RELEASE_SCHEMA:
+        raise _NotIntact(f"{record.RELEASE_INDEX} is not a {record.RELEASE_SCHEMA} record")
     identity, digest, files = (index.get(k) for k in ("identity", "identity_digest", "files"))
     if not isinstance(identity, dict) or not isinstance(digest, str):
-        raise _NotIntact(f"{ship_release.RELEASE_INDEX} has no identity and identity_digest")
+        raise _NotIntact(f"{record.RELEASE_INDEX} has no identity and identity_digest")
     if not isinstance(files, dict) or len(files) > MAX_FILES:
         raise _NotIntact(
-            f"{ship_release.RELEASE_INDEX} has no files map of at most {MAX_FILES:,} entries"
+            f"{record.RELEASE_INDEX} has no files map of at most {MAX_FILES:,} entries"
         )
     return index
 
@@ -382,19 +426,25 @@ def _path_problem(rel: Any) -> Optional[str]:
 def _clean(value: Any, limit: int = 200) -> str:
     """Text from a record, printable and cut, as ``fluid runs status`` shows it, so a record
     cannot rewrite the terminal."""
-    from fluid_build.cli.ops.release_status import clean
+    from fluid_build.util.release_record import clean
 
     return clean(value, limit)
 
 
 class _Reader:
+    def __init__(self) -> None:
+        #: The sha256 of each object read, and its S3 VersionId when it has one.
+        self.hashes: Dict[str, str] = {}
+        self.versions: Dict[str, Optional[str]] = {}
+
     def index(self) -> bytes:  # pragma: no cover - interface
         raise NotImplementedError
 
     def sha256(self, rel: str) -> str:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def identity_hex(self) -> Optional[str]:
+    def layout(self) -> Optional[Tuple[str, str]]:
+        """``(code hex, environment)`` when the source sits at ``<code hex>/<env>/``."""
         return None
 
     def read(self, rel: str, limit: int) -> bytes:  # pragma: no cover - interface
@@ -408,6 +458,7 @@ class _DirReader(_Reader):
     handle, so a FIFO or a device never blocks."""
 
     def __init__(self, root: str) -> None:
+        super().__init__()
         self.root = Path(root)
         try:
             mode = os.stat(self.root).st_mode
@@ -506,6 +557,7 @@ class _S3Reader(_Reader):
     ) -> None:
         from fluid_build.util import s3
 
+        super().__init__()
         bucket, key = s3.split_uri(uri)
         if not bucket or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise _Undecided(f"{_clean(uri)} is not s3://bucket/prefix/")
@@ -521,15 +573,20 @@ class _S3Reader(_Reader):
         except Exception as exc:  # noqa: BLE001 - botocore's errors: no client, no decision
             raise _Undecided(f"no S3 client could be made: {type(exc).__name__}") from None
 
-    def identity_hex(self) -> Optional[str]:
-        last = self.prefix.rstrip("/").rsplit("/", 1)[-1]
-        return last if re.fullmatch(r"[0-9a-f]{64}", last) else None
+    def layout(self) -> Optional[Tuple[str, str]]:
+        parts = self.prefix.rstrip("/").split("/")
+        if len(parts) >= 2 and re.fullmatch(r"[0-9a-f]{64}", parts[-2]):
+            return parts[-2], parts[-1]
+        return None
 
     def _body(self, rel: str) -> Any:
         from fluid_build.util import s3
 
         try:
-            return self.client.get_object(Bucket=self.bucket, Key=self.prefix + rel)["Body"]
+            got = self.client.get_object(Bucket=self.bucket, Key=self.prefix + rel)
+            version = got.get("VersionId")
+            self.versions[rel] = version if isinstance(version, str) else None
+            return got["Body"]
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
             code = s3.error_code(exc)
             if s3.is_missing_code(code):

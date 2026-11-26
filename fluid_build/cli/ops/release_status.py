@@ -34,11 +34,11 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from fluid_build.util.release_record import clean
+
 #: Release directories read in one directory, and bytes of one ``release.json``.
 MAX_ENTRIES = 2_000
 MAX_INDEX_BYTES = 1_048_576
-#: Characters of any text taken from a record.
-_TEXT = 200
 #: External files read from one record: as many as a lock may list.
 MAX_EXTERNAL = 256
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -47,17 +47,6 @@ NOT_AUTHENTICATED = (
     "Records are read as written. 'intact' means a record's identity_digest matches its identity; "
     "it does not say who wrote the record, and its sealed time and source are outside that digest."
 )
-
-
-def clean(value: Any, limit: int = _TEXT, *, keep_end: bool = False) -> str:
-    """``value`` as text with every non-printable character (a control character, a bidirectional
-    mark, a line separator) replaced by ``?``, and cut at ``limit``: its end kept for a path
-    (``keep_end``), which names the release's directory, so two releases under one long root
-    never look alike."""
-    text = "".join(ch if ch.isprintable() else "?" for ch in str(value))
-    if len(text) <= limit:
-        return text
-    return "..." + text[len(text) - limit + 3 :] if keep_end else text[: limit - 3] + "..."
 
 
 @dataclass
