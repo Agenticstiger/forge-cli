@@ -145,6 +145,8 @@ class ShipOptions:
     # --release-to s3://bucket/prefix/: where the sealed release is then published, write-once
     # (_release_publish); "" for nowhere. --release-to-require: checks of its bucket first.
     release_to: str = ""
+    #: ``--release-archive``: the sealed release also as one ``.tgz`` at this path.
+    release_archive: str = ""
     release_to_require: Tuple[str, ...] = ()
 
 

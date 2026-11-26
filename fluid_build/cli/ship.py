@@ -185,7 +185,7 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         "--emit",
         default=None,
         metavar="LIST",
-        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else stage 3's own).",
+        help="Stage 3 --emit list (default: $GENERATE_EMIT, else stage 3's own).",
     )
     g.add_argument(
         "--require-artifacts",
@@ -321,6 +321,12 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         help="Also seal the external files LOCK lists (with --release-dir).",
     )
     g.add_argument(
+        "--release-archive",
+        default=None,
+        metavar="PATH",
+        help="Also write the sealed release as one .tgz at PATH.",
+    )
+    g.add_argument(
         "--release-to",
         default=None,
         metavar="S3URI",
@@ -373,6 +379,7 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
     opts, selected, not_selected, project_dir = _prepare(args)
     opts.artifacts = _artifacts_lock(args, release_dir)
     opts.release_to, opts.release_to_require = _release_to(args)
+    opts.release_archive = _release_archive(args)
     with _working_directory(project_dir):
         anchor = None  # an explicit --journal-dir is the operator's, links and all
         if journal_dir is None and release_dir is not None:
@@ -403,6 +410,16 @@ def _artifacts_lock(args: argparse.Namespace, release_dir: Optional[Path]) -> st
     value = flag if flag is not None else os.environ.get(_release_lock.LOCK_ENV, "")
     value = value.strip() if flag is not None or release_dir is not None else ""
     return os.path.abspath(value) if value else ""
+
+
+def _release_archive(args: argparse.Namespace) -> str:
+    """``--release-archive``, as an absolute path from where ship was invoked; "" for none."""
+    value = getattr(args, "release_archive", None)
+    if value is None:
+        return ""
+    if not value.strip():  # `--release-archive "$OUT"` with OUT unset
+        raise st.ShipUsageError("--release-archive needs the path of the .tgz to write")
+    return os.path.abspath(value.strip())
 
 
 def _release_to(args: argparse.Namespace) -> Tuple[str, Tuple[str, ...]]:
@@ -644,6 +661,8 @@ class _Context:
     keep: Optional["_Journaling"] = None  # the stage journal, when one is kept
     # --artifacts: the external files the release seals, read when its identity is built
     external: List[Any] = field(default_factory=list)
+    #: ``--release-archive``: the report's ``release.archive`` entry once it was tried.
+    archive: Optional[Dict[str, object]] = None
     # the store token ship unwrapped for every stage, handed to each through a pipe
     store_token: Optional[str] = field(default=None, repr=False)
 
@@ -1143,12 +1162,15 @@ def _release_block(
         return None
     if identity is None and not problem:
         problem = _first_stop(ordered)
-    return {
+    block: Dict[str, object] = {
         "dir": str(ctx.release_dir),
         "status": "published" if identity is not None else "not-published",
         "identity_digest": None if identity is None else release.identity_digest(identity),
         "reason": problem,
     }
+    if ctx.archive is not None:
+        block["archive"] = ctx.archive
+    return block
 
 
 def _first_stop(ordered: Sequence[report.StageRecord]) -> str:
@@ -1212,8 +1234,52 @@ def _close_release(
         _say_why_not(ctx, why)
         return failed
     ctx.ci.info(f"Release published: {ctx.release_dir} ({release.identity_digest(identity)})")
+    if ctx.opts.release_archive:  # before any upload: a failed upload keeps the local file
+        archived = _write_archive(ctx, ordered, merged, identity, exit_code)
+        if archived != exit_code:
+            return archived
     if ctx.opts.release_to:
         return _publish_remote(ctx, ordered, merged, identity, exit_code)
+    return exit_code
+
+
+def _write_archive(
+    ctx: _Context,
+    ordered: List[report.StageRecord],
+    merged: List[report.StageRecord],
+    identity: Dict[str, object],
+    exit_code: int,
+) -> int:
+    """Write the sealed release to ``--release-archive``; the run's report says where and its
+    sha256, or why not. A failure leaves no archive and the sealed directory as it is."""
+    from . import _release_archive as archive
+
+    assert ctx.release_dir is not None
+    path = ctx.opts.release_archive
+    block = _release_block(ctx, identity, None) or {}
+    try:
+        digest = archive.write_archive(ctx.release_dir, path)
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - any failure is reported
+        if isinstance(exc, KeyboardInterrupt):
+            why, failed = "interrupted while archiving", report.EXIT_INTERRUPTED
+        else:
+            why = str(exc) if isinstance(exc, archive.ArchiveError) else type(exc).__name__
+            failed = _failed_code(ordered, st.applies_changes(ctx.opts))
+        ctx.archive = block["archive"] = {"path": path, "status": "not-written", "reason": why}
+        _write_reports(ctx, merged, failed, block)
+        with ctx.ci.fenced():
+            ctx.ci.info(f"fluid ship: release archive not written to {path}: {why}")
+        ctx.logger.error(
+            "fluid ship: the release is sealed in %s and no archive was written", ctx.release_dir
+        )
+        return failed
+    ctx.archive = block["archive"] = {
+        "path": path,
+        "status": "written",
+        "sha256": f"sha256:{digest}",
+    }
+    _write_reports(ctx, merged, exit_code, block)
+    ctx.ci.info(f"Release archive: {path} (sha256:{digest})")
     return exit_code
 
 
@@ -1338,6 +1404,8 @@ def _explain(
         )
         if opts.artifacts:
             _out(f"external: the files {opts.artifacts} lists, sealed under external/<name>/")
+        if opts.release_archive:
+            _out(f"archive: then written as one .tgz to {opts.release_archive}")
         if opts.release_to:
             from . import _release_publish
 
