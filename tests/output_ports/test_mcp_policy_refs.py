@@ -108,8 +108,16 @@ def test_the_gateways_loader_resolves_a_policy_pointer(tmp_path):
 
 @pytest.mark.parametrize("expose", _UNRESOLVED)
 def test_every_row_filter_reader_refuses_an_unresolved_pointer(expose):
-    calls: Dict[str, Callable[[], Any]] = {
-        "declares_row_filters": lambda: query_compiler.declares_row_filters(expose),
+    # ``declares_row_filters`` reads the policy alone: a pointer in the contract or the
+    # columns does not stop it (the read paths below still need those columns).
+    if "$ref" not in expose and "$ref" not in str(expose.get("policy")):
+        assert query_compiler.declares_row_filters(expose) is True
+        calls: Dict[str, Callable[[], Any]] = {}
+    else:
+        calls = {
+            "declares_row_filters": lambda: query_compiler.declares_row_filters(expose),
+        }
+    calls |= {
         "row_filter_predicate": lambda: query_compiler.row_filter_predicate(
             expose, {"principal": EU}, dialect="duckdb"
         ),

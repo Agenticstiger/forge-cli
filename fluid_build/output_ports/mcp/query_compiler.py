@@ -672,9 +672,12 @@ def _first_ref(node: Any, path: str) -> Optional[Tuple[str, Any]]:
     return None
 
 
-def _refuse_unresolved_refs(expose: Mapping[str, Any]) -> None:
+def _refuse_unresolved_refs(expose: Mapping[str, Any], *, policy_only: bool = False) -> None:
     """Refuse an expose that is itself a ``$ref``, or whose ``policy``, ``contract`` or
-    ``contract.schema`` column entries still hold one. The row filters, readers, column
+    ``contract.schema`` column entries still hold one. With ``policy_only``, only the
+    expose itself and its ``policy`` count: the decision whether an expose declares row
+    filters is read from the policy alone, so a pointer in its contract or columns does
+    not make it filtered. The row filters, readers, column
     restrictions and declared columns behind the pointer would read as absent, and the
     expose would be served as though it declared none. forge's loader and ``fluid
     bundle`` resolve every reference before the gateway reads a contract; a caller that
@@ -684,7 +687,7 @@ def _refuse_unresolved_refs(expose: Mapping[str, Any]) -> None:
     found = (at, expose["$ref"]) if "$ref" in expose else None
     found = found or _first_ref(expose.get("policy"), f"{at}.policy")
     contract = expose.get("contract")
-    if found is None and isinstance(contract, Mapping):
+    if found is None and not policy_only and isinstance(contract, Mapping):
         schema = contract.get("schema")
         if "$ref" in contract:
             found = (f"{at}.contract", contract["$ref"])
@@ -709,7 +712,9 @@ def _refuse_unresolved_refs(expose: Mapping[str, Any]) -> None:
         )
 
 
-def _authz_block(expose: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+def _authz_block(
+    expose: Mapping[str, Any], *, policy_only: bool = False
+) -> Optional[Mapping[str, Any]]:
     """The expose's ``policy.authz``, or ``None`` when it declares none.
 
     Refuses an expose that still holds an unresolved ``$ref`` where this reads
@@ -718,7 +723,7 @@ def _authz_block(expose: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     rows to be filtered, so reading it as "no filter" would serve them all. A ``policy``
     or ``authz`` that is not a mapping is refused for the same reason.
     """
-    _refuse_unresolved_refs(expose)
+    _refuse_unresolved_refs(expose, policy_only=policy_only)
     policy = expose.get("policy")
     if policy is None or (isinstance(policy, Mapping) and not policy):
         return None
@@ -741,12 +746,54 @@ def _authz_block(expose: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     return authz
 
 
-def declares_row_filters(expose: Mapping[str, Any]) -> bool:
+def _resolve_document(
+    expose: Mapping[str, Any], contract: Optional[Mapping[str, Any]]
+) -> Tuple[Mapping[str, Any], Optional[Mapping[str, Any]]]:
+    """``expose`` and ``contract`` with the document's same-document pointers resolved.
+
+    ``contract`` is the whole document as written. It is resolved only when the expose or
+    ``accessPolicy`` holds a ``$ref``, and the expose is read at its own position in the
+    resolved document (found by identity, then by equality). A document that cannot be
+    resolved (a pointer to nothing, to another file, or in a cycle) leaves both as
+    written, so a pointer left in the policy is still refused where it is read.
+    """
+    if not isinstance(contract, Mapping):
+        return expose, contract
+    held = _first_ref(expose, "") is not None or _first_ref(contract.get("accessPolicy"), "")
+    if not held:
+        return expose, contract
+    from fluid_build import contract_refs
+    from fluid_build.util.ref_confinement import RefResolutionError
+
+    try:
+        resolved = contract_refs.resolve_pointer_refs(contract)
+    except RefResolutionError:
+        return expose, contract
+    if not isinstance(resolved, Mapping):
+        return expose, contract
+    listed, found = contract.get("exposes"), resolved.get("exposes")
+    if isinstance(listed, list) and isinstance(found, list) and len(listed) == len(found):
+        position = next((i for i, e in enumerate(listed) if e is expose), None)
+        if position is None:
+            position = next((i for i, e in enumerate(listed) if e == expose), None)
+        if position is not None and isinstance(found[position], Mapping):
+            return found[position], resolved
+    return expose, resolved
+
+
+def declares_row_filters(
+    expose: Mapping[str, Any], *, contract: Optional[Mapping[str, Any]] = None
+) -> bool:
     """Whether ``expose`` declares ``policy.authz.rowFilters`` entries.
 
-    Raises :class:`RowFilterUnavailable` for the old ``policy.rowFilters`` key and for
-    a ``policy`` or ``authz`` that is not a mapping, as every read path does."""
-    authz = _authz_block(expose)
+    Decided from the expose's policy alone: a ``$ref`` in its contract, schema or a column
+    is not read as a row filter. With ``contract=`` (the whole document as written) its
+    same-document pointers are resolved first, so a policy kept behind one is read. A
+    pointer left in the expose itself or its ``policy`` (another file, say) raises
+    :class:`RowFilterUnavailable`, as do the old ``policy.rowFilters`` key and a ``policy``
+    or ``authz`` that is not a mapping, as every read path does."""
+    expose, _ = _resolve_document(expose, contract)
+    authz = _authz_block(expose, policy_only=True)
     return bool(authz.get("rowFilters")) if authz is not None else False
 
 
@@ -898,7 +945,13 @@ def row_filter_predicate(
     :class:`RowFilterUnavailable`, which every caller sees whichever filter it is, as
     does the old ``policy.rowFilters`` key. The predicate binds no parameter: every
     value in it is the contract's own literal.
+
+    With ``contract=`` the document's same-document pointers are resolved first
+    (:func:`declares_row_filters`); without it, or when they cannot be resolved, any
+    unresolved ``$ref`` in the expose is refused, since the read needs the declared
+    columns and the sensitivity flags behind it.
     """
+    expose, contract = _resolve_document(expose, contract)
     authz = _authz_block(expose)
     raw = None if authz is None else authz.get("rowFilters")
     if authz is None or raw is None:
@@ -1883,7 +1936,8 @@ def compile_semantic_query(
 
     ``contract`` is the contract the expose belongs to, when the caller has it: its
     ``accessPolicy`` read grants then read every row alongside ``policy.authz.readers``
-    (:func:`row_filter_predicate`).
+    (:func:`row_filter_predicate`), and its same-document pointers are resolved first,
+    so ``expose`` is read as resolved.
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
@@ -1891,6 +1945,7 @@ def compile_semantic_query(
         raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
 
+    expose, contract = _resolve_document(expose, contract)
     # Row-level security first: a caller the policy does not name, or a filter that
     # cannot be applied, is refused before the payload is looked at.
     row_predicate = row_filter_predicate(
@@ -4431,6 +4486,8 @@ def compile_free_form_sql(
     if not isinstance(table_reference, str) or not table_reference.strip():
         raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
+    if expose is not None:
+        expose, contract = _resolve_document(expose, contract)
     # Row-level security first: a caller the policy does not name, or a filter that
     # cannot be applied, is refused before the statement is looked at further.
     row_predicate = row_filter_predicate(

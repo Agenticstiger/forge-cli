@@ -308,7 +308,7 @@ class PostgresDriver(EngineDriver):
         held = (["superuser"] if superuser else []) + [str(r) for r in memberships or []]
         if not held:
             return
-        if declares_row_filters(self.expose):
+        if declares_row_filters(self.expose, contract=self.contract):
             raise RowFilterUnavailable(
                 f"the gateway connects to Postgres as a role that is {', '.join(held)}. Such a "
                 "role can read a table's files and the write-ahead log, so the rows a row "
