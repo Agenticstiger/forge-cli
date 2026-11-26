@@ -480,29 +480,36 @@ class TestVerifyBundleKeyedMode:
         assert result["exit_code"] == 0
 
 
-def test_verify_blob_pins_the_signer_in_single_argv_elements(tmp_path, monkeypatch) -> None:
-    """Keyless verification needs an exact identity and issuer, each one argv element, so a
+def test_blob_signing_uses_one_bundle_and_pins_the_signer(tmp_path, monkeypatch) -> None:
+    """sign-blob and verify-blob take --bundle, the one shape cosign 2.x and 3.x both accept;
+    keyless verification pins an exact identity and issuer, each one argv element, so a
     value that starts with '-' is never read as a flag."""
     import pytest
 
-    blob, sig, pem = tmp_path / "s.intoto.jsonl", tmp_path / "s.sig", tmp_path / "s.pem"
-    for path in (blob, sig, pem):
+    blob, bundle = tmp_path / "s.intoto.jsonl", tmp_path / "s.intoto.jsonl.sigstore.json"
+    for path in (blob, bundle):
         path.write_bytes(b"x")
-    seen = {}
+    seen = []
     monkeypatch.setattr(_signing, "_resolve_cosign", lambda: "cosign")
     monkeypatch.setattr(
-        _signing,
-        "_run_cosign",
-        lambda argv, timeout=0: seen.setdefault("argv", argv) and {"exit_code": 0},
+        _signing, "_run_cosign", lambda argv, timeout=0: seen.append(argv) or {"exit_code": 0}
     )
+    done = _signing.sign_blob(str(blob))
+    assert seen[-1] == ["cosign", "sign-blob", "--yes", "--bundle", str(bundle), str(blob)]
+    assert done["bundle_path"] == str(bundle)
+    _signing.sign_blob(str(blob), key_ref="awskms:///alias/k")
+    assert seen[-1][3:5] == ["--key", "awskms:///alias/k"]
     _signing.verify_blob(
         str(blob),
-        sig_path=str(sig),
-        pem_path=str(pem),
+        bundle_path=str(bundle),
         certificate_identity="-x@example.com",
         certificate_oidc_issuer="https://issuer.example.com",
     )
-    assert "--certificate-identity=-x@example.com" in seen["argv"]
-    assert "--certificate-oidc-issuer=https://issuer.example.com" in seen["argv"]
+    assert seen[-1][:4] == ["cosign", "verify-blob", "--bundle", str(bundle)]
+    assert "--certificate-identity=-x@example.com" in seen[-1]
+    assert "--certificate-oidc-issuer=https://issuer.example.com" in seen[-1]
+    assert not any(
+        a in ("--output-signature", "--output-certificate", "--signature") for a in sum(seen, [])
+    )
     with pytest.raises(_signing.CLIError):
-        _signing.verify_blob(str(blob), sig_path=str(sig), pem_path=str(pem))
+        _signing.verify_blob(str(blob), bundle_path=str(bundle))
