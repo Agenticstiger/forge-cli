@@ -32,6 +32,7 @@ def contract(
     composite: bool = False,
     versioned: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
+    expose: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     schema: List[Dict[str, Any]] = [
         {"name": "branch_id", "type": key_type},
@@ -44,6 +45,7 @@ def contract(
         expose_policy["classification"] = classification
     if expose_policy:
         branch["policy"] = expose_policy
+    branch.update(copy.deepcopy(expose or {}))
     if composite:
         schema.append({"name": "region", "type": "string"})
     if versioned:

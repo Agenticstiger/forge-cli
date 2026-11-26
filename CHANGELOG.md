@@ -360,6 +360,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `policy.authz.rowFilters` entry names in another case, `fluid apply` could also make it a grantee
   of `fluid_all_rows`, the row access policy that reads every row. It now compares the identities
   with their case folded. Present since 0.19.0.
+- **`fluid profile` no longer publishes a public table whole when its contract calls it
+  personal.** A table marked `Public` was left out for a `sensitivity`, a `pii`, `phi` or
+  `sensitive` tag, a column restriction or a masking, but not for a column `labels` entry, a
+  column `semanticType` or an expose-level tag, so a table with an email column typed
+  `semanticType: email`, or tagged `pii` in its `policy.tags`, was still written under
+  `references`. It is now left out, and named under Not measured without a value, when:
+  - a tag, or a label's key or value, of a column has a part that is `pii`, `phi` or `sensitive`
+    (split on `-`, `_` and `.`, and between a lower-case letter and a capital, any case, so
+    `pii-email`, which `fluid forge` writes, and `contains-pii` count), or is `personal-data` or
+    `personal_data` as a whole, or a column label `sensitivity` is not `none`;
+  - a column's `semanticType` is one of a list of personal data, read in any case and with any of
+    those separators (`e-mail`, `eMail`, `IPAddress` and `US_SSN` are read), or ends in one
+    (`USA_PASSPORT_NUMBER`, `customer_email`): the classes `fluid forge` writes (email, phone,
+    ssn, national_id, payment_card, dob, address, geo, name, ip_address, mac_address, credentials,
+    username, medical, special_category) and the names Presidio, Google Cloud Sensitive Data
+    Protection and Amazon Macie use for names, contact details, identity documents, tax and
+    insurance numbers, bank and card numbers, health records, dates of birth, age, gender and
+    similar; or the words `pii`, `phi`, `sensitive`, `personal`, `personal_data` and
+    `confidential`. A key such as `identifier`, a place such as `location` or `postal_code`, and
+    `country_name` are not refused;
+  - the expose's `tags` or `labels`, or those of its `policy`, `policy.authz` or
+    `policy.privacy`, say so as above.
+  A tag or label that only looks alike (`piiless`, `pipeline`) does not refuse.
 
 ## [0.41.0] — 2026-11-25
 
