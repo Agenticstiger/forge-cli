@@ -174,7 +174,9 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
             files_checked=checked,
             problems=tuple(problems),
             objects=tuple(
-                {"path": _clean(rel), "sha256": hexd, "version_id": reader.versions.get(rel)}
+                # a listed path is checked printable and at most 1,024 characters
+                # (_path_problem), so it is kept whole: a reader HEADs it by this key
+                {"path": _clean(rel, 1024), "sha256": hexd, "version_id": reader.versions.get(rel)}
                 for rel, hexd in reader.hashes.items()
             ),
         )

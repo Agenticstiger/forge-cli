@@ -71,8 +71,11 @@ def _contract() -> Dict[str, object]:
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.cli._ci_env import clear_ci_source
+
     for name in ("FLUID_ENV", "GENERATE_EMIT", "FLUID_RUN_ID", *st.STAGE_TOGGLES.values()):
         monkeypatch.delenv(name, raising=False)
+    clear_ci_source(monkeypatch)  # the same run on a laptop and in a CI runner
 
 
 @pytest.fixture

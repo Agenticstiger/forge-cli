@@ -352,6 +352,92 @@ def test_an_object_that_reads_back_unlocked_is_refused(tmp_path: Path) -> None:
         publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
 
 
+def _locked_bucket() -> FakeS3:
+    s3 = FakeS3()
+    s3.object_lock, s3.retention = True, ("GOVERNANCE", 1)
+    return s3
+
+
+def test_an_expired_retention_on_a_rerun_is_refused_with_the_ways_out(tmp_path: Path) -> None:
+    index = sealed(tmp_path / "rel")
+    s3 = _locked_bucket()
+    publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
+    s3.expired |= {f"{_prefix(index)}bundle.tgz", f"{_prefix(index)}release.json"}
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
+    message = str(raised.value)
+    assert "2 object(s) under s3://acme-releases/" in message
+    assert "are no longer locked (the retention ran out, the last on 20" in message
+    assert "aws s3api put-object-retention" in message
+    assert "publish under a new code digest, from a new commit" in message
+    # Without the requirement, the re-run of a published release stands.
+    again = publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
+    assert (again.written, again.already) == (0, 4)
+
+
+def test_an_expired_retention_is_refused_before_release_json_is_written(tmp_path: Path) -> None:
+    index = sealed(tmp_path / "rel")
+    s3 = _locked_bucket()
+    s3.put("acme-releases", f"{_prefix(index)}bundle.tgz", b"bundle")  # an earlier run's
+    s3.expired.add(f"{_prefix(index)}bundle.tgz")
+    with pytest.raises(publish.PublishError, match=r"1 object\(s\) under .* no longer locked"):
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
+    assert not any(k.endswith("release.json") for k in s3.writes)
+
+
+def test_an_expired_retention_on_another_runs_release_is_refused(tmp_path: Path) -> None:
+    first = sealed(tmp_path / "one", run_id="run-1")
+    sealed(tmp_path / "two", run_id="run-2")
+    s3 = _locked_bucket()
+    publish.publish_release(tmp_path / "one", TARGET, clients=s3, require=("object-lock",))
+    s3.expired.add(f"{_prefix(first)}reports/ship-report.json")
+    with pytest.raises(publish.PublishError, match="no longer locked"):
+        publish.publish_release(tmp_path / "two", TARGET, clients=s3, require=("object-lock",))
+    assert publish.publish_release(tmp_path / "two", TARGET, clients=s3).by_another_run
+
+
+def test_object_lock_on_another_runs_release_checks_every_key_it_lists(tmp_path: Path) -> None:
+    first = sealed(tmp_path / "one", {"reports/ship-report.json": b"{}", "reports/x.json": b"1"})
+    sealed(tmp_path / "two", run_id="run-2")  # same identity, and no reports/x.json
+    s3 = _locked_bucket()
+    publish.publish_release(tmp_path / "one", TARGET, clients=s3, require=("object-lock",))
+    s3.unlocked.add(f"{_prefix(first)}reports/x.json")  # only the remote release lists it
+    with pytest.raises(publish.PublishError, match="reports/x.json reads back with no Object Lock"):
+        publish.publish_release(tmp_path / "two", TARGET, clients=s3, require=("object-lock",))
+
+
+@pytest.mark.parametrize(
+    "period",
+    [{"Days": True}, {"Days": "1"}, {"Days": 1.0}, {"Days": 0}, {"Years": -1}, {}],
+)
+def test_a_default_retention_period_that_is_not_a_positive_count_is_refused(
+    tmp_path: Path, period: Any
+) -> None:
+    sealed(tmp_path / "rel")
+    s3 = _locked_bucket()
+    s3.rule_period = period
+    with pytest.raises(publish.PublishError, match="no default retention with a period"):
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
+    assert s3.writes == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"ObjectLockMode": "LEGAL"},
+        {"ObjectLockMode": ""},
+        {"ObjectLockRetainUntilDate": "2099-01-01T00:00:00Z"},
+        {"ObjectLockRetainUntilDate": __import__("datetime").datetime(2099, 1, 1)},  # naive
+    ],
+)
+def test_a_lock_read_back_of_another_shape_is_not_a_lock(tmp_path: Path, fields: Any) -> None:
+    sealed(tmp_path / "rel")
+    s3 = _locked_bucket()
+    s3.head_lock = fields
+    with pytest.raises(publish.PublishError, match="reads back with no Object Lock retention"):
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3, require=("object-lock",))
+
+
 def test_a_release_json_changed_after_verify_is_not_published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -471,6 +557,22 @@ def test_without_boto3_ship_refuses_before_any_stage(
     assert fake.calls == []
 
 
+@pytest.mark.parametrize("commit", ["c0ffee1", COMMIT[:39], COMMIT + "a"])
+def test_ship_refuses_a_commit_that_is_not_full_before_any_stage(
+    work: Path,
+    bundled: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_ci: None,
+    caplog: Any,
+    commit: str,
+) -> None:
+    fake = _install(monkeypatch, bundled)
+    monkeypatch.setenv("GITHUB_SHA", commit)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel", "--release-to", TARGET]) == 2
+    assert f"the CI names {commit}, not a full 40- or 64-hex commit" in caplog.text
+    assert fake.calls == []
+
+
 def test_explain_names_where_the_release_goes(
     work: Path, capsys: pytest.CaptureFixture[str], in_ci: None
 ) -> None:
@@ -490,3 +592,85 @@ def test_the_flags_are_on_the_parser() -> None:
     ship.register(parser.add_subparsers())
     args = parser.parse_args(["ship", "--release-to", TARGET, "--release-to-require", "versioning"])
     assert (args.release_to, args.release_to_require) == (TARGET, ["versioning"])
+
+
+def test_ship_refuses_a_checkout_at_another_commit_than_the_ci_names(
+    work: Path,
+    bundled: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_ci: None,
+    caplog: Any,
+) -> None:
+    fake = _install(monkeypatch, bundled)
+    monkeypatch.setattr("fluid_build.cli._ship_release.checkout_head", lambda _d: "b" * 40)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 2
+    assert f"the CI names commit {COMMIT}, and the contract's checkout is at {'b' * 40}" in (
+        caplog.text
+    )
+    assert fake.calls == []
+    monkeypatch.setattr("fluid_build.cli._ship_release.checkout_head", lambda _d: COMMIT)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0
+
+
+def test_a_checkout_git_cannot_read_is_named_and_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    import subprocess
+
+    from fluid_build.cli import _ship_release
+
+    def dubious(argv: Any, **kw: Any) -> Any:
+        return subprocess.CompletedProcess(
+            argv, 128, "", "fatal: detected dubious ownership in repository at '/w'\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", dubious)
+    assert _ship_release.checkout_head(tmp_path) is None
+    assert "release_checkout_unknown" in caplog.text and "dubious ownership" in caplog.text
+    caplog.clear()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kw: subprocess.CompletedProcess(
+            argv, 128, "", "fatal: not a git repository (or any parent)\n"
+        ),
+    )
+    assert _ship_release.checkout_head(tmp_path) is None and caplog.text == ""
+
+
+def test_a_checkout_without_git_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    import subprocess
+
+    from fluid_build.cli import _ship_release
+
+    def no_git(argv: Any, **kw: Any) -> Any:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", no_git)
+    assert _ship_release.checkout_head(tmp_path) is None
+    assert "release_checkout_unknown: git cannot run" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--stage", "1-2", "--ci-output", "plain", "--release-dir", "../rel"],
+        [*_UNTIL_4, "--release-dir", "../rel", "--artifacts", "missing.lock.yaml"],
+    ],
+)
+def test_a_refused_release_run_in_ci_runs_no_git(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, in_ci: None, argv: Any
+) -> None:
+    """In a CI runner the source commit is known, and the checkout check runs git: only once
+    every other refusal passed, just before stage 1."""
+    fake = _install(monkeypatch, bundled)
+    asked = []
+    monkeypatch.setattr(
+        "fluid_build.cli._ship_release.checkout_head", lambda d: asked.append(d) or None
+    )
+    assert _ship(argv) == 2
+    assert fake.calls == [] and asked == []
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel2"]) == 0
+    assert len(asked) == 1

@@ -70,6 +70,11 @@ class Release:
     #: after it was sealed, or was never one. True proves little: whoever writes a record can
     #: compute the digest, and the sealed time and the source are outside it.
     intact: bool = True
+    #: The release's code digest, the same for every environment sealed from one commit.
+    code_digest: Optional[str] = None
+    #: The newest receipt of each environment for that code (``fluid runs receipt record``),
+    #: ``{env: {"result", "time_verified", "identity_digest"}}``.
+    receipts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         out = asdict(self)
@@ -221,6 +226,7 @@ def _release(shown: str, index: Mapping[str, Any]) -> Optional[Release]:
         bundle_digest=_text(_mapping(identity.get("bundle")).get("manifest_digest"), 80),
         external=_external(identity),
         intact=intact,
+        code_digest=_text(index.get("code_digest"), 80),
     )
 
 
@@ -267,6 +273,9 @@ def _release_in(directory: Path, shown: str, wanted: str, found: Found) -> Optio
     elif release.product_id != wanted:
         found.skip("a release of another product")
     else:
+        from fluid_build.cli import _release_receipt
+
+        release.receipts = _release_receipt.newest_by_environment(directory, release.code_digest)
         return release
     return None
 
@@ -414,6 +423,14 @@ def describe(release: Release) -> List[str]:
             f"  external {item.get('name', '?')} ({item.get('kind', '?')})"
             f" sha256:{item.get('sha256', '?')}"
             + (f"  from {built}" if built else "  (the record names no source)")
+        )
+    for env, receipt in sorted(release.receipts.items()):
+        if "problem" in receipt:
+            lines.append(f"  receipt  {env} cannot be told: {receipt['problem']}")
+            continue
+        mine = " (this release)" if receipt.get("identity_digest") == release.release_id else ""
+        lines.append(
+            f"  receipt  {env} {receipt.get('result')} {receipt.get('time_verified')}{mine}"
         )
     if not release.intact:
         lines.append(
