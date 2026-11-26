@@ -155,8 +155,10 @@ def deploy_release(
             break
     if failure is not None:
         # a FAILED deploy receipt always goes with exit 1: the deploy reached a target and
-        # stopped, whatever stopped it
-        out.exit_code, out.reason = FAIL, str(failure)
+        # stopped, whatever stopped it. A dry run writes no receipt and keeps what it found
+        # (2 when a read decided nothing).
+        out.exit_code = failure.exit_code if dry_run else FAIL
+        out.reason = str(failure)
     else:
         copied = sum(1 for r in out.targets if r["action"] == "copied")
         out.exit_code = PASS
@@ -315,15 +317,28 @@ def _pinned(
             "s3:GetBucketVersioning is needed)",
             UNDECIDED,
         ) from None
-    if status != "Enabled" or any(
-        not s3.version_id(o.get("version_id")) or not o.get("etag") for o in checked.objects
-    ):
+    if status != "Enabled":
         # Suspended (or never on): every write is the "null" version, replaced in place
         raise DeployError(
             f"{checked.source} sits in a bucket whose versioning is "
             f"{clean(status, 20) if status else 'off'} (Enabled is needed), so a copy cannot be "
             "pinned to the bytes that were verified: publish releases to a bucket with "
             "versioning Enabled (fluid ship --release-to-require versioning)",
+            UNDECIDED,
+        )
+    unpinned = [o["path"] for o in checked.objects if not s3.version_id(o.get("version_id"))]
+    if unpinned:
+        raise DeployError(
+            f"{checked.source}{clean(unpinned[0], 200)} was written while the bucket's versioning "
+            "was off or Suspended (version null), which the next write replaces in place, so it "
+            "pins nothing: publish the release again now that versioning is Enabled",
+            UNDECIDED,
+        )
+    untagged = [o["path"] for o in checked.objects if not o.get("etag")]
+    if untagged:
+        raise DeployError(
+            f"{checked.source}{clean(untagged[0], 200)} was read with no ETag, so its copy cannot "
+            "be tied to the bytes that were verified",
             UNDECIDED,
         )
     try:

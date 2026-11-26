@@ -1103,3 +1103,50 @@ def test_a_deploy_statement_names_its_own_policy_and_never_stands_for_a_check() 
     assert receipts.statement(receipt, b"{}")["predicate"]["policy"]["uri"].endswith(
         "#report-verdict"
     )
+
+
+def test_objects_written_while_versioning_was_suspended_are_named(tmp_path: Path) -> None:
+    """Versioning Enabled now, and the release's objects still the "null" version they were
+    written as: publish again."""
+    s3 = SuspendedS3()
+    uri = _published(tmp_path, s3)
+    s3.versioning = "Enabled"
+    done = _deploy(uri, s3)
+    assert done.exit_code == 2 and "written while the bucket's versioning was off or " in (
+        done.reason
+    )
+    assert "publish the release again" in done.reason and _target_writes(s3) == []
+
+
+def test_an_object_read_with_no_etag_is_named(
+    tmp_path: Path, s3: DeployS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uri = _published(tmp_path, s3)
+    real = DeployS3.get_object
+
+    def no_etag(self: Any, **kw: Any) -> Dict[str, Any]:
+        got = real(self, **kw)
+        got.pop("ETag", None)
+        return got
+
+    monkeypatch.setattr(DeployS3, "get_object", no_etag)
+    done = _deploy(uri, s3)
+    assert done.exit_code == 2 and "was read with no ETag" in done.reason
+
+
+def test_a_dry_run_that_cannot_read_a_target_decides_nothing(
+    tmp_path: Path, s3: DeployS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uri = _published(tmp_path, s3)
+    real = DeployS3.head_object
+
+    def slow(self: Any, **kw: Any) -> Dict[str, Any]:
+        if kw.get("ExpectedBucketOwner"):
+            raise S3Error("SlowDown", 503)
+        return real(self, **kw)
+
+    monkeypatch.setattr(DeployS3, "head_object", slow)
+    done = _deploy(uri, s3, dry_run=True)
+    assert done.exit_code == 2 and done.receipt is None
+    done = _deploy(uri, s3)  # a real deploy that stopped: exit 1 and a FAILED receipt
+    assert done.exit_code == 1 and done.receipt is not None

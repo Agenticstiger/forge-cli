@@ -209,7 +209,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes the "null" version, replaced in place, which pins nothing), and its `release.json` must
   have one version and no delete marker (exit 1 otherwise: targets rewritten after the seal keep
   the code digest), so the release prefix's writers must hold neither `s3:DeleteObjectVersion`
-  nor `s3:PutBucketVersioning`; `--sign` is checked before any copy. Then each target, every DAG
+  nor `s3:PutBucketVersioning`; the deploy role reads the bucket's versioning
+  (`s3:GetBucketVersioning`) and the versions of `release.json` (`s3:ListBucketVersions`);
+  `--sign` is checked before any copy. Then each target, every DAG
   last: one that already has the file's full-object SHA-256 is left alone; otherwise CopyObject
   copies the release object at the version and ETag the check read (`CopySourceIfMatch`), with `If-Match`
   the target's ETag, or `If-None-Match: *` for a new key, `ExpectedBucketOwner` on every call to
