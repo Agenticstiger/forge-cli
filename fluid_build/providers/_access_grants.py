@@ -9,7 +9,8 @@ what the gateway enforces are one definition, not copies:
 * :class:`GrantScope` and :func:`parse_grant_scope`: which exposes a grant's
   ``resources`` name;
 * :func:`logical_key`: a principal as written, with its type prefix spelled one way;
-* :data:`READ_VERBS`: the permissions that read.
+* :data:`READ_VERBS`: the permissions that read;
+* :func:`identity_key` and :func:`aws_principal_key`: whether two spellings are one principal.
 
 Only the standard library is imported, because the gateway imports this module and
 ``fluid_build.iac`` loads every provider.
@@ -102,6 +103,40 @@ def logical_key(raw: Any) -> str:
     return text
 
 
+#: An IAM role or user ARN: partition, account, kind, then any path and the name.
+AWS_IAM_NAMED_RE = re.compile(r"arn:(aws[a-z0-9-]*):iam::([^:\s]+):(role|user)/(?:\S*/)?([^/\s]+)")
+
+#: A whole AWS account as a principal: its bare ID, or its ``:root`` ARN.
+AWS_ACCOUNT_RE = re.compile(r"(?:arn:aws[a-z0-9-]*:iam::)?(\d{12})(?::root)?")
+
+
+def aws_principal_key(identity: Any) -> str:
+    """One spelling of an AWS principal, to tell whether two name the same one.
+
+    IAM keeps one role (and one user) per name in an account, whatever its path, and
+    does not tell names apart by case (IAM API Reference, CreateRole ``RoleName``:
+    "Names are not distinguished by case"; ``Path`` is a separate parameter). So
+    ``role/Analyst`` and ``role/data/analyst`` in one account are the role
+    ``role/analyst``: the key keeps the partition, account and kind, and the name
+    lower-cased, without the path. A whole account (its ID, or its ``:root`` ARN)
+    keys as the bare ID. Anything else is the text, trimmed.
+
+    The key is for comparison only. A grant is emitted with its principal as written.
+    On a live account Lake Formation refuses a spelling IAM does not hold ("Invalid
+    path for user", "Invalid principal"; seen 2026-11-16), so matching by key makes
+    ``fluid validate`` refuse or filter such a grant before ``apply`` ever sends it.
+    """
+    text = str(identity or "").strip()
+    named = AWS_IAM_NAMED_RE.fullmatch(text)
+    if named:
+        partition, account, kind, name = named.groups()
+        return f"arn:{partition}:iam::{account}:{kind}/{name.lower()}"
+    account = AWS_ACCOUNT_RE.fullmatch(text)
+    if account:
+        return account.group(1)
+    return text
+
+
 def identity_key(raw: Any) -> str:
     """The address a principal names, to tell whether two spellings are one principal.
 
@@ -109,14 +144,16 @@ def identity_key(raw: Any) -> str:
     unprefixed principal as a member of the type it infers (``user:`` for an address,
     ``serviceAccount:`` for a service-account address), so ``alice@x`` and
     ``user:alice@x`` are one member there; keying by the address alone puts them
-    together here. It is for comparison only and only ever groups more principals, so
+    together here, and an AWS role is keyed as :func:`aws_principal_key` keys it (one role
+    per name, whatever its path), as the Lake Formation emitter files a row filter. It is
+    for comparison only and only ever groups more principals, so
     a subtraction that uses it narrows.
     """
     text = logical_key(raw)
     head, sep, rest = text.partition(":")
     if sep and head.strip().lower() in CANONICAL_PREFIXES and rest.strip():
         text = rest.strip()
-    return text.casefold()
+    return aws_principal_key(text).casefold()
 
 
 class ReaderRuleError(ValueError):
@@ -293,6 +330,9 @@ __all__ = [
     "GrantScope",
     "READ_VERBS",
     "ReaderRuleError",
+    "AWS_ACCOUNT_RE",
+    "AWS_IAM_NAMED_RE",
+    "aws_principal_key",
     "every_row_readers",
     "identity_key",
     "logical_key",

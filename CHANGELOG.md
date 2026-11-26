@@ -47,24 +47,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resource the gateway cannot evaluate, or whose principal `binding.principals` maps to `[]` never
   counts, and neither does a reader mapped to `[]`. Nor does a grant whose only read is `owner`: it
   reads on BigQuery but holds no table privilege on Databricks, and the gateway counts only what
-  reads on every platform. A principal a row filter names never
-  reads every row, whatever its spelling (the type prefix, which an unprefixed address leaves
-  to be inferred, and the case are folded for that comparison, and two principals that
-  `binding.principals` maps to one identity are one). A caller's verified principals match as written and are never translated through
-  `binding.principals`. Without `contract=` only `policy.authz.readers` read every row, narrowed
-  the same two ways. An `accessPolicy` or `binding.principals` that cannot be read as written is
-  refused with `RowFilterUnavailable`. `row_filter_predicate`, `compile_semantic_query`,
-  `compile_free_form_sql` and the `sample` read take the keyword; the gateway's own tools pass the
-  session's contract.
+  reads on every platform. A principal a row filter names never reads every row, whatever its
+  spelling (the type prefix, which an unprefixed address leaves to be inferred, and the case are
+  folded for that comparison, an AWS role is one whatever its path, and two principals that
+  `binding.principals` maps to one identity are one). A caller's verified principals match as
+  written and are never translated through `binding.principals`. Without `contract=` only
+  `policy.authz.readers` read every row, narrowed the same ways. An `accessPolicy` or
+  `binding.principals` that cannot be read as written is
+  refused with `RowFilterUnavailable`. `row_filter_predicate`, `compile_semantic_query` and
+  `compile_free_form_sql` take the keyword, and the `sample` read uses the contract its driver was
+  built with; the gateway's own tools pass the session's contract.
 - **`declares_row_filters` decides from the expose's policy alone.** A `$ref` left in an expose's
   `contract` or columns no longer reads as filtered, so a library caller that reads the contract
   as written no longer has to work around a refusal there. With `contract=` (the whole document as
   written) it first resolves the document's same-document pointers, so a policy kept behind one is
   read; a pointer in the expose or its policy that cannot be resolved (another file, say) is still
   refused. The read paths (`row_filter_predicate`, `compile_semantic_query`,
-  `compile_free_form_sql` and the `sample` read) still refuse any unresolved pointer in the expose
-  or in `accessPolicy`, with or without `contract=`: the column restrictions and sensitivity flags
-  they apply are computed from the expose as passed, so they need the document resolved first.
+  `compile_free_form_sql` and the `sample` read) still refuse any unresolved pointer in the expose,
+  with or without `contract=`, and in `accessPolicy` when `contract=` reads it: the column
+  restrictions and sensitivity flags they apply are computed from the expose as passed, so they
+  need the document resolved first.
 
 ### Fixed
 

@@ -269,6 +269,23 @@ def test_two_principals_that_binding_principals_maps_to_one_identity_are_one_pri
     assert "branch" in _predicate(contract, BRANCH)
 
 
+@pytest.mark.parametrize(
+    ("filtered_arn", "reader_arn"),
+    [
+        ("arn:aws:iam::111122223333:role/team/Analyst", "arn:aws:iam::111122223333:role/analyst"),
+        ("arn:aws:iam::111122223333:role/analyst", "arn:aws:iam::111122223333:role/ANALYST"),
+        ("arn:aws:iam::111122223333:root", "111122223333"),
+    ],
+)
+def test_two_principals_mapped_to_one_iam_role_are_one_principal(filtered_arn, reader_arn):
+    # IAM keeps one role per name, whatever its path and case, and the Lake Formation
+    # emitter files its filter by that key, so the filtered role's other spelling is
+    # filtered too.
+    contract = _contract([_grant(GRANTEE)], principals={BRANCH: filtered_arn, GRANTEE: reader_arn})
+    assert _refused(lambda: _predicate(contract, GRANTEE)) == "RowFilterIdentityMissing"
+    assert "branch" in _predicate(contract, BRANCH)
+
+
 def test_principals_mapped_to_different_identities_stay_apart():
     contract = _contract(
         [_grant(GRANTEE)],
