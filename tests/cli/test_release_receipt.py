@@ -1067,3 +1067,33 @@ def test_a_listing_whose_pages_do_not_advance_decides_nothing(
     monkeypatch.setattr(s3, "list_object_versions", stuck)
     found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
     assert found.exit_code == 2 and "cannot be listed to its end" in found.reason
+
+
+@pytest.mark.parametrize("extension", ["x", [1]])
+def test_a_signed_statement_of_another_shape_does_not_pass(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any], extension: Any
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    done = receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    key = done.uri.split("/", 3)[3].removesuffix(".json") + ".intoto.jsonl"
+    statement = json.loads(s3.objects[("acme-releases", key)])
+    statement["predicate"][receipts.RECEIPT_EXTENSION] = extension
+    body = json.dumps(statement).encode()
+    s3.objects[("acme-releases", key)] = body
+    s3.objects[("acme-releases", key + ".sig")] = hashlib.sha256(body).hexdigest().encode()
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 1 and "is not one a receipt is signed as" in found.reason
+
+
+def test_a_cosign_that_does_not_answer_decides_nothing(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import _signing
+
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    monkeypatch.setattr(_signing, "verify_blob", lambda path, **kw: {"exit_code": 124})
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 2 and "cosign did not answer" in found.reason

@@ -290,7 +290,10 @@ class _DirStore(_Store):
             linked = self._linked()
             for part in (self.directory.parent, self.directory):  # one level at a time
                 if not linked and not os.path.lexists(part):
-                    os.mkdir(part, 0o700)
+                    try:
+                        os.mkdir(part, 0o700)
+                    except FileExistsError:
+                        pass  # another record made it meanwhile; checked as a link below
             linked = linked or self._linked()
         except OSError as exc:
             raise ReceiptError(
@@ -1166,6 +1169,8 @@ def _signature_problem(
             )
         except CLIError as exc:
             raise ReceiptError(f"--require-signed: {exc.event}", UNDECIDED) from None
+    if result.get("exit_code") in (124, 127):  # cosign timed out, or could not run
+        raise ReceiptError("--require-signed: cosign did not answer", UNDECIDED)
     if result.get("exit_code") != 0:
         return "--require-signed: the newest receipt's signature does not verify for that signer"
     try:
@@ -1173,6 +1178,8 @@ def _signature_problem(
         predicate = signed["predicate"]
         extension = predicate[RECEIPT_EXTENSION]
         subject = signed["subject"][0]["digest"]["sha256"]
+        if not isinstance(predicate, Mapping) or not isinstance(extension, Mapping):
+            raise TypeError(RECEIPT_EXTENSION)
     except (UnicodeDecodeError, ValueError, RecursionError, KeyError, IndexError, TypeError):
         return "--require-signed: the signed Statement is not one a receipt is signed as"
     index: Mapping[str, Any] = next(

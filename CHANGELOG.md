@@ -156,7 +156,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that environment and of the same code. A newest file there that is not a receipt fails the
   check rather than falling back to an older one, and so does a receipt overwritten or deleted
   after it was written (the listing reads every version and delete marker; reading receipts in
-  S3 needs `s3:ListBucketVersions`) or one of other code under this code's folder. A receipt of
+  S3 needs `s3:ListBucketVersions` and `s3:GetObjectVersion`, and `--require-signed` also
+  `s3:GetBucketVersioning`) or one of other code under this code's folder. A receipt of
   this code named later than now decides nothing (exit 2), and a listing past 50,000 entries
   decides nothing. It never reads a release's `gates` or
   `provenance`. A receipt is only as trusted as whoever can write `receipts/<env>/`: keep that to
