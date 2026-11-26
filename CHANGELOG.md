@@ -98,11 +98,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over 5 GiB are refused before any write. `--release-to-require versioning` refuses a bucket
   without versioning; `--release-to-require object-lock` refuses one without Object Lock and a
   default retention (a mode and a period: an enabled lock with no rule locks nothing), and then
-  checks that every object reads back with a lock mode and a retain-until date still to come.
-  GOVERNANCE retention yields to `s3:BypassGovernanceRetention`; COMPLIANCE yields to no one. The run report's `release.remote` says where the release went, or why
-  not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
-  boto3 is refused before stage 1 (exit 2), and so is a run whose CI names no commit: without one
-  the release has no code digest.
+  checks that every object, the ones already there included, reads back with a GOVERNANCE or
+  COMPLIANCE mode and a retain-until date still to come. When an object already there is no
+  longer locked, the run is refused before `release.json` is written, with the count, the last
+  date a lock ran out, and the two ways on: extend each version's retention
+  (`aws s3api put-object-retention`), or publish under a new code digest from a new commit.
+  Without `object-lock` required, such a re-run stands as before.
+  GOVERNANCE retention yields to `s3:BypassGovernanceRetention`; COMPLIANCE yields to no one. The
+  run report's `release.remote` says where the release went, or why not. `--release-to` without
+  `--release-dir`, a target that is not `s3://bucket/prefix/`, or no boto3 is refused before
+  stage 1 (exit 2), and so is a run whose CI names no commit, or a commit that is not a full 40-
+  or 64-hex one: without one the release has no code digest.
 - **`fluid runs verify-release SRC` checks a sealed release, read-only.** SRC is a release
   directory or the `s3://` prefix `--release-to` wrote. It checks that `release.json` is a
   `fluid-release/1` record whose `identity_digest` is the digest of its `identity`, that an S3 key

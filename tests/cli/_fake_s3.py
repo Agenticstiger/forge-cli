@@ -52,6 +52,11 @@ class FakeS3:
         self.retention: Optional[Tuple[str, int]] = None
         self.lock_rule = True  # with object_lock: a Rule.DefaultRetention is set
         self.unlocked: Set[str] = set()  # keys that read back with no lock fields
+        self.expired: Set[str] = set()  # keys whose retention ran out yesterday
+        #: Lock fields as some other store answers them: replace the mode, the retain-until
+        #: date, or the default rule's period (``{"Days": True}``).
+        self.head_lock: Dict[str, Any] = {}
+        self.rule_period: Optional[Dict[str, Any]] = None
 
     def __call__(self, service: str, region: Optional[str]) -> "FakeS3":
         assert service == "s3"
@@ -102,8 +107,10 @@ class FakeS3:
         if self.retention and Key not in self.unlocked:
             import datetime as dt
 
-            until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=self.retention[1])
+            days = -1 if Key in self.expired else self.retention[1]
+            until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)
             head.update(ObjectLockMode=self.retention[0], ObjectLockRetainUntilDate=until)
+            head.update(self.head_lock)
         return head
 
     def get_object(self, *, Bucket: str, Key: str, VersionId: str = "") -> Dict[str, Any]:
@@ -128,7 +135,8 @@ class FakeS3:
         config: Dict[str, Any] = {"ObjectLockEnabled": "Enabled"}
         if self.lock_rule:
             mode, days = self.retention or ("GOVERNANCE", 1)
-            config["Rule"] = {"DefaultRetention": {"Mode": mode, "Days": days}}
+            period = {"Days": days} if self.rule_period is None else self.rule_period
+            config["Rule"] = {"DefaultRetention": {"Mode": mode, **period}}
         return {"ObjectLockConfiguration": config}
 
 
