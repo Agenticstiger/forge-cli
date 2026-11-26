@@ -54,20 +54,16 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
+from ..providers._access_grants import AWS_ACCOUNT_RE as _AWS_ACCOUNT_RE
+from ..providers._access_grants import AWS_IAM_NAMED_RE as _AWS_IAM_NAMED_RE
+from ..providers._access_grants import CANONICAL_PREFIXES as _GCP_PREFIXES
+from ..providers._access_grants import aws_principal_key, logical_key
 from .access import AccessGrant, _split_principal
 from .base import UnsupportedBindingError
 
 #: Top-level domains reserved for documentation and testing: RFC 2606 section 2
 #: and RFC 6761 section 6. No registrar issues them, so no identity has one.
 RESERVED_TLDS = frozenset({"example", "test", "invalid", "localhost"})
-
-#: IAM member prefixes, lower-cased, to the spelling IAM expects.
-_GCP_PREFIXES = {
-    "user": "user",
-    "group": "group",
-    "serviceaccount": "serviceAccount",
-    "domain": "domain",
-}
 
 #: An email-shaped IAM member, and a ``domain:`` member.
 _GCP_EMAIL_MEMBER_RE = re.compile(r"(user|group|serviceAccount):[^@\s:]+@[A-Za-z0-9.-]+")
@@ -76,12 +72,6 @@ _GCP_DOMAIN_MEMBER_RE = re.compile(r"domain:[A-Za-z0-9.-]+")
 #: An IAM principal ARN, as ``governance.lakeFormation.grants[].principal`` takes it
 #: (the schema's pattern; the rest may carry an ``{{ env.* }}`` template).
 _AWS_PRINCIPAL_RE = re.compile(r"arn:aws[a-z0-9-]*:iam::\S+")
-
-#: An IAM role or user ARN: partition, account, kind, then any path and the name.
-_AWS_IAM_NAMED_RE = re.compile(r"arn:(aws[a-z0-9-]*):iam::([^:\s]+):(role|user)/(?:\S*/)?([^/\s]+)")
-
-#: A whole AWS account as a principal: its bare ID, or its ``:root`` ARN.
-_AWS_ACCOUNT_RE = re.compile(r"(?:arn:aws[a-z0-9-]*:iam::)?(\d{12})(?::root)?")
 
 #: An AWS Organizations organization or organizational unit, as a principal.
 _AWS_ORGANIZATION_RE = re.compile(r"arn:aws[a-z0-9-]*:organizations::\S+")
@@ -128,21 +118,6 @@ _LAKEKEEPER_PREFIXES = {
 _LAKEKEEPER_BAD_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 PrincipalMap = Dict[str, Tuple[str, ...]]
-
-
-def logical_key(raw: Any) -> str:
-    """A principal as written, with its type prefix spelled one way.
-
-    ``serviceaccount:x`` and ``serviceAccount:x`` name the same principal, as
-    ``accessPolicy`` has always read them (``iac/access.py``); the rest of the
-    string is kept exactly, since the mapping is looked up by it.
-    """
-    text = str(raw or "").strip()
-    head, sep, rest = text.partition(":")
-    canonical = _GCP_PREFIXES.get(head.strip().lower())
-    if sep and canonical and rest.strip():
-        return f"{canonical}:{rest.strip()}"
-    return text
 
 
 def grant_key(grant: AccessGrant) -> str:
@@ -403,33 +378,6 @@ def resolve_principal(
         check(identity, raw=key, where=where, mapped=mapped or platform == AWS)
         for identity in identities
     )
-
-
-def aws_principal_key(identity: Any) -> str:
-    """One spelling of an AWS principal, to tell whether two name the same one.
-
-    IAM keeps one role (and one user) per name in an account, whatever its path, and
-    does not tell names apart by case (IAM API Reference, CreateRole ``RoleName``:
-    "Names are not distinguished by case"; ``Path`` is a separate parameter). So
-    ``role/Analyst`` and ``role/data/analyst`` in one account are the role
-    ``role/analyst``: the key keeps the partition, account and kind, and the name
-    lower-cased, without the path. A whole account (its ID, or its ``:root`` ARN)
-    keys as the bare ID. Anything else is the text, trimmed.
-
-    The key is for comparison only. A grant is emitted with its principal as written.
-    On a live account Lake Formation refuses a spelling IAM does not hold ("Invalid
-    path for user", "Invalid principal"; seen 2026-11-16), so matching by key makes
-    ``fluid validate`` refuse or filter such a grant before ``apply`` ever sends it.
-    """
-    text = str(identity or "").strip()
-    named = _AWS_IAM_NAMED_RE.fullmatch(text)
-    if named:
-        partition, account, kind, name = named.groups()
-        return f"arn:{partition}:iam::{account}:{kind}/{name.lower()}"
-    account = _AWS_ACCOUNT_RE.fullmatch(text)
-    if account:
-        return account.group(1)
-    return text
 
 
 def aws_principal_account(identity: Any) -> Optional[str]:

@@ -9,6 +9,12 @@ on:
 # `contents: write` itself, below, so a step added to any other job later
 # cannot inherit write access to the repository.
 #
+# The work is split in two for the same reason. `update-catalog` installs
+# unpinned third-party packages and runs them against a network response; it
+# holds no write token and keeps none on disk (`persist-credentials: false`).
+# `push-proposal` holds the write token but runs only git and a JSON parse
+# over one file: nothing it installs or fetches ever executes there.
+#
 # `pull-requests: write` used to be granted for peter-evans/create-pull-request.
 # It never worked: this repository has `can_approve_pull_request_reviews:
 # false`, so every run ended with
@@ -25,11 +31,14 @@ permissions:
 jobs:
   update-catalog:
     runs-on: ubuntu-latest
-    # Pushes auto/update-model-catalog with the checkout's token; nothing else.
-    permissions:
-      contents: write
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
     steps:
+      # The default checkout leaves the job's token in .git/config, readable by
+      # every later step, including the pip install below. Nothing here pushes.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
@@ -54,26 +63,86 @@ jobs:
         run: |
           git diff --quiet fluid_build/cli/llm_models.json || echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      # Push a proposal branch; a human opens the pull request from it.
-      #
-      # Deliberately not create-pull-request. That needs Actions to hold
-      # PR-creation rights repository-wide, which is a broad grant to buy one
-      # weekly chore — and the model choice wants a human look anyway: the
-      # script ranks on score and price, which cannot tell that a
-      # highest-scoring model shipped yesterday and nobody has run it in anger.
-      #
-      # force-push because the branch IS the current proposal, not a history.
-      # Last Monday's superseded suggestion is not worth preserving, and
-      # nothing else writes here.
-      - name: Push the proposed catalog to a branch
+      # The one file this job may hand on. An artifact, not a branch: the job
+      # that can write to the repository decides what to do with it.
+      - name: Hand the proposed catalog to the push job
         if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: model-catalog
+          path: fluid_build/cli/llm_models.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Report no change
+        if: steps.diff.outputs.changed != 'true'
+        run: echo "::notice::Model catalog is unchanged — nothing to propose."
+
+  # Push a proposal branch; a human opens the pull request from it.
+  #
+  # Deliberately not create-pull-request. That needs Actions to hold
+  # PR-creation rights repository-wide, which is a broad grant to buy one
+  # weekly chore — and the model choice wants a human look anyway: the
+  # script ranks on score and price, which cannot tell that a
+  # highest-scoring model shipped yesterday and nobody has run it in anger.
+  #
+  # force-push because the branch IS the current proposal, not a history.
+  # Last Monday's superseded suggestion is not worth preserving, and
+  # nothing else writes here.
+  push-proposal:
+    needs: update-catalog
+    if: needs.update-catalog.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    # Pushes auto/update-model-catalog; nothing else.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: model-catalog
+          path: proposed
+
+      # The artifact is data produced by a job that ran fetched code. Only a
+      # JSON object with exactly the catalog's top-level keys is allowed to
+      # replace the file; anything else stops here.
+      - name: Check and place the proposed catalog
+        run: |
+          set -euo pipefail
+          python3 - proposed/llm_models.json <<'PY'
+          import json
+          import sys
+
+          keys = {"schema_version", "updated_at", "source", "default_provider", "tiers", "providers"}
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              catalog = json.load(handle)
+          if not isinstance(catalog, dict) or set(catalog) != keys:
+              sys.exit("the proposed catalog is not a JSON object with the catalog's top-level keys")
+          PY
+          cp proposed/llm_models.json fluid_build/cli/llm_models.json
+          rm -r proposed
+
+      # The token goes to the one step that pushes, as an HTTP header in the
+      # environment (git reads GIT_CONFIG_*), so it is in neither argv nor
+      # .git/config. actions/checkout authenticates the same way.
+      - name: Push the proposed catalog to a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add fluid_build/cli/llm_models.json
           git commit -m 'chore: update LLM model catalog from OpenRouter'
-          git push --force origin HEAD:refs/heads/auto/update-model-catalog
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git push --force origin HEAD:refs/heads/auto/update-model-catalog
           {
             echo "### Model catalog changed"
             echo
@@ -85,7 +154,3 @@ jobs:
             echo "which cannot judge whether a newly-topping model is production-ready."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::Catalog changed — pushed to auto/update-model-catalog. Open a PR from it to land the change."
-
-      - name: Report no change
-        if: steps.diff.outputs.changed != 'true'
-        run: echo "::notice::Model catalog is unchanged — nothing to propose."

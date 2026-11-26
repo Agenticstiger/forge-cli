@@ -123,6 +123,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
   `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
   environment sealed from one commit and one lock, and absent without a source commit.
+- **The MCP `query` tool reads a column of the version an as-of relationship reaches.** A
+  dimension or a filter key `<relationship>.<column>` on a `semantics.relationships[]` entry that
+  declares `asOf` reads `column` of the version of the target valid on the row's `asOf` value
+  (`joinType: inner` drops rows that reach none; a row that reaches none reads NULL). The target is
+  read only through its own governed projection: its declared columns that no policy restricts and
+  the rows its `policy.authz.rowFilters` leave the same caller, so a version the caller may not read
+  never bounds a visible one; a caller its filters do not name is refused. A restricted target
+  column cannot be read, filtered on or joined on, and a PII column is redacted under its
+  `<relationship>_<column>` name. It works where the gateway reads the target in the same statement:
+  DuckDB (the same database; the target's file must be inside `--readable-paths`), BigQuery (the
+  same project), Snowflake (the same database and schema), PostgreSQL (the same connection
+  settings and database) and Athena (the same workgroup, region and output location). A target
+  with another `agentPolicy`, on another platform, outside the readable paths or whose table name
+  another file holds is refused, and a relationship that is not a well-formed as-of reading is
+  refused with the reason.
 
 ### Changed
 
@@ -150,6 +165,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes `IfNoneMatch`.
 - **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
   and behaviour.
+- **The release builds with a locked build backend.** `setuptools`, `setuptools-scm` and `wheel`
+  are pinned and hashed in `requirements/release-tools.txt`, and the release runs
+  `python -m build --no-isolation`, so no release installs a build backend from PyPI while it
+  builds. Re-dispatch a tag cut before this change (0.41.0 and earlier) with `--ref <tag>`.
+- **The release signs its provenance in jobs of their own.** The jobs that build the
+  distribution files and the image run the package's dependencies, fetched from PyPI at release
+  time, so they no longer hold the token that signs as the release workflow. `attest` signs the
+  wheel and the sdist after checking they are the files the build recorded before any of that
+  code ran, and `attest-image` signs the pushed image. Nothing is published unless `attest`
+  succeeded.
+- **A pull request that changes the release path rehearses the release.** `release.yml` runs as a
+  dry run on a pull request that touches it, the release locks, the Dockerfile, `.grype.yaml`,
+  `pyproject.toml` or `MANIFEST.in`. It builds and checks the distribution files, builds, checks
+  and scans the image, and writes the release notes from the newest tag's CHANGELOG section,
+  failing if that section is not found. It uploads, signs, pushes and announces nothing, no job it
+  runs holds a signing token, and it never shares the release's concurrency group. The release
+  notes are now written by a read-only job; the GitHub Release job only posts them.
+- **The release verifies what it published.** Two read-only jobs end a release. One downloads the
+  GitHub Release's files and checks each with `gh attestation verify`, against its
+  `.intoto.jsonl` bundle and against GitHub's attestation store; the other checks that every GHCR
+  tag the push moved resolves to the digest the run pushed, and verifies it and the attestation
+  stored beside it. Every check pins the signer: the release workflow, the ref and commit the run
+  started from, and a GitHub-hosted runner.
+- **The weekly model-catalog refresh runs fetched code without a write token.** The workflow
+  installed unpinned packages and ran them against a network response in the same job that held
+  `contents: write`, with the checkout's token stored on disk. It is now two jobs: the one that
+  fetches runs read-only with no stored credential and hands the changed catalog on as a file, and
+  the one that pushes the proposal branch checks that file parses as a JSON object, installs and
+  runs nothing, and gives the token to the single step that pushes.
+- **The verification image's Singer tap is installed from a hash lock.** `Dockerfile.verify` ran
+  an unpinned `pip install meltanolabs-tap-postgres` into its own virtual environment. The tap and
+  its dependencies are now named in `requirements/singer-tap.in` and hash-locked in
+  `requirements/singer-tap.txt`, installed with `--require-hashes`.
+- **The security tools' lock no longer carries known advisories.** `requirements/ci-security.txt`
+  is now resolved for Python 3.12, the version that installs it, which lets it take `filelock`
+  4.3.1 (the pip-audit dependency chain had no bound) and, through overrides until the scanner pins
+  fixed releases itself, `opentelemetry` 1.45.2 and `wcmatch` 12.0.4. The OSV scan of the lock
+  went from 20 advisories to none, and the scanner's output on this repository is unchanged.
+- **Who reads every row of a row-filtered expose through the MCP gateway.** On an expose that
+  declares `policy.authz.rowFilters`, the principals that read every row are those in
+  `policy.authz.readers` and, for a library caller that passes `contract=`, the principal of each
+  `accessPolicy` grant that reads (`read`, `select`, `query` or `admin`), has no condition and
+  covers the expose. A grant that only writes, has a condition, is scoped to another expose or to a
+  resource the gateway cannot evaluate, or whose principal `binding.principals` maps to `[]` never
+  counts, and neither does a reader mapped to `[]`. Nor does a grant whose only read is `owner`: it
+  reads on BigQuery but holds no table privilege on Databricks, and the gateway counts only what
+  reads on every platform. A principal a row filter names never reads every row, whatever its
+  spelling (the type prefix, which an unprefixed address leaves to be inferred, and the case are
+  folded for that comparison, an AWS role is one whatever its path, and two principals that
+  `binding.principals` maps to one identity are one). A caller's verified principals match as
+  written and are never translated through `binding.principals`. Without `contract=` only
+  `policy.authz.readers` read every row, narrowed the same ways. An `accessPolicy` or
+  `binding.principals` that cannot be read as written, an `accessPolicy` that holds an unresolved
+  `$ref`, a `binding` that is itself a `$ref`, or a `binding.principals` that holds one, is
+  refused with `RowFilterUnavailable`. `row_filter_predicate`, `compile_semantic_query` and
+  `compile_free_form_sql` take the keyword, and the `sample` read uses the contract its driver
+  was built with; the gateway's own tools pass the session's contract.
+- **`declares_row_filters` decides from the expose's policy alone.** A `$ref` left in an expose's
+  `contract` or columns is no longer refused there, so a library caller that reads the contract
+  as written no longer has to work around a refusal. With `contract=` (the whole document as
+  written) it first resolves the document's same-document pointers, so a policy kept behind one is
+  read; a pointer in the expose or its policy that cannot be resolved (another file, say) is still
+  refused. The read paths (`row_filter_predicate`, `compile_semantic_query`,
+  `compile_free_form_sql` and the `sample` read) still refuse any unresolved pointer in the expose
+  itself, its `policy`, its `contract`, its `contract.schema` or a column, with or without
+  `contract=`, and in `accessPolicy` when `contract=` reads it: the column
+  restrictions and sensitivity flags they apply are computed from the expose as passed, so they
+  need the document resolved first.
 
 ### Fixed
 
@@ -158,6 +241,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows still ended `FAILED: SystemExit: 0` and `fluid apply --mode amend-and-build` reported it
   failed. The runner now returns normally on success and exits only with a failure's code. EMR
   runs are unchanged.
+- **The GHCR image holds the release's own wheel and reports its version.** The image built the
+  package from the source tree, where setuptools-scm finds no git history, so `fluid --version` in
+  the 0.41.0 image says `v0.0.0+unknown`, and that build fetched its own build backend. The image
+  now installs the wheel the release built and PyPI serves, the release refuses to push an image
+  whose package reports another version, and the image's pip, setuptools and wheel come from the
+  hash-locked `requirements/release-image.txt`. A local image build runs `python -m build --wheel`
+  first.
+
+### Security
+
+- **On BigQuery, a principal a row filter names stays out of the every-row policy whatever its
+  case.** When an `accessPolicy` grant or `policy.authz.readers` spelled a principal that a
+  `policy.authz.rowFilters` entry names in another case, `fluid apply` could also make it a grantee
+  of `fluid_all_rows`, the row access policy that reads every row. It now compares the identities
+  with their case folded. Present since 0.19.0.
 
 ## [0.41.0] — 2026-11-25
 

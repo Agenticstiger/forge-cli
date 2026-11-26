@@ -1,0 +1,10 @@
+# Source for requirements/release-image.txt: the packaging tools the release
+# image (the root Dockerfile) installs over its Python base. The image installs
+# the release's own wheel and builds nothing, but it has carried current
+# setuptools and wheel since the base's older copies held fixable advisories
+# that the release scan flags, and a dependency may still import them at run
+# time. The base is Python 3.14. Regenerate with
+# scripts/ci/compile_requirements.sh and review the diff.
+pip
+setuptools
+wheel

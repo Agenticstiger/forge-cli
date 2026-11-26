@@ -1,0 +1,6 @@
+# Source for requirements/singer-tap.txt: the Singer tap Dockerfile.verify puts
+# in its own virtual environment, for the meltano runner's embedded Singer mode.
+# The image is Python 3.12. Regenerate with scripts/ci/compile_requirements.sh.
+meltanolabs-tap-postgres>=0.5
+# pyyaml 6.0.4 is excluded as in pyproject.toml (yaml/pyyaml#953).
+pyyaml!=6.0.4

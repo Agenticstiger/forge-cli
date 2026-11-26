@@ -189,6 +189,32 @@ def test_every_promoted_model_gets_an_entry() -> None:
                 assert selected in listed, f"{provider}.{role}={selected} has no models[] entry"
 
 
+def test_a_refresh_keeps_the_tiers_it_does_not_fetch(tmp_path, monkeypatch) -> None:
+    """`tiers` is read by the model catalog and not produced by the fetch; a
+    refresh that left it out would delete it from the file."""
+    existing = tmp_path / "llm_models.json"
+    existing.write_text('{"tiers": {"openai": {"flagship": "x"}}, "providers": {}}', "utf-8")
+    monkeypatch.setattr(umc, "CATALOG_PATH", existing)
+    api = [
+        {
+            "creator": {"slug": "openai"},
+            "api_model_id": "gpt-brand-new",
+            "evaluations": {"intelligence_index": 98.0},
+            "pricing": {"input_per_million_tokens": 10.0},
+        }
+    ]
+    catalog = umc.build_catalog(api)
+    assert catalog["tiers"] == {"openai": {"flagship": "x"}}
+    assert set(catalog) == {
+        "schema_version",
+        "updated_at",
+        "source",
+        "default_provider",
+        "tiers",
+        "providers",
+    }
+
+
 def test_capabilities_come_from_litellm_when_it_knows() -> None:
     """The borrow. litellm ships this per model; we were guessing per provider."""
     caps = umc.capabilities_for("gemini", "gemini-2.5-flash")

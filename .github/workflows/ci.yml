@@ -958,7 +958,10 @@ jobs:
             tests/output_ports/test_query_rls.py \
             tests/output_ports/test_quickstart_golden_path.py \
             tests/output_ports/test_restricted_columns_projection.py \
-            tests/output_ports/test_rls_real_engine_duckdb.py
+            tests/output_ports/test_rls_real_engine_duckdb.py \
+            tests/output_ports/test_row_filter_pointers.py \
+            tests/output_ports/test_row_filter_readers.py \
+            tests/test_row_filter_reader_parity.py
 
   # ──────────────────────────────────────────────────────────────
   # dbt v2 canary. The `test` and `coverage-and-audit` jobs install
