@@ -15,7 +15,7 @@ import inspect
 
 import fluid_build.api as api
 
-EXPECTED_API_VERSION = "1.3"
+EXPECTED_API_VERSION = "1.4"
 
 EXPECTED_ALL = {
     "__api_version__",
@@ -79,6 +79,8 @@ EXPECTED_ALL = {
     # release verification (added in 1.3)
     "ReleaseVerification",
     "verify_release",
+    # verify report verdict (added in 1.4)
+    "report_verdict",
 }
 
 
@@ -202,3 +204,12 @@ def test_modules_under_api_have_copyright_headers() -> None:
         with open(src_file) as fh:
             head = fh.read(500)
         assert "Copyright" in head, f"Missing copyright header in {modinfo.name}"
+
+
+def test_report_verdict_is_the_one_promote_uses() -> None:
+    """The public verdict is the one ``fluid datamesh-manager promote --verify-report`` takes."""
+    from fluid_build.cli import _dmm_promote
+
+    report = {"summary": {"total": 1, "match": 1, "mismatch": 0, "error": 0}}
+    assert api.report_verdict(report) == _dmm_promote.report_verdict(report) == (True, "")
+    assert api.report_verdict({"summary": {"total": 1}})[0] is False

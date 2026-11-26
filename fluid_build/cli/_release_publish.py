@@ -138,6 +138,13 @@ def refusal(target: str, release_dir: Optional[Path], require: Sequence[str]) ->
     from . import _ship_release
 
     if _ship_release.source_identity(os.environ) is None:
+        found = _ship_release.source_revision(os.environ) or {}
+        if found.get("revision"):
+            return (
+                f"--release-to {target} files the release under the digest of its code, and the "
+                f"CI names {found['revision']}, not a full 40- or 64-hex commit: set the CI's "
+                "commit variable to the full commit"
+            )
         return (
             f"--release-to {target} files the release under the digest of its code, which needs "
             "the commit the CI built, and no CI variable names one (GITHUB_SHA, CI_COMMIT_SHA, "
@@ -211,12 +218,22 @@ def publish_release(
     for check in require:
         upload.require(check)
     if upload.check_index(files[-1], identity_hex):
-        for item in files:  # with object-lock required, each object there must carry its lock
-            if upload.lock and (head := upload._head(prefix + item.rel)) is not None:
-                upload._locked(head, f"{uri}{item.rel}")
+        if upload.lock:  # each object the release there lists must carry its lock
+            for rel in upload.remote_paths:
+                head = upload._head(prefix + rel)
+                if head is None:
+                    raise upload._fail(f"{uri}{rel} is listed by {uri}release.json and is gone")
+                upload._locked(head, f"{uri}{rel}")
+            upload.refuse_expired()
         return Published(uri=uri, written=0, already=0, by_another_run=True, retention=upload.lock)
-    for item in files:
+    for item in files[:-1]:
         upload.put(item)
+    if upload.index_there:  # this release, published before: its release.json counts too
+        upload.put(files[-1])
+    upload.refuse_expired()  # before release.json, so no reader takes the release as published
+    if not upload.index_there:
+        upload.put(files[-1])
+        upload.refuse_expired()
     return Published(uri=uri, written=upload.written, already=upload.already, retention=upload.lock)
 
 
@@ -303,11 +320,17 @@ class _Upload:
         #: ``--release-to-require object-lock``: the bucket's default retention ("MODE, n days"),
         #: which every object read back must carry.
         self.lock: Optional[str] = None
+        #: Objects already there whose lock has run out: (shown uri, retain-until date).
+        self.expired: List[Tuple[str, Any]] = []
+        #: The paths the ``release.json`` another run published lists (``check_index``).
+        self.remote_paths: List[str] = []
 
     def _done(self) -> str:
         """What this run left in S3, for a refusal's message."""
         if not (self.written or self.already):
             return "nothing was written"
+        if self.index_there:
+            return f"{self.written} object(s) were written; the release was already published"
         return (
             f"{self.written} object(s) were written and {self.already} were already there; "
             "release.json is written last, so no reader takes this release as published"
@@ -356,7 +379,7 @@ class _Upload:
         period = [
             f"{default[unit]} {unit.lower()}"
             for unit in ("Days", "Years")
-            if isinstance(default.get(unit), int) and default[unit] > 0
+            if type(default.get(unit)) is int and default[unit] > 0
         ]
         if mode not in ("GOVERNANCE", "COMPLIANCE") or not period:
             missing = (
@@ -377,19 +400,37 @@ class _Upload:
         return True
 
     def _locked(self, head: Mapping[str, Any], shown: str) -> None:
-        """With ``object-lock`` required: the object itself carries a lock that has not run out
-        (the bucket's rule is what the object should get; this is what it got)."""
+        """With ``object-lock`` required: the object itself carries a lock (the bucket's rule is
+        what the object should get; this is what it got). A lock that has run out is noted, and
+        :meth:`refuse_expired` refuses the run with every such object counted."""
         import datetime as dt
 
         if not self.lock:
             return
         until = head.get("ObjectLockRetainUntilDate")
-        if not head.get("ObjectLockMode") or not isinstance(until, dt.datetime):
+        if (
+            head.get("ObjectLockMode") not in ("GOVERNANCE", "COMPLIANCE")
+            or not isinstance(until, dt.datetime)
+            or until.tzinfo is None
+        ):
             raise self._fail(f"{shown} reads back with no Object Lock retention")
-        if until.tzinfo is None:
-            until = until.replace(tzinfo=dt.timezone.utc)
         if until <= dt.datetime.now(dt.timezone.utc):
-            raise self._fail(f"{shown} reads back with an Object Lock retention that has run out")
+            self.expired.append((shown, until))
+
+    def refuse_expired(self) -> None:
+        """Refuse when an object already there is no longer locked: with ``object-lock``
+        required, a release that can be deleted is not published. A re-run without that
+        requirement stands, as any re-run of a published release does."""
+        if not self.expired:
+            return
+        last = max(until for _, until in self.expired)
+        raise self._fail(
+            f"--release-to-require object-lock: {len(self.expired)} object(s) under {self.uri} "
+            f"are no longer locked (the retention ran out, the last on "
+            f"{last.strftime('%Y-%m-%dT%H:%M:%SZ')}). Extend each version's retention "
+            "(aws s3api put-object-retention), or publish under a new code digest, from a new "
+            "commit"
+        )
 
     def _head(self, key: str, *, denied_is_missing: bool = False) -> Optional[Dict[str, Any]]:
         """The object's metadata with its checksum, or None when there is none.
@@ -434,6 +475,7 @@ class _Upload:
             return False
         there = api_release.verify_release(self.uri, clients=lambda _service, _region: self.client)
         if there.intact and there.identity_digest == f"sha256:{identity_hex}":
+            self.remote_paths = [str(o["path"]) for o in there.objects]
             return True
         if there.intact:
             raise PublishError(

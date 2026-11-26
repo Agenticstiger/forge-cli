@@ -337,7 +337,7 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         action="append",
         default=None,
         metavar="CHECK",
-        help="Refuse a bucket without versioning, or object-lock retention.",
+        help="Refuse unless: versioning, or object-lock (each object locked).",
     )
     g.add_argument(
         "--journal-dir",
@@ -510,6 +510,9 @@ def _run_selected(
     try:
         if keep is not None:  # before any stage: one run at a time holds the target
             keep.hold(opts)
+        problem = release.checkout_refusal(release_dir, opts)  # last: it runs git
+        if problem:
+            raise st.ShipUsageError(problem)
         with _store_token_for_stages(selected) as store_token:
             return _run_held(
                 args,

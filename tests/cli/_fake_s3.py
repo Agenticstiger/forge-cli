@@ -52,6 +52,13 @@ class FakeS3:
         self.retention: Optional[Tuple[str, int]] = None
         self.lock_rule = True  # with object_lock: a Rule.DefaultRetention is set
         self.unlocked: Set[str] = set()  # keys that read back with no lock fields
+        self.expired: Set[str] = set()  # keys whose retention ran out yesterday
+        self.overwritten: Set[str] = set()  # keys with a second version (listed)
+        self.deleted: Set[str] = set()  # keys hidden by a delete marker (listed)
+        #: Lock fields as some other store answers them: replace the mode, the retain-until
+        #: date, or the default rule's period (``{"Days": True}``).
+        self.head_lock: Dict[str, Any] = {}
+        self.rule_period: Optional[Dict[str, Any]] = None
 
     def __call__(self, service: str, region: Optional[str]) -> "FakeS3":
         assert service == "s3"
@@ -68,7 +75,7 @@ class FakeS3:
         IfNoneMatch: str,
     ) -> Dict[str, Any]:
         self.calls.append("put_object")
-        data = Body.read()
+        data = Body if isinstance(Body, bytes) else Body.read()
         assert IfNoneMatch == "*" and ContentLength == len(data)
         if Key in self.deny_put or "*" in self.deny_put:
             raise S3Error("AccessDenied", 403)
@@ -88,11 +95,15 @@ class FakeS3:
         self.objects[(bucket, key)] = data
         self.checksums[(bucket, key)] = b64(data) if checksum == "" else checksum
 
-    def head_object(self, *, Bucket: str, Key: str, ChecksumMode: str) -> Dict[str, Any]:
+    def head_object(
+        self, *, Bucket: str, Key: str, ChecksumMode: str, VersionId: str = ""
+    ) -> Dict[str, Any]:
         self.calls.append("head_object")
         assert ChecksumMode == "ENABLED"
         if (Bucket, Key) not in self.objects:
             raise S3Error("404", 404)
+        if VersionId and VersionId != self.version_of(Key):
+            raise S3Error("NoSuchVersion", 404)
         head: Dict[str, Any] = {"ContentLength": len(self.objects[(Bucket, Key)])}
         checksum = self.checksums[(Bucket, Key)]
         if Key in self.misreport:
@@ -102,8 +113,10 @@ class FakeS3:
         if self.retention and Key not in self.unlocked:
             import datetime as dt
 
-            until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=self.retention[1])
+            days = -1 if Key in self.expired else self.retention[1]
+            until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)
             head.update(ObjectLockMode=self.retention[0], ObjectLockRetainUntilDate=until)
+            head.update(self.head_lock)
         return head
 
     def get_object(self, *, Bucket: str, Key: str, VersionId: str = "") -> Dict[str, Any]:
@@ -114,8 +127,49 @@ class FakeS3:
             raise S3Error("NoSuchKey", 404)
         got: Dict[str, Any] = {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
         if self.versions:
-            got["VersionId"] = hashlib.sha256(Key.encode()).hexdigest()[:32]
+            got["VersionId"] = self.version_of(Key)
         return got
+
+    @staticmethod
+    def version_of(key: str) -> str:
+        """The VersionId the fake gives ``key``'s one version."""
+        return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+    def list_object_versions(
+        self, *, Bucket: str, Prefix: str, KeyMarker: str = "", VersionIdMarker: str = ""
+    ) -> Dict[str, Any]:
+        """Each key's one version (plus ``overwritten`` keys' older one, and ``deleted`` keys'
+        delete marker), two keys a page, so a listing that does not follow the markers misses
+        some."""
+        self.calls.append("list_object_versions")
+        keys = sorted(k for b, k in self.objects if b == Bucket and k.startswith(Prefix))
+        keys += sorted(k for k in self.deleted if k.startswith(Prefix))
+        start = keys.index(KeyMarker) + 1 if KeyMarker else 0
+        page = keys[start : start + 2]
+        out: Dict[str, Any] = {"Versions": [], "DeleteMarkers": []}
+        for key in page:
+            if key in self.deleted:
+                out["DeleteMarkers"].append({"Key": key, "VersionId": "marker", "IsLatest": True})
+                continue
+            out["Versions"].append({"Key": key, "VersionId": self.version_of(key)})
+            if key in self.overwritten:
+                out["Versions"].append({"Key": key, "VersionId": "older"})
+        if start + 2 < len(keys):
+            out.update(IsTruncated=True, NextKeyMarker=page[-1], NextVersionIdMarker="x")
+        return out
+
+    def list_objects_v2(
+        self, *, Bucket: str, Prefix: str, ContinuationToken: str = ""
+    ) -> Dict[str, Any]:
+        """Two keys a page, so a listing that does not follow the token misses some."""
+        self.calls.append("list_objects_v2")
+        keys = sorted(k for b, k in self.objects if b == Bucket and k.startswith(Prefix))
+        start = int(ContinuationToken or 0)
+        page = keys[start : start + 2]
+        out: Dict[str, Any] = {"Contents": [{"Key": k} for k in page]}
+        if start + 2 < len(keys):
+            out.update(IsTruncated=True, NextContinuationToken=str(start + 2))
+        return out
 
     def get_bucket_versioning(self, *, Bucket: str) -> Dict[str, Any]:
         self.calls.append("get_bucket_versioning")
@@ -128,7 +182,8 @@ class FakeS3:
         config: Dict[str, Any] = {"ObjectLockEnabled": "Enabled"}
         if self.lock_rule:
             mode, days = self.retention or ("GOVERNANCE", 1)
-            config["Rule"] = {"DefaultRetention": {"Mode": mode, "Days": days}}
+            period = {"Days": days} if self.rule_period is None else self.rule_period
+            config["Rule"] = {"DefaultRetention": {"Mode": mode, **period}}
         return {"ObjectLockConfiguration": config}
 
 

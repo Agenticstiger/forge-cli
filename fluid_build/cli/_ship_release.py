@@ -43,6 +43,7 @@ from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 from fluid_build.util.release_record import (  # the record's names, which callers read here too
     RELEASE_INDEX,
     RELEASE_SCHEMA,
+    clean,
     code_digest,
     identity_digest,
 )
@@ -223,6 +224,74 @@ def refusal(
         except ReleaseError as exc:
             return str(exc)
     return None
+
+
+def checkout_head(directory: Path) -> Optional[str]:
+    """The commit the git checkout holding ``directory`` is at, or None: no git, not a
+    checkout, or an answer that is not a full hex commit."""
+    import subprocess
+
+    try:
+        done = subprocess.run(  # noqa: S603 - argv list, shell=False
+            ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            shell=False,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOG.warning(
+            "release_checkout_unknown: git cannot run to tell which commit %s is at (%s); the "
+            "release names the commit the CI names, unchecked",
+            clean(directory, keep_end=True),
+            type(exc).__name__,
+        )
+        return None
+    out = done.stdout if isinstance(done.stdout, str) else ""
+    head = out.strip().lower()
+    if done.returncode == 0 and _REVISION.fullmatch(head):
+        return head
+    err = done.stderr if isinstance(done.stderr, str) else ""
+    if done.returncode not in (0, None) and "not a git repository" not in err:
+        # e.g. "dubious ownership" in a container: the check cannot run, say so
+        LOG.warning(
+            "release_checkout_unknown: git cannot tell which commit %s is at (%s); the "
+            "release names the commit the CI names, unchecked",
+            clean(directory, keep_end=True),
+            clean(err.strip().splitlines()[-1] if err.strip() else done.returncode, 160),
+        )
+    return None
+
+
+def checkout_refusal(release_dir: Optional[Path], opts: st.ShipOptions) -> Optional[str]:
+    """Why a release run would name a commit it was not built from, or ``None``. Asked last,
+    once every other refusal passed and the journal holds the target, just before stage 1:
+    it runs git, which a refused invocation should never need."""
+    if release_dir is None:
+        return None
+    return _checkout_problem(Path(opts.contract).absolute().parent)
+
+
+def _checkout_problem(contract_dir: Path) -> Optional[str]:
+    """Why the release would name a commit it was not built from, or None: the CI names one
+    commit, and the contract's checkout is at another (the contract in a second repository or a
+    submodule, or a pull-request pipeline that builds a local merge commit). The release's code digest is the
+    commit's, so it must be the one built. A contract outside a git checkout is not checked."""
+    source = source_identity(os.environ)
+    if source is None:
+        return None
+    head = checkout_head(contract_dir)
+    named = source["digest"]["gitCommit"]
+    if head is None or head == named:
+        return None
+    return (
+        f"--release-dir: the CI names commit {named}, and the contract's checkout is at "
+        f"{clean(head, 64)}: a release names the commit it was built from. This happens when the "
+        "contract sits in a second repository or a submodule, or when a pull-request pipeline "
+        "builds a local merge commit (Bitbucket, Jenkins merge-with-target): seal from the "
+        "checkout the CI variable names, or set that variable to the commit checked out"
+    )
 
 
 def forget_stage_reports(root: Path) -> None:

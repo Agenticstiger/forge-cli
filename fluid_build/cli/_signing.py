@@ -277,8 +277,52 @@ def sign_bundle(
     extension, cosign-not-on-PATH, bad key_ref). A non-zero exit from
     cosign is returned in the dict — callers decide how to react.
     """
-    cosign = _resolve_cosign()
     bundle = _validate_bundle_path(bundle_path)
+    return _sign_file(bundle, sig_out=sig_out, pem_out=pem_out, key_ref=key_ref, timeout=timeout)
+
+
+def sign_blob(
+    path: str,
+    *,
+    key_ref: Optional[str] = None,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> Dict:
+    """Sign any regular file with cosign (keyless by default, keyed with ``key_ref``) into one
+    Sigstore bundle, ``<file>.sigstore.json``: the signature, the certificate and the log proof.
+    For a record that is not a bundle, such as a release receipt's in-toto Statement.
+
+    ``--bundle`` is the one output both cosign 2.x and 3.x write (3.x no longer takes
+    ``--output-signature``/``--output-certificate`` for a blob); 2.x writes its own bundle
+    format, 3.x the Sigstore one, so sign and verify with the same major version.
+
+    Returns the :func:`_run_cosign` dict plus ``bundle_path``.
+    Raises CLIError when ``path`` is not a regular file or cosign is not on PATH.
+    """
+    cosign = _resolve_cosign()
+    blob = Path(path).resolve()
+    if not blob.is_file():
+        raise CLIError(2, "signing_blob_not_file", {"path": str(blob)})
+    bundle = blob.with_name(blob.name + ".sigstore.json")
+    argv = [cosign, "sign-blob", "--yes"]
+    if key_ref is not None:
+        _validate_key_ref(key_ref)
+        argv += ["--key", key_ref]
+    argv += ["--bundle", str(bundle), str(blob)]
+    result = _run_cosign(argv, timeout=timeout)
+    result["bundle_path"] = str(bundle)
+    result["key_mode"] = "keyless" if key_ref is None else "keyed"
+    return result
+
+
+def _sign_file(
+    bundle: Path,
+    *,
+    sig_out: Optional[str],
+    pem_out: Optional[str],
+    key_ref: Optional[str],
+    timeout: int,
+) -> Dict:
+    cosign = _resolve_cosign()
     sig_path = Path(sig_out).resolve() if sig_out else bundle.with_suffix(bundle.suffix + ".sig")
     pem_path = Path(pem_out).resolve() if pem_out else bundle.with_suffix(bundle.suffix + ".pem")
 
@@ -420,8 +464,51 @@ def verify_bundle(
     return result
 
 
+def verify_blob(
+    path: str,
+    *,
+    bundle_path: str,
+    key_ref: Optional[str] = None,
+    certificate_identity: Optional[str] = None,
+    certificate_oidc_issuer: Optional[str] = None,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> Dict:
+    """Verify a file :func:`sign_blob` signed, from its bundle, with ``cosign verify-blob``:
+    against ``key_ref`` (keyed), or with the signer pinned exactly (``certificate_identity``
+    and ``certificate_oidc_issuer``, both required keyless: an identity that is not pinned
+    proves nothing about who signed).
+
+    Returns the :func:`_run_cosign` dict; ``exit_code`` 0 is a valid signature.
+    Raises CLIError on a malformed input or no cosign.
+    """
+    cosign = _resolve_cosign()
+    blob = Path(path).resolve()
+    if not blob.is_file() or not Path(bundle_path).is_file():
+        raise CLIError(2, "signing_blob_not_file", {"path": str(blob)})
+    argv = [cosign, "verify-blob", "--bundle", bundle_path]
+    if key_ref is not None:
+        _validate_key_ref(key_ref)
+        argv += ["--key", key_ref]
+    else:
+        if not (certificate_identity and certificate_oidc_issuer):
+            raise CLIError(
+                2,
+                "signing_identity_not_pinned",
+                {"hint": "keyless verification needs the signer's identity and issuer"},
+            )
+        # one argv element each, so a value that starts with "-" is never read as a flag
+        argv += [
+            f"--certificate-identity={certificate_identity}",
+            f"--certificate-oidc-issuer={certificate_oidc_issuer}",
+        ]
+    argv.append(str(blob))
+    return _run_cosign(argv, timeout=timeout)
+
+
 __all__ = [
     "cosign_available",
+    "sign_blob",
+    "verify_blob",
     "sign_bundle",
     "verify_bundle",
 ]

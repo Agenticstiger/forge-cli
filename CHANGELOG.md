@@ -112,11 +112,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over 5 GiB are refused before any write. `--release-to-require versioning` refuses a bucket
   without versioning; `--release-to-require object-lock` refuses one without Object Lock and a
   default retention (a mode and a period: an enabled lock with no rule locks nothing), and then
-  checks that every object reads back with a lock mode and a retain-until date still to come.
-  GOVERNANCE retention yields to `s3:BypassGovernanceRetention`; COMPLIANCE yields to no one. The run report's `release.remote` says where the release went, or why
-  not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
-  boto3 is refused before stage 1 (exit 2), and so is a run whose CI names no commit: without one
-  the release has no code digest.
+  checks that every object, the ones already there included, reads back with a GOVERNANCE or
+  COMPLIANCE mode and a retain-until date still to come. When an object already there is no
+  longer locked, the run is refused before `release.json` is written, with the count, the last
+  date a lock ran out, and the two ways on: extend each version's retention
+  (`aws s3api put-object-retention`), or publish under a new code digest from a new commit.
+  Without `object-lock` required, such a re-run stands as before.
+  GOVERNANCE retention yields to `s3:BypassGovernanceRetention`; COMPLIANCE yields to no one. The
+  run report's `release.remote` says where the release went, or why not. `--release-to` without
+  `--release-dir`, a target that is not `s3://bucket/prefix/`, or no boto3 is refused before
+  stage 1 (exit 2), and so is a run whose CI names no commit, or a commit that is not a full 40-
+  or 64-hex one: without one the release has no code digest.
 - **`fluid runs verify-release SRC` checks a sealed release, read-only.** SRC is a release
   directory or the `s3://` prefix `--release-to` wrote. It checks that `release.json` is a
   `fluid-release/1` record whose `identity_digest` is the digest of its `identity`, that an S3 key
@@ -137,6 +143,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
   `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
   environment sealed from one commit and one lock, and absent without a source commit.
+- **`fluid runs receipt record SRC --report R` writes what an environment's check of a sealed
+  release found, write-once, beside the release.** It verifies SRC, then writes a
+  `fluid-receipt/1` to `<code hex>/receipts/<env>/<utc>-<identity16>.json` (on disk,
+  `receipts/<env>/` beside the release directory, never through a link), with the report stored
+  next to it. The receipt names the release's `code_digest` and `identity_digest`, each object it
+  verified with its sha256 and S3 VersionId, the report's sha256 and counts, the CI run (any
+  credentials in its URLs cut out), and the deploy targets: `--target s3://bucket/key#versionId`
+  (an object version, since a key alone can change) or `--target git+<repo>@<commit>` (a full
+  commit, recorded and never checked; the repository URL is kept without user, password, query
+  or fragment). `--check-targets` reads each S3 version back and records the checksums S3 holds
+  for it (its sha256 when it has one), its ETag and size; one that is not there fails the
+  receipt, and one that cannot be read writes nothing (exit 2). It is `PASSED` when the report's
+  verdict passes (`fluid_build.api.report_verdict`), the report checked the whole release (not
+  one `--expose`), and every checked target reads back, and `FAILED` otherwise; a failed receipt
+  is written too. A report that does not name this release, a release that is not intact, an
+  `--env` that is not the release's, or a target that is not one writes nothing. Its fields
+  follow SLSA's verification summary attestation, and `--sign` (`--sign-key REF` for a key
+  instead of keyless) also stores an in-toto Statement of that predicate type over the release's
+  `release.json`, signed with cosign before anything is written. Exit 0 `PASSED`, 1 `FAILED` or
+  refused, 2 cannot decide or a usage error.
+- **`fluid runs receipt check SRC --env nonprod` lets a release on only after an earlier
+  environment checked the same code.** It verifies SRC, then reads the newest `nonprod` receipt
+  for SRC's code digest. It passes when that receipt is `PASSED`, the report stored beside it is
+  the one it names and still passes, and the `nonprod` release it names is there, intact, of
+  that environment and of the same code. A newest file there that is not a receipt fails the
+  check rather than falling back to an older one, and so does a receipt overwritten or deleted
+  after it was written (the listing reads every version and delete marker; reading receipts in
+  S3 needs `s3:ListBucketVersions` and `s3:GetObjectVersion`) or one of other code under this
+  code's folder. A receipt of this code named later than now decides nothing (exit 2), and a
+  listing past 50,000 entries decides nothing; receipts are never moved or expired. It never
+  reads a release's `gates` or `provenance`. It reports whether each object of both releases
+  and of the receipt carries an Object Lock in force, read at the version it checked, and
+  `--require-locked` fails the check when one does not: a receipt whose lock ran out gates
+  nothing, and the way on is a fresh check of the earlier environment, so the retention must
+  cover the time from that check to the later deploy. A receipt is only as trusted as whoever
+  can write `receipts/<env>/`: keep that to the verifier's own identity, or sign receipts and
+  pass `--require-signed` with the signer (`--verify-key REF`, or `--certificate-identity` and
+  `--certificate-oidc-issuer` for keyless; a signer the build code cannot reach, such as a
+  separate job or a key only the verifier can use). `--require-signed` needs the Statement to
+  verify with cosign (2.0 or later; sign and verify with the same major version) and to name
+  the receipt's own sha256, environment, code and identity and the `release.json` it was read
+  at. It implies `--require-locked` over the receipt, its report and its Statement too, and
+  needs a bucket with Object Lock and a default retention (`s3:GetBucketObjectLockConfiguration`)
+  where no writer of `receipts/<env>/` holds `s3:DeleteObjectVersion`,
+  `s3:BypassGovernanceRetention` or `s3:PutObjectRetention`, since a signature cannot show that
+  a newer receipt was never there. On a release on disk it decides nothing (exit 2). Exit 0
+  passes, 1 does not, 2 cannot decide (a release with no code digest included).
+  `fluid runs status --release-dir` lists the newest receipt of each environment under each
+  release, picked as the check picks it.
+- **A release is sealed only from the commit the CI names.** When the contract sits in a git
+  checkout at another commit than the CI's variable names (the contract in a second repository
+  or a submodule, or a pull-request pipeline that builds a local merge commit, as Bitbucket and
+  Jenkins merge-with-target do; GitHub's `pull_request` checks out the merge commit
+  `GITHUB_SHA` names, so it matches), `fluid ship --release-dir` refuses before stage 1
+  (exit 2), and says so: the release's code digest is that commit's. When git cannot say (a
+  "dubious ownership" checkout in a container), ship warns `release_checkout_unknown`.
+- **`fluid verify --release SRC --out R` names the release it checked in the report.** SRC is
+  verified first, and must be a release of the contract's product. The report gains `release:
+  {source, product, environment, identity_digest, code_digest, expose}`, which `receipt record`
+  requires.
+- **`fluid_build.api.report_verdict` is public** (API 1.4): whether a `fluid verify --out`
+  report is a pass, and why not, the rule `fluid datamesh-manager promote --verify-report`
+  already used.
 - **The MCP `query` tool reads a column of the version an as-of relationship reaches.** A
   dimension or a filter key `<relationship>.<column>` on a `semantics.relationships[]` entry that
   declares `asOf` reads `column` of the version of the target valid on the row's `asOf` value
