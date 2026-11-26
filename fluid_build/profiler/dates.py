@@ -65,7 +65,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from functools import partial
 from itertools import combinations
@@ -109,6 +109,9 @@ __all__ = [
     "PairContext",
     "RelationshipAsks",
     "checked",
+    "coded_cells",
+    "coded_edges",
+    "coded_span",
     "contract_unformed",
     "choose_lifetimes",
     "declared_empty_levels",
@@ -362,6 +365,61 @@ def trimmed_span(cells: Sequence[int], minimum_cell: int) -> Optional[Tuple[int,
     return first, last
 
 
+def coded_span(
+    cells: Sequence[int],
+    minimum_cell: int,
+    low: Optional[int] = None,
+    high: Optional[int] = None,
+) -> Optional[List[Tuple[int, int]]]:
+    """The bins of a ladder a history member is counted on, as ``(first, last)`` runs of its bins.
+
+    The ladder is trimmed as :func:`trimmed_span` trims it, to the bins from the first holding a
+    record to the last holding one, and an outer edge stands where its end bin holds at least
+    *minimum_cell* records, the rule of a date span. Where an end bin holds fewer, it is joined to
+    the bins next to it until the run holds that many, and the run then reaches out to a public
+    bound: the bin *low* (at the bottom) or *high* (at the top), the ladder's ends unless the caller
+    gives bins that published figures fix. That is top and bottom coding, as sdcMicro's
+    ``topBotCoding`` and a global recode of the tails do, with the coded value public: no edge is
+    placed by fewer than *minimum_cell* records, and a coded end says only that its bin was small,
+    as a withheld cell does. The interior edges stay the ladder's. ``None`` only when the records
+    together are fewer than *minimum_cell*.
+    """
+    held = [position for position, count in enumerate(cells) if count]
+    if not held or sum(cells) < minimum_cell:
+        return None
+    bottom = 0 if low is None else min(low, held[0])
+    top = len(cells) - 1 if high is None else max(high, held[-1])
+    runs = [[position, position] for position in range(held[0], held[-1] + 1)]
+
+    def holds(run: Sequence[int]) -> int:
+        return sum(cells[run[0] : run[1] + 1])
+
+    # each end is coded by its own outermost bin, decided before either end is folded
+    fold_low = cells[held[0]] < minimum_cell
+    fold_high = cells[held[-1]] < minimum_cell
+    while fold_low and len(runs) > 1 and holds(runs[0]) < minimum_cell:
+        runs[1][0] = runs[0][0]
+        del runs[0]
+    while fold_high and len(runs) > 1 and holds(runs[-1]) < minimum_cell:
+        runs[-2][1] = runs[-1][1]
+        del runs[-1]
+    if fold_low:
+        runs[0][0] = bottom
+    if fold_high:
+        runs[-1][1] = top
+    return [(run[0], run[1]) for run in runs]
+
+
+def coded_edges(ladder: Sequence[int], runs: Sequence[Tuple[int, int]]) -> List[int]:
+    """The edges of *runs* (from :func:`coded_span`) on *ladder*: each run's lower edge, then the top."""
+    return [ladder[first] for first, _ in runs] + [ladder[runs[-1][1] + 1]]
+
+
+def coded_cells(cells: Sequence[int], runs: Sequence[Tuple[int, int]]) -> List[int]:
+    """The records of each run of :func:`coded_span`."""
+    return [sum(cells[first : last + 1]) for first, last in runs]
+
+
 def _order_cells(cells: Sequence[int], edges: Sequence[int]) -> List[int]:
     """The records of each cell between *edges* (ladder edges), from the ladder's *cells*."""
     return [
@@ -412,13 +470,19 @@ def _checked(
     backend: StatisticsBackend,
     timed: Tuple[Optional["StageTimings"], str],
     what: str = "the days of",
+    withheld: Sequence[Mapping[str, Sequence[bool]]] = (),
 ) -> Tuple[EdgeDecision, ...]:
+    """One ``check_edge_counts`` call over *statistics*; *withheld* marks, per statistic and group,
+    the cells another rule withholds already (``True``), which the check reads as withheld."""
     from fluid_build.profiler import runner
 
+    edged = [runner._edge_statistic(each, measured, rule) for each, measured in statistics]
+    for position, marks in enumerate(withheld):
+        edged[position] = _marked(edged[position], marks)
     try:
         with runner._timed(timed[0], "check", timed[1]):
             return backend.check_edge_counts(
-                [runner._edge_statistic(each, measured, rule) for each, measured in statistics],
+                edged,
                 total=total,
                 minimum_cell=rule.minimum_cell,
                 zeros_disclosive=rule.zeros_disclosive,
@@ -431,6 +495,23 @@ def _checked(
             {"written": "nothing", "next": "report this: the output check refused its input"},
         ) from None
 
+
+def _marked(statistic: Any, marks: Mapping[str, Sequence[bool]]) -> Any:
+    """*statistic* with the cells *marks* flags read as withheld by a rule of the caller."""
+    cells = dict(statistic.cell_status)
+    for key, flags in marks.items():
+        if not any(flags):
+            continue
+        before = cells.get(key, (_FREE,) * len(flags))
+        cells[key] = tuple(
+            _LINKED if flag and status == _FREE else status
+            for status, flag in zip(before, flags, strict=True)
+        )
+    return replace(statistic, cell_status=cells)
+
+
+#: Why a cell is withheld that a check of the caller withholds before the output check runs.
+_LINKED = "another statistic would give it back"
 
 checked = _checked
 histogram = _histogram

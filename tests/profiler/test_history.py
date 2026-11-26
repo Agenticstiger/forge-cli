@@ -360,15 +360,12 @@ def test_rows_with_no_entity_are_left_out_of_the_history(stations, tmp_path):
     assert _history_of(with_keyless) == _history_of(result)
 
 
-def test_first_starts_are_withheld_whole_on_the_year_ladder(stations):
-    # Where each end is the next start, the end column's counts are the start column's less the
-    # first starts, so published first starts would give a withheld cell of either column back.
-    result, _ = stations
+def test_first_starts_are_published_on_the_year_ladder_trimmed_to_their_years(stations):
+    # Every station's first version starts in 2022: one bin, from the records' own first year.
+    result, rows = stations
     entry = _history_of(result)["firstStart"]
-    assert [g["status"] for g in entry["groups"]] == ["C"]
-    assert entry["sampleSize"] == {"min": 0}
-    edges = [int(each) for each in entry["bins"]]
-    assert edges[0] < _ms("1901-01-01") and edges[-1] > _ms("2100-12-31")
+    assert [int(each) for each in entry["bins"]] == [_ms("2022-01-01"), _ms("2023-01-01")]
+    assert _bins(entry) == [_rounded(_expected(rows)["entities"])]
 
 
 def test_version_length_counts_the_days_to_the_next_start_on_the_ladder_of_days(stations):
@@ -506,7 +503,7 @@ def test_a_timestamp_window_is_a_history_too(tmp_path):
     published = _history_of(result)
     assert _levels(published["chain"])["nextStart"] == _rounded(want["chain"]["nextStart"])
     assert _levels(published["lastVersion"])["closed"] == _rounded(want["last"]["closed"])
-    assert [g["status"] for g in published["firstStart"]["groups"]] == ["C"]
+    assert [g["status"] for g in published["firstStart"]["groups"]] == ["F"]
     load_profile_text(result.canonical.decode("utf-8"))
 
 
@@ -762,7 +759,7 @@ def test_no_message_holds_a_count(tmp_path):
 # -- first starts outside a span -----------------------------------------------------------------
 
 
-def test_first_starts_with_no_span_are_written_on_the_year_ladder_withheld_whole(tmp_path):
+def test_a_few_first_starts_apart_from_the_rest_are_coded_into_the_bin_beside_them(tmp_path):
     rows = _stations()
     stray = [row for row in rows if row["station_id"] >= 325]
     for row in stray:
@@ -772,11 +769,13 @@ def test_first_starts_with_no_span_are_written_on_the_year_ladder_withheld_whole
                 row[key] = (date.fromisoformat(row[key]) + timedelta(days=shift)).isoformat()
     result = _profile(tmp_path, _contract(), rows)
     entry = _history_of(result)["firstStart"]
-    assert [g["status"] for g in entry["groups"]] == ["C"]
-    assert entry["sampleSize"] == {"min": 0}
-    edges = [int(each) for each in entry["bins"]]
-    assert edges[0] < _ms("1901-01-01") and edges[-1] > _ms("2100-12-31")
-    assert _ms("2022-01-01") in edges
+    # Five stations start in 2026: too few for an end bin, so they join the 2022 bin.
+    # the start column publishes no maximum, so the coded top reaches the ladder's own top
+    assert [int(each) for each in entry["bins"]] == [
+        _ms("2022-01-01"),
+        history._year_ladder()[-1],
+    ]
+    assert _bins(entry) == [_rounded(330)]
     # The rest of the history is not touched by it.
     assert _group(_history_of(result)["chain"])
     load_profile_text(result.canonical.decode("utf-8"))
@@ -825,19 +824,33 @@ def test_a_table_a_bundle_answers_is_left_alone(tmp_path):
 # -- the audit -----------------------------------------------------------------------------------
 
 
-def test_the_audit_withholds_a_cell_the_entities_and_the_versions_would_give_back(
-    tmp_path, monkeypatch
-):
-    # No station has ten versions: the two empty top cells are withheld, and the versions held
-    # beside the entities show that no entity can hold as many as the cell of 3 to 4 might.
-    counts = {1: 80, 2: 70, 3: 60, 5: 50}
+def test_no_withheld_cell_of_versions_per_entity_can_be_pinned_by_the_versions(tmp_path):
+    # A few stations hold three or four versions and none five to nine: the check withholds
+    # those cells, and the entities and versions known exactly pin none of them.
+    counts = {1: 80, 2: 70, 3: 8, 10: 40}
     rows = _stations(entities_by_versions=counts)
-    audited = _group(_history_of(_profile(tmp_path, _contract(), rows))["versionsPerEntity"])
-    assert audited["cellStatus"] == ["F", "F", "C", "C", "C", "C"]
-    assert audited["binCounts"] == [80, 70, None, None, None, None]
-    monkeypatch.setattr(history, "_audited", lambda decision, group, versions, rule: decision)
-    plain = _group(_history_of(_profile(tmp_path, _contract(), rows))["versionsPerEntity"])
-    assert plain["cellStatus"] == ["F", "F", "F", "C", "C", "C"]
+    entry = _history_of(_profile(tmp_path, _contract(), rows))["versionsPerEntity"]
+    edges = [int(each) for each in entry["bins"]]
+    assert edges == [1, 2, 3, 5, 10, 20]
+    group = _group(entry)
+    shown = [status == "F" for status in group["cellStatus"]]
+    assert not all(shown)
+    want = _expected(rows)["per_entity"]
+    cells = [
+        sum(n for v, n in want.items() if lo <= v < hi)
+        for lo, hi in zip(edges, edges[1:], strict=False)
+    ]
+    versions = _expected(rows)["versions"]
+    pinned = disclosure.pinned_children_cells(edges[:-1], cells, shown, versions, RULE, 0, 20)
+    assert pinned == frozenset()
+
+
+def test_the_children_audit_reads_a_bounded_top_bin():
+    # More versions than every entity at the top of its bin can hold: no table holds, so the
+    # bounded audit makes no claim and returns the withheld cell; the open top bin holds any.
+    lower, cells, shown = (1, 2, 3, 5, 10), [20, 50, 12, 15, 10], [True, True, True, False, True]
+    assert disclosure.pinned_children_cells(lower, cells, shown, 494, RULE, 0, 20) == {3}
+    assert disclosure.pinned_children_cells(lower, cells, shown, 494, RULE, 0) == frozenset()
 
 
 def test_a_versions_audit_that_pins_nothing_withholds_nothing_more(tmp_path):
@@ -875,7 +888,7 @@ def test_the_report_counts_the_members_published_and_names_no_count_of_records(s
     lines: List[str] = []
     profile_cmd._report_structure(lambda text, **_: lines.append(text), result)
     history_lines = [line for line in lines if "History:" in line]
-    assert history_lines == [f"exposes[{TABLE}]: History: 9 of 10 members published."]
+    assert history_lines == [f"exposes[{TABLE}]: History: 10 of 10 members published."]
     assert not any(str(len(rows)) in line for line in lines)
 
 
