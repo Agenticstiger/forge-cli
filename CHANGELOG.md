@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tag the push moved resolves to the digest the run pushed, and verifies it and the attestation
   stored beside it. Every check pins the signer: the release workflow, the ref and commit the run
   started from, and a GitHub-hosted runner.
+- **The weekly model-catalog refresh runs fetched code without a write token.** The workflow
+  installed unpinned packages and ran them against a network response in the same job that held
+  `contents: write`, with the checkout's token stored on disk. It is now two jobs: the one that
+  fetches runs read-only with no stored credential and hands the changed catalog on as a file, and
+  the one that pushes the proposal branch checks that file parses as a JSON object, installs and
+  runs nothing, and gives the token to the single step that pushes.
 
 ### Fixed
 
