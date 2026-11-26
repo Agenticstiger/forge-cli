@@ -52,10 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parts read (an ungrouped level histogram, an ungrouped histogram of a number or timestamp
   column, or the rows with a value where `count` or `nullCount` is published), for small cells
   before any rounding, the published cells never withheld. Grouped statistics, quantiles,
-  calendars, date spans and pairs, zero cells beside a column's cells, and an entity unit beside
-  its table's own statistics, which count the same records where every entity holds one row, are
-  not checked together: a reader can difference such counts, and the rounding hides the
-  difference only when neither count lies at a rounding edge.
+  supports, calendars, date spans and pairs and a relationship's counts are not held in a
+  table's set; a column's cells are not held beside a part that does not read the column, and no
+  zero cell is looked for beside them; a table's facts asked with no query over that table keep
+  the facts' own check; and an entity unit is not checked with the statistics its table and its
+  parent table publish, which count the same records where every entity holds one row. A reader
+  can difference such counts, and the rounding hides the difference only when neither count lies
+  at a rounding edge.
   The report adds `Queries: N of M published whole`.
 
 
