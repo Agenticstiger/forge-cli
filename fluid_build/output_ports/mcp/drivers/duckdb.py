@@ -127,6 +127,10 @@ class DuckDBDriver(EngineDriver):
         # prepared once (related_table_reference), and why one cannot be read here.
         self._related: Optional[Dict[str, "DuckDBDriver"]] = None
         self._related_refused: Dict[str, str] = {}
+        # Targets whose view could not be made on the live connection. Unlike a refusal
+        # above, which is a fact of the contract, this one can pass (a file that was not
+        # there yet), so it is retried on the next read.
+        self._related_unviewed: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # EngineDriver surface
@@ -240,13 +244,19 @@ class DuckDBDriver(EngineDriver):
         for target_id, driver in related.items():
             if driver._path is None or target_id in self._related_refused:
                 continue
-            try:
-                driver._configure_connection(connection)
-            except Exception as exc:  # noqa: BLE001 - a target that fails is refused later
-                self._related_refused[target_id] = "its file cannot be read in this connection"
-                self.logger.info("duckdb_related_view_failed: %s: %s", target_id, exc)
+            self._view_related(connection, target_id, driver)
         self._connection = connection
         return connection
+
+    def _view_related(self, connection: Any, target_id: str, driver: "DuckDBDriver") -> None:
+        """Make ``driver``'s view on ``connection``; remember why not when it fails."""
+        try:
+            driver._configure_connection(connection)
+        except Exception as exc:  # noqa: BLE001 - a target that fails is refused later
+            self._related_unviewed[target_id] = "its file cannot be read in this connection"
+            self.logger.info("duckdb_related_view_failed: %s: %s", target_id, exc)
+        else:
+            self._related_unviewed.pop(target_id, None)
 
     def _related_drivers(self) -> Dict[str, "DuckDBDriver"]:
         """A driver for each other expose of the contract that an as-of relationship of this
@@ -322,10 +332,14 @@ class DuckDBDriver(EngineDriver):
             )
         if driver.expose.get("binding") != target.get("binding"):
             raise UnsupportedBindingError("the expose supplied is not the one this gateway reads")
-        self._get_connection()
+        connection = self._get_connection()
         refused = self._related_refused.get(target_id)
         if refused:
             raise UnsupportedBindingError(refused)
+        if driver is not self and target_id in self._related_unviewed:
+            self._view_related(connection, target_id, driver)
+            if target_id in self._related_unviewed:
+                raise UnsupportedBindingError(self._related_unviewed[target_id])
         return driver._table
 
     def _configure_connection(self, connection: Any) -> None:

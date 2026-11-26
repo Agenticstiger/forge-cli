@@ -365,6 +365,19 @@ def _refused(w: _World, **kwargs: Any) -> str:
     return message
 
 
+def test_a_target_file_that_is_back_after_a_failed_first_read_serves_the_relationship(
+    world: Any,
+) -> None:
+    w = world()
+    stations = w.data / "stations.csv"
+    kept = stations.read_text()
+    stations.unlink()
+    _refused(w)
+    stations.write_text(kept)
+    result = w.query(measure="reading_count", dimensions=["station_on_date.sensor_model"], limit=50)
+    assert _grouped(result, "reading_count") == pytest.approx(_expect(UNFILTERED, "reading_count"))
+
+
 def test_a_target_outside_the_readable_paths_is_refused_without_its_path(
     world: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
