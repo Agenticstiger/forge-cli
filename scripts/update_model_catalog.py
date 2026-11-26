@@ -348,6 +348,8 @@ def build_catalog(api_models: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
         "updated_at": date.today().isoformat(),
         "source": "https://artificialanalysis.ai",
         "default_provider": existing.get("default_provider", "gemini"),
+        # Not fetched: kept as it stands, so a refresh does not drop it.
+        "tiers": existing.get("tiers", {}),
         "providers": providers_data,
     }
 

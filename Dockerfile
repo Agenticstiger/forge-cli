@@ -1,7 +1,9 @@
 # FLUID CLI Docker Image
 # Multi-stage build for minimal production image
 #
-# Build locally:
+# The image installs a wheel from dist/: the release passes the one its build
+# job made, signed and uploaded to PyPI. Build locally:
+#   python -m build --wheel
 #   docker build -t forge-cli .
 #   docker build --build-arg PROFILE=alpha -t forge-cli:alpha .
 #
@@ -44,38 +46,42 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # Upgrade the packaging toolchain — the slim base ships older pip /
 # setuptools / wheel that carry fixable advisories the release Grype
 # gate would (correctly) flag. Keeping them current keeps the image clean.
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# The versions come from requirements/release-image.txt, hash-locked:
+# --require-hashes refuses anything that is not in the file.
+COPY requirements/release-image.txt /tmp/release-image.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/release-image.txt \
+    && rm /tmp/release-image.txt
 
 # ============================================
-# Build stage — install from source
+# Build stage — install the wheel
 # ============================================
 FROM base AS builder
 
 ARG PROFILE=stable
 
-WORKDIR /build
+# The wheel, not the source tree: nothing is built in the image, so no build
+# backend is fetched, and the package is the file the release signed. Built
+# here from source, with no .git in the context, setuptools-scm fell back to
+# version 0.0.0+unknown.
+COPY dist/*.whl /tmp/dist/
 
-# Copy only dependency files first for better layer caching
-COPY pyproject.toml README.md ./
-COPY fluid_build/ fluid_build/
-
-# Install the package (non-editable)
-RUN pip install --prefix=/install .
-
-# Install provider dependencies based on profile. Every profile names
+# Install it with the provider dependencies of the profile. Every profile names
 # [standard] (litellm + mcp) and [lineage], so the image keeps AI,
 # `fluid mcp serve` and OpenLineage emission now that they are out of the base
 # install (0.28.0).
-RUN if [ "${PROFILE}" = "experimental" ] || [ "${PROFILE}" = "alpha" ]; then \
-      pip install --prefix=/install \
-        ".[local,gcp,snowflake,viz,standard,lineage]"; \
-    elif [ "${PROFILE}" = "beta" ]; then \
-      pip install --prefix=/install \
-        ".[local,gcp,viz,standard,lineage]"; \
-    else \
-      pip install --prefix=/install \
-        ".[local,standard,lineage]"; \
-    fi
+RUN set -eu; \
+    set -- /tmp/dist/*.whl; \
+    if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then \
+      echo "expected exactly one wheel in dist/; run python -m build --wheel first" >&2; \
+      exit 1; \
+    fi; \
+    case "${PROFILE}" in \
+      experimental | alpha) extras="local,gcp,snowflake,viz,standard,lineage" ;; \
+      beta) extras="local,gcp,viz,standard,lineage" ;; \
+      *) extras="local,standard,lineage" ;; \
+    esac; \
+    pip install --prefix=/install "$1[${extras}]"; \
+    rm -rf /tmp/dist
 
 # ============================================
 # Production stage — minimal runtime

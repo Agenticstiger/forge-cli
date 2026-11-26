@@ -38,12 +38,21 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
+REPO = Path(__file__).resolve().parents[1]
+WORKFLOW = REPO / ".github" / "workflows" / "release.yml"
 
 _STATUS_FNS = {"success", "always", "failure", "cancelled"}
 _TESTPYPI_JOBS = {"publish-testpypi", "verify-testpypi"}
@@ -276,11 +285,16 @@ def _order(jobs: dict) -> list[str]:
     return order
 
 
-def _simulate(jobs: dict, *, dispatch: bool, skip: bool, fail: str | None = None) -> dict[str, str]:
+def _simulate(
+    jobs: dict, *, dispatch: bool, skip: bool, fail: str | None = None, dry: bool = False
+) -> dict[str, str]:
     """{job: success | failure | skipped}. `fail` names a job whose work fails
-    if the job is allowed to run."""
+    if the job is allowed to run. `dry` is a pull request's dry run."""
     result: dict[str, str] = {}
-    gate_outputs = {"skip_testpypi": "true" if dispatch and skip else "false"}
+    gate_outputs = {
+        "skip_testpypi": "true" if dispatch and skip else "false",
+        "publish": "false" if dry else "true",
+    }
     for name in _order(jobs):
         job = jobs[name]
         ancestors_ok = all(result[a] == "success" for a in _ancestors(jobs, name))
@@ -298,7 +312,7 @@ def _simulate(jobs: dict, *, dispatch: bool, skip: bool, fail: str | None = None
                 ok = result[parts[1]] == "success"
                 return gate_outputs.get(parts[3], "") if ok and parts[1] == "quality-gate" else ""
             if path == "github.event_name":
-                return "workflow_dispatch" if dispatch else "push"
+                return "pull_request" if dry else "workflow_dispatch" if dispatch else "push"
             raise AssertionError(f"{_name}: expression reads unmodelled `{path}`")
 
         ctx = {
@@ -381,16 +395,34 @@ _PATHS = {
     "tag push": dict(dispatch=False, skip=False),
     "dispatch": dict(dispatch=True, skip=False),
     "dispatch with skip_testpypi": dict(dispatch=True, skip=True),
+    "pull request dry run": dict(dispatch=False, skip=False, dry=True),
+}
+
+# What a dry run leaves out: every job that uploads, signs or announces.
+_NOT_IN_A_DRY_RUN = {
+    "attest",
+    "publish-testpypi",
+    "verify-testpypi",
+    "publish-pypi",
+    "verify-pypi",
+    "attest-image",
+    "github-release",
+    "verify-release",
+    "verify-image",
 }
 
 
 @pytest.mark.parametrize("path", list(_PATHS))
 def test_a_healthy_run_publishes_everything_it_should(path: str) -> None:
     """Guards against over-gating: with nothing failing, every job runs, except
-    the two TestPyPI jobs on the outage path."""
+    the two TestPyPI jobs on the outage path and the publishing jobs on a dry
+    run."""
     jobs = _jobs()
     got = _simulate(jobs, **_PATHS[path])
-    skipped_on_purpose = _TESTPYPI_JOBS if _PATHS[path]["skip"] else set()
+    if _PATHS[path].get("dry"):
+        skipped_on_purpose = _NOT_IN_A_DRY_RUN
+    else:
+        skipped_on_purpose = _TESTPYPI_JOBS if _PATHS[path]["skip"] else set()
     assert {j for j, r in got.items() if r == "skipped"} == skipped_on_purpose, got
 
 
@@ -435,7 +467,7 @@ def test_normal_path_also_waits_for_pypi(path: str, downstream: str) -> None:
     assert got[downstream] == "skipped", f"{downstream} ran although publish-pypi failed ({path})"
 
 
-@pytest.mark.parametrize("path", list(_PATHS))
+@pytest.mark.parametrize("path", [p for p in _PATHS if not _PATHS[p].get("dry")])
 def test_verify_pypi_follows_a_successful_pypi_upload(path: str) -> None:
     assert _after_pypi_failure(path)["verify-pypi"] == "skipped"
 
@@ -448,14 +480,20 @@ def _ok(got: dict[str, str], job: str) -> bool:
 # the run skips TestPyPI. A job that runs when its rule is false acts on a step
 # that failed or never ran; one skipped when its rule is true is over-gated.
 _RUNS_WHEN = {
-    "quality-gate": lambda got, skip: True,
-    "build": lambda got, skip: _ok(got, "quality-gate"),
-    "publish-testpypi": lambda got, skip: not skip and _ok(got, "build"),
-    "verify-testpypi": lambda got, skip: not skip and _ok(got, "publish-testpypi"),
-    "publish-pypi": lambda got, skip: _ok(got, "build") and (skip or _ok(got, "verify-testpypi")),
-    "verify-pypi": lambda got, skip: _ok(got, "publish-pypi"),
-    "docker": lambda got, skip: _ok(got, "publish-pypi"),
-    "github-release": lambda got, skip: _ok(got, "publish-pypi"),
+    "quality-gate": lambda got, skip, dry: True,
+    "build": lambda got, skip, dry: _ok(got, "quality-gate"),
+    "attest": lambda got, skip, dry: not dry and _ok(got, "build"),
+    "publish-testpypi": lambda got, skip, dry: not skip and _ok(got, "attest"),
+    "verify-testpypi": lambda got, skip, dry: not skip and _ok(got, "publish-testpypi"),
+    "publish-pypi": lambda got, skip, dry: _ok(got, "attest")
+    and (skip or _ok(got, "verify-testpypi")),
+    "verify-pypi": lambda got, skip, dry: _ok(got, "publish-pypi"),
+    "docker": lambda got, skip, dry: _ok(got, "build") and (dry or _ok(got, "publish-pypi")),
+    "attest-image": lambda got, skip, dry: not dry and _ok(got, "docker"),
+    "release-notes": lambda got, skip, dry: _ok(got, "quality-gate"),
+    "github-release": lambda got, skip, dry: _ok(got, "publish-pypi") and _ok(got, "release-notes"),
+    "verify-release": lambda got, skip, dry: not dry and _ok(got, "github-release"),
+    "verify-image": lambda got, skip, dry: not dry and _ok(got, "attest-image"),
 }
 
 
@@ -472,10 +510,11 @@ def test_every_job_runs_exactly_when_its_rule_holds(path: str, failing: str | No
     is SKIPPED, and that condition would still cut a GitHub Release and move
     GHCR `latest` for a version PyPI never received."""
     got = _simulate(_jobs(), fail=failing, **_PATHS[path])
+    skip, dry = _PATHS[path]["skip"], _PATHS[path].get("dry", False)
     wrong = [
         f"{job} {'ran' if got[job] != 'skipped' else 'was skipped'}"
         for job, rule in _RUNS_WHEN.items()
-        if (got[job] != "skipped") is not rule(got, _PATHS[path]["skip"])
+        if (got[job] != "skipped") is not rule(got, skip, dry)
     ]
     assert not wrong, f"{path}, {failing or 'nothing'} failing: {wrong} in {got}"
 
@@ -755,3 +794,672 @@ def test_gate_refuses_a_start_ref_that_does_not_contain_the_tag(
         assert part in got["failed"], (part, got["failed"])
     # Refused before the ci.yml lookup: nothing past this point runs.
     assert "listWorkflowRuns" not in [c[0] for c in got["calls"]], got["calls"]
+
+
+# --------------------------------------------------------------------------
+# The build backend comes from the hash lock, never from PyPI at build time.
+# --------------------------------------------------------------------------
+
+
+def _locked(name: str) -> dict[str, str]:
+    """{canonical name: pinned version} of requirements/<name>.txt."""
+    pins: dict[str, str] = {}
+    for line in (REPO / "requirements" / f"{name}.txt").read_text().splitlines():
+        m = re.match(r"([A-Za-z0-9._-]+)==([^\s;\\]+)", line)
+        if m:
+            pins[canonicalize_name(m.group(1))] = m.group(2)
+    return pins
+
+
+def test_the_release_is_built_without_build_isolation() -> None:
+    """With isolation, build installs [build-system] requires fresh from PyPI,
+    unpinned and unhashed, on every release."""
+    (step,) = [s for s in _steps("build") if s.get("name") == "Build wheel and sdist"]
+    assert step["run"].split() == ["python", "-m", "build", "--no-isolation"], step["run"]
+
+
+def test_every_build_requirement_is_hash_locked_for_the_release() -> None:
+    """build --no-isolation stops when a requirement is missing, so a new entry in
+    [build-system] requires that is not in the lock fails the release; this
+    test says so on the pull request instead."""
+    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    pins = _locked("release-tools")
+    for req in map(Requirement, pyproject["build-system"]["requires"]):
+        name = canonicalize_name(req.name)
+        assert name in pins, f"{req} is missing from requirements/release-tools.txt"
+        assert req.specifier.contains(
+            pins[name], prereleases=True
+        ), f"{name}=={pins[name]} vs {req}"
+
+
+# --------------------------------------------------------------------------
+# The image holds the release's own wheel and builds nothing.
+# --------------------------------------------------------------------------
+
+
+def _instructions(path: Path) -> list[str]:
+    """A Dockerfile's instructions, continuation lines joined, comments dropped."""
+    out: list[str] = []
+    buf: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.startswith("#") or (not s and not buf):
+            continue
+        more = s.endswith("\\")
+        buf.append(s[:-1].strip() if more else s)
+        if not more:
+            out.append(" ".join(buf))
+            buf = []
+    return out
+
+
+def _pip_installs(path: Path) -> list[str]:
+    return [
+        cmd.strip()
+        for ins in _instructions(path)
+        if ins.startswith("RUN ")
+        for cmd in re.split(r"&&|;", ins[4:])
+        if "pip install" in cmd
+    ]
+
+
+def test_the_image_installs_the_wheel_and_builds_nothing() -> None:
+    """Built from the source tree, the image fetched a fresh build backend and,
+    with no .git in the context, setuptools-scm gave it version 0.0.0+unknown
+    (the 0.41.0 image reports that)."""
+    copies = [i for i in _instructions(REPO / "Dockerfile") if i.startswith("COPY ")]
+    assert "COPY dist/*.whl /tmp/dist/" in copies, copies
+    assert not [c for c in copies if "fluid_build" in c or "pyproject.toml" in c], copies
+    installs = _pip_installs(REPO / "Dockerfile")
+    assert installs, "no pip install found in the Dockerfile"
+    for cmd in installs:
+        # Either a hash-locked file or the one wheel copied from dist/.
+        assert "--require-hashes -r " in cmd or cmd.endswith('"$1[${extras}]"'), cmd
+
+
+def test_the_docker_job_builds_the_image_around_this_release_s_wheel() -> None:
+    names = [s.get("name") for s in _steps("docker")]
+    download = next(s for s in _steps("docker") if s.get("name") == "Download wheel")
+    assert download["with"] == {"name": "dist", "path": "dist/"}, download
+    check = names.index("Check the scanned image holds this release's wheel")
+    assert names.index("Download wheel") < names.index("Build image for scanning (no push)") < check
+    assert check < names.index("Build and push Docker image"), names
+    step = _steps("docker")[check]
+    assert step["env"]["VERSION"] == "${{ needs.quality-gate.outputs.version }}", step
+    assert "fluid_build.__version__" in step["run"] and "exit 1" in step["run"], step["run"]
+
+
+# --------------------------------------------------------------------------
+# Signing happens only in jobs that run no code fetched at release time.
+# --------------------------------------------------------------------------
+
+_SIGNERS = {"attest", "attest-image", "publish-testpypi", "publish-pypi"}
+
+
+def test_only_jobs_that_run_no_fetched_code_can_sign() -> None:
+    """A job with `id-token: write` can sign anything as this workflow. The
+    jobs that build, install or run the package (whose dependencies come from
+    PyPI at release time) hold no such token; the jobs that do run pinned
+    actions and shell that installs and runs nothing."""
+    jobs = _jobs()
+    signers = {
+        n for n, j in jobs.items() if (j.get("permissions") or {}).get("id-token") == "write"
+    }
+    assert signers == _SIGNERS, signers
+    runs_code = re.compile(r"pip install|python -m build|docker (build|run)|\bfluid\b|cyclonedx")
+    for name in sorted(signers):
+        for step in jobs[name]["steps"]:
+            assert not runs_code.search(step.get("run", "")), (name, step.get("name"))
+
+
+def _record_and_check(tmp_path: Path, tamper: bool) -> subprocess.CompletedProcess:
+    """Run the build job's digest step, then the attest job's check, as bash."""
+    record = next(s for s in _steps("build") if s.get("id") == "digests")["run"]
+    check = next(
+        s
+        for s in _steps("attest")
+        if s.get("name") == "Check the files are the ones the build job made"
+    )["run"]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+    out = tmp_path / "out"
+    env = {**os.environ, "GITHUB_OUTPUT": str(out)}
+    subprocess.run(["bash", "-c", record], cwd=tmp_path, env=env, check=True, capture_output=True)
+    (line,) = [ln for ln in out.read_text().splitlines() if ln.startswith("sha256=")]
+    if tamper:
+        (dist / "pkg-1.0-py3-none-any.whl").write_bytes(b"other wheel")
+    env["SHA256"] = line.removeprefix("sha256=")
+    return subprocess.run(
+        ["bash", "-c", check], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_the_attest_job_signs_only_the_files_the_build_recorded(tmp_path, tamper: bool) -> None:
+    """The smoke install runs the package's dependencies in the build job, after
+    the digests are taken and the files uploaded; a file changed after that is
+    refused before anything is signed."""
+    got = _record_and_check(tmp_path, tamper)
+    assert (got.returncode != 0) is tamper, got.stdout + got.stderr
+    build = [s.get("name") for s in _steps("build")]
+    order = [
+        build.index("Build wheel and sdist"),
+        build.index("Record the distribution files' digests"),
+        build.index("Upload build artifacts"),
+        build.index("Isolated wheel install and verify"),
+    ]
+    assert order == sorted(order), build
+    assert _jobs()["build"]["outputs"]["sha256"] == "${{ steps.digests.outputs.sha256 }}"
+    attest = _steps("attest")
+    check = next(i for i, s in enumerate(attest) if s.get("env", {}).get("SHA256"))
+    signing = [i for i, s in enumerate(attest) if "attest-build-provenance" in s.get("uses", "")]
+    assert attest[check]["env"]["SHA256"] == "${{ needs.build.outputs.sha256 }}"
+    assert signing and check < min(signing), attest
+
+
+_DIST_CHECK = "Check the files are the ones the build job made"
+
+
+def test_every_job_that_takes_dist_checks_it_against_the_build_job() -> None:
+    """The artifact store can be written by code fetched later in the same run
+    (the TestPyPI smoke install, the image build), so each job that uploads,
+    installs or signs dist/ re-checks it before any step that uses it."""
+    takers = {}
+    for name, job in _jobs().items():
+        steps = job["steps"]
+        for i, step in enumerate(steps):
+            if (
+                step.get("uses", "").startswith("actions/download-artifact")
+                and step.get("with", {}).get("name") == "dist"
+            ):
+                takers[name] = (job, i)
+    assert set(takers) == {
+        "attest",
+        "publish-testpypi",
+        "publish-pypi",
+        "github-release",
+        "docker",
+    }, set(takers)
+    for name, (job, i) in takers.items():
+        assert "build" in job["needs"], name
+        later = job["steps"][i + 1 :]
+        check = next((j for j, s in enumerate(later) if s.get("name") == _DIST_CHECK), None)
+        assert check is not None, name
+        assert later[check]["env"]["SHA256"] == "${{ needs.build.outputs.sha256 }}", name
+        assert "sha256sum --check --strict" in later[check]["run"], name
+        # No action (upload, publish, sign, push) comes between them.
+        assert not [x for x in later[:check] if "uses" in x], name
+
+
+@pytest.mark.parametrize("change", ["none", "swap", "extra", "missing"])
+def test_the_dist_check_refuses_a_changed_file_set(tmp_path, change: str) -> None:
+    record = next(s for s in _steps("build") if s.get("id") == "digests")["run"]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+    out = tmp_path / "out"
+    env = {**os.environ, "GITHUB_OUTPUT": str(out)}
+    subprocess.run(["bash", "-c", record], cwd=tmp_path, env=env, check=True, capture_output=True)
+    (line,) = [ln for ln in out.read_text().splitlines() if ln.startswith("sha256=")]
+    env["SHA256"] = line.removeprefix("sha256=")
+    if change == "swap":
+        (dist / "pkg-1.0.tar.gz").write_bytes(b"other")
+    elif change == "extra":
+        (dist / "extra.txt").write_bytes(b"x")
+    elif change == "missing":
+        (dist / "pkg-1.0.tar.gz").unlink()
+    for name in ("attest", "publish-testpypi", "publish-pypi", "github-release", "docker"):
+        check = next(s for s in _steps(name) if s.get("name") == _DIST_CHECK)["run"]
+        got = subprocess.run(
+            ["bash", "-c", check], cwd=tmp_path, env=env, capture_output=True, text=True
+        )
+        assert (got.returncode != 0) is (change != "none"), (name, got.stdout + got.stderr)
+
+
+def test_the_testpypi_install_takes_the_package_from_testpypi_and_the_rest_from_pypi() -> None:
+    """With both indexes in one resolution, a dependency name that exists on
+    TestPyPI is taken from whichever index has the higher version."""
+    run = next(s for s in _steps("verify-testpypi") if s.get("name") == "Install from TestPyPI")[
+        "run"
+    ]
+    assert "--extra-index-url" not in run
+    installs = [ln.strip() for ln in run.replace("\\\n", " ").splitlines() if "pip install" in ln]
+    assert len(installs) == 2, installs
+    first, second = installs
+    assert "--no-deps" in first and "https://test.pypi.org/simple/" in first, first
+    assert "--no-deps" not in second and "https://pypi.org/simple/" in second, second
+    assert "test.pypi.org" not in second, second
+
+
+def _push_check(tmp_path: Path, *, digest: str, held: str, version: str = "1.2.0") -> tuple:
+    """Run the pushed-image check under bash with a fake `docker`."""
+    step = next(
+        s
+        for s in _steps("docker")
+        if s.get("name") == "Check the pushed image holds this release's wheel"
+    )
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "docker.log"
+    fake = bindir / "docker"
+    fake.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\necho "{held}"\n', encoding="utf-8")
+    fake.chmod(0o700)
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "IMAGE": "ghcr.io/Some-Owner/forge-cli",
+        "DIGEST": digest,
+        "VERSION": version,
+    }
+    got = subprocess.run(
+        ["bash", "-c", step["run"]], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    return got, (log.read_text() if log.exists() else "")
+
+
+_DIGEST = "sha256:" + "ab" * 32
+
+
+def test_the_pushed_image_is_asked_what_it_holds(tmp_path) -> None:
+    """The push is a second build; the scan build's check says nothing about it."""
+    got, log = _push_check(tmp_path, digest=_DIGEST, held="1.2.0")
+    assert got.returncode == 0, got.stdout + got.stderr
+    assert f"ghcr.io/some-owner/forge-cli@{_DIGEST}" in log, log
+
+
+def test_a_pushed_image_with_another_version_fails_the_job(tmp_path) -> None:
+    got, _ = _push_check(tmp_path, digest=_DIGEST, held="0.0.0+unknown")
+    assert got.returncode != 0 and "::error::" in got.stdout, got.stdout
+
+
+def test_a_push_without_a_digest_fails_before_anything_runs(tmp_path) -> None:
+    got, log = _push_check(tmp_path, digest="", held="1.2.0")
+    assert got.returncode != 0 and log == "", (got.stdout, log)
+
+
+def test_the_pushed_image_is_checked_after_the_push_and_before_it_is_signed() -> None:
+    names = [s.get("name") for s in _steps("docker")]
+    push = names.index("Build and push Docker image")
+    check = names.index("Check the pushed image holds this release's wheel")
+    assert push < check
+    step = _steps("docker")[check]
+    assert step["if"] == "needs.quality-gate.outputs.publish == 'true'"
+    assert step["env"]["DIGEST"] == "${{ steps.push.outputs.digest }}"
+    assert _jobs()["attest-image"]["needs"] == ["quality-gate", "docker"]
+
+
+def test_the_image_attestation_signs_the_digest_the_docker_job_pushed() -> None:
+    docker = _jobs()["docker"]
+    assert docker["outputs"]["digest"] == "${{ steps.push.outputs.digest }}"
+    (step,) = [s for s in _steps("attest-image") if "attest-build-provenance" in s.get("uses", "")]
+    assert step["with"]["subject-digest"] == "${{ needs.docker.outputs.digest }}"
+    assert step["with"]["push-to-registry"] is True
+
+
+# --------------------------------------------------------------------------
+# The dry run: a pull request rehearses the release and publishes nothing.
+# --------------------------------------------------------------------------
+
+_PUBLISHING_ACTIONS = (
+    "docker/login-action",
+    "pypa/gh-action-pypi-publish",
+    "actions/attest-build-provenance",
+    "softprops/action-gh-release",
+)
+
+
+def _publishes(step: dict) -> bool:
+    """A step that logs in, uploads, signs, pushes or announces."""
+    uses = step.get("uses", "")
+    if uses.startswith(_PUBLISHING_ACTIONS):
+        return True
+    return uses.startswith("docker/build-push-action") and step.get("with", {}).get("push") is True
+
+
+def _step_runs(job: str, step: dict, *, dry: bool) -> bool:
+    cond = step.get("if")
+    if cond is None:
+        return True
+
+    def lookup(path: str) -> object:
+        if path in ("needs.quality-gate.outputs.publish", "steps.meta.outputs.publish"):
+            return "false" if dry else "true"
+        raise AssertionError(f"{job}: step condition reads unmodelled `{path}`")
+
+    fns = {"success": lambda: True, "always": lambda: True}
+    fns.update({"failure": lambda: False, "cancelled": lambda: False})
+    return _condition(str(cond), {"lookup": lookup, "fn": fns})[0]
+
+
+@pytest.mark.parametrize("path", list(_PATHS))
+def test_a_dry_run_uploads_signs_pushes_and_announces_nothing(path: str) -> None:
+    """Job conditions keep the publishing jobs out of a dry run; step conditions
+    keep docker's login and push out of it. On a real run every one runs."""
+    jobs = _jobs()
+    dry = _PATHS[path].get("dry", False)
+    ran = _simulate(jobs, **_PATHS[path])
+    steps = [
+        (name, step)
+        for name, job in jobs.items()
+        if ran[name] != "skipped"
+        for step in job.get("steps", [])
+        if _publishes(step)
+    ]
+    running = [
+        f"{n}: {s.get('name') or s.get('uses')}" for n, s in steps if _step_runs(n, s, dry=dry)
+    ]
+    if dry:
+        assert not running, running
+        # Not vacuous: the dry run reaches docker, whose login and push it skips.
+        assert ran["docker"] == "success" and [n for n, _ in steps] == ["docker", "docker"]
+    else:
+        assert len(running) == len(steps) > 0, running
+
+
+def test_no_job_in_a_dry_run_holds_a_signing_token() -> None:
+    """A same-repository pull request gets the token scopes a job asks for. The
+    only write scope a dry run hands out is docker's, whose push is skipped."""
+    jobs = _jobs()
+    ran = _simulate(jobs, **_PATHS["pull request dry run"])
+    writes = {
+        (name, scope)
+        for name, job in jobs.items()
+        if ran[name] != "skipped"
+        for scope, level in (job.get("permissions") or {}).items()
+        if level == "write"
+    }
+    assert writes == {("docker", "packages")}, writes
+
+
+def test_a_dry_run_never_shares_the_release_concurrency_group() -> None:
+    """A group keeps one pending run and cancels the one before it, so a dry run
+    in the `release` group could cancel a tag push waiting there."""
+    conc = yaml.safe_load(WORKFLOW.read_text())["concurrency"]
+    assert conc["group"] == (
+        "${{ github.event_name == 'pull_request' && "
+        "format('release-dry-run-{0}', github.ref) || 'release' }}"
+    )
+    assert conc["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+
+
+def test_a_change_to_what_builds_the_release_runs_the_dry_run() -> None:
+    on = yaml.safe_load(WORKFLOW.read_text())[True]  # PyYAML reads the `on` key as True
+    assert set(on) == {"push", "pull_request", "workflow_dispatch"}, set(on)
+    paths = set(on["pull_request"]["paths"])
+    must = {
+        ".github/workflows/release.yml",
+        "requirements/release-tools.txt",
+        "requirements/release-image.txt",
+        "Dockerfile",
+        "pyproject.toml",
+        "requirements/release-tools.in",
+        "requirements/release-image.in",
+        ".grype.yaml",
+        "MANIFEST.in",
+    }
+    assert must <= paths, must - paths
+    assert [p for p in paths if not (REPO / p).exists()] == []
+
+
+@pytest.mark.parametrize(
+    "event, tag, publish",
+    [
+        ("pull_request", "1234/merge", "false"),
+        ("pull_request", "v1.2.0", "false"),  # a tag-shaped ref is still a dry run
+        ("push", "v1.2.0", "true"),
+        ("workflow_dispatch", "v1.2.0rc1", "true"),
+    ],
+)
+def test_the_gate_publishes_only_outside_a_pull_request(
+    tmp_path, event: str, tag: str, publish: str
+) -> None:
+    step = next(s for s in _steps("quality-gate") if s.get("id") == "meta")
+    out = tmp_path / "out"
+    env = {
+        **os.environ,
+        "EVENT_NAME": event,
+        "TAG_INPUT": tag,
+        "SKIP_TESTPYPI_INPUT": "false",
+        "GITHUB_OUTPUT": str(out),
+        "GITHUB_ACTOR": "someone",
+    }
+    subprocess.run(["bash", "-c", step["run"]], env=env, check=True, capture_output=True)
+    outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+    assert outputs["publish"] == publish, outputs
+    if publish == "false":
+        assert outputs["tag"] == outputs["version"] == "", outputs
+    else:
+        assert outputs["tag"] == tag and outputs["version"] == tag[1:], outputs
+
+
+_CHANGELOG = """# Changelog
+
+## [Unreleased]
+
+### Added
+
+- **A greenhouse view.**
+
+## [1.2.0] — 2026-01-02
+
+### Added
+
+- **A garden planner.**
+
+## [1.1.0] — 2026-01-01
+
+### Added
+
+- **A seed list.**
+"""
+
+
+def _notes(
+    tmp_path: Path, changelog: str, *, publish: bool, version: str = "", newer_tag: str = ""
+) -> tuple:
+    """Run the release-notes step under bash on a repository tagged v1.2.0."""
+    step = next(s for s in _steps("release-notes") if s.get("name", "").startswith("Generate"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+    _git(repo, "add", "CHANGELOG.md")
+    _git(repo, "commit", "-q", "-m", "first")
+    _git(repo, "tag", "v1.2.0")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "second")
+    if newer_tag:
+        _git(repo, "tag", newer_tag)
+    summary = tmp_path / "summary.md"
+    env = {
+        **os.environ,
+        "PUBLISH": "true" if publish else "false",
+        "VERSION": version,
+        "PROFILE": "stable",
+        "IS_PRE": "false",
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    proc = subprocess.run(
+        ["bash", "-c", step["run"]], cwd=repo, env=env, capture_output=True, text=True
+    )
+    notes = repo / "release-notes.md"
+    return (
+        proc,
+        notes.read_text() if notes.exists() else "",
+        summary.read_text() if summary.exists() else "",
+    )
+
+
+def test_a_dry_run_reads_the_newest_tag_s_section(tmp_path) -> None:
+    proc, notes, summary = _notes(tmp_path, _CHANGELOG, publish=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "A garden planner." in notes and "A seed list." not in notes, notes
+    assert "A greenhouse view." not in notes and "data-product-forge==1.2.0" in notes, notes
+    assert "A garden planner." in summary, summary
+
+
+def test_a_dry_run_skips_a_newer_pre_release_tag_that_has_no_section(tmp_path) -> None:
+    """A pre-release's real run falls back to git log, so its section may not
+    exist yet; the dry run must not go red over it."""
+    proc, notes, _ = _notes(tmp_path, _CHANGELOG, publish=False, newer_tag="v1.3.0rc1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "A garden planner." in notes and "==1.2.0" in notes, notes
+
+
+def test_a_dry_run_fails_when_the_newest_tag_s_section_is_not_found(tmp_path) -> None:
+    """The extractor once matched nothing for every release and fell back to
+    git log in silence; a dry run reads a section that exists, so it says so."""
+    broken = _CHANGELOG.replace("## [1.2.0] — 2026-01-02", "## 1.2.0 - 2026-01-02")
+    proc, _, _ = _notes(tmp_path, broken, publish=False)
+    assert proc.returncode != 0 and "::error::" in proc.stdout, proc.stdout
+
+
+def test_a_release_still_falls_back_to_git_log_with_a_warning(tmp_path) -> None:
+    proc, notes, summary = _notes(tmp_path, _CHANGELOG, publish=True, version="1.3.0")
+    assert proc.returncode == 0 and "::warning::" in proc.stdout, proc.stdout + proc.stderr
+    assert "- second (" in notes and summary == "", notes
+
+
+# --------------------------------------------------------------------------
+# verify-release and verify-image check what was published, with a fake `gh`.
+# --------------------------------------------------------------------------
+
+_FAKE_GH = """#!{python}
+import json, os, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:2] == ["release", "download"]:
+    out = Path(args[args.index("--dir") + 1])
+    out.mkdir(exist_ok=True)
+    for name in os.environ["FAKE_RELEASE_FILES"].split():
+        (out / name).write_text("x", encoding="utf-8")
+    sys.exit(0)
+if args[:2] == ["attestation", "verify"]:
+    if "--format" in args:
+        digest = os.environ["FAKE_DIGEST"]
+        print(json.dumps([{"verificationResult": {"statement": {"subject": [{"digest": {"sha256": digest}}]}}}]))
+    sys.exit(int(os.environ.get("FAKE_VERIFY_RC", "0")))
+sys.exit(2)
+"""
+
+_POLICY = [
+    "--repo",
+    "o/r",
+    "--signer-workflow",
+    "o/r/.github/workflows/release.yml",
+    "--source-ref",
+    "refs/tags/v1.2.0",
+    "--source-digest",
+    "c0ffee",
+    "--deny-self-hosted-runners",
+    "--predicate-type",
+    "https://slsa.dev/provenance/v1",
+]
+_FILES = "pkg-1.2.0-py3-none-any.whl pkg-1.2.0.tar.gz sbom.cdx.json"
+_BUNDLES = "pkg-1.2.0-py3-none-any.whl.intoto.jsonl pkg-1.2.0.tar.gz.intoto.jsonl"
+
+
+def _verify(tmp_path: Path, job: str, **env: str) -> tuple:
+    """Run a verify job's step under bash; returns (process, gh calls)."""
+    if not shutil.which("jq"):
+        pytest.skip("jq not installed")
+    (step,) = _steps(job)
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    gh = fake / "gh"
+    gh.write_text(_FAKE_GH.replace("{python}", sys.executable), encoding="utf-8")
+    gh.chmod(0o700)
+    log = tmp_path / "gh.log"
+    run_env = {
+        **os.environ,
+        "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_GH_LOG": str(log),
+        "GITHUB_REPOSITORY": "o/r",
+        "GITHUB_REF": "refs/tags/v1.2.0",
+        "GITHUB_SHA": "c0ffee",
+        **env,
+    }
+    proc = subprocess.run(
+        ["bash", "-c", step["run"]], cwd=tmp_path, env=run_env, capture_output=True, text=True
+    )
+    calls = [json.loads(ln) for ln in log.read_text().splitlines()] if log.exists() else []
+    return proc, calls
+
+
+def _pins_the_policy(call: list[str]) -> bool:
+    n = len(_POLICY)
+    return any(call[i : i + n] == _POLICY for i in range(len(call) - n + 1))
+
+
+def test_every_release_file_is_verified_with_its_bundle_and_online(tmp_path) -> None:
+    proc, calls = _verify(
+        tmp_path,
+        "verify-release",
+        TAG="v1.2.0",
+        FAKE_RELEASE_FILES=f"{_FILES} {_BUNDLES}",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert calls[0][:3] == ["release", "download", "v1.2.0"], calls
+    verifies = [c for c in calls if c[:2] == ["attestation", "verify"]]
+    for file in ("pkg-1.2.0-py3-none-any.whl", "pkg-1.2.0.tar.gz"):
+        mine = [c for c in verifies if c[2] == file]
+        assert [("--bundle" in c) for c in mine] == [True, False], mine
+        assert all(_pins_the_policy(c) for c in mine), mine
+        assert mine[0][mine[0].index("--bundle") + 1] == f"{file}.intoto.jsonl"
+    assert len(verifies) == 4, verifies
+
+
+@pytest.mark.parametrize(
+    "files, rc, says",
+    [
+        (
+            f"{_FILES} pkg-1.2.0-py3-none-any.whl.intoto.jsonl",
+            0,
+            "no pkg-1.2.0.tar.gz.intoto.jsonl",
+        ),
+        (f"pkg-1.2.0-py3-none-any.whl {_BUNDLES}", 0, "exactly one wheel and one sdist"),
+        (f"{_FILES} {_BUNDLES}", 1, ""),  # gh attestation verify refuses
+    ],
+)
+def test_a_release_file_that_does_not_verify_fails_the_job(tmp_path, files, rc, says) -> None:
+    proc, _ = _verify(
+        tmp_path,
+        "verify-release",
+        TAG="v1.2.0",
+        FAKE_RELEASE_FILES=files,
+        FAKE_VERIFY_RC=str(rc),
+    )
+    assert proc.returncode != 0 and says in proc.stdout, proc.stdout + proc.stderr
+
+
+_TAGS = "ghcr.io/o/r:1.2.0\nghcr.io/o/r:1.2\nghcr.io/o/r:stable-latest\nghcr.io/o/r:latest\n"
+
+
+@pytest.mark.parametrize("resolves_to, ok", [("aaaa", True), ("bbbb", False)])
+def test_every_moved_image_tag_must_name_the_pushed_digest(tmp_path, resolves_to, ok) -> None:
+    proc, calls = _verify(
+        tmp_path,
+        "verify-image",
+        DIGEST="sha256:aaaa",
+        TAGS=_TAGS,
+        FAKE_DIGEST=resolves_to,
+    )
+    assert (proc.returncode == 0) is ok, proc.stdout + proc.stderr
+    oci = [c for c in calls if c[:2] == ["attestation", "verify"]]
+    assert all(_pins_the_policy(c) for c in oci), oci
+    if ok:
+        tags = [t for t in _TAGS.splitlines() if t]
+        assert [c[2] for c in oci] == [f"oci://{t}" for t in tags] + [f"oci://{tags[0]}"], oci
+        assert "--bundle-from-oci" in oci[-1], oci
+    else:
+        assert "ghcr.io/o/r:1.2.0 resolves to sha256:bbbb" in proc.stdout, proc.stdout
+
+
+def test_an_image_check_with_nothing_pushed_fails(tmp_path) -> None:
+    proc, calls = _verify(tmp_path, "verify-image", DIGEST="", TAGS="", FAKE_DIGEST="x")
+    assert proc.returncode != 0 and not calls, proc.stdout

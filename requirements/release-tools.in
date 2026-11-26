@@ -6,3 +6,11 @@ pip
 build
 twine
 cyclonedx-bom==7.3.0
+# The build backend: pyproject.toml's [build-system] requires, with the same
+# bounds. The build job runs `python -m build --no-isolation`, so the release is
+# built with these locked versions instead of whatever PyPI serves at build time.
+# build refuses to start when one is missing or out of bounds, so a new entry in
+# [build-system] requires must be added here too.
+setuptools>=68
+setuptools-scm>=8
+wheel
