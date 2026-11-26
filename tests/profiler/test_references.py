@@ -150,6 +150,18 @@ def _cases() -> Dict[str, Dict[str, Any]]:
             "branch_rows": [{**row, "label": "x"} for row in library.branches(BRANCHES)],
             "expect": False,
         }
+    for tag in ("pii", "Sensitive"):
+        # a schema-invalid single tag (a string, not a list) is still one tag
+        cases[f"tag {tag} as a plain string"] = {
+            "contract": {"branch_columns": [{"name": "label", "type": "string", "tags": tag}]},
+            "branch_rows": [{**row, "label": "x"} for row in library.branches(BRANCHES)],
+            "expect": False,
+        }
+    cases["a plain string tag that is no label"] = {
+        "contract": {"branch_columns": [{"name": "label", "type": "string", "tags": "geo"}]},
+        "branch_rows": [{**row, "label": "x"} for row in library.branches(BRANCHES)],
+        "expect": True,
+    }
     cases["tag that is no label"] = {
         "contract": {
             "branch_columns": [{"name": "label", "type": "string", "tags": ["geo", "reference"]}]
@@ -514,6 +526,17 @@ def test_mutant_a_row_level_policy_is_no_restriction(tmp_path, monkeypatch):
 
 def test_mutant_no_tag_marks_a_column(tmp_path, monkeypatch):
     monkeypatch.setattr(references, "_tagged_sensitive", lambda entry: False)
+    assert _differs(tmp_path)
+
+
+def test_mutant_a_tag_that_is_a_plain_string_is_no_tag(tmp_path, monkeypatch):
+    def only_lists(entry: Any) -> bool:
+        tags = entry.get("tags")
+        return isinstance(tags, list) and any(
+            isinstance(tag, str) and tag.casefold() in ("pii", "phi", "sensitive") for tag in tags
+        )
+
+    monkeypatch.setattr(references, "_tagged_sensitive", only_lists)
     assert _differs(tmp_path)
 
 

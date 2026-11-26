@@ -204,6 +204,8 @@ def _marked_public(expose: Mapping[str, Any]) -> bool:
 
 def _tagged_sensitive(entry: Mapping[str, Any]) -> bool:
     tags = entry.get("tags")
+    if isinstance(tags, str):  # a schema-invalid single tag still labels the column
+        tags = [tags]
     return isinstance(tags, list) and any(
         isinstance(tag, str) and tag.casefold() in _SENSITIVE_TAGS for tag in tags
     )

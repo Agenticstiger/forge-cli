@@ -863,6 +863,7 @@ def pinned_children_cells(
     childless: int = 0,
     upper: Optional[int] = None,
     at_least: Sequence[int] = (),
+    floors: Sequence[int] = (),
 ) -> FrozenSet[int]:
     """The withheld cells of a children-per-parent table a reader may work out exactly.
 
@@ -881,6 +882,12 @@ def pinned_children_cells(
     in the first cell, and each published cell in its band. With *at_least* (see
     :func:`parents_at_or_above`) the reader also knows, of each bin, that at least that many
     parents lie in it or in a bin above: a table with fewer of them is not one it can hold true.
+    With *floors* (the children each parent is known to hold at least) it also knows what they
+    add to the children's total: a parent in a bin holds at least the larger of the bin's lower
+    edge and its floor. The least total a table allows pairs the floors, the largest first, with
+    the table's parent slots, the highest bin first; a table whose least total exceeds *children*
+    is not one it can hold true. A floor above its bin's lower edge uses up more of the total,
+    and so bounds the other parents from above.
 
     A withheld cell is safe when two such tables differ in it. The true table (*cells*)
     is one; the other is searched for among the tables one or two parents' moves away.
@@ -895,6 +902,7 @@ def pinned_children_cells(
         for value, shown in zip(cells, published, strict=True)
     ]
     any_published = any(published)
+    ranked = sorted(floors, reverse=True)
 
     def holds(table: Sequence[int]) -> bool:
         if min(table) < 0 or table[0] < childless:
@@ -909,7 +917,7 @@ def pinned_children_cells(
             rest = sum(value for value, shown in zip(table, published, strict=True) if not shown)
             if not check_count(rest, rule).published:
                 return False
-        if sum(edge * value for edge, value in zip(lower_edges, table, strict=True)) > children:
+        if _least_children(lower_edges, table, ranked) > children:
             return False
         if tops[-1] is None and table[-1] > 0:
             return True
@@ -944,6 +952,22 @@ def pinned_children_cells(
         if not _two_tables(cells, index, moves, holds, repairs):
             pinned.add(index)
     return frozenset(pinned)
+
+
+def _least_children(
+    lower_edges: Sequence[int], table: Sequence[int], ranked_floors: Sequence[int]
+) -> int:
+    """The fewest children the parents of *table* hold together, given the floors of some.
+
+    Each parent holds at least its bin's lower edge and at least its floor. Which parent has
+    which floor is not known, and the fewest is had by giving the largest floors to the highest
+    bins (*ranked_floors* are sorted largest first).
+    """
+    slots: List[int] = []
+    for edge, value in reversed(list(zip(lower_edges, table, strict=True))):
+        slots.extend([edge] * value)
+    paired = sum(max(slot, floor) for slot, floor in zip(slots, ranked_floors, strict=False))
+    return paired + sum(slots[len(ranked_floors) :])
 
 
 def parents_at_or_above(lower_edges: Sequence[int], floors: Iterable[int]) -> List[int]:

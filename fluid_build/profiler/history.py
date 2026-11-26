@@ -1354,12 +1354,16 @@ def _guarded(
     is the changes out of it). Every key is a parent of the relationship that keys the column, so
     beside the relationship's published children per parent a reader forms, for each bin, the
     parents that lie in it or above it (:func:`disclosure.parents_at_or_above`). The bins the
-    relationship withheld, which no other count gave back, may be pinned by that. Where they are,
-    both entries are withheld whole, at the level of the group, so neither a size, a
-    ``sampleSize`` nor a cell of them is written: a number written beside a withheld cell gives
-    that cell back (by the group's size) as much as the cell does. The check is run again on
-    what is written, so it holds as it stands. Nothing here reads a value: it reads counts the
-    profiler formed.
+    relationship withheld, which no other count gave back, may be pinned by that. A floor also
+    uses up part of the children's total (a parent holds at least the larger of its bin's lower
+    edge and its floor), so a floor above its bin's edge bounds the other parents from above; the
+    reader is given the floors themselves (:func:`disclosure.pinned_children_cells`), and the
+    total is the relationship's own children, which is never above what a rounded row count lets
+    a reader assume. Where they are, both entries are withheld whole, at the level of the group,
+    so neither a size, a ``sampleSize`` nor a cell of them is written: a number written beside a
+    withheld cell gives that cell back (by the group's size) as much as the cell does. The check
+    is run again on what is written, so it holds as it stands. Nothing here reads a value: it
+    reads counts the profiler formed.
     """
     from fluid_build.profiler import runner
 
@@ -1393,7 +1397,7 @@ def _guarded(
         )
         known = disclosure.parents_at_or_above(lower, floors)
         pinned = disclosure.pinned_children_cells(
-            lower, cells, shown, children, rule, 0, None, known
+            lower, cells, shown, children, rule, 0, None, known, floors
         )
         if not pinned - base:
             return whole

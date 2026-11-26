@@ -11,6 +11,7 @@ per parent reads; a brute-force reader checks that no withheld bin can be worked
 
 from __future__ import annotations
 
+import itertools
 import json
 import random
 from pathlib import Path
@@ -43,6 +44,11 @@ def _tracked(result: Any) -> Dict[str, Any]:
 
 def _said(result: Any, name: str = "branch_id") -> str:
     return dict(result.not_measured).get(f"history of card.{name}", "")
+
+
+def _twice(members: Sequence[Sequence[Any]]) -> List[List[Any]]:
+    """Each member holds two versions at the branch it starts at: the children are twice the cells."""
+    return [[*chain, *chain] for chain in members]
 
 
 def _spread(keys: Sequence[Any] = BRANCHES, per: int = 20) -> List[List[Any]]:
@@ -95,7 +101,7 @@ def test_the_published_cells_of_a_key_are_its_entities_by_their_first_branch(tmp
             tmp_path / "kept",
             library.contract(),
             library.branches(kept),
-            library.cards(library.spread(kept, size)),
+            library.cards(_twice(library.spread(kept, size))),
         )
     )["branch_id"]["initial"]["groups"]
     for published, true in zip(shown["levelCounts"], size, strict=True):
@@ -118,7 +124,7 @@ def test_a_value_that_is_no_key_is_named_and_the_column_is_not_followed(tmp_path
 
 def test_a_null_foreign_key_is_followed_and_counted_in_no_level(tmp_path):
     keys = library.keys(4)
-    members = library.spread(keys, [45, 30, 0, 30]) + [[None] for _ in range(15)]
+    members = _twice(library.spread(keys, [45, 30, 0, 30])) + [[None] for _ in range(15)]
     result = library.profile(
         tmp_path, library.contract(), library.branches(keys), library.cards(members)
     )
@@ -246,7 +252,7 @@ def _floors(document: Dict[str, Any], size: int, *, outgoing: bool = True) -> Li
 
 def _tables(
     parents: int,
-    children: int,
+    totals: Sequence[int],
     published: Sequence[Optional[int]],
     floors: Sequence[int],
 ) -> List[Tuple[int, ...]]:
@@ -255,7 +261,9 @@ def _tables(
     Cells are non-negative and sum to the parents; a published cell lies in its band; the parents
     can be matched to bins so that each holds at least its floor; the children are at least what
     the bins' lower edges and the floors give, and at most what their upper edges give; and the
-    withheld cells together are not a small count (the check's own rule).
+    withheld cells together are not a small count (the check's own rule). The children's total is
+    one of *totals*: the exact count, or each count the document's rounded ``rowCount`` allows. A
+    floor above its bin's lower edge uses up more of the total, so it bounds the other parents.
     """
     lower = list(CHILDREN_EDGES[:-1])
     tops = [edge - 1 for edge in CHILDREN_EDGES[1:-1]] + [None]
@@ -266,15 +274,11 @@ def _tables(
         slots: List[int] = []
         for at in range(len(table) - 1, -1, -1):
             slots += [lower[at]] * table[at]
-        if (
-            sum(max(slot, floor) for slot, floor in zip(slots, ranked, strict=False))
-            + sum(slots[len(ranked) :])
-            > children
-        ):
-            return False
-        if table[-1] == 0 and (
-            sum((top or 0) * value for top, value in zip(tops, table, strict=True)) < children
-        ):
+        least = sum(max(slot, floor) for slot, floor in zip(slots, ranked, strict=False)) + sum(
+            slots[len(ranked) :]
+        )
+        most = sum((top or 0) * value for top, value in zip(tops, table, strict=True))
+        if not any(least <= total and (table[-1] > 0 or most >= total) for total in totals):
             return False
         for at, edge in enumerate(lower):
             if sum(table[at:]) < sum(1 for floor in floors if floor >= edge):
@@ -302,10 +306,89 @@ def _tables(
     return found
 
 
+def _single_versions(document: Dict[str, Any]) -> bool:
+    """Whether the document says each entity holds one version: one published bin, ``[1, 2)``."""
+    entry = document["tables"]["card"]["history"]["versionsPerEntity"]
+    (group,) = entry["groups"]
+    return bool(
+        group["status"] == "F" and entry["bins"] == ["1", "2"] and len(group["binCounts"]) == 1
+    )
+
+
+def _first_cells_published(document: Dict[str, Any]) -> bool:
+    """Whether the first cells are published, for a table small enough to search key by key."""
+    follow = document["tables"]["card"]["history"]["columns"]["branch_id"]
+    (initial,) = follow["initial"]["groups"]
+    return bool(initial["status"] == "F" and len(follow["initial"]["levels"]) <= 6)
+
+
+def _single_version_tables(
+    document: Dict[str, Any],
+    totals: Sequence[int],
+    published: Sequence[Optional[int]],
+) -> List[Tuple[int, ...]]:
+    """Every table of children per parent a reader can hold true over one version an entity.
+
+    A key's children are then its entities, so each published first-version cell bounds its
+    parent's children from both sides, and the children's total is the entities' total: one of
+    *totals* that the ``initial`` size's band also allows. A table is held true by an assignment
+    of the keys to its bins in which each key's range meets its bin and the children can sum to
+    the total. (Ported from a brute-force search over the keys' assignments, which is what a
+    reader with these upper bounds does.)
+    """
+    lower = list(CHILDREN_EDGES[:-1])
+    tops = [edge - 1 for edge in CHILDREN_EDGES[1:-1]] + [10**9]
+    (initial,) = document["tables"]["card"]["history"]["columns"]["branch_id"]["initial"]["groups"]
+    cells = initial["levelCounts"]
+    ranges = [_band(cell) if cell is not None else (0, 10**9) for cell in cells]
+    low, high = _band(initial["k"])
+    sums = [total for total in totals if low <= total <= high]
+    found = set()
+    for assignment in itertools.product(range(len(lower)), repeat=len(ranges)):
+        table = tuple(assignment.count(at) for at in range(len(lower)))
+        if table in found:
+            continue
+        spans = [
+            (max(floor, lower[at]), min(ceiling, tops[at]))
+            for at, (floor, ceiling) in zip(assignment, ranges, strict=True)
+        ]
+        if any(least > most for least, most in spans):
+            continue  # a key that meets no value of its bin
+        if not any(sum(l for l, _ in spans) <= total <= sum(m for _, m in spans) for total in sums):
+            continue
+        if any(
+            shown is not None and not _band(shown)[0] <= value <= _band(shown)[1]
+            for value, shown in zip(table, published, strict=True)
+        ):
+            continue
+        if any(shown is not None for shown in published):
+            rest = sum(v for v, shown in zip(table, published, strict=True) if shown is None)
+            if not disclosure.check_count(rest, RULE).published:
+                continue
+        found.add(table)
+    return sorted(found)
+
+
+def _row_count_totals(document: Dict[str, Any]) -> List[int]:
+    """Every count of child rows the document's rounded ``rowCount`` leaves open."""
+    low, high = _band(document["tables"]["card"]["rowCount"])
+    return list(range(low, high + 1))
+
+
 def _derivable(
-    result: Any, rows: Sequence[Dict[str, Any]], keys: Sequence[str], *, outgoing: bool = True
+    result: Any,
+    rows: Sequence[Dict[str, Any]],
+    keys: Sequence[str],
+    *,
+    outgoing: bool = True,
+    banded: bool = False,
+    total: Optional[Sequence[int]] = None,
 ) -> List[int]:
-    """The withheld bins of the relationship's cells a reader can work out, by brute force."""
+    """The withheld bins of the relationship's cells a reader can work out, by brute force.
+
+    The reader knows the children's total exactly, or with *banded* only as the document's rounded
+    ``rowCount`` gives it (any count in the band). *total* sets the counts it takes outright.
+    """
     document = result.document
     (group,) = document["relationships"][0]["statistics"][0]["groups"]
     published: List[Optional[int]] = (
@@ -314,8 +397,11 @@ def _derivable(
     held = [row["branch_id"] for row in rows if row["branch_id"] is not None]
     per_key = [held.count(key) for key in keys]
     floors = _floors(document, len(keys), outgoing=outgoing)
-    tables = _tables(len(keys), len(held), published, floors)
-    bare = _tables(len(keys), len(held), published, [0] * len(keys))
+    totals = total or (_row_count_totals(document) if banded else [len(held)])
+    tables = _tables(len(keys), totals, published, floors)
+    if _single_versions(document) and _first_cells_published(document):
+        tables = _single_version_tables(document, totals, published)
+    bare = _tables(len(keys), totals, published, [0] * len(keys))
     true = [0] * (len(CHILDREN_EDGES) - 1)
     for count in per_key:
         true[min(max(i for i, edge in enumerate(CHILDREN_EDGES[:-1]) if edge <= count), 6)] += 1
@@ -384,6 +470,24 @@ STAR = [
 ]
 
 
+#: One member holds one card, so a branch's first-version cell is its parent's children, and the
+#: cell that is published bounds every other parent from above through the children's total: with
+#: the first branch holding at least 43 of the 59 to 62 rows, no other holds more than 19. Each is
+#: a draw of a seeded search (two to five branches, one version a member) that gave a bin back.
+SINGLE_VERSION = {
+    "single-2-0-12-45": [2, 0, 12, 45],
+    "single-45-0-0-12": [45, 0, 0, 12],
+    "single-30-1-0-10": [30, 1, 0, 10],
+    "single-5-10-12-30": [5, 10, 12, 30],
+    "single-45-12-10-0": [45, 12, 10, 0],
+}
+#: A draw that only a reader told the exact row count (and the number of entities) works a bin out
+#: of: the document's rounded ``rowCount`` leaves it nothing, so it is held to the readers below.
+SINGLE_VERSION_EXACT_COUNT = {"single-15-30-0-10-3": [15, 30, 0, 10, 3]}
+#: Single versions whose first cells floor no parent beyond what the total holds: published.
+SINGLE_VERSION_PUBLISHED = {"single-0-0-20-30": [0, 0, 20, 30]}
+
+
 def _trial_85() -> Tuple[List[str], List[List[str]]]:
     """The 86th draw of a seeded search: its changes out of a key alone floor four parents."""
     rng = random.Random(2)
@@ -404,6 +508,14 @@ def _pinned_members() -> Dict[str, Tuple[List[str], List[List[Any]]]]:
         "moving": (BRANCHES, MOVING),
         "star": (BRANCHES, STAR),
         "trial-85": (keys85, members85),
+        **{
+            name: (library.keys(len(per)), library.spread(library.keys(len(per)), per))
+            for name, per in {
+                **SINGLE_VERSION,
+                **SINGLE_VERSION_EXACT_COUNT,
+                **SINGLE_VERSION_PUBLISHED,
+            }.items()
+        },
     }
 
 
@@ -433,11 +545,23 @@ def _published_numbers(result: Any) -> List[str]:
 
 
 @pytest.mark.parametrize("case", PINNED)
+@pytest.mark.parametrize("banded", [False, True], ids=["exact-total", "row-count-band"])
 def test_a_reader_forming_each_keys_floor_cannot_work_out_a_withheld_bin_of_children(
-    tmp_path, case
+    tmp_path, case, banded
 ):
+    if case in SINGLE_VERSION_EXACT_COUNT and not banded:
+        pytest.skip("a reader told the row count exactly knows more than the document says")
     result, rows, keys = _profile_of(tmp_path, case)
-    assert _derivable(result, rows, keys) == []
+    assert _derivable(result, rows, keys, banded=banded) == []
+
+
+@pytest.mark.parametrize("case", sorted(SINGLE_VERSION))
+def test_a_published_first_cell_does_not_bound_the_other_parents_from_above(tmp_path, case):
+    result, _rows, _keys = _profile_of(tmp_path, case)
+    follow = _tracked(result)["branch_id"]
+    # what the reader would pin from a cell that is published is withheld with it, whole
+    assert follow["initial"]["groups"] == [{"group": "", "status": "C"}]
+    assert _published_numbers(result) == []
 
 
 @pytest.mark.parametrize("case", ["3x20", "4x25", "12x40", "sink", "trial-85"])
@@ -482,7 +606,8 @@ def test_without_the_guard_the_same_reader_works_a_bin_out(tmp_path, monkeypatch
 
 
 #: What ``fluid profile`` wrote for this foreign key before the guard read the changes out of a key
-#: and a group's size (commit f6490a863): the guard changes none of it where no bin is pinned.
+#: and a group's size (commit f6490a863): the guard changes none of it where no bin is pinned. Each
+#: member holds two versions at its branch, so the children total leaves room for every parent.
 NO_PIN = {
     "initial": {
         "definition": "levelHistogram/1",
@@ -514,11 +639,39 @@ def test_the_guard_leaves_a_foreign_key_alone_where_the_floors_pin_no_bin(tmp_pa
     # Two branches show their cells; the other two (one of them empty) are withheld together, so
     # no parent is known to hold a row and no bin of the children is given back.
     keys = library.keys(4)
-    members = library.spread(keys, [45, 30, 0, 30])
+    members = _twice(library.spread(keys, [45, 30, 0, 30]))
     rows = library.cards(members)
     result = library.profile(tmp_path, library.contract(), library.branches(keys), rows)
     assert _derivable(result, rows, keys) == []
+    assert _derivable(result, rows, keys, banded=True) == []
     assert json.loads(json.dumps(_tracked(result)["branch_id"])) == NO_PIN
+
+
+def test_a_first_cell_the_total_leaves_room_around_is_still_published(tmp_path):
+    result, rows, keys = _profile_of(tmp_path, "single-0-0-20-30")
+    (shown,) = _tracked(result)["branch_id"]["initial"]["groups"]
+    assert shown["status"] == "F" and shown["levelCounts"][3] == 30
+    assert _derivable(result, rows, keys) == []
+    assert _derivable(result, rows, keys, banded=True) == []
+
+
+def test_the_same_cells_over_one_version_each_are_withheld_for_the_total_they_leave(tmp_path):
+    """The golden above over one version a member: 105 rows, which four parents cannot all fill.
+
+    The first two cells floor two parents at 43 and 28, and the group's size less those cells
+    floors a third at 24; a fourth with 20 or more would need 115 rows of the 103 to 107 the
+    document allows, so the guard reads the 20-or-more bin as pinned at three and withholds the
+    entry whole. (It places the withheld mass on one key, which errs toward withholding: the
+    reader below, which places it nowhere, finds nothing here.) Over two versions a member there
+    are twice the rows, room for all four parents, and the cells are published as they were.
+    """
+    keys = library.keys(4)
+    rows = library.cards(library.spread(keys, [45, 30, 0, 30]))
+    result = library.profile(tmp_path, library.contract(), library.branches(keys), rows)
+    assert _tracked(result)["branch_id"]["initial"]["groups"] == [{"group": "", "status": "C"}]
+    assert _published_numbers(result) == []
+    assert _derivable(result, rows, keys) == []
+    assert _derivable(result, rows, keys, banded=True) == []
 
 
 def test_the_guard_changes_no_other_table_and_the_document_reads_back(tmp_path):
@@ -531,7 +684,14 @@ def test_the_guard_changes_no_other_table_and_the_document_reads_back(tmp_path):
 # -- mutants -------------------------------------------------------------------------------------
 
 
-def _leaks(tmp_path: Path, cases: Sequence[str] = tuple(PINNED), **reads: Any) -> bool:
+SINGLE_CASES = sorted(SINGLE_VERSION)
+
+
+def _leaks(tmp_path: Path, cases: Optional[Sequence[str]] = None, **reads: Any) -> bool:
+    """Whether the reader works a bin out of any case: the exact-count case needs a banded one."""
+    cases = cases or [
+        case for case in PINNED if reads.get("banded") or case not in SINGLE_VERSION_EXACT_COUNT
+    ]
     for number, case in enumerate(cases):
         folder = tmp_path / str(number)
         folder.mkdir()
@@ -543,6 +703,8 @@ def _leaks(tmp_path: Path, cases: Sequence[str] = tuple(PINNED), **reads: Any) -
 
 def test_the_reader_leaks_nothing_of_the_real_guard(tmp_path):
     assert not _leaks(tmp_path)
+    (tmp_path / "band").mkdir()
+    assert not _leaks(tmp_path / "band", banded=True)
 
 
 def test_mutant_the_guard_withholds_nothing(tmp_path, monkeypatch):
@@ -617,6 +779,96 @@ def test_mutant_a_cell_is_withheld_and_its_group_still_published(tmp_path, monke
     monkeypatch.setattr(history, "_guarded", lambda *args: False)
     monkeypatch.setattr(history, "_initial", by_cells)
     assert _leaks(tmp_path, ["3x20", "4x25", "12x40"])
+
+
+def _no_floors(lower: Sequence[int], table: Sequence[int], ranked: Sequence[int]) -> int:
+    return sum(edge * value for edge, value in zip(lower, table, strict=True))
+
+
+def _smallest_first(lower: Sequence[int], table: Sequence[int], ranked: Sequence[int]) -> int:
+    slots: List[int] = []
+    for edge, value in reversed(list(zip(lower, table, strict=True))):
+        slots += [edge] * value
+    paired = sum(max(slot, floor) for slot, floor in zip(slots, reversed(ranked), strict=False))
+    return paired + sum(slots[len(ranked) :])
+
+
+EDGES = list(CHILDREN_EDGES[:-1])
+
+
+def test_the_least_children_pair_the_largest_floors_with_the_highest_bins() -> None:
+    # two parents in the top bin (20+) and one in the bin of 0: floors 43, 28 and 5
+    table = [1, 0, 0, 0, 0, 0, 2]
+    assert disclosure._least_children(EDGES, table, [43, 28, 5]) == 43 + 28 + 5
+    assert disclosure._least_children(EDGES, table, [43]) == 43 + 20 + 0
+    assert disclosure._least_children(EDGES, table, []) == 40
+    # a floor under its bin's lower edge adds nothing; one above uses up more of the total
+    assert disclosure._least_children(EDGES, table, [3, 3, 3]) == 20 + 20 + 3
+
+
+def test_a_floor_above_its_bins_edge_bounds_the_other_parents_from_above() -> None:
+    # four parents, 62 children, one of them known to hold 43: a second with 20 or more would
+    # need 63, so the floor gives a withheld cell back that the children alone did not
+    table = [1, 0, 1, 0, 0, 0, 2]
+    shown = [False] * 7
+    floors = [43, 0, 0, 0]
+    known = disclosure.parents_at_or_above(EDGES, floors)
+    base = disclosure.pinned_children_cells(EDGES, table, shown, 62, RULE)
+    assert disclosure.pinned_children_cells(EDGES, table, shown, 62, RULE, 0, None, known) == base
+    assert (
+        disclosure.pinned_children_cells(EDGES, table, shown, 62, RULE, 0, None, known, floors)
+        - base
+    )
+
+
+def test_mutant_the_floors_use_up_none_of_the_childrens_total(tmp_path, monkeypatch):
+    monkeypatch.setattr(disclosure, "_least_children", _no_floors)
+    assert _leaks(tmp_path, SINGLE_CASES, banded=True)
+    with pytest.raises(AssertionError):
+        test_the_least_children_pair_the_largest_floors_with_the_highest_bins()
+
+
+def test_mutant_the_floors_are_paired_with_the_bins_smallest_first(tmp_path, monkeypatch):
+    monkeypatch.setattr(disclosure, "_least_children", _smallest_first)
+    with pytest.raises(AssertionError):
+        test_the_least_children_pair_the_largest_floors_with_the_highest_bins()
+    # a pairing that wastes the total withholds what the real guard publishes
+    with pytest.raises(AssertionError):
+        test_a_first_cell_the_total_leaves_room_around_is_still_published(tmp_path)
+
+
+def _total_shifted(by: int, *, band: Optional[int] = None):
+    """A guard that reads the children's total off by *by*, or at an end of its rounded band."""
+    original = disclosure.pinned_children_cells
+
+    def shifted(lower, cells, published, children, rule, *rest):
+        total = children + by if band is None else _band(children)[band]
+        return original(lower, cells, published, total, rule, *rest)
+
+    return shifted
+
+
+def test_the_guard_holds_with_the_total_at_the_upper_end_of_its_rounded_band(tmp_path, monkeypatch):
+    """A reader holds the total only to the band of the rounded row count: its upper end is enough."""
+    monkeypatch.setattr(disclosure, "pinned_children_cells", _total_shifted(0, band=1))
+    assert not _leaks(tmp_path, SINGLE_CASES, banded=True)
+
+
+def test_mutant_the_guard_takes_the_childrens_total_above_the_row_counts_band(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(disclosure, "pinned_children_cells", _total_shifted(5))
+    assert _leaks(tmp_path, SINGLE_CASES, banded=True)
+
+
+def test_mutant_the_reader_takes_the_row_counts_lower_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(history, "_guarded", lambda *args: False)
+    result, rows, keys = _profile_of(tmp_path, "3x20")
+    low = _band(result.document["tables"]["card"]["rowCount"])[0]
+    assert low < len(rows)  # the true count is above the lower end of its band
+    assert _derivable(result, rows, keys, banded=True) != []  # the real band holds the true table
+    with pytest.raises(AssertionError, match="must hold the true table"):
+        _derivable(result, rows, keys, total=[low])
 
 
 def test_mutant_a_value_with_no_key_is_placed_in_the_first_level(tmp_path, monkeypatch):
