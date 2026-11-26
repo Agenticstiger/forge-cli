@@ -10,8 +10,10 @@
 says whether it is the release it claims to be:
 
 - ``intact``: the index parses as a ``fluid-release/1`` record, its ``identity_digest`` is the
-  digest of its ``identity``, an S3 key that ends in an identity's hex is this identity's, and
-  every file the index lists is there with the sha256 it names;
+  digest of its ``identity``, an S3 key that ends in an identity's hex is this identity's, every
+  file the index lists is there with the sha256 it names, and the files ``identity`` pins (the
+  bundle, each external file, the artifacts MANIFEST and what it lists, the plan) are listed with
+  the digests ``identity`` names, so a file swapped with its index entry rewritten is caught;
 - ``not-intact``: one of those is false (a missing index, a changed or missing file);
 - ``undecided``: the release could not be read (access denied, a network error, no boto3).
 
@@ -160,6 +162,8 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
     if named is not None and (match is None or match.group(1) != named):
         problems.append(f"it sits under {named}, the key of another identity")
     checked, undecided = _check_files(reader, index["files"], problems)
+    if not problems:
+        _check_bound(reader, identity, index["files"], problems, undecided)
     if problems:
         return result(NOT_INTACT, checked, problems)
     if undecided:
@@ -194,6 +198,123 @@ def _check_files(
         if "sha256:" + actual != expected:
             problems.append(f"{_clean(rel)}: its bytes are not the sha256 the index names")
     return checked, undecided
+
+
+def _check_bound(
+    reader: "_Reader",
+    identity: Mapping[str, Any],
+    files: Mapping[str, Any],
+    problems: List[str],
+    undecided: List[str],
+) -> None:
+    """Tie the files to the digests ``identity`` pins, so a file swapped with a ``files`` entry
+    rewritten to match is not intact: the bundle's sha256, each external file's, the artifacts
+    MANIFEST's Merkle root and each artifact it lists, and the plan's digests. ``files`` sits
+    outside ``identity_digest``; these are inside it."""
+
+    def listed(rel: str, digest: Any, what: str) -> None:
+        if not isinstance(digest, str) or files.get(rel) != digest:
+            problems.append(f"{rel}: the index does not list it with the sha256 {what} names")
+
+    bundle = identity.get("bundle")
+    if isinstance(bundle, Mapping) and "sha256" in bundle:
+        listed("bundle.tgz", bundle.get("sha256"), "the identity's bundle")
+    for item in identity.get("external") or []:
+        item = item if isinstance(item, Mapping) else {}
+        digest = item.get("digest")
+        hex_digest = digest.get("sha256") if isinstance(digest, Mapping) else None
+        path = item.get("path")
+        listed(
+            str(path) if isinstance(path, str) else "external/?",
+            f"sha256:{hex_digest}" if isinstance(hex_digest, str) else None,
+            "the identity's external entry",
+        )
+    artifacts = identity.get("artifacts")
+    if isinstance(artifacts, Mapping) and "manifest_digest" in artifacts:
+        _check_artifacts(reader, artifacts.get("manifest_digest"), files, problems, undecided)
+    plan = identity.get("plan")
+    if isinstance(plan, Mapping):
+        _check_plan(reader, plan, files, problems, undecided)
+
+
+def _read_json_member(
+    reader: "_Reader", rel: str, files: Mapping[str, Any], problems: List[str], undecided: List[str]
+) -> Optional[Mapping[str, Any]]:
+    """``rel`` (a file the index lists, already hashed) as a JSON object, or None with why."""
+    if rel not in files:
+        problems.append(f"{rel}: the identity pins it and the index does not list it")
+        return None
+    try:
+        data = reader.read(rel, MAX_INDEX_BYTES)
+    except _NotIntact as exc:
+        problems.append(f"{rel}: {exc}")
+        return None
+    except _Undecided as exc:
+        undecided.append(f"{rel}: {exc}")
+        return None
+    try:
+        parsed = json.loads(data)
+    except (ValueError, RecursionError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        problems.append(f"{rel}: not a JSON object of at most {MAX_INDEX_BYTES:,} bytes")
+        return None
+    return parsed
+
+
+def _check_artifacts(
+    reader: "_Reader",
+    root: Any,
+    files: Mapping[str, Any],
+    problems: List[str],
+    undecided: List[str],
+) -> None:
+    from fluid_build.forge.core.bundle import merkle_root
+
+    manifest = _read_json_member(reader, "artifacts/MANIFEST.json", files, problems, undecided)
+    if manifest is None:
+        return
+    listed = manifest.get("files")
+    if not isinstance(listed, Mapping) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in listed.items()
+    ):
+        problems.append("artifacts/MANIFEST.json: lists no files map")
+        return
+    if manifest.get("digest") != root or merkle_root(listed) != root:
+        problems.append(
+            "artifacts/MANIFEST.json: its Merkle root is not the one the identity names"
+        )
+        return
+    for rel in sorted(listed):
+        if files.get(f"artifacts/{rel}") != listed[rel]:
+            problems.append(
+                f"{_clean(f'artifacts/{rel}')}: the index does not list it with the sha256 the "
+                "artifacts MANIFEST names"
+            )
+
+
+def _check_plan(
+    reader: "_Reader",
+    pinned: Mapping[str, Any],
+    files: Mapping[str, Any],
+    problems: List[str],
+    undecided: List[str],
+) -> None:
+    from fluid_build.forge.core.plan_digest import compute_plan_digest
+
+    plan = _read_json_member(reader, "plan.json", files, problems, undecided)
+    if plan is None:
+        return
+    try:
+        recomputed = compute_plan_digest(dict(plan))
+    except (TypeError, ValueError, RecursionError):
+        recomputed = None
+    if (
+        plan.get("planDigest") != pinned.get("plan_digest")
+        or recomputed != pinned.get("plan_digest")
+        or plan.get("bundleDigest") != pinned.get("bundle_digest")
+    ):
+        problems.append("plan.json: its digests are not the ones the identity names")
 
 
 def _parse_index(data: bytes) -> Dict[str, Any]:
@@ -249,6 +370,10 @@ class _Reader:
     def identity_hex(self) -> Optional[str]:
         return None
 
+    def read(self, rel: str, limit: int) -> bytes:  # pragma: no cover - interface
+        """At most ``limit`` bytes of ``rel``; more is not intact."""
+        raise NotImplementedError
+
 
 class _DirReader(_Reader):
     """A release directory. No link is followed: a file is opened with ``O_NOFOLLOW`` and must
@@ -303,6 +428,16 @@ class _DirReader(_Reader):
             os.close(fd)
         if len(data) > MAX_INDEX_BYTES:
             raise _NotIntact(f"release.json is longer than {MAX_INDEX_BYTES:,} bytes")
+        return data
+
+    def read(self, rel: str, limit: int) -> bytes:
+        fd = self._open(rel)
+        try:
+            data = _read_at_most(fd, limit + 1)
+        finally:
+            os.close(fd)
+        if len(data) > limit:
+            raise _NotIntact(f"it is longer than {limit:,} bytes")
         return data
 
     def sha256(self, rel: str) -> str:
@@ -389,6 +524,16 @@ class _S3Reader(_Reader):
             raise _Undecided(f"{self.uri}release.json cannot be read: {type(exc).__name__}")
         if len(data) > MAX_INDEX_BYTES:
             raise _NotIntact(f"release.json is longer than {MAX_INDEX_BYTES:,} bytes")
+        return data
+
+    def read(self, rel: str, limit: int) -> bytes:
+        body = self._body(rel)
+        try:
+            data: bytes = body.read(limit + 1)
+        except Exception as exc:  # noqa: BLE001 - a broken connection
+            raise _Undecided(f"it cannot be read: {type(exc).__name__}") from None
+        if len(data) > limit:
+            raise _NotIntact(f"it is longer than {limit:,} bytes")
         return data
 
     def sha256(self, rel: str) -> str:

@@ -114,10 +114,9 @@ class FakeStages:
             out.mkdir(parents=True, exist_ok=True)
             (out / "product.odcs.orders.yaml").write_text("x")
             digest = release._sha256(out / "product.odcs.orders.yaml")
+            listed = {"odcs/product.odcs.orders.yaml": digest}
             Path(st.ARTIFACTS_MANIFEST).write_text(
-                json.dumps(
-                    {"digest": "sha256:m", "files": {"odcs/product.odcs.orders.yaml": digest}}
-                )
+                json.dumps({"digest": bundle_mod.merkle_root(listed), "files": listed})
             )
         elif stage == "validate":
             Path(st.VALIDATE_REPORT).write_text("{}")
@@ -255,7 +254,12 @@ def test_a_passing_run_publishes_the_release(
     assert index["identity"]["fluid_version"] == "0.7.5"
     assert index["identity"]["forge_version"] == fluid_build.__version__
     assert index["identity"]["emit"] == list(release._emit_set(st.ShipOptions(contract="c")))
-    assert index["identity"]["artifacts"] == {"manifest_digest": "sha256:m"}
+    listed = {
+        "odcs/product.odcs.orders.yaml": release._sha256(
+            rel / "artifacts/odcs/product.odcs.orders.yaml"
+        )
+    }
+    assert index["identity"]["artifacts"] == {"manifest_digest": bundle_mod.merkle_root(listed)}
     assert "plan" not in index["identity"]  # stage 6 did not run
     assert index["identity_digest"] == release.identity_digest(index["identity"])
     assert [g["status"] for g in index["gates"]][:5] == ["passed"] * 4 + ["not-run"]

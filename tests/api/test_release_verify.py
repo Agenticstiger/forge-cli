@@ -224,3 +224,119 @@ def test_the_command_writes_json(tmp_path: Path, capsys: pytest.CaptureFixture[s
     shown: List[str] = list(json.loads(out))
     assert code == 0 and json.loads(out)["status"] == "intact"
     assert shown == sorted(api_release.ReleaseVerification("", "intact").as_dict())
+
+
+# ---------------------------------------------------------------------------
+# The files identity pins
+# ---------------------------------------------------------------------------
+
+
+def _pinned(directory: Path) -> Path:
+    """A release whose identity pins its bundle, an external file, its artifacts and its plan,
+    as ``fluid ship`` seals one."""
+    import hashlib
+
+    from fluid_build.cli import _ship_release as release
+    from fluid_build.forge.core.bundle import merkle_root
+    from fluid_build.forge.core.plan_digest import compute_plan_digest
+
+    def sha(data: bytes) -> str:
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    listed = {"odcs/orders.yaml": sha(b"odcs")}
+    manifest = {"digest": merkle_root(listed), "files": listed}
+    plan: Any = {"bundleDigest": "sha256:" + "b" * 64, "actions": []}
+    plan["planDigest"] = compute_plan_digest(plan)
+    files = {
+        "bundle.tgz": b"bundle",
+        "external/jobs/jobs.zip": b"jobs",
+        "artifacts/odcs/orders.yaml": b"odcs",
+        "artifacts/MANIFEST.json": json.dumps(manifest).encode(),
+        "plan.json": json.dumps(plan).encode(),
+    }
+    directory.mkdir(parents=True)
+    for rel, data in files.items():
+        (directory / rel).parent.mkdir(parents=True, exist_ok=True)
+        (directory / rel).write_bytes(data)
+    identity = {
+        "product_id": "acme.orders",
+        "environment": "dev",
+        "bundle": {"manifest_digest": "sha256:" + "b" * 64, "sha256": sha(b"bundle")},
+        "artifacts": {"manifest_digest": manifest["digest"]},
+        "plan": {"bundle_digest": plan["bundleDigest"], "plan_digest": plan["planDigest"]},
+        "external": [
+            {
+                "name": "jobs",
+                "kind": "spark-package",
+                "path": "external/jobs/jobs.zip",
+                "digest": {"sha256": hashlib.sha256(b"jobs").hexdigest()},
+            }
+        ],
+    }
+    index = {
+        "schema": release.RELEASE_SCHEMA,
+        "identity": identity,
+        "identity_digest": release.identity_digest(identity),
+        "files": release._files(directory),
+    }
+    (directory / "release.json").write_text(json.dumps(index), encoding="utf-8")
+    return directory
+
+
+def _swap(directory: Path, rel: str, data: bytes, *, listed: bool = True) -> None:
+    """Replace ``rel`` and rewrite its ``files`` entry to match, keeping the identity."""
+    import hashlib
+
+    (directory / rel).write_bytes(data)
+    index = json.loads((directory / "release.json").read_text(encoding="utf-8"))
+    if listed:
+        index["files"][rel] = "sha256:" + hashlib.sha256(data).hexdigest()
+    else:
+        del index["files"][rel]
+    (directory / "release.json").write_text(json.dumps(index), encoding="utf-8")
+
+
+def test_a_release_whose_identity_pins_its_files_is_intact(tmp_path: Path) -> None:
+    result = verify_release(_pinned(tmp_path / "rel"))
+    assert (result.status, result.files_checked) == ("intact", 5), result.problems
+
+
+@pytest.mark.parametrize(
+    "rel, problem",
+    [
+        ("bundle.tgz", "bundle.tgz: the index does not list it with the sha256 the identity's"),
+        ("external/jobs/jobs.zip", "external/jobs/jobs.zip: the index does not list it"),
+        ("artifacts/odcs/orders.yaml", "the sha256 the artifacts MANIFEST names"),
+        ("artifacts/MANIFEST.json", "artifacts/MANIFEST.json: "),
+        ("plan.json", "plan.json: "),
+    ],
+)
+def test_a_pinned_file_swapped_with_its_entry_rewritten_is_not_intact(
+    tmp_path: Path, rel: str, problem: str
+) -> None:
+    directory = _pinned(tmp_path / "rel")
+    _swap(directory, rel, b'{"swapped": true}')
+    result = verify_release(directory)
+    assert result.status == "not-intact"
+    assert any(p.startswith(problem) or problem in p for p in result.problems), result.problems
+
+
+@pytest.mark.parametrize("rel", ["bundle.tgz", "external/jobs/jobs.zip", "plan.json"])
+def test_a_pinned_file_dropped_from_the_index_is_not_intact(tmp_path: Path, rel: str) -> None:
+    directory = _pinned(tmp_path / "rel")
+    _swap(directory, rel, b"x", listed=False)
+    assert verify_release(directory).status == "not-intact"
+
+
+def test_a_pinned_release_in_s3_is_bound_too(tmp_path: Path) -> None:
+    directory = _pinned(tmp_path / "rel")
+    s3 = FakeS3()
+    uri = publish.publish_release(directory, "s3://acme-releases/r/", clients=s3).uri
+    assert verify_release(uri, clients=s3).intact
+    index = json.loads(s3.objects[_key(uri, "release.json")])
+    import hashlib
+
+    s3.objects[_key(uri, "bundle.tgz")] = b"evil"
+    index["files"]["bundle.tgz"] = "sha256:" + hashlib.sha256(b"evil").hexdigest()
+    s3.objects[_key(uri, "release.json")] = json.dumps(index).encode()
+    assert verify_release(uri, clients=s3).status == "not-intact"
