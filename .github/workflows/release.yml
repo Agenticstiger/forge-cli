@@ -733,6 +733,8 @@ jobs:
         with:
           ref: ${{ needs.quality-gate.outputs.sha }}
 
+      # Into the build context: the Dockerfile installs this wheel, the file the
+      # build job made and PyPI serves, instead of building the source tree.
       - name: Download wheel
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -779,6 +781,22 @@ jobs:
             PROFILE=${{ needs.quality-gate.outputs.profile }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The Dockerfile installs the wheel from dist/, the one the build job made.
+      # An image that reports another version is not this release: built from
+      # the source tree, as before, it reported 0.0.0+unknown.
+      - name: Check the image holds this release's wheel
+        env:
+          VERSION: ${{ needs.quality-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm --entrypoint python forge-cli:scan -I -c \
+            'import fluid_build; print(fluid_build.__version__)')
+          if [ "${got}" != "${VERSION}" ]; then
+            echo "::error::the image's fluid_build is version '${got}', not ${VERSION}"
+            exit 1
+          fi
+          echo "The image holds data-product-forge ${got}."
 
       # Grype (Anchore) — scans the image for OS + library CVEs that
       # pip-audit cannot see (base-image packages). Pinned by version

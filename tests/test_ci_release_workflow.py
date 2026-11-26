@@ -799,3 +799,60 @@ def test_every_build_requirement_is_hash_locked_for_the_release() -> None:
         assert req.specifier.contains(
             pins[name], prereleases=True
         ), f"{name}=={pins[name]} vs {req}"
+
+
+# --------------------------------------------------------------------------
+# The image holds the release's own wheel and builds nothing.
+# --------------------------------------------------------------------------
+
+
+def _instructions(path: Path) -> list[str]:
+    """A Dockerfile's instructions, continuation lines joined, comments dropped."""
+    out: list[str] = []
+    buf: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.startswith("#") or (not s and not buf):
+            continue
+        more = s.endswith("\\")
+        buf.append(s[:-1].strip() if more else s)
+        if not more:
+            out.append(" ".join(buf))
+            buf = []
+    return out
+
+
+def _pip_installs(path: Path) -> list[str]:
+    return [
+        cmd.strip()
+        for ins in _instructions(path)
+        if ins.startswith("RUN ")
+        for cmd in re.split(r"&&|;", ins[4:])
+        if "pip install" in cmd
+    ]
+
+
+def test_the_image_installs_the_wheel_and_builds_nothing() -> None:
+    """Built from the source tree, the image fetched a fresh build backend and,
+    with no .git in the context, setuptools-scm gave it version 0.0.0+unknown
+    (the 0.41.0 image reports that)."""
+    copies = [i for i in _instructions(REPO / "Dockerfile") if i.startswith("COPY ")]
+    assert "COPY dist/*.whl /tmp/dist/" in copies, copies
+    assert not [c for c in copies if "fluid_build" in c or "pyproject.toml" in c], copies
+    installs = _pip_installs(REPO / "Dockerfile")
+    assert installs, "no pip install found in the Dockerfile"
+    for cmd in installs:
+        # Either a hash-locked file or the one wheel copied from dist/.
+        assert "--require-hashes -r " in cmd or cmd.endswith('"$1[${extras}]"'), cmd
+
+
+def test_the_docker_job_builds_the_image_around_this_release_s_wheel() -> None:
+    names = [s.get("name") for s in _steps("docker")]
+    download = next(s for s in _steps("docker") if s.get("name") == "Download wheel")
+    assert download["with"] == {"name": "dist", "path": "dist/"}, download
+    check = names.index("Check the image holds this release's wheel")
+    assert names.index("Download wheel") < names.index("Build image for scanning (no push)") < check
+    assert check < names.index("Build and push Docker image"), names
+    step = _steps("docker")[check]
+    assert step["env"]["VERSION"] == "${{ needs.quality-gate.outputs.version }}", step
+    assert "fluid_build.__version__" in step["run"] and "exit 1" in step["run"], step["run"]

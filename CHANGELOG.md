@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows still ended `FAILED: SystemExit: 0` and `fluid apply --mode amend-and-build` reported it
   failed. The runner now returns normally on success and exits only with a failure's code. EMR
   runs are unchanged.
+- **The GHCR image holds the release's own wheel and reports its version.** The image built the
+  package from the source tree, where setuptools-scm finds no git history, so `fluid --version` in
+  the 0.41.0 image says `v0.0.0+unknown`, and that build fetched its own build backend. The image
+  now installs the wheel the release built and PyPI serves, the release refuses to push an image
+  whose package reports another version, and the image's pip, setuptools and wheel come from the
+  hash-locked `requirements/release-image.txt`. A local image build runs `python -m build --wheel`
+  first.
 
 ## [0.41.0] — 2026-11-25
 
