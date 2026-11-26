@@ -141,26 +141,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`fluid profile` withholds a cell of a table's history, not the member.** `versionsPerEntity`,
-  `versionLength` and `firstStart` are counted on their public ladders trimmed to the bins that
-  hold records, as a date pair's days are. An end bin of fewer than `minimumCell` records is
-  joined to the bins beside it until the run holds that many, and that coded end then reaches a
-  public bound (the ladder's end, or the start column's published extremes), so no outer edge is
-  placed by fewer than `minimumCell` records. Each member's cells pass the output
-  check with complementary suppression, so a zero or small bin withholds that cell (and what the
-  check needs beside it) while the group and its count of entities stay published. A member is
-  written withheld whole, on its whole ladder, when its records together are too few or the check
-  leaves none of its cells.
-  `firstStart` is published (it was always withheld whole) and is also checked beside the start
-  and end columns: a cell of later versions or of closed last ends that the first starts would let
-  a reader form, and that is small, withholds the first-start cells beside it, or the member when
-  only its outer edge sets that cell apart. A declared `endMarker` writes `lastVersion`'s `closed`
-  as 0 and the marker value's transitions as zeros, and a declared `currentFlag` its value's
-  transitions, where the records leave them empty, as a declared `chain` already did; where the
-  records break the statement the cells are checked as before. Where the rows with no entity and a
-  NULL end are few (the end column's NULLs beside the open last versions), `lastVersion` is
-  withheld. `fluxsim init` now writes a history where a version
-  length histogram with small end bins used to stop it.
 - **The `aws` extra needs boto3 and botocore 1.35.2 or later**, the first release whose PutObject
   takes `IfNoneMatch`.
 - **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
@@ -233,6 +213,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `contract=`, and in `accessPolicy` when `contract=` reads it: the column
   restrictions and sensitivity flags they apply are computed from the expose as passed, so they
   need the document resolved first.
+- **`fluid profile` withholds a cell of a table's history, not the member.** `versionsPerEntity`,
+  `versionLength` and `firstStart` are counted on their public ladders trimmed to the bins that
+  hold records, as a date pair's days are. An end bin of fewer than `minimumCell` records is
+  joined to the bins beside it until the run holds that many, and that coded end then reaches a
+  public bound (the ladder's end, or the start column's published extremes), so no outer edge is
+  placed by fewer than `minimumCell` records. Each member's cells pass the output
+  check with complementary suppression, so a zero or small bin withholds that cell (and what the
+  check needs beside it) while the group and its count of entities stay published. A member is
+  written withheld whole, on its whole ladder, when its records together are too few or the check
+  leaves none of its cells.
+  `firstStart` is published (it was always withheld whole) and is also checked beside the start
+  and end columns: a cell of later versions or of closed last ends that the first starts would let
+  a reader form, and that is small, withholds the first-start cells beside it, or the member when
+  only its outer edge sets that cell apart. A declared `endMarker` writes `lastVersion`'s `closed`
+  as 0 and the marker value's transitions as zeros, and a declared `currentFlag` its value's
+  transitions, where the records leave them empty, as a declared `chain` already did; where the
+  records break the statement the cells are checked as before. Where the rows with no entity and a
+  NULL end are few (the end column's NULLs beside the open last versions), `lastVersion` is
+  withheld. `fluxsim init` now writes a history where a version
+  length histogram with small end bins used to stop it.
 
 ### Fixed
 
