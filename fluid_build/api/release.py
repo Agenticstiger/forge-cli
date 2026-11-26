@@ -78,8 +78,9 @@ class ReleaseVerification:
     files_checked: int = 0
     problems: Tuple[str, ...] = field(default_factory=tuple)
     #: Each object read, ``release.json`` first: ``{"path", "sha256", "version_id"}`` (the S3
-    #: VersionId, ``None`` for a directory or a bucket without versioning), for a record of
-    #: exactly which versions were checked.
+    #: VersionId, ``None`` for a directory or a bucket without versioning, ``"null"`` versions
+    #: included), and in S3 the ``etag`` it was read at, for a record of exactly which versions
+    #: were checked.
     objects: Tuple[Dict[str, Optional[str]], ...] = field(default_factory=tuple)
 
     @property
@@ -176,7 +177,12 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
             objects=tuple(
                 # a listed path is checked printable and at most 1,024 characters
                 # (_path_problem), so it is kept whole: a reader HEADs it by this key
-                {"path": _clean(rel, 1024), "sha256": hexd, "version_id": reader.versions.get(rel)}
+                {
+                    "path": _clean(rel, 1024),
+                    "sha256": hexd,
+                    "version_id": reader.versions.get(rel),
+                    **({"etag": reader.etags[rel]} if reader.etags.get(rel) else {}),
+                }
                 for rel, hexd in reader.hashes.items()
             ),
         )
@@ -304,14 +310,16 @@ def _check_bound(
     if not isinstance(external, list):
         problems.append("its identity's external entry is not a list")
         external = []
-    pinned_external = set()
+    pinned_external: Dict[str, Any] = {}
+    kinds: Dict[str, Any] = {}
     for item in external:
         item = item if isinstance(item, Mapping) else {}
         digest = item.get("digest")
         hex_digest = digest.get("sha256") if isinstance(digest, Mapping) else None
         path = item.get("path")
         rel = str(path) if isinstance(path, str) else "external/?"
-        pinned_external.add(rel)
+        pinned_external[rel] = hex_digest
+        kinds[rel] = item.get("kind")
         listed(
             rel,
             f"sha256:{hex_digest}" if isinstance(hex_digest, str) else None,
@@ -320,6 +328,8 @@ def _check_bound(
     for rel in sorted(files):
         if rel.startswith("external/") and rel not in pinned_external:
             problems.append(f"{_clean(rel)}: the index lists it and the identity does not")
+    if "deploy" in identity:
+        problems.extend(_deploy_problems(identity["deploy"], pinned_external, kinds))
     artifacts = identity.get("artifacts")
     root = artifacts.get("manifest_digest") if isinstance(artifacts, Mapping) else None
     _check_artifacts(reader, root, files, problems, undecided)
@@ -328,6 +338,38 @@ def _check_bound(
         _check_plan(reader, plan, files, problems, undecided)
     elif "plan.json" in files:
         problems.append("plan.json: the index lists it and the identity pins no plan")
+
+
+def _deploy_problems(deploy: Any, pinned: Mapping[str, Any], kinds: Mapping[str, Any]) -> List[str]:
+    """Why ``identity["deploy"]`` (``fluid ship --deploy-targets``) is not one a release seals:
+    an account, and each target an external file of this release, by its path, sha256 and kind
+    (the kind orders the deploy: DAGs last), sent to one ``s3://bucket/key``."""
+    from fluid_build.util import s3
+
+    if not isinstance(deploy, Mapping) or not isinstance(deploy.get("targets"), list):
+        return ["its identity's deploy entry is not an account with a targets list"]
+    found: List[str] = []
+    account = deploy.get("account")
+    if not isinstance(account, str) or re.fullmatch(r"[0-9]{12}", account) is None:
+        found.append("its identity's deploy entry names no 12-digit account")
+    seen = set()
+    for item in deploy["targets"]:
+        item = item if isinstance(item, Mapping) else {}
+        path, to = item.get("path"), item.get("to")
+        digest = item.get("digest")
+        hex_digest = digest.get("sha256") if isinstance(digest, Mapping) else None
+        shown = _clean(path) if isinstance(path, str) else "a deploy target"
+        if not s3.is_object_uri(to) or to in seen:
+            found.append(f"{shown}: its deploy target names no s3:// object of its own")
+        seen.add(to)
+        if (
+            not isinstance(hex_digest, str)
+            or not isinstance(path, str)
+            or pinned.get(path) != hex_digest
+            or kinds.get(path) != item.get("kind")
+        ):
+            found.append(f"{shown}: the identity deploys it, and pins no external file so")
+    return found
 
 
 def _read_json_member(
@@ -468,6 +510,9 @@ class _Reader:
         #: The sha256 of each object read, and its S3 VersionId when it has one.
         self.hashes: Dict[str, str] = {}
         self.versions: Dict[str, Optional[str]] = {}
+        #: The ETag S3 answered with each object read (the version read), for a copy that
+        #: must take exactly those bytes (``CopySourceIfMatch``).
+        self.etags: Dict[str, Optional[str]] = {}
 
     def index(self) -> bytes:  # pragma: no cover - interface
         raise NotImplementedError
@@ -622,8 +667,9 @@ class _S3Reader(_Reader):
             pinned = self.versions.get(rel)  # a second read takes the version the first read did
             extra = {"VersionId": pinned} if pinned else {}
             got = self.client.get_object(Bucket=self.bucket, Key=self.prefix + rel, **extra)
-            version = got.get("VersionId")
-            self.versions.setdefault(rel, version if isinstance(version, str) else None)
+            self.versions.setdefault(rel, s3.version_id(got.get("VersionId")))
+            etag = got.get("ETag")
+            self.etags.setdefault(rel, etag if isinstance(etag, str) else None)
             return got["Body"]
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
             code = s3.error_code(exc)

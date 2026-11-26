@@ -737,7 +737,7 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
             _cmd(
                 "runs",
                 "Inspect run history and sealed releases "
-                "(status / verify-release / receipt / logs / diff)",
+                "(status / verify-release / receipt / deploy / logs / diff)",
             ),
         ),
     ),

@@ -77,10 +77,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "SCHEDULER_DESTINATION, SCHEDULER_ENVIRONMENT_NAME, SCHEDULER_LOCATION, "
             "SCHEDULER_WORKSPACE, SCHEDULE_SYNC_DRY_RUN, VALIDATE_STRICT, VERIFY_STRICT, "
             "GENERATE_EMIT, DIFF_EXIT_ON_DRIFT, DIFF_LAST_APPLIED, PLAN_HTML, POLICY_APPLY_MODE, "
-            "RELEASE_ARTIFACTS, "
+            "RELEASE_ARTIFACTS, RELEASE_DEPLOY_TARGETS, "
             "and RUN_STAGE_<N>_<NAME>: false switches a stage off, even one --stage names "
-            "(a run with nothing left says so and exits 0); true switches on 10 or 11 when "
-            "--stage is not given.\n\n"
+            "(a run left with none exits 0); true switches on 10 or 11 without --stage.\n\n"
             "Stage journal (--journal-dir, or with --release-dir): a stage that changes the "
             "target is refused after an attempt with no known outcome until "
             "--acknowledge-inspected names it."
@@ -193,8 +192,8 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
         default=None,
         metavar="LIST",
         help=(
-            "Stage 3 fails unless this run writes each (repeatable, comma-separated): any "
-            "--emit key but spark, odcs one per port. Earlier runs' files never count."
+            "Stage 3 fails unless this run writes each (repeatable, comma-separated --emit "
+            "keys but spark; odcs: one per port)."
         ),
     )
 
@@ -321,6 +320,12 @@ def _add_output_options(g: argparse._ArgumentGroup) -> None:
         help="Also seal the external files LOCK lists (with --release-dir).",
     )
     g.add_argument(
+        "--deploy-targets",
+        default=None,
+        metavar="FILE",
+        help="Also seal where runs deploy copies each one (with --artifacts).",
+    )
+    g.add_argument(
         "--release-archive",
         default=None,
         metavar="PATH",
@@ -378,6 +383,7 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
     acknowledged = _acknowledged(args, journal_dir or release_dir)
     opts, selected, not_selected, project_dir = _prepare(args)
     opts.artifacts = _artifacts_lock(args, release_dir)
+    opts.deploy_targets = _deploy_targets_file(args, release_dir)
     opts.release_to, opts.release_to_require = _release_to(args)
     opts.release_archive = _release_archive(args)
     with _working_directory(project_dir):
@@ -408,6 +414,19 @@ def _artifacts_lock(args: argparse.Namespace, release_dir: Optional[Path]) -> st
     if flag is not None and not flag.strip():  # `--artifacts "$LOCK"` with LOCK unset
         raise st.ShipUsageError("--artifacts needs the path of a lock file")
     value = flag if flag is not None else os.environ.get(_release_lock.LOCK_ENV, "")
+    value = value.strip() if flag is not None or release_dir is not None else ""
+    return os.path.abspath(value) if value else ""
+
+
+def _deploy_targets_file(args: argparse.Namespace, release_dir: Optional[Path]) -> str:
+    """``--deploy-targets``, else ``$RELEASE_DEPLOY_TARGETS`` in a run that seals a release, as
+    an absolute path; "" for none. Read as ``--artifacts`` is (:func:`_artifacts_lock`)."""
+    from . import _deploy_targets
+
+    flag = getattr(args, "deploy_targets", None)
+    if flag is not None and not flag.strip():  # `--deploy-targets "$FILE"` with FILE unset
+        raise st.ShipUsageError("--deploy-targets needs the path of a targets file")
+    value = flag if flag is not None else os.environ.get(_deploy_targets.TARGETS_ENV, "")
     value = value.strip() if flag is not None or release_dir is not None else ""
     return os.path.abspath(value) if value else ""
 
@@ -1133,17 +1152,23 @@ def _release_identity(
     ctx: _Context, ordered: List[report.StageRecord]
 ) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
     """``(identity, None)``, or ``(None, why it cannot be built)``."""
-    from . import _release_lock
+    from . import _deploy_targets, _release_lock
 
     try:
         # Read again once the stages ran: the files must still be the bytes the lock names.
         external = _release_lock.load(ctx.opts.artifacts) if ctx.opts.artifacts else []
+        deploy = (
+            _deploy_targets.load(ctx.opts.deploy_targets, external)
+            if ctx.opts.deploy_targets
+            else None
+        )
         identity = release.build_identity(
             ctx.opts,
             Path.cwd(),
             with_plan=_plan_in_release(ordered),
             applied=any(r.number == st.APPLY_STAGE and r.status == report.PASSED for r in ordered),
             external=external,
+            deploy=deploy,
         )
     except release.ReleaseError as exc:
         return None, str(exc)
@@ -1404,6 +1429,8 @@ def _explain(
         )
         if opts.artifacts:
             _out(f"external: the files {opts.artifacts} lists, sealed under external/<name>/")
+        if opts.deploy_targets:
+            _out(f"deploy: where {opts.deploy_targets} sends each one, sealed in its identity")
         if opts.release_archive:
             _out(f"archive: then written as one .tgz to {opts.release_archive}")
         if opts.release_to:

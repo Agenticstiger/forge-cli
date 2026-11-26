@@ -979,6 +979,34 @@ SIGNER = receipts.SignerPolicy(
 )
 
 
+@pytest.mark.parametrize("field", ["check", "policy"])
+def test_require_signed_refuses_a_statement_of_a_deploy(
+    tmp_path: Path,
+    s3: FakeS3,
+    cosign: Dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """A signed Statement that says it records a deploy (its check, or its policy) never stands
+    for a verification, whatever else it says."""
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    real = receipts.statement
+
+    def of_a_deploy(receipt: Any, data: bytes) -> Dict[str, Any]:
+        out = real(receipt, data)
+        if field == "check":
+            out["predicate"][receipts.RECEIPT_EXTENSION]["check"] = "deploy"
+        else:
+            out["predicate"]["policy"]["uri"] = f"{receipts.RECEIPT_EXTENSION}#deploy-log"
+        return out
+
+    monkeypatch.setattr(receipts, "statement", of_a_deploy)
+    receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 1 and f"Statement's {field} is not the receipt's" in found.reason
+
+
 def test_require_signed_passes_a_receipt_signed_by_the_pinned_signer(
     tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
 ) -> None:

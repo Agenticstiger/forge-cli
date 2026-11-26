@@ -109,6 +109,33 @@ def read_back(clients: Callable[..., Any], region: Optional[str], uri: str, limi
     return data
 
 
+def version_id(value: Any) -> Optional[str]:
+    """An S3 VersionId that pins one version, or None. ``"null"`` is what S3 answers for an
+    object written while versioning was off or Suspended: that version is replaced in place by
+    the next write, so it pins nothing."""
+    return value if isinstance(value, str) and value and value != "null" else None
+
+
+#: A bucket name, as S3 takes it (no ``..``, checked apart).
+BUCKET_NAME = r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+
+
+def is_object_uri(uri: Any) -> bool:
+    """Whether ``uri`` is ``s3://bucket/key`` naming one object: a bucket name S3 takes, and a
+    printable key of at most 1,024 characters with no whitespace that is not a prefix."""
+    import re
+
+    if not isinstance(uri, str) or not uri.startswith("s3://"):
+        return False
+    bucket, _, key = uri[len("s3://") :].partition("/")
+    return (
+        re.fullmatch(BUCKET_NAME, bucket) is not None
+        and ".." not in bucket
+        and re.fullmatch(r"[!-~]{1,1024}", key) is not None
+        and not key.endswith("/")
+    )
+
+
 def sha256_b64(hex_digest: str) -> str:
     """A hex sha256 as S3's ``ChecksumSHA256`` writes it: the digest's bytes in base64."""
     return base64.b64encode(bytes.fromhex(hex_digest)).decode("ascii")
