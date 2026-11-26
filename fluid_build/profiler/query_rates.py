@@ -106,12 +106,14 @@ the parts whose texts read the column, and for small cells only, before any roun
 one, so that query is withheld.
 
 **One way per table.** A run counts one table's records one way: as its rows (a fact asked of the
-table, a table unit, a view unit) or as its entities by one column (an entity unit). A fact
-decides first, then the first query in the request's order that is answered; a query whose unit
-counts the table another way is refused before any read with :data:`COUNTED_ANOTHER_WAY`. The
-rows and the entities of a table are two populations, checked as two sets, and where every
-entity holds one row they are the same records: a query over the rows and one over the
-entities would differ by one record that no set check sees.
+table, a table unit, a view unit), as its entities by one column (an entity unit over it), or as
+the parents of one relationship's children (an entity unit over a child table, keyed into it,
+whose entities are its rows). A fact decides first, then the first query in the request's order
+that is answered; a query whose unit counts a table another way is refused before any read with
+:data:`COUNTED_ANOTHER_WAY`. The rows and the entities of a table are two populations, checked as
+two sets, and where every entity holds one row they are the same records: a query over the rows
+and one over the entities would differ by one record that no set check sees, and so would a
+query over a parent's rows and one over its children grouped by the parent's key.
 
 **Errors that depend on a record.** A condition that could raise an error depending on a row's
 value (a cast, arithmetic, a ``CASE``, an unlisted function) is refused before any read with
@@ -126,12 +128,10 @@ span or pair and a relationship's counts are not held in a table's set, a column
 held beside a part that does not read the column, and no zero cell is looked for beside a
 column's cells (a part that names the column empties many of them by its text). A table's facts
 asked with no query over that table keep the facts' own check, without its columns' cells. An
-entity unit's population is not checked with its table's own statistics, which count the same
-records where every entity holds one row. A counted entity
-population is checked apart from the parent table's own facts and queries: two sets over the
-same rows, never crossed with each other, so a query over the parent's rows and one over its
-entities are not differenced together. A reader can difference such counts, and the rounding
-hides the difference only when neither count lies at a rounding edge. Where the parent table
+entity unit's population is not checked with the statistics its table and its parent table
+publish, which count the same records where every entity holds one row. A reader can difference
+such counts, and the rounding hides the difference only when neither count lies at a rounding
+edge. Where the parent table
 repeats a key (records that break its declared key), an entity is counted once for each parent
 row that holds its key, and so is its unit's ``k``. The cost is bounded and public: at most
 :data:`MOST_QUERIES` queries, each statement limited in time and memory, run in a locked
@@ -265,9 +265,11 @@ CAN_FAIL = (
     "joined by AND, OR and NOT"
 )
 COUNTED_ANOTHER_WAY = (
-    "a fact or an earlier query counts the same table's records another way (as its rows, or as "
-    "its entities by another column); two sets over one table's records could give a record "
-    "back by differencing, so fluid profile counts a table's records one way per run"
+    "a fact or an earlier query counts the records of a table this query counts (its own, or the "
+    "parent table whose rows its entities are) another way: as the rows, as the entities by "
+    "another column, or as the parents of another relationship's children; two sets over one "
+    "table's records could give a record back by differencing, so fluid profile counts a "
+    "table's records one way per run"
 )
 #: How a unit counts its table's records: as the rows, or as the entities of one column.
 _ROWS: Tuple[str, ...] = ("rows",)
@@ -462,6 +464,20 @@ def _way_of(plan: QueryPlan) -> Tuple[str, ...]:
     return _ROWS if plan.entity is None else ("entities", plan.entity.key)
 
 
+def _claims(plan: QueryPlan) -> List[Tuple[str, Tuple[str, ...]]]:
+    """Each table whose records *plan* counts, and how it counts them.
+
+    Its own table, as :func:`_way_of` says, and for an entity unit keyed into a declared parent
+    table, that table too: the unit's entities are the parent's rows, counted as the parents of
+    one relationship's children. A unit keyed into its own table counts that table one way.
+    """
+    claims = [(plan.table or "", _way_of(plan))]
+    entity = plan.entity
+    if entity is not None and entity.parent is not None and entity.parent[0] != entity.table:
+        claims.append((entity.parent[0], ("parents", entity.table, entity.key)))
+    return claims
+
+
 def _schema_of(contract: Mapping[str, Any], request: Request) -> Dict[str, Table]:
     exposes = {
         str(item.get("exposeId")): item
@@ -544,7 +560,8 @@ class _Planner:
     def plan(self, index: int, query: RequestQuery) -> QueryPlan:
         planned = self._plan(index, query)
         if planned.reason is None and planned.table is not None:
-            self._ways.setdefault(planned.table, _way_of(planned))
+            for table, way in _claims(planned):
+                self._ways.setdefault(table, way)
         return planned
 
     def _plan(self, index: int, query: RequestQuery) -> QueryPlan:
@@ -950,9 +967,9 @@ class _Planner:
         return None
 
     def _room(self, plan: QueryPlan) -> Optional[str]:
-        way = _way_of(plan)
-        if self._ways.get(plan.table or "", way) != way:
-            return COUNTED_ANOTHER_WAY
+        for claimed, way in _claims(plan):
+            if self._ways.get(claimed, way) != way:
+                return COUNTED_ANOTHER_WAY
         unit = plan.unit
         if self._per_unit.get(unit, 0) >= MOST_PER_UNIT:
             return f"past the {MOST_PER_UNIT} queries over one unit that fluid profile answers"

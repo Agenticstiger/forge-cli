@@ -41,8 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any other aggregate, and a table's natural entity, is named before any read, and so are the
   units and queries over one table's entities past the number one set check can count. A run
   counts one table's records one way: as its rows (a fact of the table, a table unit or a view
-  unit) or as its entities by one column. A fact decides first, then the first answered query in
-  request order, and a query whose unit counts the table another way is named before any read. A sum or average over a decimal of more than 18 digits is refused before any read (its total could overflow depending on the records), and decimals of up to 38 digits now load exactly. A condition that could raise an error depending on a
+  unit), as its entities by one column, or as the parents of one relationship's children (a unit
+  over a child table, grouped by its key into the table). A fact decides first, then the first
+  answered query in request order, and a query whose unit counts a table another way is named
+  before any read. A sum or average over a decimal of more than 18 digits is refused before any read (its total could overflow depending on the records), and decimals of up to 38 digits now load exactly. A condition that could raise an error depending on a
   row's value is refused before any read with the gateway's own condition fence, and any failure
   that still depends on the records withholds every query of the run with one fixed message, so
   a run says at most that some statement failed, never which. A query is checked as a set with the

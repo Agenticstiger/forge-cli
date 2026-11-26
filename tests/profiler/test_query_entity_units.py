@@ -777,6 +777,78 @@ def test_strict_refuses_a_table_counted_two_ways_before_any_read(tmp_path):
     assert query_rates.COUNTED_ANOTHER_WAY in str(refused.value.context)
 
 
+#: Customers 0 to 997 over their own rows, and over their orders grouped by customer: where each
+#: holds one order, the two differ by customer 5 alone, whose one order the unit keeps or not.
+PARENT_ROWS = _stats.RequestQuery(
+    "parent_rows", "SELECT customer_id FROM customers WHERE customer_id < 998", table="customers"
+)
+KEPT = (
+    "SELECT customer_id, max(quantity) AS m FROM orders WHERE quantity > 2 OR customer_id <> 5 "
+    "GROUP BY customer_id"
+)
+PARENTS_OVER = _on_unit("parents_over", _over(KEPT, '"v"."customer_id" < 998'), KEPT)
+
+
+@pytest.mark.parametrize("counted", [True, False])
+@pytest.mark.parametrize("quantity", [5, 1])
+def test_a_parent_counted_as_rows_is_not_counted_through_its_children_too(
+    tmp_path, quantity, counted
+):
+    orders = _orders(counts=SINGLES)
+    assert orders[5]["customer_id"] == 5
+    orders[5]["quantity"] = quantity
+    result = _profile(tmp_path, PARENT_ROWS, PARENTS_OVER, orders=orders, counted=counted)
+    said = _said(result)
+    assert said["query parents_over"] == query_rates.COUNTED_ANOTHER_WAY
+    assert "query parent_rows" not in said
+    assert [each["name"] for each in result.document["queries"]] == ["parent_rows"]
+
+
+def test_a_parent_counted_through_its_children_is_not_counted_as_rows_too(tmp_path):
+    result = _profile(tmp_path, PARENTS_OVER, PARENT_ROWS, orders=_orders(counts=SINGLES))
+    said = _said(result)
+    assert said["query parent_rows"] == query_rates.COUNTED_ANOTHER_WAY
+    assert "query parents_over" not in said
+    assert [each["name"] for each in result.document["queries"]] == ["parents_over"]
+
+
+def test_a_fact_of_the_parent_counts_its_rows_before_a_unit_over_its_children(tmp_path):
+    contract = _contract()
+    contract["exposes"][0]["contract"]["invariants"] = [
+        {"id": "northern", "check": "region = 'north'"}
+    ]
+    fact = _stats.RequestFact("customers.northern", "customers", "northern")
+    result = _profile(tmp_path, PARENTS_OVER, contract=contract, facts=(fact,))
+    assert _said(result)["query parents_over"] == query_rates.COUNTED_ANOTHER_WAY
+
+
+def test_strict_refuses_a_parent_counted_two_ways_before_any_read(tmp_path):
+    with pytest.raises(ProfileError) as refused:
+        _profile(tmp_path, PARENT_ROWS, PARENTS_OVER, strict=True, gone=True)
+    assert query_rates.COUNTED_ANOTHER_WAY in str(refused.value.context)
+
+
+def test_a_unit_keyed_into_its_own_table_keeps_one_way_for_it():
+    contract = _contract()
+    orders = contract["exposes"][1]
+    orders["contract"]["schema"].append({"name": "reorder_of", "type": "int"})
+    again = {
+        "name": "reorders",
+        "to": "orders",
+        "fromColumns": ["reorder_of"],
+        "toColumns": ["order_id"],
+        "cardinality": "many_to_one",
+    }
+    orders["semantics"] = {
+        "relationships": [*ORDERS_BY_CUSTOMER["semantics"]["relationships"], again]
+    }
+    unit = "SELECT reorder_of, count(*) AS n FROM orders GROUP BY reorder_of"
+    first = _on_unit("first", _over(unit, '"v"."n" >= 2', "reorder_of"), unit)
+    second = _on_unit("second", _over(unit, '"v"."n" >= 3', "reorder_of"), unit)
+    planned = query_rates.plan_queries(contract, _request(first, second), FakeBackend().enum_levels)
+    assert [plan.reason for plan in planned.plans] == [None, None]
+
+
 def test_one_table_is_grouped_by_one_entity_column_per_run():
     contract = _contract()
     orders = contract["exposes"][1]
