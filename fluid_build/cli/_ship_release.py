@@ -43,6 +43,7 @@ from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 from fluid_build.util.release_record import (  # the record's names, which callers read here too
     RELEASE_INDEX,
     RELEASE_SCHEMA,
+    clean,
     code_digest,
     identity_digest,
 )
@@ -199,6 +200,9 @@ def refusal(
             f"--release-dir {release_dir} already exists: a release goes into a new "
             "directory, never one an earlier run wrote"
         )
+    checkout = _checkout_problem(Path(opts.contract).absolute().parent)
+    if checkout:
+        return checkout
     for num in REQUIRED_STAGES:
         if num not in selected:
             why = not_selected.get(num, "not selected")
@@ -218,6 +222,46 @@ def refusal(
         except ReleaseError as exc:
             return str(exc)
     return None
+
+
+def checkout_head(directory: Path) -> Optional[str]:
+    """The commit the git checkout holding ``directory`` is at, or None: no git, not a
+    checkout, or an answer that is not a full hex commit."""
+    import subprocess
+
+    try:
+        done = subprocess.run(  # noqa: S603 - argv list, shell=False
+            ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            shell=False,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = done.stdout if isinstance(done.stdout, str) else ""
+    head = out.strip().lower()
+    return head if done.returncode == 0 and _REVISION.fullmatch(head) else None
+
+
+def _checkout_problem(contract_dir: Path) -> Optional[str]:
+    """Why the release would name a commit it was not built from, or None: the CI names one
+    commit, and the contract's checkout is at another (a workflow that checks out a pull
+    request's head while the CI variable names the base). The release's code digest is the
+    commit's, so it must be the one built. A contract outside a git checkout is not checked."""
+    source = source_identity(os.environ)
+    if source is None:
+        return None
+    head = checkout_head(contract_dir)
+    named = source["digest"]["gitCommit"]
+    if head is None or head == named:
+        return None
+    return (
+        f"--release-dir: the CI names commit {named}, and the contract's checkout is at "
+        f"{clean(head, 64)}: a release names the commit it was built from, so seal it from a "
+        "checkout of that commit"
+    )
 
 
 def forget_stage_reports(root: Path) -> None:
