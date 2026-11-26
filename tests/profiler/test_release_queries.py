@@ -537,12 +537,13 @@ def test_a_document_of_the_gym_with_a_query_over_a_table_it_does_not_hold_is_ref
         FakeBackend().check_document(json.dumps(only))
 
 
-def test_the_notes_say_a_truncated_entity_is_described_by_what_is_kept_and_name_no_count():
+def test_the_notes_say_an_entity_is_kept_whole_or_dropped_whole_and_name_no_count():
     from fluid_build.cli import _profile_follow
 
     plan = _plan(gq.PLUS_ROWS)
     (note,) = _profile_follow.query_notes(plan)
-    assert "more rows than the cap under one parent row is described by the rows kept" in note
+    assert "kept whole or dropped whole under one parent row" in note
+    assert "more rows than the cap under it is not described" in note
     assert not any(ch.isdigit() for ch in note)
 
 

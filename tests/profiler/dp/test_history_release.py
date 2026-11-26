@@ -630,8 +630,8 @@ def test_the_truncation_keeps_an_entity_s_versions_together_by_a_rule_over_its_p
 
     for member in ("1", "2", "3", "4", "5"):
         assert kept_of(more, member) == kept_of(rows, member)
-    # member 1 holds three rows and keeps two; every kept row is one of its own
-    assert len(kept_of(rows, "1")) == 2
+    # member 1 holds card 101 (two versions) and card 102 (one): one card is kept whole, never both
+    assert {row["card_no"] for row in kept_of(rows, "1")} in ({"101"}, {"102"})
     # under the cap every version of every entity is kept, so the history describes whole entities
     roomy = _plan()
     encoded = gym.encode(roomy)

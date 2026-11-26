@@ -51,9 +51,12 @@ written, each is named with :data:`~fluid_build.profiler.query_rates.RUN_FAILED`
 of the release are unaffected (the parts and their shares were fixed before any record was read)
 and the same run draws the same bytes again.
 
-Truncation is per row of the parent table, not per entity: a release that follows keeps at most the
-cap of an entity's rows under one parent row, so an entity with more rows than the cap under one
-parent row is described by the rows kept, and a query by entity counts the entity so.
+Truncation of a table whose history entity a query counts (the query by a natural entity) is per
+entity; a followed key's groups are the rows of one parent row and keep the row rule. A release keeps an
+entity's rows under one parent row whole or drops them whole
+(:func:`~fluid_build.profiler.dp.bounding.bound_entities`), within the cap of the followed
+relationship. An entity with more rows than the cap under one parent row is dropped whole, so a
+query by entity does not count it.
 """
 
 from __future__ import annotations

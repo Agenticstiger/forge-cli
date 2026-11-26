@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes `versionsPerEntity`, `firstStart`, `versionLength`, `chain`, `lastVersion`, each tracked
   column's `initial` and `transitions`, and `reasons` of the table, on the same public ladders
   the exact history uses. Each member is a count table over the followed table charged `m_T` with
-  an equal share of its own; every cell is published, nothing is withheld. A release whose
+  an equal share of its own; every cell is published, nothing is withheld. Under one parent row
+  the cap is spent on whole entities: an entity is kept with all of its versions or dropped with
+  all of them, by a priority that reads only that parent's rows, and one with more versions than
+  the cap is not described. A release whose
   records put one entity's versions under two parent rows is refused
   (`profile_release_entity_units`) before anything is written. The expose, an unreached table and
   a table with no window are named with the reason.

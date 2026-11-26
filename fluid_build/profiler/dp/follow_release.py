@@ -324,6 +324,9 @@ class FollowReleasePlan:
     ] = ()
     #: The consumer queries the release answers (and names), ``None`` when the request has none.
     queries: Optional[query_release.QueryRelease] = None
+    #: The tables whose entities the release states (its history, or a query over its entities),
+    #: with the columns of an entity's key. The truncation keeps such a table's entities whole.
+    entity_tables: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
 
     @property
     def selects(self) -> bool:
@@ -710,6 +713,7 @@ def plan_follow_release(
     parent_sets: List[Tuple[str, Tuple[str, ...]]] = []
     entity_units: List[Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]]] = []
     extra_read: Dict[str, List[str]] = {}
+    entity_of: Dict[str, Tuple[str, ...]] = {}
     entities = _entity_relationships(declared)
 
     def note_entities(each: runner.Relationship) -> None:
@@ -923,6 +927,9 @@ def plan_follow_release(
             continue
         histories[table] = planned
         extra_read.setdefault(table, []).extend(planned.read)
+        # the history states the table's entities, so the truncation keeps each whole
+        entity_of[table] = (planned.entity,)
+        note_keys(table, (planned.entity,))
         if (planned.entity,) != into.spec.child_columns:
             # an entity lies in one unit by construction when its key is the followed one; else the
             # records are checked (profile_release_entity_units)
@@ -957,6 +964,8 @@ def plan_follow_release(
             entering = tree.edge_into(asked_query.table)
             if asked_query.form != query_release.FORM_FOLLOWED or entering is None:
                 continue
+            # a group of a followed relationship is the rows of one parent row: it leaves with its
+            # parent whole, so the rows kept under a parent need no grouping by entity here
             for each in declared:
                 if each.entity and (
                     each.parent,
@@ -1087,6 +1096,7 @@ def plan_follow_release(
         parent_sets=tuple(dict.fromkeys(parent_sets)),
         entity_units=tuple(entity_units),
         queries=queries,
+        entity_tables=tuple(entity_of.items()),
     )
     parts = follow_parts(plan, {})
     if not parts:
@@ -1787,6 +1797,7 @@ def truncated(plan: FollowReleasePlan, rows: FollowRows, seed: bytes) -> Dict[st
         {edge.child: rows.keys[(edge.parent, edge.spec.parent_columns)] for edge in follows.edges},
         {edge.child: rows.keys[(edge.child, edge.spec.child_columns)] for edge in follows.edges},
         seed,
+        entity_keys={table: rows.keys[(table, names)] for table, names in plan.entity_tables},
     )
 
 

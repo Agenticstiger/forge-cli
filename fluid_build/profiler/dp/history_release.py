@@ -42,9 +42,10 @@ The history is released whole or not at all: the five core members are one unit,
 under the cell cap in that order, after the null counts and before the statistics grouped through a
 link (:func:`~fluid_build.profiler.dp.follow_release.admit`).
 
-Truncation is per row of the parent table, not per entity: a release that follows keeps at most the
-cap of an entity's versions under one parent row, so an entity with more versions than the cap under
-one parent row is described by the versions kept.
+Truncation is per entity: a release that follows keeps an entity's versions under one parent row
+whole or drops them whole (:func:`~fluid_build.profiler.dp.bounding.bound_entities`), by a keyed
+priority that reads only that parent's rows, within the cap of the followed relationship. An entity
+with more versions than the cap under one parent row is dropped whole, so it is not described.
 """
 
 from __future__ import annotations

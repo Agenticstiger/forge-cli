@@ -57,6 +57,7 @@ __all__ = [
     "ROWS",
     "UnitPlan",
     "UnitRefused",
+    "bound_entities",
     "bound_rows",
     "capped_counts",
     "encode_values",
@@ -383,6 +384,11 @@ def encode_values(values: Sequence[object]) -> bytes:
     return bytes(out)
 
 
+def _frame(part: bytes) -> bytes:
+    """*part* behind its length, so that two parts side by side cannot be read another way."""
+    return len(part).to_bytes(8, "big") + part
+
+
 def bound_rows(
     units: Sequence[Optional[bytes]],
     contents: Sequence[bytes],
@@ -408,11 +414,68 @@ def bound_rows(
         if unit is None:
             kept.append(i)
             continue
-        key = len(unit).to_bytes(8, "big") + unit + contents[i]
+        key = _frame(unit) + contents[i]
         groups.setdefault(unit, []).append((priority(seed, label, key), contents[i], i))
     for rows in groups.values():
         rows.sort()
         kept.extend(i for _, _, i in rows[:max_rows])
+    kept.sort()
+    return kept
+
+
+def bound_entities(
+    units: Sequence[Optional[bytes]],
+    entities: Sequence[Optional[bytes]],
+    contents: Sequence[bytes],
+    seed: bytes,
+    max_rows: int,
+    label: str = _LABEL,
+) -> List[int]:
+    """The indices of the rows kept, ascending: at most *max_rows* per unit, whole entities only.
+
+    Where :func:`bound_rows` keeps the *max_rows* rows of a unit with the smallest priority, this
+    spends the same cap on the unit's entities: row ``i`` is a version of entity ``entities[i]``
+    under unit ``units[i]``, and an entity is kept with every row it has under that unit or with
+    none. The unit's entities are taken in the order of a keyed priority of the seed, the label,
+    the unit and the entity's own key bytes (never a row's position), an entity is kept when its
+    rows still fit in the capacity left and dropped when they do not, and the next entity is then
+    tried: a smaller one may still fit. An entity with more rows than *max_rows* is therefore
+    always dropped whole. A row with no entity (``None``) describes none, so it is a group of its
+    own, taken by the priority of its content like a row of :func:`bound_rows`. What is kept under
+    a unit depends only on the seed, the label and that unit's own rows, never on another unit or on
+    the order of the rows. A unit of ``None`` keeps its row, as in :func:`bound_rows`.
+    """
+    if len(units) != len(contents) or len(entities) != len(contents):
+        raise ValueError("units, entities and contents must have one entry per row")
+    if not _is_int(max_rows) or max_rows < 1:
+        raise ValueError("max_rows must be a whole number of at least 1")
+    kept: List[int] = []
+    groups: Dict[bytes, Dict[bytes, List[int]]] = {}
+    alike: Dict[Tuple[bytes, bytes], int] = {}
+    for i, unit in enumerate(units):
+        if unit is None:
+            kept.append(i)
+            continue
+        entity = entities[i]
+        if entity is not None:
+            key = b"E" + entity
+        else:
+            # a row with no entity is a group of its own; two rows with the same content are
+            # interchangeable, so they are told apart by how many came before them, not by position
+            seen = alike.get((unit, contents[i]), 0)
+            alike[(unit, contents[i])] = seen + 1
+            key = b"R" + _frame(contents[i]) + seen.to_bytes(8, "big")
+        groups.setdefault(unit, {}).setdefault(key, []).append(i)
+    for unit, members in groups.items():
+        ordered = sorted(
+            (priority(seed, label, _frame(unit) + _frame(key)), key) for key in members
+        )
+        room = max_rows
+        for _, key in ordered:
+            rows = members[key]
+            if len(rows) <= room:
+                kept.extend(rows)
+                room -= len(rows)
     kept.sort()
     return kept
 

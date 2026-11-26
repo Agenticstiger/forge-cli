@@ -487,10 +487,9 @@ def test_a_tracked_column_named_several_leaves_reasons_out_and_the_engine_reads_
     FakeBackend().check_document(drawn.canonical.decode("utf-8"))
 
 
-def test_the_history_note_says_a_truncated_entity_is_described_by_what_is_kept():
+def test_the_history_note_says_an_entity_is_kept_whole_or_dropped_whole():
     from fluid_build.cli import _profile_follow
 
     notes = " ".join(_profile_follow.unknown_values_notes(_plan().table(TABLE).plan, TABLE))
-    assert "more versions than the cap under one parent row is described by the versions kept" in (
-        notes
-    )
+    assert "kept whole or dropped whole under one parent row" in notes
+    assert "more versions than the cap under it is not described" in notes

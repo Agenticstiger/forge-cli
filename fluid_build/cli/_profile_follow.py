@@ -70,8 +70,8 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
             "versions of an entity, member by member, on public ladders that are never trimmed to "
             "the records: each member is noised on its own and joins no clique. An entity's "
             "versions follow one row of the parent table; the engine cannot check that, and its "
-            "evidence says so. An entity with more versions than the cap under one parent row is "
-            "described by the versions kept."
+            "evidence says so. An entity is kept whole or dropped whole under one parent row, and "
+            "one with more versions than the cap under it is not described."
         )
     if plan.date_pairs:
         notes.append(
@@ -100,8 +100,9 @@ def query_notes(plan: Any, drawn: Any = None) -> List[str]:
         "on its own, joins no clique and is made to agree with no other table, and no group is "
         "suppressed. The engine cannot check that a query reads only a record's own unit and "
         "the tables the unit does not reach, nor that an entity's rows lie in one unit; its "
-        "evidence says so. An entity with more rows than the cap under one parent row is "
-        "described by the rows kept."
+        "evidence says so. For a query by a table's natural entity, an entity is kept whole or "
+        "dropped whole under one parent row, and one with more rows than the cap under it is "
+        "not described."
     ]
 
 
