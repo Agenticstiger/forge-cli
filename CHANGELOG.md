@@ -204,22 +204,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid runs deploy SRC --env E` copies a sealed release's external files to its targets.**
   It verifies the release and its environment, optionally passes `--require-receipt ENV` (as
   `fluid runs receipt check`, with `--require-locked` and `--require-signed`), and checks that
-  the credentials are the release's account (STS). A release in S3 must sit in a versioned
-  bucket (exit 2 otherwise: no version to pin a copy to) and its `release.json` must have one
-  version and no delete marker (exit 1 otherwise: targets rewritten after the seal keep the code
-  digest), so the release prefix's writers must not hold `s3:DeleteObjectVersion`; `--sign` is
-  checked before any copy. Then each target, every DAG last: one that
-  already has the file's full-object SHA-256 is left alone; otherwise CopyObject copies the
-  release object at the version that was verified (`CopySourceIfMatch` its ETag) with `If-Match`
+  the credentials are the release's account (STS). A release in S3 must sit in a bucket with
+  versioning Enabled, every object read at a real version (exit 2 otherwise: Suspended or off
+  writes the "null" version, replaced in place, which pins nothing), and its `release.json` must
+  have one version and no delete marker (exit 1 otherwise: targets rewritten after the seal keep
+  the code digest), so the release prefix's writers must hold neither `s3:DeleteObjectVersion`
+  nor `s3:PutBucketVersioning`; `--sign` is checked before any copy. Then each target, every DAG
+  last: one that already has the file's full-object SHA-256 is left alone; otherwise CopyObject
+  copies the release object at the version and ETag the check read (`CopySourceIfMatch`), with `If-Match`
   the target's ETag, or `If-None-Match: *` for a new key, `ExpectedBucketOwner` on every call to
   it and a SHA-256 checksum, and reads it back. A target changed meanwhile (412) stops the
   deploy before the DAGs; a race (409) is tried three times; a bucket policy that enforces
-  conditional writes (501) is named and refused. A release directory is put with the same
+  conditional writes (501) is named and refused. A 412 whose target now holds the release's
+  bytes (a copy whose answer was lost) counts as copied. A release directory is put with the same
   conditions. It writes a deploy receipt (`"check": "deploy"`) with each target's VersionId,
   and the deploy log as its report, to `<code hex>/deploys/<env>/` (`deploys/<env>/` beside a
   release directory), never under `receipts/<env>/`, so a deployer needs no write where the gate
-  reads; a failure once a target was reached writes a FAILED one.
-  `--dry-run` writes nothing. Exit 0 deployed, 1 refused or failed, 2 cannot decide.
+  reads; a failure once a target was reached writes a FAILED one and exits 1. `--dry-run` writes
+  nothing. Exit 0 deployed, 1 refused or failed, 2 cannot decide before any target. `verify-release`
+  ties each target's kind to its sealed file's, and an environment cannot be named `receipts`
+  or `deploys`.
 
 - **Only a verify receipt gates.** A receipt now states `check`, `verify` or `deploy` (absent:
   verify). `fluid runs receipt check` reads `receipts/<env>/` only, and a newest entry there that

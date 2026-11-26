@@ -219,6 +219,11 @@ def refusal(
             f"--release-dir {release_dir} already exists: a release goes into a new "
             "directory, never one an earlier run wrote"
         )
+    if opts.env in ("receipts", "deploys"):
+        return (
+            f"--env {opts.env}: a release's environment names its folder beside receipts/ and "
+            "deploys/, so it cannot be one of those"
+        )
     for num in REQUIRED_STAGES:
         if num not in selected:
             why = not_selected.get(num, "not selected")

@@ -318,13 +318,14 @@ def _register_deploy(sub: argparse._SubParsersAction) -> None:
         description=(
             "Verifies SRC, that it is the release of --env, and that the credentials are the "
             "account its deploy targets (fluid ship --deploy-targets) belong to; in S3 also "
-            "that the bucket is versioned and release.json has one version. Then copies "
+            "that the bucket has versioning Enabled and release.json one version. Then copies "
             "each target, every Airflow DAG last: a target that already has the file's SHA-256 "
             "is left alone; otherwise the release object at its verified version is copied "
             "with If-Match the target's ETag, or If-None-Match * for a new one, and read back. "
             "Records a deploy receipt in deploys/<env>/ beside the release, which never gates "
-            "(only a verify receipt in receipts/<env>/ does). Exit 0 deployed or nothing to change, 1 refused or failed, 2 cannot "
-            "decide."
+            "(only a verify receipt in receipts/<env>/ does). Exit 0 deployed or nothing to "
+            "change, 1 refused or failed (a FAILED deploy receipt), 2 cannot decide before any "
+            "target."
         ),
     )
     dep.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")

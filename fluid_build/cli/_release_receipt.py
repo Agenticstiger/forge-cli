@@ -57,6 +57,8 @@ _S3_TARGET = re.compile(
 )
 _GIT_TARGET = re.compile(r"git\+(?P<url>\S+)@(?P<commit>[0-9a-f]{40}|[0-9a-f]{64})")
 _CONFLICT_TRIES = 3
+#: Names an environment cannot take: they are the folders beside ``<env>/``.
+RESERVED_ENVIRONMENTS = (rr.RECEIPTS_DIR, rr.DEPLOYS_DIR)
 #: An environment name, as a key segment of the published layout takes it.
 _ENVIRONMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._=+-]{0,254}")
 #: A receipt named later than now by more than this is not taken: a name from the future would
@@ -367,10 +369,9 @@ class _S3Store(_Store):
                     if sink is not None:
                         sink.append(name)
                     else:
-                        version = item.get("VersionId")
-                        seen.setdefault(name, []).append(
-                            version if isinstance(version, str) and version != "null" else None
-                        )
+                        from fluid_build.util import s3
+
+                        seen.setdefault(name, []).append(s3.version_id(item.get("VersionId")))
             _within_cap(self.shown, list(seen) + markers)
             if not page.get("IsTruncated"):
                 break
@@ -403,8 +404,7 @@ class _S3Store(_Store):
             pinned = self.versions.get(name)  # a second read takes the version the first did
             extra = {"VersionId": pinned} if pinned else {}
             got = self.client.get_object(Bucket=self.bucket, Key=self.prefix + name, **extra)
-            version = got.get("VersionId")
-            self.versions.setdefault(name, version if isinstance(version, str) else None)
+            self.versions.setdefault(name, s3.version_id(got.get("VersionId")))
             body = got["Body"]
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
             code = s3.error_code(exc)
@@ -592,7 +592,11 @@ def _verified(source: str, clients: ClientFactory, region: Optional[str]) -> Any
             "it in a CI run that names its commit",
             UNDECIDED,
         )
-    if not isinstance(checked.environment, str) or not _ENVIRONMENT.fullmatch(checked.environment):
+    if (
+        not isinstance(checked.environment, str)
+        or not _ENVIRONMENT.fullmatch(checked.environment)
+        or checked.environment in RESERVED_ENVIRONMENTS
+    ):
         raise ReceiptError(
             f"{checked.source} names no environment a receipts folder can take (letters, digits "
             "and ._=+-, starting with a letter, digit or _)",
@@ -907,7 +911,11 @@ def statement(receipt: Mapping[str, Any], receipt_bytes: bytes) -> Dict[str, Any
             "verifier": receipt["verifier"],
             "timeVerified": receipt["time_verified"],
             "resourceUri": receipt["resource_uri"],
-            "policy": {"uri": f"{RECEIPT_EXTENSION}#report-verdict"},
+            # a deploy is a record, not a verification: a VSA consumer tells them by the policy
+            "policy": {
+                "uri": f"{RECEIPT_EXTENSION}#"
+                + ("deploy-log" if receipt.get("check") == rr.DEPLOY else "report-verdict")
+            },
             "inputAttestations": [
                 {
                     "uri": receipt["report"]["name"],
@@ -1303,6 +1311,15 @@ def _signature_problem(
         "type": (signed.get("_type"), INTOTO_STATEMENT_TYPE),
         "predicate type": (signed.get("predicateType"), VSA_PREDICATE_TYPE),
         "result": (predicate.get("verificationResult"), rr.PASSED),
+        "check": (extension.get("check", rr.VERIFY), rr.VERIFY),
+        "policy": (
+            (
+                (predicate.get("policy") or {}).get("uri")
+                if isinstance(predicate.get("policy"), Mapping)
+                else None
+            ),
+            f"{RECEIPT_EXTENSION}#report-verdict",
+        ),
         "receipt": (extension.get("receipt_sha256"), hashlib.sha256(data).hexdigest()),
         "environment": (extension.get("environment"), receipt["environment"]),
         "code digest": (extension.get("code_digest"), receipt["code_digest"]),
@@ -1401,8 +1418,12 @@ def newest_by_environment(
             except NoReceipt:
                 continue
             except ReceiptError as exc:
-                entry = {"problem": clean(str(exc), 300)}
-                break
+                problem = {"problem": clean(str(exc), 300)}
+                if check == rr.VERIFY:
+                    entry.update(problem)
+                else:  # a bad deploys/ entry hides nothing of the verify result
+                    entry["deploy"] = problem
+                continue
             found = {
                 "result": receipt["result"],
                 "time_verified": receipt["time_verified"],

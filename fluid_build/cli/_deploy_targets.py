@@ -49,9 +49,6 @@ _KEYS = {"account", "region", "targets"}
 _TARGET_KEYS = {"artifact", "to"}
 _ACCOUNT = re.compile(r"[0-9]{12}")
 _REGION = re.compile(r"[a-z]{2}(-[a-z0-9]+){1,3}-[0-9]{1,2}")
-_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
-#: An S3 key the deploy writes: printable, no whitespace, at most 1,024 characters.
-_KEY = re.compile(r"[!-~]{1,1024}")
 
 
 class TargetsError(release.ReleaseError):
@@ -144,16 +141,10 @@ def _target(item: Any, where: str, by_name: Mapping[str, Any]) -> Dict[str, Any]
 
 
 def is_object_uri(uri: str) -> bool:
-    """Whether ``uri`` is ``s3://bucket/key`` naming one object."""
-    if not uri.startswith("s3://"):
-        return False
-    bucket, _, key = uri[len("s3://") :].partition("/")
-    return (
-        _BUCKET.fullmatch(bucket) is not None
-        and ".." not in bucket
-        and _KEY.fullmatch(key) is not None
-        and not key.endswith("/")
-    )
+    """Whether ``uri`` is ``s3://bucket/key`` naming one object (``util.s3.is_object_uri``)."""
+    from fluid_build.util import s3
+
+    return s3.is_object_uri(uri)
 
 
 def load(path: str, external: Sequence[Any]) -> Dict[str, Any]:

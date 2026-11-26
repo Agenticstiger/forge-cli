@@ -374,6 +374,7 @@ class DeployS3(FakeS3):
         got = super().get_object(Bucket=Bucket, Key=Key, VersionId=VersionId)
         if "VersionId" in got:
             got["VersionId"] = self.version(Bucket, Key)
+        got["ETag"] = self.etag(Bucket, Key)
         return got
 
     def copy_object(self, **kw: Any) -> Dict[str, Any]:
@@ -652,7 +653,7 @@ def test_a_release_in_a_bucket_without_versioning_is_not_copied(
     s3.versions, s3.versioning = False, None
     uri = _published(tmp_path, s3)
     done = _deploy(uri, s3)
-    assert done.exit_code == 2 and "bucket without versioning" in done.reason
+    assert done.exit_code == 2 and "versioning is off (Enabled is needed)" in done.reason
     assert _target_writes(s3) == [] and s3.copies == [] and done.receipt is None
 
 
@@ -919,3 +920,186 @@ def test_the_command_prints_each_target_and_exits_with_the_deploy(
     args = _parse(uri, "--env", "prod", "--json")
     assert args.func(args, logging.getLogger("t")) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "deployed"
+
+
+# ---------------------------------------------------------------------------
+# A bucket whose versioning is Suspended, and the other edges of a copy
+# ---------------------------------------------------------------------------
+
+
+class SuspendedS3(DeployS3):
+    """Versioning Suspended: every object written now is the "null" version, which the next
+    write replaces in place (no older version is kept or listed)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.versioning = "Suspended"
+
+    def version(self, bucket: str, key: str) -> str:
+        return "null"
+
+    @staticmethod
+    def version_of(key: str) -> str:
+        return "null"
+
+    def write(self, bucket: str, key: str, data: bytes) -> None:
+        self.put(bucket, key, data)
+        self.writes.append(key)
+
+
+def test_a_suspended_bucket_pins_nothing_and_nothing_is_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A "null" version is replaced in place: bytes written after the check would be copied."""
+    s3 = SuspendedS3()
+    uri = _published(tmp_path, s3)
+    real = deploys._Copier._write
+
+    def writer_races(self: Any, target: Any, *a: Any, **kw: Any) -> Any:
+        src = uri.split("/", 3)[3] + "external/orders-jobs/orders_jobs-1.4.0.zip"
+        s3.put("acme-releases", src, b"EVIL package")
+        return real(self, target, *a, **kw)
+
+    monkeypatch.setattr(deploys._Copier, "_write", writer_races)
+    done = _deploy(uri, s3)
+    assert done.exit_code == 2 and "versioning is Suspended (Enabled is needed)" in done.reason
+    assert _target_writes(s3) == [] and s3.copies == [] and done.receipt is None
+
+
+def test_a_suspended_bucket_s_release_json_rewritten_in_place_is_not_taken(
+    tmp_path: Path,
+) -> None:
+    s3 = SuspendedS3()
+    uri = _published(tmp_path, s3)
+    key = uri.split("/", 3)[3] + "release.json"
+    index = json.loads(s3.objects[("acme-releases", key)])
+    for t in index["identity"]["deploy"]["targets"]:
+        if t["artifact"] == "orders-jobs":
+            t["to"] = "s3://acme-jobs/somewhere/else.zip"
+    index["identity_digest"] = release.identity_digest(index["identity"])
+    s3.put("acme-releases", key, (json.dumps(index, indent=2, sort_keys=True) + "\n").encode())
+    done = _deploy(uri, s3)
+    assert done.exit_code == 2 and ("acme-jobs", "somewhere/else.zip") not in s3.objects
+
+
+def test_a_verified_read_s_null_version_is_no_version() -> None:
+    from fluid_build.util import s3
+
+    assert [s3.version_id(v) for v in ("null", "", None, 3, "v1")] == [None] * 4 + ["v1"]
+
+
+def test_the_copy_takes_the_etag_the_check_read_not_a_fresh_one(
+    tmp_path: Path, s3: DeployS3
+) -> None:
+    uri = _published(tmp_path, s3)
+    checked = receipts._verified(uri, s3, None)
+    etags = {o["path"]: o["etag"] for o in checked.objects}
+    assert _deploy(uri, s3).exit_code == 0
+    prefix = uri.split("/", 3)[3]
+    for copy in s3.copies:
+        rel = copy["CopySource"]["Key"][len(prefix) :]
+        assert copy["CopySourceIfMatch"] == etags[rel]
+
+
+def test_a_copy_whose_answer_was_lost_and_whose_retry_meets_it_counts_as_copied(
+    tmp_path: Path,
+) -> None:
+    class LostResponse(DeployS3):
+        lost = True
+
+        def copy_object(self, **kw: Any) -> Dict[str, Any]:
+            out = super().copy_object(**kw)
+            if self.lost:  # applied, the answer lost, botocore's retry meets the key: 412
+                self.lost = False
+                raise S3Error("PreconditionFailed", 412)
+            return out
+
+    s3 = LostResponse()
+    uri = _published(tmp_path, s3)
+    done = _deploy(uri, s3)
+    assert done.exit_code == 0, done.reason
+    assert [t["action"] for t in done.targets] == ["copied", "copied"]
+    assert all(t["version_id"] for t in done.targets)
+
+
+def test_a_412_without_a_code_is_read_by_its_status(tmp_path: Path, s3: DeployS3) -> None:
+    uri = _published(tmp_path, s3)
+    s3.put("acme-jobs", "jobs/orders_jobs.zip", b"someone else's")
+    s3.copy_errors = [S3Error("", 412)]
+    done = _deploy(uri, s3)
+    assert done.exit_code == 1 and "changed meanwhile" in done.reason
+
+
+def test_a_copy_s3_refused_fails_with_exit_1_and_a_failed_receipt(
+    tmp_path: Path, s3: DeployS3
+) -> None:
+    uri = _published(tmp_path, s3)
+    s3.copy_errors = [S3Error("NoSuchBucket", 404)]
+    done = _deploy(uri, s3)
+    stored = json.loads(s3.objects[("acme-releases", str(done.receipt).split("/", 3)[3])])
+    assert done.exit_code == 1 and stored["result"] == "FAILED"
+
+
+def test_a_dag_relabelled_as_a_file_is_not_intact(tmp_path: Path) -> None:
+    block = _deploy_block()
+    for t in block["targets"]:
+        if t["kind"] == "airflow-dag":
+            t["kind"] = "file"
+            t["to"] = "s3://acme-airflow/aaa/orders_dag.py"
+    _sealed_release(tmp_path / "rel", "prod", block)
+    found = api_release.verify_release(tmp_path / "rel")
+    assert not found.intact and any("pins no external file so" in p for p in found.problems)
+
+
+def test_a_target_uri_s3_does_not_take_is_not_intact(tmp_path: Path) -> None:
+    block = _deploy_block()
+    block["targets"][0]["to"] = "s3://Bad_Bucket/key"
+    _sealed_release(tmp_path / "rel", "prod", block)
+    assert not api_release.verify_release(tmp_path / "rel").intact
+
+
+def test_a_bad_deploy_entry_keeps_the_verify_result_in_status(tmp_path: Path) -> None:
+    _sealed_release(tmp_path / "nonprod", "nonprod", _deploy_block())
+    rel = tmp_path / "nonprod"
+    block = receipts.report_release_block(str(rel), "acme.orders")
+    report = tmp_path / "verify.json"
+    report.write_text(json.dumps({"summary": PASSING, "release": block}), encoding="utf-8")
+    receipts.record_receipt(str(rel), report_path=str(report), now=T0)
+    junk = tmp_path / "deploys" / "nonprod"
+    junk.mkdir(parents=True)
+    (junk / "20261126T090001.000000Z-0000000000000000.json").write_text("{}", encoding="utf-8")
+    index = json.loads((rel / "release.json").read_text(encoding="utf-8"))
+    found = receipts.newest_by_environment(rel, index["code_digest"])["nonprod"]
+    assert found["result"] == "PASSED" and "problem" in found["deploy"]
+
+
+@pytest.mark.parametrize("environment", ["receipts", "deploys"])
+def test_an_environment_named_as_a_folder_is_refused_at_the_seal(
+    lockdir: Path, environment: str
+) -> None:
+    from fluid_build.cli import _ship_stages as st
+
+    opts = st.ShipOptions(contract=str(lockdir / "contract.fluid.yaml"), env=environment)
+    assert "cannot be one of those" in str(release.refusal(lockdir / "rel", [1, 2, 3, 4], {}, opts))
+
+
+def test_a_deploy_statement_names_its_own_policy_and_never_stands_for_a_check() -> None:
+    receipt: Dict[str, Any] = {
+        "check": "deploy",
+        "verifier": {},
+        "time_verified": rr.iso(T0),
+        "resource_uri": "s3://b-1/p/",
+        "report": {"name": "x.report.json", "sha256": "sha256:" + "a" * 64},
+        "result": "PASSED",
+        "environment": "nonprod",
+        "code_digest": "sha256:" + "b" * 64,
+        "identity_digest": "sha256:" + "c" * 64,
+        "release_objects": [],
+    }
+    signed = receipts.statement(receipt, b"{}")
+    assert signed["predicate"]["policy"]["uri"].endswith("#deploy-log")
+    assert signed["predicate"][receipts.RECEIPT_EXTENSION]["check"] == "deploy"
+    receipt["check"] = "verify"
+    assert receipts.statement(receipt, b"{}")["predicate"]["policy"]["uri"].endswith(
+        "#report-verdict"
+    )

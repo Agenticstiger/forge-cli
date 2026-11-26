@@ -14,8 +14,9 @@ DAG folder never picks up a DAG before the files it runs:
 
 - a target whose object already has the file's full-object SHA-256 is left as it is;
 - otherwise the file is copied from the release object at the version that was verified (a
-  release in S3 must sit in a versioned bucket, and its release.json have one version), with
-  ``CopySourceIfMatch`` that version's ETag, ``If-Match`` the target's ETag when it exists or
+  release in S3 must sit in a bucket with versioning Enabled, and its release.json have one
+  version), and the ETag that read answered (``CopySourceIfMatch``), with
+  ``If-Match`` the target's ETag when it exists or
   ``If-None-Match: *`` when it does not, so a target changed meanwhile is never overwritten,
   and ``ExpectedBucketOwner`` the release's account on every call to it;
 - each copy is read back and must have the SHA-256 the release names; its VersionId is kept.
@@ -153,7 +154,9 @@ def deploy_release(
             record["problem"] = str(exc)
             break
     if failure is not None:
-        out.exit_code, out.reason = failure.exit_code, str(failure)
+        # a FAILED deploy receipt always goes with exit 1: the deploy reached a target and
+        # stopped, whatever stopped it
+        out.exit_code, out.reason = FAIL, str(failure)
     else:
         copied = sum(1 for r in out.targets if r["action"] == "copied")
         out.exit_code = PASS
@@ -301,16 +304,30 @@ def _pinned(
     """
     from fluid_build.util import s3
 
-    if any(not o.get("version_id") for o in checked.objects):
+    bucket, key = s3.split_uri(source.rstrip("/") + "/release.json")
+    client = factory("s3", region)
+    try:
+        status = client.get_bucket_versioning(Bucket=bucket).get("Status")
+    except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
+        code = s3.error_code(exc)
         raise DeployError(
-            f"{checked.source} sits in a bucket without versioning, so a copy cannot be pinned "
-            "to the bytes that were verified: publish releases to a versioned bucket "
-            "(fluid ship --release-to-require versioning)",
+            f"the versioning of {bucket} cannot be read ({code or type(exc).__name__}; "
+            "s3:GetBucketVersioning is needed)",
+            UNDECIDED,
+        ) from None
+    if status != "Enabled" or any(
+        not s3.version_id(o.get("version_id")) or not o.get("etag") for o in checked.objects
+    ):
+        # Suspended (or never on): every write is the "null" version, replaced in place
+        raise DeployError(
+            f"{checked.source} sits in a bucket whose versioning is "
+            f"{clean(status, 20) if status else 'off'} (Enabled is needed), so a copy cannot be "
+            "pinned to the bytes that were verified: publish releases to a bucket with "
+            "versioning Enabled (fluid ship --release-to-require versioning)",
             UNDECIDED,
         )
-    bucket, key = s3.split_uri(source.rstrip("/") + "/release.json")
     try:
-        got = factory("s3", region).list_object_versions(Bucket=bucket, Prefix=key)
+        got = client.list_object_versions(Bucket=bucket, Prefix=key)
     except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
         code = s3.error_code(exc)
         raise DeployError(
@@ -405,6 +422,7 @@ class _Copier:
         self.source = source
         self.remote = source.startswith("s3://")
         self.versions = {str(o["path"]): o.get("version_id") for o in checked.objects}
+        self.etags = {str(o["path"]): o.get("etag") for o in checked.objects}
         self.factory = factory
         self.region = region
         self.dest = dest
@@ -442,8 +460,17 @@ class _Copier:
             except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
                 code = s3.error_code(exc)
                 status = s3.http_status(exc)
+                if not code and status in (409, 412):  # a code-less answer, by its status
+                    code = str(status)
                 if code in s3.CONFLICT_CODES and attempt < _CONFLICT_TRIES:
                     continue
+                if code in s3.PRECONDITION_CODES:
+                    # a copy whose first answer was lost lands, and its retry meets it: when
+                    # the target now has the release's bytes, it is this copy
+                    landed = self._head(bucket, key, None, shown)
+                    if landed is not None and _full_sha256(landed) == digest:
+                        written = {"VersionId": landed.get("VersionId")}
+                        break
                 raise _write_error(shown, code, status, exc, conditions) from None
         version = written.get("VersionId") if isinstance(written.get("VersionId"), str) else None
         back = self._head(bucket, key, version, shown)
@@ -492,16 +519,12 @@ class _Copier:
         common = dict(Bucket=bucket, Key=key, ExpectedBucketOwner=self.account, **conditions)
         if self.remote:
             src_bucket, prefix = s3.split_uri(self.source.rstrip("/") + "/")
-            copy_source: Dict[str, str] = {"Bucket": src_bucket, "Key": prefix + rel}
-            pinned = self.versions.get(rel)
-            if pinned:
-                copy_source["VersionId"] = pinned
-            src_head = self.factory("s3", self.region).head_object(
-                Bucket=src_bucket, Key=prefix + rel, **({"VersionId": pinned} if pinned else {})
-            )
+            # the version and the ETag the verify read (``_pinned`` refused a release without)
+            copy_source = {"Bucket": src_bucket, "Key": prefix + rel}
+            copy_source["VersionId"] = str(self.versions[rel])
             copied: Dict[str, Any] = self.dest.copy_object(
                 CopySource=copy_source,
-                CopySourceIfMatch=src_head["ETag"],
+                CopySourceIfMatch=str(self.etags[rel]),
                 ChecksumAlgorithm="SHA256",
                 **common,
             )
@@ -553,7 +576,7 @@ def _write_error(
         )
     if code in s3.CONFLICT_CODES:
         return DeployError(f"{shown}: the copy raced other writes {_CONFLICT_TRIES} times (409)")
-    return DeployError(f"{shown}: the copy failed ({code or type(exc).__name__})", UNDECIDED)
+    return DeployError(f"{shown}: the copy failed ({code or type(exc).__name__})")
 
 
 def _full_sha256(head: Mapping[str, Any]) -> Optional[str]:
