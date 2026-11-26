@@ -729,9 +729,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$PUBLISH" != "true" ]; then
-            # A dry run has no tag: read the section of the newest tag this
-            # commit contains. That section exists, so it must be found.
-            VERSION=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)
+            # A dry run has no tag: read the section of the newest release tag
+            # this commit contains. That section exists, so it must be found.
+            # Pre-release tags are skipped: a real run of one may fall back to
+            # git log, so its section need not exist.
+            VERSION=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*[a-z]*' HEAD)
             VERSION="${VERSION#v}"
           fi
 

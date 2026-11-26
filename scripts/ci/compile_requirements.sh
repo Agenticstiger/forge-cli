@@ -6,8 +6,10 @@
 #   scripts/ci/compile_requirements.sh ci-tools     # one of them
 #
 # --universal resolves once for every platform and Python version at or above
-# --python-version, so one file serves the whole CI matrix (3.10 to 3.14) and
-# the Jenkins nodes. --generate-hashes records every wheel and sdist hash, so
+# --python-version, so a lock serves every interpreter from there up. Each lock
+# is compiled for the oldest Python that installs it (see the case below): the
+# CI tools and the type checker run across the matrix, so they start at 3.10.
+# --generate-hashes records every wheel and sdist hash, so
 # `pip install --require-hashes -r <file>` rejects anything else.
 #
 # A requirements/<name>.overrides file, when present, is passed as --override:

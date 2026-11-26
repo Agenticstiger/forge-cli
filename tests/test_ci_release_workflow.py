@@ -1063,6 +1063,10 @@ def test_a_change_to_what_builds_the_release_runs_the_dry_run() -> None:
         "requirements/release-image.txt",
         "Dockerfile",
         "pyproject.toml",
+        "requirements/release-tools.in",
+        "requirements/release-image.in",
+        ".grype.yaml",
+        "MANIFEST.in",
     }
     assert must <= paths, must - paths
     assert [p for p in paths if not (REPO / p).exists()] == []
@@ -1121,7 +1125,9 @@ _CHANGELOG = """# Changelog
 """
 
 
-def _notes(tmp_path: Path, changelog: str, *, publish: bool, version: str = "") -> tuple:
+def _notes(
+    tmp_path: Path, changelog: str, *, publish: bool, version: str = "", newer_tag: str = ""
+) -> tuple:
     """Run the release-notes step under bash on a repository tagged v1.2.0."""
     step = next(s for s in _steps("release-notes") if s.get("name", "").startswith("Generate"))
     repo = tmp_path / "repo"
@@ -1132,6 +1138,8 @@ def _notes(tmp_path: Path, changelog: str, *, publish: bool, version: str = "") 
     _git(repo, "commit", "-q", "-m", "first")
     _git(repo, "tag", "v1.2.0")
     _git(repo, "commit", "-q", "--allow-empty", "-m", "second")
+    if newer_tag:
+        _git(repo, "tag", newer_tag)
     summary = tmp_path / "summary.md"
     env = {
         **os.environ,
@@ -1158,6 +1166,14 @@ def test_a_dry_run_reads_the_newest_tag_s_section(tmp_path) -> None:
     assert "A garden planner." in notes and "A seed list." not in notes, notes
     assert "A greenhouse view." not in notes and "data-product-forge==1.2.0" in notes, notes
     assert "A garden planner." in summary, summary
+
+
+def test_a_dry_run_skips_a_newer_pre_release_tag_that_has_no_section(tmp_path) -> None:
+    """A pre-release's real run falls back to git log, so its section may not
+    exist yet; the dry run must not go red over it."""
+    proc, notes, _ = _notes(tmp_path, _CHANGELOG, publish=False, newer_tag="v1.3.0rc1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "A garden planner." in notes and "==1.2.0" in notes, notes
 
 
 def test_a_dry_run_fails_when_the_newest_tag_s_section_is_not_found(tmp_path) -> None:

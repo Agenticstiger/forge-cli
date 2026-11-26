@@ -3,7 +3,7 @@
 # environment, never into the project's, so the audit sees only what the project
 # resolves. Regenerate with scripts/ci/compile_requirements.sh. The job runs on
 # Python 3.12, so the lock is resolved for 3.12: the fixed releases of filelock
-# and wcmatch below need Python 3.11 or newer.
+# (below) and wcmatch (in the overrides) need Python 3.11 or newer.
 bandit[toml]
 semgrep==1.186.0
 pip-audit

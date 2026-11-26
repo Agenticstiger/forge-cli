@@ -92,7 +92,7 @@ def test_the_security_tools_lock_holds_the_overrides_and_the_filelock_floor() ->
     assert pins["filelock"] >= Version("4.2.1")
 
 
-@pytest.mark.parametrize("name", ["ci-security", "singer-tap"])
+@pytest.mark.parametrize("name", _compile_targets())
 def test_every_pin_carries_hashes(name: str) -> None:
     text = (REQ / f"{name}.txt").read_text(encoding="utf-8")
     entries = re.split(r"\n(?=[A-Za-z0-9][A-Za-z0-9._-]*==)", text)
@@ -100,3 +100,24 @@ def test_every_pin_carries_hashes(name: str) -> None:
     assert pinned
     for entry in pinned:
         assert "--hash=sha256:" in entry, entry.splitlines()[0]
+
+
+@pytest.mark.parametrize(
+    "lock, dockerfile",
+    [
+        ("release-image", "Dockerfile"),
+        ("singer-tap", "Dockerfile.verify"),
+        ("verify-image", "Dockerfile.verify"),
+    ],
+)
+def test_an_image_lock_is_compiled_for_the_python_of_its_base_image(
+    lock: str, dockerfile: str
+) -> None:
+    """A lock compiled for 3.14 cannot be promised to install on another base."""
+    script = _script()
+    m = re.search(rf"\b{lock}\b[^)]*\) compile_one \"\$\{{target\}}\" (\d+\.\d+)", script)
+    assert m, lock
+    base = re.search(
+        r"^FROM python:(\d+\.\d+)", (REPO / dockerfile).read_text(encoding="utf-8"), re.M
+    )
+    assert base and base.group(1) == m.group(1), (lock, dockerfile)

@@ -130,9 +130,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes `IfNoneMatch`.
 - **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
   and behaviour.
-
-### Changed
-
 - **The release builds with a locked build backend.** `setuptools`, `setuptools-scm` and `wheel`
   are pinned and hashed in `requirements/release-tools.txt`, and the release runs
   `python -m build --no-isolation`, so no release installs a build backend from PyPI while it
