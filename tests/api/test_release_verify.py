@@ -239,6 +239,18 @@ def test_a_denied_read_cannot_be_decided(tmp_path: Path) -> None:
     assert verify_release(uri, clients=s3).exit_code == 2
 
 
+def test_without_botocore_an_s3_source_cannot_be_decided(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    for name in ("boto3", "botocore", "botocore.config"):  # as an install without [aws] is
+        monkeypatch.setitem(sys.modules, name, None)
+    result = verify_release("s3://acme-releases/r/")
+    assert (result.exit_code, result.problems) == (
+        2,
+        ("reading an s3:// release needs boto3: pip install 'data-product-forge[aws]'",),
+    )
+
+
 def test_without_boto3_an_s3_source_cannot_be_decided(monkeypatch: pytest.MonkeyPatch) -> None:
     def missing(service: str, region: Any, **_: Any) -> Any:
         raise s3_util.S3Unavailable("no boto3")

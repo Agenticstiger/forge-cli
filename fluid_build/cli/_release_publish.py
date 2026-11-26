@@ -116,7 +116,6 @@ def parse_target(value: str) -> Target:
 def refusal(target: str, release_dir: Optional[Path], require: Sequence[str]) -> Optional[str]:
     """Why ``--release-to`` cannot run, before any stage: no ``--release-dir``, a target that is
     not one, or no boto3. ``None`` when it can."""
-    import importlib.util
 
     if release_dir is None:
         if target:
@@ -132,7 +131,9 @@ def refusal(target: str, release_dir: Optional[Path], require: Sequence[str]) ->
         parse_target(target)
     except PublishError as exc:
         return str(exc)
-    if importlib.util.find_spec("boto3") is None:
+    from fluid_build.util import s3
+
+    if not s3.installed():
         return f"--release-to {target} needs boto3: pip install 'data-product-forge[aws]'"
     from . import _ship_release
 

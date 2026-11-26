@@ -40,7 +40,9 @@ COMMIT = "c0ffee" * 6 + "c0ff"
 
 @pytest.fixture
 def in_ci(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A CI run that names its commit: the release then has a code digest."""
+    """A CI run that names its commit: the release then has a code digest. boto3 counts as
+    installed (the publish talks to fake clients), whether or not this environment has it."""
+    monkeypatch.setattr("fluid_build.util.s3.installed", lambda: True)
     for name, value in {
         "GITHUB_RUN_ID": "42",
         "GITHUB_SHA": COMMIT,
@@ -100,7 +102,7 @@ def test_the_target_needs_a_release_a_ci_commit_and_boto3(
     monkeypatch.delenv("GITHUB_RUN_ID")
     assert "needs the commit the CI built" in str(publish.refusal(TARGET, tmp_path, ()))
     monkeypatch.setenv("GITHUB_RUN_ID", "42")
-    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    monkeypatch.setattr("fluid_build.util.s3.installed", lambda: False)
     assert "pip install 'data-product-forge[aws]'" in str(publish.refusal(TARGET, tmp_path, ()))
 
 
@@ -456,6 +458,16 @@ def test_ship_refuses_a_target_it_cannot_publish_to_before_any_stage(
     fake = _install(monkeypatch, bundled)
     assert _ship([*_UNTIL_4, *argv]) == 2
     assert problem in caplog.text
+    assert fake.calls == []
+
+
+def test_without_boto3_ship_refuses_before_any_stage(
+    work: Path, bundled: Path, monkeypatch: pytest.MonkeyPatch, in_ci: None, caplog: Any
+) -> None:
+    fake = _install(monkeypatch, bundled)
+    monkeypatch.setattr("fluid_build.util.s3.installed", lambda: False)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel", "--release-to", TARGET]) == 2
+    assert "pip install 'data-product-forge[aws]'" in caplog.text
     assert fake.calls == []
 
 

@@ -32,6 +32,13 @@ class S3Unavailable(RuntimeError):
     """boto3 is not installed: the ``[aws]`` extra is missing."""
 
 
+def installed() -> bool:
+    """Whether boto3 and botocore can be imported (the ``[aws]`` extra), without importing them."""
+    import importlib.util
+
+    return all(importlib.util.find_spec(name) is not None for name in ("boto3", "botocore"))
+
+
 def default_clients(service: str, region: Optional[str], *, config: Any = None) -> Any:
     """A boto3 client, from the default credential chain (``AWS_ENDPOINT_URL`` included);
     ``config``, a ``botocore.config.Config``, bounds its calls. ``region`` None: the profile's.
@@ -50,9 +57,17 @@ def default_clients(service: str, region: Optional[str], *, config: Any = None) 
 
 def bounded_clients(service: str, region: Optional[str]) -> Any:
     """:func:`default_clients`, bounded: an endpoint that does not answer fails in seconds, and a
-    call is tried at most three times (botocore's standard retry mode)."""
-    from botocore.config import Config
+    call is tried at most three times (botocore's standard retry mode).
 
+    Raises:
+        S3Unavailable: boto3 or botocore is not installed.
+    """
+    try:
+        from botocore.config import Config
+    except ImportError as exc:
+        raise S3Unavailable(
+            "boto3 is not installed: pip install 'data-product-forge[aws]'"
+        ) from exc
     config = Config(
         connect_timeout=10, read_timeout=120, retries={"mode": "standard", "max_attempts": 3}
     )
