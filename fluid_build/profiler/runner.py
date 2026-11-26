@@ -70,6 +70,7 @@ from fluid_build.profiler import (
     history,
     query_rates,
     ranks,
+    references,
     sources,
 )
 from fluid_build.profiler._stats import (
@@ -1104,16 +1105,6 @@ def profile_exposes(
             )  # fmt: skip
         )
     )
-    if request is None:  # a request has no ask for a history, and a bundle's table has its own
-        date_notes.extend(
-            history.form_histories(
-                history.HistoryStage(
-                    raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
-                    tallies, fractional_bits, timings,
-                    frozenset((each.child, tuple(each.child_columns)) for each in relationships),
-                )  # fmt: skip
-            )
-        )
     counted_entries: Dict[int, Tuple[Dict[str, Any], RelationshipResult]] = {
         position: _children_per_parent(
             each,
@@ -1128,6 +1119,26 @@ def profile_exposes(
         for position, each in enumerate(relationships)
         if each.counted
     }
+    released = references.NONE
+    if request is None:  # a request has no ask for a history, and a bundle's table has its own
+        released = references.form_references(
+            references.Stage(raw_exposes, plans, reads, relationships, backend, blocks)
+        )
+        date_notes.extend(
+            history.form_histories(
+                history.HistoryStage(
+                    raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
+                    tallies, fractional_bits, timings,
+                    frozenset((each.child, tuple(each.child_columns)) for each in relationships),
+                    released,
+                    {
+                        (relationships[at].child, tuple(relationships[at].child_columns)): done.shown
+                        for at, (_, done) in counted_entries.items()
+                    },
+                )  # fmt: skip
+            )
+        )
+        date_notes.extend(released.notes)
     counted = list(counted_entries.values())
     calendars.withhold_beside_relationships(tables_doc, [entry for entry, _ in counted], tallies)
     relationship_docs, relationship_notes = _relationship_dates(
@@ -1195,6 +1206,7 @@ def profile_exposes(
             relationships=relationship_docs,
             invariants=invariants,
             queries=queries,
+            references=released.tables,
         )
         canonical = document.canonical_bytes(built)
         backend.check_document(canonical.decode("utf-8"))

@@ -74,6 +74,16 @@ withholds its group: its bins then say nothing of where records lie.
   the group sizes and their total as it sees any grouped level histogram. The group of a value
   that a declared ``endMarker`` or ``currentFlag`` puts on the last version alone has no change by
   the contract: where the records leave it empty it is out of the check and written as zeros.
+  A column that a counted relationship keys on its own (a foreign key) is tracked too, where
+  the profile releases the table it references whole
+  (:mod:`fluid_build.profiler.references`): its levels are that table's keys, in the order it
+  publishes them. A value that is no key, a table that is not published and a key that is not
+  text are named and the column is not tracked. A published cell of ``initial`` (and of a change
+  into the key) is also a floor on the children of that key's parent, so beside the relationship's
+  children per parent it can give back a bin that relationship withholds
+  (:func:`disclosure.parents_at_or_above`); while it does, the published ``initial`` cell whose
+  key sits highest is withheld, and ``transitions`` whole where changes into the keys still
+  would (:func:`_guarded`).
 * ``reasons`` (with at least two tracked columns): the changes by the one tracked column that moves,
   or ``several``. Its cells and the transitions' group totals are linked: with two tracked columns
   ``several = M_a + M_b - k``, with ``M_a`` the changes of ``a`` (the sum of its transitions' group
@@ -96,7 +106,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import (
     TYPE_CHECKING,
@@ -111,7 +121,7 @@ from typing import (
     Tuple,
 )
 
-from fluid_build.profiler import dates, defaults, disclosure, sources
+from fluid_build.profiler import dates, defaults, disclosure, references, sources
 from fluid_build.profiler._stats import (
     DeclaredBlock,
     DeclaredStatistic,
@@ -181,6 +191,13 @@ class HistoryStage:
     timings: Optional["StageTimings"]
     #: The ``(child table, child columns)`` of every relationship the profile counts.
     counted_keys: FrozenSet[Tuple[str, Tuple[str, ...]]] = frozenset()
+    #: The tables the profile releases whole, whose keys a foreign key of a history follows.
+    released: Optional[references.References] = None
+    #: Which bins of each counted relationship's children per parent publish their cell, by
+    #: ``(child table, child columns)``.
+    children_shown: Mapping[Tuple[str, Tuple[str, ...]], Tuple[bool, ...]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -197,6 +214,8 @@ class _Tracked:
     name: str
     levels: Tuple[str, ...]
     values: Sequence[Optional[int]]  # the index of the row's level; ``None`` where null
+    #: The column is a foreign key whose levels are the keys of the table it references.
+    followed: bool = False
 
 
 class _Unformed(Exception):
@@ -1006,22 +1025,39 @@ def _declared_levels(declared: Optional[DeclaredBlock], name: str) -> Optional[T
     return None
 
 
+def _place(index: Mapping[str, int], level: str) -> int:
+    """The position of *level* among a column's levels; ``KeyError`` for a value outside them."""
+    return index[level]
+
+
 def _tracked(
     context: _Context,
     window: Any,
     declared: Optional[DeclaredBlock],
 ) -> Tuple[List[_Tracked], List[Tuple[str, str]]]:
-    """The categorical columns a history follows, and each one left out with why."""
+    """The categorical columns a history follows, and each one left out with why.
+
+    A column that a counted relationship keys on its own is a foreign key: it is followed by the
+    keys of the table it references, where the profile releases that table whole
+    (:mod:`fluid_build.profiler.references`), and whatever levels the contract declares for it.
+    """
     stage, read = context.stage, context.read
     taken = {window.key, window.start_column, window.end_column}
     found: List[_Tracked] = []
     notes: List[Tuple[str, str]] = []
     for column in context.plan.columns:
-        if column.domain != "category" or column.name in taken:
+        key = (
+            stage.released.follow(context.expose_id, column.name)
+            if stage.released is not None
+            else None
+        )
+        if column.name in taken or (column.domain != "category" and key is None):
             continue
         what = f"history of {context.expose_id}.{column.name}"
-        levels = _declared_levels(declared, column.name)
-        if levels is None:
+        levels = key.levels if key is not None else _declared_levels(declared, column.name)
+        if key is not None and key.why is not None:
+            notes.append((what, key.why))
+        elif levels is None:
             notes.append((what, _NO_LEVELS))
         elif len(levels) < 2:
             notes.append((what, "it declares fewer than two levels"))
@@ -1035,26 +1071,50 @@ def _tracked(
                 values: List[Optional[int]] = []
                 for position, raw in enumerate(read.values[column.name]):
                     value = stage.backend.read_value(
-                        "category", raw, column=column.name, row_index=position
+                        column.domain, raw, column=column.name, row_index=position
                     )
-                    values.append(None if value is None else index[value])
-            except (ReadRefused, KeyError):
-                notes.append((what, "a value of it is outside its declared levels"))
+                    if value is not None and key is not None:
+                        value = references.spell(value, domain=column.domain)
+                    values.append(None if value is None else _place(index, value))
+            except (ReadRefused, KeyError, ValueError):
+                notes.append(
+                    (
+                        what,
+                        (
+                            "a value of it is not a key of the table it references"
+                            if key is not None
+                            else "a value of it is outside its declared levels"
+                        ),
+                    )
+                )
                 continue
-            found.append(_Tracked(column.name, levels, values))
+            found.append(_Tracked(column.name, levels, values, followed=key is not None))
     return found, notes
 
 
-def _initial(
-    context: _Context, column: _Tracked, stations: Mapping[Tuple[Any, ...], Sequence[_Version]]
-) -> Dict[str, Any]:
+def _initial_counts(
+    column: _Tracked, stations: Mapping[Tuple[Any, ...], Sequence[_Version]]
+) -> List[int]:
     counts = [0] * len(column.levels)
     for held in stations.values():
         value = column.values[held[0].position]
         if value is not None:
             counts[value] += 1
+    return counts
+
+
+def _initial(
+    context: _Context,
+    column: _Tracked,
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+    withheld: FrozenSet[int] = frozenset(),
+) -> Dict[str, Any]:
     return _levels_entry(
-        context, f"{context.expose_id}.{column.name} initial", column.levels, counts
+        context,
+        f"{context.expose_id}.{column.name} initial",
+        column.levels,
+        _initial_counts(column, stations),
+        withheld=withheld,
     )
 
 
@@ -1088,14 +1148,11 @@ def _final_levels(window: Any, column: _Tracked) -> FrozenSet[int]:
     return frozenset(found)
 
 
-def _transitions(
-    context: _Context,
-    window: Any,
-    column: _Tracked,
-    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
-) -> Dict[str, Any]:
-    backend = context.stage.backend
-    levels, size = column.levels, len(column.levels)
+def _move_counts(
+    column: _Tracked, stations: Mapping[Tuple[Any, ...], Sequence[_Version]]
+) -> Tuple[List[List[int]], int]:
+    """The changes from each level to each other, and the changes from a NULL."""
+    size = len(column.levels)
     moves = [[0] * size for _ in range(size)]
     from_null = 0
     for held in stations.values():
@@ -1107,6 +1164,25 @@ def _transitions(
                 from_null += 1
             else:
                 moves[moved[0]][moved[1]] += 1
+    return moves, from_null
+
+
+def _transitions(
+    context: _Context,
+    window: Any,
+    column: _Tracked,
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+    *,
+    whole: bool = False,
+) -> Dict[str, Any]:
+    """The changes of *column*, grouped by the column; with *whole*, every group withheld."""
+    backend = context.stage.backend
+    levels, size = column.levels, len(column.levels)
+    if whole:
+        return context.withheld(
+            "levelHistogram/1", {"levels": list(levels)}, list(levels), column.name
+        )
+    moves, from_null = _move_counts(column, stations)
     total = from_null + sum(sum(each) for each in moves)
     name = f"{context.expose_id}.{column.name} transitions"
     # The check sees each group on the levels but its own: one cell fewer, in a placeholder order.
@@ -1180,6 +1256,132 @@ def _reasons(
 
 
 # ---------------------------------------------------------------------------
+# A tracked foreign key beside the relationship's children per parent
+# ---------------------------------------------------------------------------
+
+
+def _published_cells(entry: Mapping[str, Any]) -> List[List[bool]]:
+    """Which cells of each group of a written level histogram are published."""
+    size = len(entry["levels"])
+    return [
+        (
+            [count is not None for count in group["levelCounts"]]
+            if group["status"] == _FREE
+            else [False] * size
+        )
+        for group in entry["groups"]
+    ]
+
+
+def _floor(count: int, rule: disclosure.DisclosureRule) -> int:
+    """The records a reader knows a published cell holds at least: its band's lower end."""
+    return disclosure.sample_size(count, rule)["min"]
+
+
+def _incoming_floors(
+    column: _Tracked,
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+    transitions: Mapping[str, Any],
+    rule: disclosure.DisclosureRule,
+) -> List[int]:
+    """The child rows each key is known to hold from the published changes into it.
+
+    The next version of every change into a key is a row of its own, and it holds that key.
+    """
+    moves, _ = _move_counts(column, stations)
+    shown = _published_cells(transitions)
+    size = len(column.levels)
+    return [
+        sum(
+            _floor(moves[before][after], rule)
+            for before in range(size)
+            if before != after and shown[before][after]
+        )
+        for after in range(size)
+    ]
+
+
+def _guarded(
+    context: _Context,
+    window: Any,
+    column: _Tracked,
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+) -> Tuple[FrozenSet[int], bool]:
+    """The cells of a foreign key's ``initial`` to withhold, and whether its ``transitions`` go.
+
+    A published cell of ``initial`` for a key says that key's parent holds at least that many child
+    rows (each entity's first version is a row of its own), and so does a published change into
+    it. Every key is a parent of the relationship that keys the column, so beside the relationship's
+    published children per parent a reader forms, for each bin, the parents that lie in it or above
+    it (:func:`disclosure.parents_at_or_above`). The bins the relationship withheld, which no other
+    count gave back, may be pinned by that. While they are, the published cell of ``initial`` whose
+    key sits highest is withheld too; a ``transitions`` that still pins one is withheld whole.
+    Nothing here reads a value: it reads counts the profiler formed.
+    """
+    from fluid_build.profiler import runner
+
+    stage = context.stage
+    shown = stage.children_shown.get((context.expose_id, (column.name,)))
+    if shown is None:
+        return frozenset(), False
+    edges = runner.CHILDREN_EDGES
+    lower = list(edges[:-1])
+    per_key = [0] * len(column.levels)
+    for value in column.values:
+        if value is not None:
+            per_key[value] += 1
+    cells = [0] * len(lower)
+    for held in per_key:
+        cells[min(bisect_right(edges, held) - 1, len(lower) - 1)] += 1
+    children, rule = sum(per_key), stage.rule
+    base = disclosure.pinned_children_cells(lower, cells, shown, children, rule)
+    # The trial runs write into counters of their own: what is written is formed once, after.
+    trial = _Context(
+        replace(stage, tallies=(Counter(), Counter())),
+        context.plan,
+        context.read,
+        context.expose_id,
+    )
+    incoming = _incoming_floors(
+        column, stations, _transitions(trial, window, column, stations), rule
+    )
+    counts = _initial_counts(column, stations)
+    held_back: FrozenSet[int] = frozenset()
+    while True:
+        shown_initial = _published_cells(_initial(trial, column, stations, held_back))[0]
+        floors = [
+            incoming[at] + (_floor(count, rule) if shown_initial[at] else 0)
+            for at, count in enumerate(counts)
+        ]
+        known = disclosure.parents_at_or_above(lower, floors)
+        pinned = disclosure.pinned_children_cells(
+            lower, cells, shown, children, rule, 0, None, known
+        )
+        if not pinned - base:
+            return held_back, False
+        open_ = [at for at, published in enumerate(shown_initial) if published]
+        if not open_:
+            return held_back, True
+        held_back |= {max(open_, key=lambda at: (bisect_right(lower, floors[at]), floors[at], -at))}
+
+
+def _entries(
+    context: _Context,
+    window: Any,
+    column: _Tracked,
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+) -> Dict[str, Any]:
+    """The ``initial`` and the ``transitions`` of one tracked column."""
+    held, whole = (
+        _guarded(context, window, column, stations) if column.followed else (frozenset(), False)
+    )
+    return {
+        "initial": _initial(context, column, stations, held),
+        "transitions": _transitions(context, window, column, stations, whole=whole),
+    }
+
+
+# ---------------------------------------------------------------------------
 # A table, and every table
 # ---------------------------------------------------------------------------
 
@@ -1215,13 +1417,7 @@ def _history(
     tracked, unfollowed = _tracked(context, window, declared)
     notes.extend(unfollowed)
     if tracked:
-        columns = {
-            column.name: {
-                "initial": _initial(context, column, stations),
-                "transitions": _transitions(context, window, column, stations),
-            }
-            for column in tracked
-        }
+        columns = {column.name: _entries(context, window, column, stations) for column in tracked}
         found["columns"] = columns
         if len(tracked) >= 2:
             found["reasons"] = _reasons(context, tracked, stations, columns, used)

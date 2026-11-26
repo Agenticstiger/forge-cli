@@ -1035,6 +1035,12 @@ def _report(
     _report_rank_correlations(say, result, several)
     _report_dates(say, result)
     _report_structure(say, result)
+    released = sorted(result.document.get("references", {}))
+    if released:
+        say(
+            "Published whole, as the contract marks them Public: " + ", ".join(released),
+            soft_wrap=True,
+        )
     for fact in result.facts:
         say(
             (

@@ -862,6 +862,7 @@ def pinned_children_cells(
     rule: DisclosureRule,
     childless: int = 0,
     upper: Optional[int] = None,
+    at_least: Sequence[int] = (),
 ) -> FrozenSet[int]:
     """The withheld cells of a children-per-parent table a reader may work out exactly.
 
@@ -877,7 +878,9 @@ def pinned_children_cells(
     together are not a small count, nor a zero where zeros are disclosive. Any table it
     can hold true has nonnegative cells with the parents' sum, ``lower * c <= children
     <= upper * c`` (a parent holds between its bin's edges), at least *childless* parents
-    in the first cell, and each published cell in its band.
+    in the first cell, and each published cell in its band. With *at_least* (see
+    :func:`parents_at_or_above`) the reader also knows, of each bin, that at least that many
+    parents lie in it or in a bin above: a table with fewer of them is not one it can hold true.
 
     A withheld cell is safe when two such tables differ in it. The true table (*cells*)
     is one; the other is searched for among the tables one or two parents' moves away.
@@ -898,6 +901,9 @@ def pinned_children_cells(
             return False
         for value, band in zip(table, bands, strict=True):
             if band is not None and not band["min"] <= value <= band["max"]:
+                return False
+        for at, need in enumerate(at_least):
+            if sum(table[at:]) < need:
                 return False
         if any_published:
             rest = sum(value for value, shown in zip(table, published, strict=True) if not shown)
@@ -938,6 +944,17 @@ def pinned_children_cells(
         if not _two_tables(cells, index, moves, holds, repairs):
             pinned.add(index)
     return frozenset(pinned)
+
+
+def parents_at_or_above(lower_edges: Sequence[int], floors: Iterable[int]) -> List[int]:
+    """For each bin of a children-per-parent table, the parents known to lie in it or above it.
+
+    *floors* are the children each parent is known to hold at least: a public key's published
+    cells, each of which counts distinct child rows of that key. A parent whose floor reaches a
+    bin's lower edge holds at least that many children, so it lies in that bin or in one above.
+    """
+    held = list(floors)
+    return [sum(1 for floor in held if floor >= edge) for edge in lower_edges]
 
 
 def _two_tables(

@@ -1033,6 +1033,7 @@ module = [
     "fluid_build.profiler.per_entity",
     "fluid_build.profiler.query_rates",
     "fluid_build.profiler.ranks",
+    "fluid_build.profiler.references",
     "fluid_build.profiler.request",
     "fluid_build.profiler.runner",
     "fluid_build.profiler.sources",
