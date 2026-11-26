@@ -33,15 +33,19 @@ def _pins(lock: Path) -> Dict[str, Version]:
     return pins
 
 
+def _script() -> str:
+    return (REPO / "scripts" / "ci" / "compile_requirements.sh").read_text(encoding="utf-8")
+
+
 def _compile_targets() -> list[str]:
-    text = (REPO / "scripts" / "ci" / "compile_requirements.sh").read_text(encoding="utf-8")
+    text = _script()
     m = re.search(r"targets=\(([a-z][^)]*)\)", text)
     assert m, "no default target list in compile_requirements.sh"
     return m.group(1).split()
 
 
 def test_every_lock_has_a_source_and_a_compile_rule() -> None:
-    script = (REPO / "scripts" / "ci" / "compile_requirements.sh").read_text(encoding="utf-8")
+    script = _script()
     for name in _compile_targets():
         assert (REQ / f"{name}.in").is_file(), name
         assert (REQ / f"{name}.txt").is_file(), name
@@ -64,7 +68,7 @@ def test_the_singer_tap_is_installed_from_its_lock_only() -> None:
 
 def test_the_security_tools_lock_is_resolved_for_the_python_that_installs_it() -> None:
     """Security Scan installs it on 3.12; the fixed filelock and wcmatch need 3.11+."""
-    script = (REPO / "scripts" / "ci" / "compile_requirements.sh").read_text(encoding="utf-8")
+    script = _script()
     m = re.search(r"([\w| -]*ci-security[\w| -]*)\) compile_one \"\$\{target\}\" (\S+)", script)
     assert m and m.group(2) == "3.12", script
 
