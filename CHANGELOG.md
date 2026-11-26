@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetches runs read-only with no stored credential and hands the changed catalog on as a file, and
   the one that pushes the proposal branch checks that file parses as a JSON object, installs and
   runs nothing, and gives the token to the single step that pushes.
+- **The verification image's Singer tap is installed from a hash lock.** `Dockerfile.verify` ran
+  an unpinned `pip install meltanolabs-tap-postgres` into its own virtual environment. The tap and
+  its dependencies are now named in `requirements/singer-tap.in` and hash-locked in
+  `requirements/singer-tap.txt`, installed with `--require-hashes`.
+- **The security tools' lock no longer carries known advisories.** `requirements/ci-security.txt`
+  is now resolved for Python 3.12, the version that installs it, which lets it take `filelock`
+  4.3.1 (the pip-audit dependency chain had no bound) and, through overrides until the scanner pins
+  fixed releases itself, `opentelemetry` 1.45.2 and `wcmatch` 12.0.4. The OSV scan of the lock
+  went from 20 advisories to none, and the scanner's output on this repository is unchanged.
 
 ### Fixed
 

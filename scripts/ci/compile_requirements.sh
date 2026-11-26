@@ -33,13 +33,13 @@ compile_one() {
 
 targets=("$@")
 if [ "${#targets[@]}" -eq 0 ]; then
-  targets=(ci-tools ci-security ci-typecheck verify-image release-tools release-image)
+  targets=(ci-tools ci-security ci-typecheck verify-image singer-tap release-tools release-image)
 fi
 
 for target in "${targets[@]}"; do
   case "${target}" in
-    ci-tools | ci-security | ci-typecheck) compile_one "${target}" 3.10 ;;
-    verify-image | release-tools) compile_one "${target}" 3.12 ;;
+    ci-tools | ci-typecheck) compile_one "${target}" 3.10 ;;
+    ci-security | verify-image | singer-tap | release-tools) compile_one "${target}" 3.12 ;;
     release-image) compile_one "${target}" 3.14 ;;
     *)
       echo "unknown lock file: ${target}" >&2

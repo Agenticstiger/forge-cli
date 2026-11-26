@@ -1,7 +1,12 @@
 # Source for requirements/ci-security.txt: the static analysers and the
 # dependency auditor of the Security Scan job. Installed into their own virtual
 # environment, never into the project's, so the audit sees only what the project
-# resolves. Regenerate with scripts/ci/compile_requirements.sh.
+# resolves. Regenerate with scripts/ci/compile_requirements.sh. The job runs on
+# Python 3.12, so the lock is resolved for 3.12: the fixed releases of filelock
+# and wcmatch below need Python 3.11 or newer.
 bandit[toml]
 semgrep==1.186.0
 pip-audit
+# pip-audit reaches filelock through cachecontrol with no upper bound, and every
+# release before 4.2.1 carries advisories, one of them high (GHSA-v4x8-3wr5-3wq8).
+filelock>=4.2.1
