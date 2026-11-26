@@ -304,8 +304,13 @@ def test_a_release_records_the_versions_of_the_exposes_and_the_code_it_was_built
         "repository": "https://github.com/org/orders",
         "ref": "refs/tags/v1.4.0",
     }
-    # the code's revision describes the run: it is not in what identifies the release
-    assert sha not in json.dumps(index["identity"])
+    # the commit is part of what identifies the release (SLSA: a resolved dependency); the
+    # ref is not, so a branch build and a tag build of one commit are one release
+    assert index["identity"]["source"] == {
+        "uri": "git+https://github.com/org/orders",
+        "digest": {"gitCommit": sha},
+    }
+    assert "refs/tags" not in json.dumps(index["identity"])
 
 
 def test_the_release_names_its_bundles_source_contract_from_where_it_sits(
@@ -837,3 +842,12 @@ def test_a_plan_made_from_the_release_applies_with_its_dbt_project(tmp_path: Pat
     edited = _cli(moved, *apply_argv)
     assert edited.returncode == 1
     assert "changed models/orders.sql" in edited.stdout + edited.stderr
+
+
+def test_without_a_ci_commit_the_identity_names_no_source() -> None:
+    assert release.source_identity({}) is None
+    assert release.source_identity({"GITHUB_RUN_ID": "1", "GITHUB_SHA": "main"}) is None
+    source = release.source_identity(
+        {"CI_JOB_ID": "1", "CI_COMMIT_SHA": "a" * 40, "CI_COMMIT_REF_NAME": "main"}
+    )
+    assert source == {"digest": {"gitCommit": "a" * 40}}  # no repository: no uri

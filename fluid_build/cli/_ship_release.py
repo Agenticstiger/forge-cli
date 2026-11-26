@@ -366,7 +366,24 @@ def build_identity(
         identity["apply_mode"] = opts.mode
     if external:
         identity["external"] = [a.entry.identity() for a in external]
+    source = source_identity(os.environ)
+    if source:
+        identity["source"] = source
     return identity
+
+
+def source_identity(env: Mapping[str, str]) -> Optional[Dict[str, Any]]:
+    """The commit the CI built, as ``identity`` records it, or ``None`` with no commit: shaped
+    as a SLSA ``resolvedDependencies`` entry, as each external file's source is
+    (``{"uri": "git+<repo>", "digest": {"gitCommit": <commit>}}``). The ref is left out, so a
+    branch build and a tag build of one commit name the same source."""
+    found = source_revision(env)
+    if not found or "revision" not in found:
+        return None
+    source: Dict[str, Any] = {"digest": {"gitCommit": found["revision"]}}
+    if "repository" in found:
+        source["uri"] = f"git+{found['repository']}"
+    return source
 
 
 def identity_digest(identity: Mapping[str, Any]) -> str:
