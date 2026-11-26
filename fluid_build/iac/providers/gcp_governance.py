@@ -80,7 +80,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
-from ...providers._access_grants import READ_VERBS
+from ...providers._access_grants import READ_VERBS, logical_key
 from .. import column_types
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
@@ -806,7 +806,8 @@ def row_policies(
     (``roles/bigquery.dataEditor`` reads rows too). The last policy selects every row
     for every other member with a grant on the expose, and never for an identity a
     filter names: BigQuery shows a principal the union of the policies naming it, so
-    a filtered identity in it would read every row.
+    a filtered identity in it would read every row. Identities are compared with their
+    case folded, so one spelled in another case in a grant or in ``readers`` stays out too.
     """
     filters = row_filters_for(exposure, index, dialect="bigquery")
     if not filters:
@@ -844,7 +845,8 @@ def row_policies(
                 grantees=tuple(sorted(identities)),
             )
         )
-    rest = sorted(members - filtered)
+    named = {logical_key(identity).casefold() for identity in filtered}
+    rest = sorted(m for m in members if logical_key(m).casefold() not in named)
     if rest:
         out.append(
             RowPolicy(

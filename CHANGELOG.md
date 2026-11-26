@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed. The runner now returns normally on success and exits only with a failure's code. EMR
   runs are unchanged.
 
+### Security
+
+- **A principal a row filter names never reads every row through BigQuery, whatever its case.** A
+  principal that a `policy.authz.rowFilters` entry names, spelled in another case in an
+  `accessPolicy` grant or in `policy.authz.readers`, could also be a grantee of the BigQuery
+  every-row policy (`fluid_all_rows`), so it could read every row; whether BigQuery treats the two
+  spellings as one principal is not documented. Present since 0.19.0. `fluid apply` now leaves
+  every identity a filter names out of that policy whatever its case.
+
 ## [0.41.0] — 2026-11-25
 
 ### Added
