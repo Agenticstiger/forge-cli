@@ -473,3 +473,38 @@ def test_a_large_plan_and_a_name_the_generators_may_write_verify(tmp_path: Path)
     _swap(directory, "reports/my report@1.json", b"{}")
     result = verify_release(directory)
     assert result.intact, result.problems
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {},
+        "x",
+        {"digest": {"gitCommit": "zz"}},
+        {"uri": "https://h/r", "digest": {"gitCommit": "a" * 40}},
+    ],
+)
+def test_a_source_that_is_not_a_commit_is_not_intact(tmp_path: Path, source: Any) -> None:
+    sealed(tmp_path / "rel")
+    _reseal(tmp_path / "rel", source=source)
+    result = verify_release(tmp_path / "rel")
+    assert result.exit_code == 1
+    assert "its identity's source is not a commit" in result.problems[0]
+
+
+def test_a_second_read_takes_the_version_the_first_did(tmp_path: Path) -> None:
+    directory = _pinned(tmp_path / "rel")
+    s3 = FakeS3()
+    s3.versions = True
+    uri = publish.publish_release(directory, "s3://acme-releases/r/", clients=s3).uri
+    asked: List[Any] = []
+    real = s3.get_object
+
+    def get_object(**kw: Any) -> Any:
+        asked.append((kw["Key"].rsplit("/", 1)[-1], kw.get("VersionId")))
+        return real(**kw)
+
+    s3.get_object = get_object  # type: ignore[method-assign]
+    assert verify_release(uri, clients=s3).intact
+    manifest_reads = [v for k, v in asked if k == "MANIFEST.json"]
+    assert len(manifest_reads) == 2 and manifest_reads[0] is None and manifest_reads[1]

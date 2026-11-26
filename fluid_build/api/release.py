@@ -6,11 +6,12 @@
 ``fluid ship --release-dir DIR`` seals a release: ``release.json`` names the release's
 ``identity``, its ``identity_digest`` and the sha256 of every other file. ``fluid ship
 --release-to s3://bucket/prefix/`` publishes the same bytes under
-``<prefix>/<product>/<environment>/<identity hex>/``. :func:`verify_release` reads one back and
+``<prefix>/<product>/<code hex>/<environment>/``. :func:`verify_release` reads one back and
 says whether it is the release it claims to be:
 
 - ``intact``: the index parses as a ``fluid-release/1`` record, its ``identity_digest`` is the
-  digest of its ``identity``, an S3 key that ends in an identity's hex is this identity's, every
+  digest of its ``identity``, its ``code_digest`` is the digest of the code ``identity`` names,
+  an S3 key laid out as ``<code hex>/<env>/`` is this release's code and environment, every
   file the index lists is there with the sha256 it names, and the files ``identity`` pins (the
   bundle, each external file, the artifacts MANIFEST and what it lists, the plan) are listed with
   the digests ``identity`` names, so a file swapped with its index entry rewritten is caught;
@@ -198,6 +199,9 @@ def _code_problems(identity: Mapping[str, Any], stated: Any) -> List[str]:
     source commit). It sits outside ``identity``, so it is recomputed, never trusted."""
     from fluid_build.util import release_record as record
 
+    source = identity.get("source")
+    if source is not None and not _is_source(source):
+        return ["its identity's source is not a commit (git+<repo> and a hex gitCommit)"]
     expected = record.code_digest(identity)
     if expected == stated:
         return []
@@ -206,6 +210,21 @@ def _code_problems(identity: Mapping[str, Any], stated: Any) -> List[str]:
     if stated is None:
         return ["its identity names a source commit, and it states no code_digest"]
     return ["its code_digest is not the digest of the code its identity names"]
+
+
+def _is_source(source: Any) -> bool:
+    """Whether ``source`` is what ``fluid ship`` writes: a hex commit, and maybe a ``git+`` uri."""
+    if not isinstance(source, Mapping) or set(source) - {"uri", "digest"}:
+        return False
+    digest = source.get("digest")
+    commit = digest.get("gitCommit") if isinstance(digest, Mapping) else None
+    uri = source.get("uri", "git+")
+    return (
+        isinstance(commit, str)
+        and re.fullmatch(r"[0-9a-f]{7,64}", commit) is not None
+        and isinstance(uri, str)
+        and uri.startswith("git+")
+    )
 
 
 def _layout_problems(reader: "_Reader", stated: Any, environment: Any) -> List[str]:
@@ -267,7 +286,9 @@ def _check_bound(
 
     def listed(rel: str, digest: Any, what: str) -> None:
         if not isinstance(digest, str) or files.get(rel) != digest:
-            problems.append(f"{rel}: the index does not list it with the sha256 {what} names")
+            problems.append(
+                f"{_clean(rel)}: the index does not list it with the sha256 {what} names"
+            )
 
     bundle = identity.get("bundle")
     if isinstance(bundle, Mapping) and "sha256" in bundle:
@@ -309,6 +330,8 @@ def _read_json_member(
         return None
     try:
         data = reader.read(rel, MAX_MEMBER_BYTES)
+        if "sha256:" + hashlib.sha256(data).hexdigest() != files[rel]:
+            raise _NotIntact("it changed while it was read")
     except _NotIntact as exc:
         problems.append(f"{rel}: {exc}")
         return None
@@ -583,9 +606,11 @@ class _S3Reader(_Reader):
         from fluid_build.util import s3
 
         try:
-            got = self.client.get_object(Bucket=self.bucket, Key=self.prefix + rel)
+            pinned = self.versions.get(rel)  # a second read takes the version the first read did
+            extra = {"VersionId": pinned} if pinned else {}
+            got = self.client.get_object(Bucket=self.bucket, Key=self.prefix + rel, **extra)
             version = got.get("VersionId")
-            self.versions[rel] = version if isinstance(version, str) else None
+            self.versions.setdefault(rel, version if isinstance(version, str) else None)
             return got["Body"]
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
             code = s3.error_code(exc)

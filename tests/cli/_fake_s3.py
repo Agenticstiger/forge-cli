@@ -97,7 +97,7 @@ class FakeS3:
             head.update(ChecksumSHA256=checksum, ChecksumType="FULL_OBJECT")
         return head
 
-    def get_object(self, *, Bucket: str, Key: str) -> Dict[str, Any]:
+    def get_object(self, *, Bucket: str, Key: str, VersionId: str = "") -> Dict[str, Any]:
         self.calls.append("get_object")
         if Key in self.deny_get:
             raise S3Error("AccessDenied", 403)
