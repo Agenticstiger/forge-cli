@@ -263,8 +263,8 @@ def test_sign_stores_a_signed_verification_summary(
 
     def fake_sign(path: str, *, key_ref: Any = None) -> Dict[str, Any]:
         signed.append((path, key_ref))
-        Path(path + ".sig").write_bytes(b"signature")
-        return {"exit_code": 0, "sig_path": path + ".sig", "pem_path": None}
+        Path(path + ".sigstore.json").write_bytes(b"bundle")
+        return {"exit_code": 0, "bundle_path": path + ".sigstore.json"}
 
     monkeypatch.setattr(_signing, "cosign_available", lambda: True)
     monkeypatch.setattr(_signing, "sign_blob", fake_sign)
@@ -277,7 +277,7 @@ def test_sign_stores_a_signed_verification_summary(
     assert done.written == [
         f"{stem}.report.json",
         f"{stem}.intoto.jsonl",
-        f"{stem}.intoto.jsonl.sig",
+        f"{stem}.intoto.jsonl.sigstore.json",
         f"{stem}.json",
     ]
     assert signed[0][1] == "awskms:///alias/k"
@@ -838,11 +838,11 @@ def test_a_cosign_that_writes_no_signature_file_writes_nothing(
     monkeypatch.setattr(
         _signing,
         "sign_blob",
-        lambda path, key_ref=None: {"exit_code": 0, "sig_path": path + ".sig", "pem_path": None},
+        lambda path, key_ref=None: {"exit_code": 0},
     )
     uris = _published(tmp_path, s3, "nonprod")
     report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
-    with pytest.raises(receipts.ReceiptError, match="wrote no signature file"):
+    with pytest.raises(receipts.ReceiptError, match="wrote no bundle"):
         receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
     assert _names(s3, "nonprod") == []
 
@@ -940,10 +940,13 @@ def test_a_bad_sign_key_writes_nothing(
 
 
 @pytest.fixture
-def cosign(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
-    """A fake cosign: signs by writing the blob's sha256 as the signature, and verifies a
-    signature when it is that sha256 and the signer is the one ``state["signer"]`` names."""
+def cosign(monkeypatch: pytest.MonkeyPatch, s3: FakeS3) -> Dict[str, Any]:
+    """A fake cosign: signs by writing the blob's sha256 as its bundle, and verifies a bundle
+    when it is that sha256 and the signer is the one ``state["signer"]`` names. The bucket
+    locks what it holds (GOVERNANCE, a day), as ``--require-signed`` needs."""
     from fluid_build.cli import _signing
+
+    s3.object_lock, s3.retention = True, ("GOVERNANCE", 1)
 
     state: Dict[str, Any] = {
         "signer": ("ci@example.com", "https://issuer.example.com"),
@@ -952,18 +955,13 @@ def cosign(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
 
     def sign(path: str, *, key_ref: Any = None) -> Dict[str, Any]:
         digest = hashlib.sha256(Path(path).read_bytes()).hexdigest().encode()
-        Path(path + ".sig").write_bytes(digest)
-        Path(path + ".pem").write_bytes(b"certificate")
-        return {
-            "exit_code": 0,
-            "sig_path": path + ".sig",
-            "pem_path": None if key_ref else path + ".pem",
-        }
+        Path(path + ".sigstore.json").write_bytes(digest)
+        return {"exit_code": 0, "bundle_path": path + ".sigstore.json"}
 
     def verify(path: str, **kw: Any) -> Dict[str, Any]:
         state["calls"].append(kw)
         good = (
-            Path(kw["sig_path"]).read_bytes()
+            Path(kw["bundle_path"]).read_bytes()
             == hashlib.sha256(Path(path).read_bytes()).hexdigest().encode()
         )
         who = (kw.get("certificate_identity"), kw.get("certificate_oidc_issuer"))
@@ -994,7 +992,10 @@ def test_require_signed_passes_a_receipt_signed_by_the_pinned_signer(
         certificate_oidc_issuer="https://issuer.example.com",
     )
     found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=other, clients=s3)
-    assert found.exit_code == 1 and "does not verify for that signer" in found.reason
+    assert (
+        found.exit_code == 1
+        and "did not verify the newest receipt's signature for that signer" in found.reason
+    )
 
 
 def test_require_signed_fails_an_unsigned_or_forged_receipt(
@@ -1043,15 +1044,137 @@ def test_require_signed_flags(
         assert code == 2 and problem in caplog.text
 
 
-def test_require_signed_needs_a_bucket_that_keeps_versions(
+FAILING = {"total": 1, "match": 0, "mismatch": 0, "error": 1}
+
+
+def test_require_signed_needs_object_lock_with_a_default_retention(
     tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
 ) -> None:
     uris = _published(tmp_path, s3, "nonprod", "prod")
     report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
     receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
-    s3.versioning = None
+    assert (
+        receipts.check_receipt(
+            uris["prod"], environment="nonprod", signer=SIGNER, clients=s3
+        ).exit_code
+        == 0
+    )
+    for change in ({"lock_rule": False}, {"object_lock": False}):
+        for attr, value in change.items():
+            setattr(s3, attr, value)
+        found = receipts.check_receipt(
+            uris["prod"], environment="nonprod", signer=SIGNER, clients=s3
+        )
+        assert found.exit_code == 2 and "has no Object Lock with a default retention" in (
+            found.reason
+        )
+        s3.lock_rule, s3.object_lock = True, True
+
+
+def test_require_signed_on_a_release_on_disk_decides_nothing(
+    tmp_path: Path, cosign: Dict[str, Any]
+) -> None:
+    for env in ("nonprod", "prod"):
+        sealed(tmp_path / env, environment=env)
+    report = _report(tmp_path / "a.json", tmp_path / "nonprod")
+    receipts.record_receipt(str(tmp_path / "nonprod"), report_path=str(report), sign=True)
+    found = receipts.check_receipt(str(tmp_path / "prod"), environment="nonprod", signer=SIGNER)
+    assert found.exit_code == 2 and "keeps no trace of a deleted receipt" in found.reason
+
+
+def test_a_rollback_by_deleting_the_newer_failed_receipt_fails_closed(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
+) -> None:
+    """The newer signed FAILED receipt removed with every version (s3:DeleteObjectVersion, once
+    its lock ran out): the older PASSED one is older still, its lock ran out first, and a
+    receipt without a lock in force gates nothing."""
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    good = _report(tmp_path / "a.json", uris["nonprod"], clients=s3)
+    bad = _report(tmp_path / "b.json", uris["nonprod"], FAILING, clients=s3)
+    first = receipts.record_receipt(
+        uris["nonprod"], report_path=str(good), sign=True, clients=s3, now=T0
+    )
+    done = receipts.record_receipt(
+        uris["nonprod"], report_path=str(bad), sign=True, clients=s3, now=T0 + timedelta(hours=1)
+    )
+    assert (
+        receipts.check_receipt(
+            uris["prod"], environment="nonprod", signer=SIGNER, clients=s3
+        ).exit_code
+        == 1
+    )
+    stem = done.uri.split("/", 3)[3][: -len(".json")]
+    for key in [k for (_b, k) in list(s3.objects) if k.startswith(stem)]:
+        del s3.objects[("acme-releases", key)]  # every version gone: no version, no marker
+    old = first.uri.split("/", 3)[3][: -len(".json")]
+    s3.expired |= {k for (_b, k) in s3.objects if k.startswith(old)}
     found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
-    assert found.exit_code == 1 and "does not keep versions" in found.reason
+    assert found.exit_code == 1 and "carry no Object Lock in force" in found.reason
+    assert "record a fresh nonprod receipt" in found.reason
+
+
+def test_require_signed_needs_the_statement_locked_too(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    done = receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    stem = done.uri.split("/", 3)[3][: -len(".json")]
+    s3.unlocked.add(f"{stem}.intoto.jsonl.sigstore.json")
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 1 and "intoto.jsonl.sigstore.json first" in found.reason
+
+
+def test_a_retry_that_finds_its_own_write_is_written(
+    tmp_path: Path, s3: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """botocore re-sends a put whose response was lost and gets 412: the object holds this
+    run's bytes, so the receipt was written."""
+    from tests.cli._fake_s3 import S3Error
+
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "a.json", uris["nonprod"], clients=s3)
+    real = s3.put_object
+
+    def lost_ack(**kw: Any) -> Dict[str, Any]:
+        real(**kw)
+        if "/receipts/" in kw["Key"]:
+            raise S3Error("PreconditionFailed", 412)
+        return {}
+
+    monkeypatch.setattr(s3, "put_object", lost_ack)
+    done = receipts.record_receipt(uris["nonprod"], report_path=str(report), clients=s3, now=T0)
+    assert done.result == "PASSED"
+    monkeypatch.setattr(s3, "put_object", real)
+    assert receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3).exit_code == 0
+    # a 412 over other bytes is still a receipt that exists
+    s3.put_object = lambda **kw: (_ for _ in ()).throw(S3Error("PreconditionFailed", 412))  # type: ignore[method-assign]
+    s3.objects[
+        ("acme-releases", done.uri.split("/", 3)[3].removesuffix(".json") + ".report.json")
+    ] = b"x"
+    with pytest.raises(receipts.ReceiptError, match="already exists"):
+        receipts.record_receipt(uris["nonprod"], report_path=str(report), clients=s3, now=T0)
+
+
+def test_cosign_stderr_is_named_when_it_does_not_verify(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import _signing
+
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    monkeypatch.setattr(
+        _signing,
+        "verify_blob",
+        lambda path, **kw: {
+            "exit_code": 1,
+            "stderr_tail": "x\nError: getting tlog: \x1b[31mtimeout",
+        },
+    )
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 1 and "transparency log or certificate authority" in found.reason
+    assert found.reason.endswith(": Error: getting tlog: ?[31mtimeout")
 
 
 def test_a_listing_whose_pages_do_not_advance_decides_nothing(
@@ -1081,7 +1204,9 @@ def test_a_signed_statement_of_another_shape_does_not_pass(
     statement["predicate"][receipts.RECEIPT_EXTENSION] = extension
     body = json.dumps(statement).encode()
     s3.objects[("acme-releases", key)] = body
-    s3.objects[("acme-releases", key + ".sig")] = hashlib.sha256(body).hexdigest().encode()
+    s3.objects[("acme-releases", key + ".sigstore.json")] = (
+        hashlib.sha256(body).hexdigest().encode()
+    )
     found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
     assert found.exit_code == 1 and "is not one a receipt is signed as" in found.reason
 

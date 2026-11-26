@@ -264,8 +264,11 @@ def _register_receipt(sub: argparse._SubParsersAction) -> None:
             "names is there and intact. Never reads a release's gates or provenance. Reports "
             "whether each object carries an Object Lock. A receipt is only as trusted as who "
             "can write receipts/<env>/: keep that to the verifier's identity, or sign receipts "
-            "with a signer build code cannot reach and pass --require-signed. Exit 0 passes, 1 "
-            "does not, 2 cannot decide."
+            "with a signer build code cannot reach and pass --require-signed, which needs a "
+            "bucket with Object Lock where no writer of receipts/<env>/ holds "
+            "s3:DeleteObjectVersion, s3:BypassGovernanceRetention or s3:PutObjectRetention. A "
+            "receipt whose lock ran out gates nothing: record a fresh one. Exit 0 passes, 1 does "
+            "not, 2 cannot decide."
         ),
     )
     chk.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")
@@ -281,8 +284,9 @@ def _register_receipt(sub: argparse._SubParsersAction) -> None:
         "--require-signed",
         action="store_true",
         help=(
-            "Also fail unless the receipt's Statement verifies with cosign for this signer: "
-            "--verify-key, or --certificate-identity with --certificate-oidc-issuer"
+            "Also fail unless the receipt's Statement verifies with cosign for this signer "
+            "(--verify-key, or --certificate-identity with --certificate-oidc-issuer); implies "
+            "--require-locked, needs Object Lock, and decides nothing on disk"
         ),
     )
     chk.add_argument("--verify-key", metavar="REF", help="With --require-signed: a cosign key")

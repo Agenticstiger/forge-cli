@@ -264,8 +264,8 @@ def checkout_head(directory: Path) -> Optional[str]:
 
 def _checkout_problem(contract_dir: Path) -> Optional[str]:
     """Why the release would name a commit it was not built from, or None: the CI names one
-    commit, and the contract's checkout is at another (a workflow that checks out a pull
-    request's head while the CI variable names the base). The release's code digest is the
+    commit, and the contract's checkout is at another (the contract in a second repository or a
+    submodule, or a pull-request pipeline that builds a local merge commit). The release's code digest is the
     commit's, so it must be the one built. A contract outside a git checkout is not checked."""
     source = source_identity(os.environ)
     if source is None:
@@ -276,8 +276,10 @@ def _checkout_problem(contract_dir: Path) -> Optional[str]:
         return None
     return (
         f"--release-dir: the CI names commit {named}, and the contract's checkout is at "
-        f"{clean(head, 64)}: a release names the commit it was built from, so seal it from a "
-        "checkout of that commit"
+        f"{clean(head, 64)}: a release names the commit it was built from. This happens when the "
+        "contract sits in a second repository or a submodule, or when a pull-request pipeline "
+        "builds a local merge commit (Bitbucket, Jenkins merge-with-target): seal from the "
+        "checkout the CI variable names, or set that variable to the commit checked out"
     )
 
 

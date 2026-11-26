@@ -48,6 +48,8 @@ VSA_PREDICATE_TYPE = "https://slsa.dev/verification_summary/v1"
 INTOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 #: The extension field of the signed Statement that carries the receipt itself.
 RECEIPT_EXTENSION = "https://fluid-build.io/receipt/v1"
+#: The Statement's cosign bundle, beside it: ``<stem>.intoto.jsonl.sigstore.json``.
+SIGNED_SUFFIX = "intoto.jsonl.sigstore.json"
 
 PASS, FAIL, UNDECIDED = 0, 1, 2
 _S3_TARGET = re.compile(
@@ -226,7 +228,9 @@ def _within_cap(shown: str, names: List[str]) -> List[str]:
     if len(names) > rr.MAX_ENTRIES:
         raise ReceiptError(
             f"{shown} holds more than {rr.MAX_ENTRIES:,} entries, so the newest receipt cannot be "
-            "told: move old receipts aside",
+            "told. Receipts are never moved or expired (a versioned bucket keeps a delete marker "
+            "for each, and the check then fails): gate this code no further, and release a new "
+            "commit, whose code digest starts a new folder",
             UNDECIDED,
         )
     return names
@@ -437,6 +441,15 @@ class _S3Store(_Store):
             except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
                 code, status = s3.error_code(exc), s3.http_status(exc)
                 if code in s3.PRECONDITION_CODES or status == 412:
+                    # a retry after a lost response finds this run's own write: ours when the
+                    # bytes are (as the release publish takes an object already there)
+                    there = self._head(name)
+                    if (
+                        there is not None
+                        and there.get("ChecksumSHA256") == s3.sha256_b64(hex_digest)
+                        and there.get("ContentLength", len(data)) == len(data)
+                    ):
+                        return
                     raise ReceiptError(
                         f"{self.shown}{name} already exists: a receipt is written once"
                     ) from None
@@ -860,8 +873,8 @@ def statement(receipt: Mapping[str, Any], receipt_bytes: bytes) -> Dict[str, Any
 def _signed(
     name: str, data: bytes, receipt: Mapping[str, Any], key_ref: Optional[str]
 ) -> List[Tuple[str, bytes]]:
-    """The receipt's Statement, signed with cosign, and its signature (and, keyless, its
-    certificate): the files stored beside the receipt."""
+    """The receipt's Statement and its cosign bundle (signature, certificate, log proof): the
+    files stored beside the receipt."""
     from fluid_build._contract_loader import CLIError
     from fluid_build.cli import _signing
 
@@ -875,15 +888,16 @@ def _signed(
         except CLIError as exc:
             raise ReceiptError(f"--sign: {exc.event}; nothing was written", UNDECIDED) from None
         if result.get("exit_code") != 0:
-            raise ReceiptError("cosign could not sign the receipt; nothing was written", UNDECIDED)
+            raise ReceiptError(
+                "cosign could not sign the receipt; nothing was written" + _cosign_tail(result),
+                UNDECIDED,
+            )
         try:
             out = [(f"{stem}.intoto.jsonl", path.read_bytes())]
-            out.append((f"{stem}.intoto.jsonl.sig", Path(result["sig_path"]).read_bytes()))
-            if result.get("pem_path"):
-                out.append((f"{stem}.intoto.jsonl.pem", Path(result["pem_path"]).read_bytes()))
+            out.append((f"{stem}.{SIGNED_SUFFIX}", Path(result["bundle_path"]).read_bytes()))
         except (OSError, KeyError, TypeError):
             raise ReceiptError(
-                "cosign wrote no signature file where it was asked to; nothing was written",
+                "cosign wrote no bundle where it was asked to; nothing was written",
                 UNDECIDED,
             ) from None
     return out
@@ -989,12 +1003,13 @@ def check_receipt(
         store = place.store(environment)
         name, receipt, data = _newest_receipt(store, code, ignored)
         reason, there = _receipt_problem(store, name, receipt, environment, place, factory, region)
+        if signer is not None:
+            _lock_rule_problem(place)
+            require_locked = True  # a signed receipt holds only while nothing can delete it
         if reason is None and signer is not None:
-            reason = _versioned_problem(place) or _signature_problem(
-                store, name, receipt, data, there, signer
-            )
+            reason = _signature_problem(store, name, receipt, data, there, signer)
         locks = (
-            _locks(place, checked, there, environment, store, name)
+            _locks(place, checked, there, environment, store, name, signed=signer is not None)
             if place.client is not None
             else []
         )
@@ -1020,7 +1035,9 @@ def check_receipt(
         elif require_locked and unlocked and out.exit_code == PASS:
             out.exit_code = FAIL
             out.reason = (
-                f"--require-locked: {len(unlocked)} object(s) carry no Object Lock in force"
+                f"--require-locked: {len(unlocked)} object(s) carry no Object Lock in force "
+                f"(none, or it ran out; {unlocked[0]} first). A receipt whose lock ran out "
+                f"gates nothing: record a fresh {environment} receipt"
             )
     elif require_locked and out.exit_code == PASS:
         out.exit_code = FAIL
@@ -1102,27 +1119,56 @@ def _receipt_problem(
     return None, there
 
 
-def _versioned_problem(place: _Place) -> Optional[str]:
-    """With ``--require-signed``: the receipts bucket keeps every version. Without versioning a
-    deleted receipt leaves no trace, so an older signed one could decide."""
+def _cosign_tail(result: Mapping[str, Any]) -> str:
+    """The last line of cosign's stderr, cleaned and cut, for a message."""
+    tail = str(result.get("stderr_tail") or "").strip().splitlines()
+    return f": {clean(tail[-1], 200)}" if tail else ""
+
+
+def _lock_rule_problem(place: _Place) -> None:
+    """With ``--require-signed``: the receipts bucket locks what it holds. A signature cannot
+    show that a newer receipt was never there; only a lock in force keeps one from being
+    deleted. On disk nothing does, so that cannot be decided.
+
+    Raises:
+        ReceiptError: (exit 2) on disk; no Object Lock with a default retention; unreadable.
+    """
     if place.client is None:
-        return None
+        raise ReceiptError(
+            "--require-signed: a release on disk keeps no trace of a deleted receipt, so an "
+            "older signed one could decide; gate on releases in a bucket with Object Lock",
+            UNDECIDED,
+        )
     from fluid_build.util import s3
 
     try:
-        status = place.client.get_bucket_versioning(Bucket=place.bucket).get("Status")
+        got = place.client.get_object_lock_configuration(Bucket=place.bucket)
+        config = got.get("ObjectLockConfiguration") or {}
     except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
+        code = s3.error_code(exc)
+        if code == "ObjectLockConfigurationNotFoundError":
+            config = {}
+        else:
+            raise ReceiptError(
+                f"--require-signed: the Object Lock of {place.bucket} cannot be read "
+                f"({code or type(exc).__name__})",
+                UNDECIDED,
+            ) from None
+    rule = config.get("Rule") if isinstance(config, Mapping) else None
+    default = rule.get("DefaultRetention") if isinstance(rule, Mapping) else None
+    default = default if isinstance(default, Mapping) else {}
+    period = any(type(default.get(u)) is int and default[u] > 0 for u in ("Days", "Years"))
+    if (
+        config.get("ObjectLockEnabled") != "Enabled"
+        or default.get("Mode") not in ("GOVERNANCE", "COMPLIANCE")
+        or not period
+    ):
         raise ReceiptError(
-            f"--require-signed: the versioning of {place.bucket} cannot be read "
-            f"({s3.error_code(exc) or type(exc).__name__})",
+            f"--require-signed: the bucket {place.bucket} has no Object Lock with a default "
+            "retention, so a receipt could be deleted without a trace and an older signed one "
+            "decide",
             UNDECIDED,
-        ) from None
-    if status != "Enabled":
-        return (
-            f"--require-signed: the bucket {place.bucket} does not keep versions, so a deleted "
-            "receipt leaves no trace"
         )
-    return None
 
 
 def _signature_problem(
@@ -1141,10 +1187,7 @@ def _signature_problem(
     from fluid_build.cli import _signing
 
     stem = name[: -len(".json")]
-    keyless = signer.key_ref is None
-    wanted = [f"{stem}.intoto.jsonl", f"{stem}.intoto.jsonl.sig"]
-    if keyless:
-        wanted.append(f"{stem}.intoto.jsonl.pem")
+    wanted = [f"{stem}.intoto.jsonl", f"{stem}.{SIGNED_SUFFIX}"]
     try:
         files = {w: store.read(w, rr.MAX_RECEIPT_BYTES) for w in wanted}
     except ReceiptError as exc:
@@ -1161,8 +1204,7 @@ def _signature_problem(
         try:
             result = _signing.verify_blob(
                 str(paths[wanted[0]]),
-                sig_path=str(paths[wanted[1]]),
-                pem_path=str(paths[wanted[2]]) if keyless else None,
+                bundle_path=str(paths[wanted[1]]),
                 key_ref=signer.key_ref,
                 certificate_identity=signer.certificate_identity,
                 certificate_oidc_issuer=signer.certificate_oidc_issuer,
@@ -1172,7 +1214,13 @@ def _signature_problem(
     if result.get("exit_code") in (124, 127):  # cosign timed out, or could not run
         raise ReceiptError("--require-signed: cosign did not answer", UNDECIDED)
     if result.get("exit_code") != 0:
-        return "--require-signed: the newest receipt's signature does not verify for that signer"
+        # cosign exits 1 both for a signature that does not verify and for a log or CA it
+        # cannot reach: either way the receipt is not taken
+        return (
+            "--require-signed: cosign did not verify the newest receipt's signature for that "
+            "signer (a signature that does not hold, or a transparency log or certificate "
+            "authority it could not reach)" + _cosign_tail(result)
+        )
     try:
         signed = json.loads(files[wanted[0]].decode("utf-8"))
         predicate = signed["predicate"]
@@ -1202,7 +1250,14 @@ def _signature_problem(
 
 
 def _locks(
-    place: _Place, checked: Any, there: Any, environment: str, store: _Store, name: str
+    place: _Place,
+    checked: Any,
+    there: Any,
+    environment: str,
+    store: _Store,
+    name: str,
+    *,
+    signed: bool = False,
 ) -> List[Dict[str, Optional[str]]]:
     """The lock each object carries: of the release checked, of the environment's release its
     receipt names, and of the receipt and its report. ``lock`` is None for an object without
@@ -1218,6 +1273,9 @@ def _locks(
             objects.versions[str(o["path"])] = o.get("version_id")
         entries += [(objects, str(o["path"])) for o in release.objects]
     entries += [(store, name), (store, rr.report_name(name))]
+    if signed:
+        stem = name[: -len(".json")]
+        entries += [(store, f"{stem}.intoto.jsonl"), (store, f"{stem}.{SIGNED_SUFFIX}")]
     for where, rel in entries:
         item: Dict[str, Optional[str]] = {
             "uri": f"{where.shown}{rel}",

@@ -156,25 +156,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that environment and of the same code. A newest file there that is not a receipt fails the
   check rather than falling back to an older one, and so does a receipt overwritten or deleted
   after it was written (the listing reads every version and delete marker; reading receipts in
-  S3 needs `s3:ListBucketVersions` and `s3:GetObjectVersion`, and `--require-signed` also
-  `s3:GetBucketVersioning`) or one of other code under this code's folder. A receipt of
-  this code named later than now decides nothing (exit 2), and a listing past 50,000 entries
-  decides nothing. It never reads a release's `gates` or
-  `provenance`. A receipt is only as trusted as whoever can write `receipts/<env>/`: keep that to
-  the verifier's own identity, or sign receipts and pass `--require-signed` with the signer
-  (`--verify-key REF`, or `--certificate-identity` and `--certificate-oidc-issuer` for keyless;
-  a signer the build code cannot reach, such as a separate job or a key only the verifier can
-  use) and a bucket that keeps versions, which then also needs the Statement to verify with cosign and to name the receipt's own
-  sha256, environment, code and identity and the `release.json` it was read at. It reports
-  whether each object of both releases and of the receipt carries an Object Lock in force, read
-  at the version it checked, and `--require-locked` fails the check when one does not. Exit 0
+  S3 needs `s3:ListBucketVersions` and `s3:GetObjectVersion`) or one of other code under this
+  code's folder. A receipt of this code named later than now decides nothing (exit 2), and a
+  listing past 50,000 entries decides nothing; receipts are never moved or expired. It never
+  reads a release's `gates` or `provenance`. It reports whether each object of both releases
+  and of the receipt carries an Object Lock in force, read at the version it checked, and
+  `--require-locked` fails the check when one does not: a receipt whose lock ran out gates
+  nothing, and the way on is a fresh check of the earlier environment, so the retention must
+  cover the time from that check to the later deploy. A receipt is only as trusted as whoever
+  can write `receipts/<env>/`: keep that to the verifier's own identity, or sign receipts and
+  pass `--require-signed` with the signer (`--verify-key REF`, or `--certificate-identity` and
+  `--certificate-oidc-issuer` for keyless; a signer the build code cannot reach, such as a
+  separate job or a key only the verifier can use). `--require-signed` needs the Statement to
+  verify with cosign (2.0 or later; sign and verify with the same major version) and to name
+  the receipt's own sha256, environment, code and identity and the `release.json` it was read
+  at. It implies `--require-locked` over the receipt, its report and its Statement too, and
+  needs a bucket with Object Lock and a default retention (`s3:GetBucketObjectLockConfiguration`)
+  where no writer of `receipts/<env>/` holds `s3:DeleteObjectVersion`,
+  `s3:BypassGovernanceRetention` or `s3:PutObjectRetention`, since a signature cannot show that
+  a newer receipt was never there. On a release on disk it decides nothing (exit 2). Exit 0
   passes, 1 does not, 2 cannot decide (a release with no code digest included).
   `fluid runs status --release-dir` lists the newest receipt of each environment under each
   release, picked as the check picks it.
 - **A release is sealed only from the commit the CI names.** When the contract sits in a git
-  checkout at another commit than the CI's variable names (a workflow that checks out a pull
-  request's head while the variable names the base), `fluid ship --release-dir` refuses before
-  stage 1 (exit 2): the release's code digest is that commit's. When git cannot say (a
+  checkout at another commit than the CI's variable names (the contract in a second repository
+  or a submodule, or a pull-request pipeline that builds a local merge commit, as Bitbucket and
+  Jenkins merge-with-target do; GitHub's `pull_request` checks out the merge commit
+  `GITHUB_SHA` names, so it matches), `fluid ship --release-dir` refuses before stage 1
+  (exit 2), and says so: the release's code digest is that commit's. When git cannot say (a
   "dubious ownership" checkout in a container), ship warns `release_checkout_unknown`.
 - **`fluid verify --release SRC --out R` names the release it checked in the report.** SRC is
   verified first, and must be a release of the contract's product. The report gains `release:
