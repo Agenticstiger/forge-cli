@@ -187,6 +187,8 @@ def _target_record(
         try:
             out["sha256"] = "sha256:" + base64.b64decode(checksum, validate=True).hex()
         except ValueError:
+            # A checksum S3 states that is not base64 names no sha256: the receipt keeps it as
+            # given under "checksums" and records no "sha256" for the target.
             pass
     if isinstance(head.get("ETag"), str):
         out["etag"] = clean(head["ETag"], 80)
