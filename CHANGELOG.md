@@ -159,11 +159,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binding.principals` maps to one identity are one). A caller's verified principals match as
   written and are never translated through `binding.principals`. Without `contract=` only
   `policy.authz.readers` read every row, narrowed the same ways. An `accessPolicy` or
-  `binding.principals` that cannot be read as written, or an `accessPolicy`, `binding` or
-  `binding.principals` that holds an unresolved `$ref`, is refused with `RowFilterUnavailable`. `row_filter_predicate`,
-  `compile_semantic_query` and `compile_free_form_sql` take the keyword, and the `sample` read
-  uses the contract its driver was built with; the gateway's own tools pass the session's
-  contract.
+  `binding.principals` that cannot be read as written, an `accessPolicy` that holds an unresolved
+  `$ref`, a `binding` that is itself a `$ref`, or a `binding.principals` that holds one, is
+  refused with `RowFilterUnavailable`. `row_filter_predicate`, `compile_semantic_query` and
+  `compile_free_form_sql` take the keyword, and the `sample` read uses the contract its driver
+  was built with; the gateway's own tools pass the session's contract.
 - **`declares_row_filters` decides from the expose's policy alone.** A `$ref` left in an expose's
   `contract` or columns is no longer refused there, so a library caller that reads the contract
   as written no longer has to work around a refusal. With `contract=` (the whole document as

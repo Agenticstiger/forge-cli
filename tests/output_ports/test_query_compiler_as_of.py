@@ -48,8 +48,10 @@ ON = (
 )
 MAIN_SQL = "\n".join(
     [
-        "SELECT DATE_TRUNC('month', reading_date) AS reading_month, "
-        "fluid_l1.fluid_c1_1 AS station_on_date_sensor_model, AVG(temperature_c) AS avg_temp",
+        (
+            "SELECT DATE_TRUNC('month', reading_date) AS reading_month, "
+            "fluid_l1.fluid_c1_1 AS station_on_date_sensor_model, AVG(temperature_c) AS avg_temp"
+        ),
         "FROM reading",
         "LEFT JOIN ("
         + WINDOW.format(columns="sensor_model AS fluid_c1_1, ")
