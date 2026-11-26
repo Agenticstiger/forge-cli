@@ -134,10 +134,13 @@ def _add_release_flags(p: argparse.ArgumentParser) -> None:
 
 
 def register_runs(subparsers: argparse._SubParsersAction) -> None:
-    """Register ``fluid runs {status,verify-release,logs,diff}``."""
+    """Register ``fluid runs {status,verify-release,receipt,logs,diff}``."""
     p = subparsers.add_parser(
         "runs",
-        help="Inspect run history and sealed releases (status / verify-release / logs / diff)",
+        help=(
+            "Inspect run history and sealed releases "
+            "(status / verify-release / receipt / logs / diff)"
+        ),
     )
     sub = p.add_subparsers(dest="runs_subcmd", required=True)
 
@@ -170,6 +173,8 @@ def register_runs(subparsers: argparse._SubParsersAction) -> None:
     v.add_argument("--json", action="store_true", help="Emit JSON")
     v.set_defaults(func=_run_verify_release)
 
+    _register_receipt(sub)
+
     lg = sub.add_parser("logs", help="Fetch component logs for a product/run")
     lg.add_argument("product_id", help="Product id")
     lg.add_argument(
@@ -190,6 +195,88 @@ def register_runs(subparsers: argparse._SubParsersAction) -> None:
     d.add_argument("--run-b", required=True, help="Comparison run id")
     _add_common_flags(d)
     d.set_defaults(func=_run_runs_diff)
+
+
+def _register_receipt(sub: argparse._SubParsersAction) -> None:
+    """``fluid runs receipt {record,check}``."""
+    r = sub.add_parser(
+        "receipt",
+        help="Record what an environment's check of a sealed release found, or gate on it",
+    )
+    rsub = r.add_subparsers(dest="receipt_subcmd", required=True)
+    rec = rsub.add_parser(
+        "record",
+        help="Write a release's receipt for its environment, write-once, beside the release",
+        description=(
+            "Verifies SRC, then writes a fluid-receipt/1 to <code hex>/receipts/<env>/ beside "
+            "it (receipts/<env>/ beside a directory), with the fluid verify report stored "
+            "next to it. PASSED when the report's verdict passes and every checked target "
+            "reads back; a FAILED receipt is written too. Exit 0 PASSED, 1 FAILED or refused "
+            "(nothing written), 2 cannot decide."
+        ),
+    )
+    rec.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")
+    rec.add_argument(
+        "--report",
+        required=True,
+        metavar="R",
+        help="The report of fluid verify --release SRC --out R",
+    )
+    rec.add_argument(
+        "--env",
+        metavar="NAME",
+        help="The release's environment (default: the one it was sealed for; must match)",
+    )
+    rec.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        metavar="T",
+        help=(
+            "Where the release went: s3://bucket/key#versionId or git+<repo>@<commit> "
+            "(repeatable; a git target is recorded, never checked)"
+        ),
+    )
+    rec.add_argument(
+        "--check-targets",
+        action="store_true",
+        help="Read each s3:// target version back and record its sha256 (a missing one fails)",
+    )
+    rec.add_argument(
+        "--sign",
+        action="store_true",
+        help="Also store an in-toto Statement of the receipt, signed with cosign (keyless)",
+    )
+    rec.add_argument(
+        "--sign-key",
+        metavar="REF",
+        help="With --sign: a cosign key (a path or a KMS URI) instead of keyless",
+    )
+    rec.add_argument("--json", action="store_true", help="Emit JSON")
+    rec.set_defaults(func=_run_receipt_record)
+
+    chk = rsub.add_parser(
+        "check",
+        help="Pass only when an earlier environment's newest receipt for this code passed",
+        description=(
+            "Verifies SRC, then reads the newest receipt of --env for SRC's code digest. Passes "
+            "when it is PASSED, the report stored beside it still passes, and the release it "
+            "names is there and intact. Never reads a release's gates or provenance. Reports "
+            "whether each object carries an Object Lock. Exit 0 passes, 1 does not, 2 cannot "
+            "decide."
+        ),
+    )
+    chk.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")
+    chk.add_argument(
+        "--env", required=True, metavar="NAME", help="The environment whose receipt is required"
+    )
+    chk.add_argument(
+        "--require-locked",
+        action="store_true",
+        help="Also fail unless every object of the release and the receipt is locked",
+    )
+    chk.add_argument("--json", action="store_true", help="Emit JSON")
+    chk.set_defaults(func=_run_receipt_check)
 
 
 # ── `fluid retention` umbrella ─────────────────────────────────────────
@@ -286,6 +373,80 @@ def _run_verify_release(args: argparse.Namespace, logger: logging.Logger) -> int
     for problem in result.problems:
         cprint_literal(f"  - {problem}", soft_wrap=True)
     return result.exit_code
+
+
+def _run_receipt_record(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """``fluid runs receipt record SRC --report R``: 0 PASSED, 1 FAILED or refused, 2 undecided."""
+    from fluid_build.cli import _release_receipt as receipts
+
+    if args.sign_key and not args.sign:
+        logger.error("--sign-key signs the receipt: add --sign")
+        return 2
+    try:
+        done = receipts.record_receipt(
+            args.source,
+            report_path=args.report,
+            environment=args.env,
+            targets=args.target,
+            check_targets=args.check_targets,
+            sign=args.sign,
+            key_ref=args.sign_key,
+        )
+    except receipts.ReceiptError as exc:
+        logger.error("%s", exc)
+        return exc.exit_code
+    if getattr(args, "json", False):
+        json.dump(
+            {"uri": done.uri, "written": done.written, "receipt": done.receipt},
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+    else:
+        cprint_literal(f"Receipt {done.result}: {done.uri}", soft_wrap=True)
+        if done.reason:
+            cprint_literal(f"  - {done.reason}", soft_wrap=True)
+        for key in ("code_digest", "identity_digest", "environment"):
+            cprint_literal(f"  {key:<16} {done.receipt[key]}", soft_wrap=True)
+    return receipts.PASS if done.result == "PASSED" else receipts.FAIL
+
+
+def _run_receipt_check(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """``fluid runs receipt check SRC --env E``: 0 passes, 1 does not, 2 cannot decide."""
+    from fluid_build.cli import _release_receipt as receipts
+
+    if not args.env.strip():
+        logger.error("--env needs an environment name")
+        return 2
+    found = receipts.check_receipt(
+        args.source, environment=args.env, require_locked=args.require_locked
+    )
+    if getattr(args, "json", False):
+        json.dump(found.as_dict(), sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return found.exit_code
+    head = {receipts.PASS: "passes", receipts.FAIL: "DOES NOT PASS"}.get(
+        found.exit_code, "cannot decide"
+    )
+    cprint_literal(f"{found.source}: {head} ({found.environment} receipt)", soft_wrap=True)
+    cprint_literal(f"  - {found.reason}", soft_wrap=True)
+    for key, value in (
+        ("code", found.code_digest),
+        ("receipt", found.receipt),
+        ("of", found.receipt_release),
+    ):
+        if value:
+            cprint_literal(f"  {key:<8} {value}", soft_wrap=True)
+    if found.locks:
+        held = [item for item in found.locks if item["lock"]]
+        cprint_literal(f"  locked   {len(held)} of {len(found.locks)} object(s)", soft_wrap=True)
+        for item in found.locks:
+            if not item["lock"]:
+                cprint_literal(f"    not locked: {item['uri']}", soft_wrap=True)
+    for note in found.ignored:
+        cprint_literal(f"  ignored  {note}", soft_wrap=True)
+    return found.exit_code
 
 
 def _run_runs_status(args: argparse.Namespace, logger: logging.Logger) -> int:

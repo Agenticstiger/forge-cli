@@ -73,7 +73,7 @@ class FakeS3:
         IfNoneMatch: str,
     ) -> Dict[str, Any]:
         self.calls.append("put_object")
-        data = Body.read()
+        data = Body if isinstance(Body, bytes) else Body.read()
         assert IfNoneMatch == "*" and ContentLength == len(data)
         if Key in self.deny_put or "*" in self.deny_put:
             raise S3Error("AccessDenied", 403)
@@ -93,11 +93,15 @@ class FakeS3:
         self.objects[(bucket, key)] = data
         self.checksums[(bucket, key)] = b64(data) if checksum == "" else checksum
 
-    def head_object(self, *, Bucket: str, Key: str, ChecksumMode: str) -> Dict[str, Any]:
+    def head_object(
+        self, *, Bucket: str, Key: str, ChecksumMode: str, VersionId: str = ""
+    ) -> Dict[str, Any]:
         self.calls.append("head_object")
         assert ChecksumMode == "ENABLED"
         if (Bucket, Key) not in self.objects:
             raise S3Error("404", 404)
+        if VersionId and VersionId != self.version_of(Key):
+            raise S3Error("NoSuchVersion", 404)
         head: Dict[str, Any] = {"ContentLength": len(self.objects[(Bucket, Key)])}
         checksum = self.checksums[(Bucket, Key)]
         if Key in self.misreport:
@@ -121,8 +125,26 @@ class FakeS3:
             raise S3Error("NoSuchKey", 404)
         got: Dict[str, Any] = {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
         if self.versions:
-            got["VersionId"] = hashlib.sha256(Key.encode()).hexdigest()[:32]
+            got["VersionId"] = self.version_of(Key)
         return got
+
+    @staticmethod
+    def version_of(key: str) -> str:
+        """The VersionId the fake gives ``key``'s one version."""
+        return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+    def list_objects_v2(
+        self, *, Bucket: str, Prefix: str, ContinuationToken: str = ""
+    ) -> Dict[str, Any]:
+        """Two keys a page, so a listing that does not follow the token misses some."""
+        self.calls.append("list_objects_v2")
+        keys = sorted(k for b, k in self.objects if b == Bucket and k.startswith(Prefix))
+        start = int(ContinuationToken or 0)
+        page = keys[start : start + 2]
+        out: Dict[str, Any] = {"Contents": [{"Key": k} for k in page]}
+        if start + 2 < len(keys):
+            out.update(IsTruncated=True, NextContinuationToken=str(start + 2))
+        return out
 
     def get_bucket_versioning(self, *, Bucket: str) -> Dict[str, Any]:
         self.calls.append("get_bucket_versioning")

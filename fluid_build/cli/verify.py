@@ -211,6 +211,14 @@ Use Cases:
     )
 
     p.add_argument("--out", help="Output verification report to JSON file")
+    p.add_argument(
+        "--release",
+        metavar="SRC",
+        help=(
+            "The sealed release this checks (a directory or s3://): verified first, and named "
+            "in the --out report, for fluid runs receipt record"
+        ),
+    )
 
     p.add_argument(
         "--show-diffs", action="store_true", help="Show detailed field-by-field differences"
@@ -314,6 +322,31 @@ Use Cases:
     p.add_argument("--env", help="Environment overlay file")
 
     p.set_defaults(func=run)
+
+
+def _release_block(args: argparse.Namespace, contract_id: Any) -> Optional[Dict[str, Any]]:
+    """``--release SRC``: the release this run checks, verified before anything else, as the
+    ``--out`` report names it. Refused without ``--out`` (nothing would name it) and on a
+    managed streaming contract (its report is checkpoint evidence, not a verify report)."""
+    source = getattr(args, "release", None)
+    if source is None:
+        return None
+    if not source.strip():
+        raise CLIError(2, "verify_release_blank", {"message": "--release needs a release"})
+    if not getattr(args, "out", None):
+        raise CLIError(
+            2,
+            "verify_release_without_out",
+            {"message": "--release names the release in the --out report: add --out REPORT"},
+        )
+    from fluid_build.cli import _release_receipt
+
+    try:
+        block = _release_receipt.report_release_block(source, str(contract_id))
+    except _release_receipt.ReceiptError as exc:
+        raise CLIError(exc.exit_code, "verify_release_refused", {"message": str(exc)}) from None
+    cprint(f"Release: {block['identity_digest']} ({block['environment']})", markup=False)
+    return block
 
 
 def assess_drift_severity(
@@ -1529,6 +1562,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     contract_id = contract.get("id", "unknown")
     cprint(f"Contract ID: {contract_id}")
+    release_block = _release_block(args, contract_id)
 
     # Relative local paths and the run records the build wrote are anchored
     # at the SOURCE contract's directory: the contract itself, or the one a
@@ -1600,6 +1634,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "--require-every-port: a managed streaming contract is verified as a whole "
                 "from checkpoint evidence, not port by port",
                 markup=False,
+            )
+        if release_block is not None:
+            raise CLIError(
+                2,
+                "verify_release_streaming",
+                {
+                    "message": "--release takes a verify report; a managed streaming contract's is checkpoint evidence"
+                },
             )
         if getattr(args, "out", None):
             Path(args.out).write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
@@ -2267,6 +2309,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             },
             "results": results,
         }
+        if release_block is not None:
+            report["release"] = release_block
         if getattr(args, "require_every_port", False):
             report["require_every_port"] = {
                 "unverified": _unverified_ports(unsupported_exposes, not_built_exposes, uncheckable)

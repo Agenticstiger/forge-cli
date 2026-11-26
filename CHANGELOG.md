@@ -129,6 +129,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
   `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
   environment sealed from one commit and one lock, and absent without a source commit.
+- **`fluid runs receipt record SRC --report R` writes what an environment's check of a sealed
+  release found, write-once, beside the release.** It verifies SRC, then writes a
+  `fluid-receipt/1` to `<code hex>/receipts/<env>/<utc>-<identity16>.json` (on disk,
+  `receipts/<env>/` beside the release directory), with the report stored next to it. The
+  receipt names the release's `code_digest` and `identity_digest`, each object it verified with
+  its sha256 and S3 VersionId, the report's sha256 and counts, the CI run, and the deploy targets:
+  `--target s3://bucket/key#versionId` (an object version, since a key alone can change) or
+  `--target git+<repo>@<commit>` (a full commit, recorded and never checked). `--check-targets`
+  reads each S3 version back and records its sha256; one that is not there fails the receipt. It
+  is `PASSED` when the report's verdict passes (`fluid_build.api.report_verdict`) and every
+  checked target reads back, and `FAILED` otherwise; a failed receipt is written too. A report
+  that does not name this release, a release that is not intact, an `--env` that is not the
+  release's, or a target that is not one writes nothing. Its fields follow SLSA's verification
+  summary attestation, and `--sign` (`--sign-key REF` for a key instead of keyless) also stores an
+  in-toto Statement of that predicate type over the release's `release.json`, signed with cosign.
+  Exit 0 `PASSED`, 1 `FAILED` or refused, 2 cannot decide.
+- **`fluid runs receipt check SRC --env nonprod` lets a release on only after an earlier
+  environment checked the same code.** It verifies SRC, then reads the newest `nonprod` receipt
+  for SRC's code digest. It passes when that receipt is `PASSED`, the report stored beside it is
+  the one it names and still passes, and the `nonprod` release it names is there, intact and of
+  the same code. A newest file there that is not a receipt fails the check rather than falling
+  back to an older one. It never reads a release's `gates` or `provenance`. It reports whether each
+  object of the release and of the receipt carries an Object Lock in force, and
+  `--require-locked` fails the check when one does not. Exit 0 passes, 1 does not, 2 cannot decide
+  (a release with no code digest included). `fluid runs status --release-dir` lists the newest
+  receipt of each environment under each release.
+- **`fluid verify --release SRC --out R` names the release it checked in the report.** SRC is
+  verified first, and must be a release of the contract's product. The report gains `release:
+  {source, product, environment, identity_digest, code_digest}`, which `receipt record` requires.
 - **`fluid_build.api.report_verdict` is public** (API 1.4): whether a `fluid verify --out`
   report is a pass, and why not, the rule `fluid datamesh-manager promote --verify-report`
   already used.
