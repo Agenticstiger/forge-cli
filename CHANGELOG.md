@@ -360,6 +360,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `policy.authz.rowFilters` entry names in another case, `fluid apply` could also make it a grantee
   of `fluid_all_rows`, the row access policy that reads every row. It now compares the identities
   with their case folded. Present since 0.19.0.
+- **`fluid profile` no longer publishes a public table whole when its contract calls it
+  personal.** A table marked `Public` was left out for a `sensitivity`, a `pii`, `phi` or
+  `sensitive` tag, a column restriction or a masking, but not for a column `labels` entry, a
+  column `semanticType` or an expose-level tag, so a table with an email column typed
+  `semanticType: email`, or tagged `pii` in its `policy.tags`, was still written under
+  `references`. It is now left out, and named under Not measured without a value, when a column
+  label's key or value is `pii`, `phi` or `sensitive` or its `sensitivity` is not `none`, when a
+  column's `semanticType` is one of a short list of personal data (email, phone, person and name
+  spellings, national and passport ids, address, date of birth, IP and MAC address, payment card,
+  username, credentials, medical, the classes `fluid forge` writes and their common spellings; a
+  key such as `identifier` or a place such as `location` is not), or when the expose's `tags`,
+  `policy.tags`, `policy.authz.tags` or `policy.privacy.tags` hold `pii`, `phi` or `sensitive`
+  (any case).
 
 ## [0.41.0] — 2026-11-25
 

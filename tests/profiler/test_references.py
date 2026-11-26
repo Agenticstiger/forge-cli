@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import pytest
 
@@ -196,12 +196,91 @@ def _cases() -> Dict[str, Dict[str, Any]]:
         "branch_rows": [{**row, "label": "x"} for row in library.branches(BRANCHES)],
         "expect": True,
     }
+
+    # a label, a semantic type or an expose-level tag that marks personal data
+    def labelled_column(**entry: Any) -> Dict[str, Any]:
+        return {
+            "contract": {"branch_columns": [{"name": "label", "type": "string", **entry}]},
+            "branch_rows": [{**row, "label": "x"} for row in library.branches(BRANCHES)],
+        }
+
+    for labels in (
+        {"pii": "true"},
+        {"PII": "yes"},
+        {"Phi": "x"},
+        {"sensitive": "x"},
+        {"data-class": "pii"},
+        {"data-class": "PHI"},
+        {"category": "Sensitive"},
+        {"category": " sensitive "},
+        {"sensitivity": "high"},
+        {"Sensitivity": "Restricted"},
+        {"team": "library", "kind": "pii"},
+    ):
+        cases[f"labels {labels}"] = {**labelled_column(labels=labels), "expect": False}
+    for labels in (
+        {"team": "library", "region": "north"},
+        {"sensitivity": "none"},
+        {"Sensitivity": "NONE"},
+        {"data-class": "reference"},
+        {"note": "no personal data"},
+    ):
+        cases[f"harmless labels {labels}"] = {**labelled_column(labels=labels), "expect": True}
+    cases["labels as a list that names pii"] = {
+        **labelled_column(labels=["geo", "PII"]),
+        "expect": False,
+    }
+    cases["labels as a list that is harmless"] = {
+        **labelled_column(labels=["geo", "reference"]),
+        "expect": True,
+    }
+    for semantic in (
+        "email",
+        "Phone",
+        "PERSON_NAME",
+        "date-of-birth",
+        "IP Address",
+        "EmailAddress",
+    ):
+        cases[f"semantic type {semantic}"] = {
+            **labelled_column(semanticType=semantic),
+            "expect": False,
+        }
+    for semantic in (
+        "identifier",
+        "primary_key",
+        "country_code",
+        "currency",
+        "category",
+        "location",
+    ):
+        cases[f"harmless semantic type {semantic}"] = {
+            **labelled_column(semanticType=semantic),
+            "expect": True,
+        }
+    for where, built in {
+        "expose": lambda tags: {"expose": {"tags": tags}},
+        "policy": lambda tags: {"policy": {"tags": tags}},
+        "authz": lambda tags: {"policy": {"authz": {"tags": tags}}},
+        "privacy": lambda tags: {"policy": {"privacy": {"tags": tags}}},
+    }.items():
+        for tag in ("pii", "PHI", "Sensitive"):
+            cases[f"{where} tag {tag}"] = {"contract": built([tag]), "expect": False}
+        cases[f"{where} tag as a plain string"] = {"contract": built("pii"), "expect": False}
+        cases[f"harmless {where} tags"] = {"contract": built(["reference", "geo"]), "expect": True}
+    cases["expose tags beside a sensitive one"] = {
+        "contract": {"expose": {"tags": ["reference", "Pii"]}},
+        "expect": False,
+    }
     return cases
 
 
-def _outcomes(tmp_path: Path) -> Dict[str, bool]:
+def _outcomes(tmp_path: Path, only: Tuple[str, ...] = ()) -> Dict[str, bool]:
+    """Each case's outcome; *only* keeps the cases whose name starts with one of its prefixes."""
     found: Dict[str, bool] = {}
     for number, (name, case) in enumerate(_cases().items()):
+        if only and not name.startswith(only):
+            continue
         folder = tmp_path / str(number)
         folder.mkdir()
         result = library.profile(
@@ -216,8 +295,10 @@ def _outcomes(tmp_path: Path) -> Dict[str, bool]:
     return found
 
 
-def _expected() -> Dict[str, bool]:
-    return {name: case["expect"] for name, case in _cases().items()}
+def _expected(only: Tuple[str, ...] = ()) -> Dict[str, bool]:
+    return {
+        name: case["expect"] for name, case in _cases().items() if not only or name.startswith(only)
+    }
 
 
 def test_the_gate_publishes_only_a_referenced_unlabelled_public_table_of_at_most_64_keyed_rows(
@@ -453,8 +534,22 @@ def test_a_private_release_writes_no_references_whatever_the_contract_marks_publ
 # -- mutants -------------------------------------------------------------------------------------
 
 
-def _differs(tmp_path: Path) -> bool:
-    return _outcomes(tmp_path) != _expected()
+def _differs(tmp_path: Path, only: Tuple[str, ...] = ()) -> bool:
+    return _outcomes(tmp_path, only) != _expected(only)
+
+
+#: The cases of the labels, the semantic types and the expose-level tags: a mutant of one of the
+#: three checks need only run its own.
+_LABEL_CASES = ("labels", "harmless labels")
+_SEMANTIC_CASES = ("semantic type", "harmless semantic type")
+_EXPOSE_TAG_CASES = (
+    "expose tag",
+    "policy tag",
+    "authz tag",
+    "privacy tag",
+    "harmless",
+    "expose tags",
+)
 
 
 def test_mutant_every_expose_counts_as_public(tmp_path, monkeypatch):
@@ -549,6 +644,39 @@ def test_mutant_a_tag_is_read_without_folding_its_case(tmp_path, monkeypatch):
     assert _differs(tmp_path)
 
 
+def test_a_table_refused_for_a_label_a_semantic_type_or_a_tag_is_named_without_a_value(tmp_path):
+    secrets = ("hushlabel", "emailish")
+    for number, contract in enumerate(
+        (
+            {
+                "branch_columns": [
+                    {"name": "label", "labels": {"data-class": "PII", "x": secrets[0]}}
+                ]
+            },
+            {"branch_columns": [{"name": "label", "labels": {"sensitivity": secrets[0]}}]},
+            {"branch_columns": [{"name": "label", "semanticType": "email_address"}]},
+            {"expose": {"tags": ["Phi", secrets[0]]}},
+            {"policy": {"tags": ["sensitive"]}},
+        )
+    ):
+        for column in contract.get("branch_columns", ()):
+            column["type"] = "string"
+        rows = [{**row, "label": "x"} for row in library.branches(BRANCHES)]
+        result = library.profile(
+            _folder(tmp_path, str(number)),
+            library.contract(**contract),
+            rows,
+            library.cards(MEMBERS),
+        )
+        assert "references" not in result.document
+        said = _notes(result)["reference table branch"]
+        assert said
+        for word in ("PII", "pii", "Phi", "email_address", *secrets):
+            assert word not in said, (word, said)
+        if "branch_columns" in contract:
+            assert "'label'" in said
+
+
 def test_a_table_with_a_restricted_row_or_a_sensitive_tag_is_named_without_a_value(tmp_path):
     for number, contract in enumerate(
         (
@@ -569,6 +697,140 @@ def test_a_table_with_a_restricted_row_or_a_sensitive_tag_is_named_without_a_val
         assert "north" not in said and "PII" not in said and said
 
 
+def test_mutant_no_label_marks_a_column(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_labels_name_sensitive", lambda entry: False)
+    assert _differs(tmp_path, _LABEL_CASES)
+
+
+def _label_map(entry: Any) -> Dict[Any, Any]:
+    labels = entry.get("labels")
+    return labels if isinstance(labels, dict) else {}
+
+
+def _labels_read(read: Any, tmp_path: Path, monkeypatch: Any) -> bool:
+    monkeypatch.setattr(references, "_labels_name_sensitive", read)
+    return _differs(tmp_path, _LABEL_CASES)
+
+
+def test_mutant_a_label_is_read_by_its_key_only(tmp_path, monkeypatch):
+    def keys(entry: Any) -> bool:
+        return any(
+            str(key).strip().casefold() in ("pii", "phi", "sensitive", "sensitivity")
+            for key in _label_map(entry)
+        )
+
+    assert _labels_read(keys, tmp_path, monkeypatch)
+
+
+def test_mutant_a_label_is_read_by_its_value_only(tmp_path, monkeypatch):
+    def values(entry: Any) -> bool:
+        return any(
+            isinstance(value, str) and value.strip().casefold() in ("pii", "phi", "sensitive")
+            for value in _label_map(entry).values()
+        )
+
+    assert _labels_read(values, tmp_path, monkeypatch)
+
+
+def test_mutant_a_sensitivity_label_is_never_a_label(tmp_path, monkeypatch):
+    def without(entry: Any) -> bool:
+        return any(
+            str(key).strip().casefold() in ("pii", "phi", "sensitive")
+            or str(value).strip().casefold() in ("pii", "phi", "sensitive")
+            for key, value in _label_map(entry).items()
+        )
+
+    assert _labels_read(without, tmp_path, monkeypatch)
+
+
+def test_mutant_any_sensitivity_label_counts_even_none(tmp_path, monkeypatch):
+    def always(entry: Any) -> bool:
+        labels = _label_map(entry)
+        return any(str(key).casefold() == "sensitivity" for key in labels) or any(
+            str(key).casefold() in ("pii", "phi", "sensitive")
+            or str(value).strip().casefold() in ("pii", "phi", "sensitive")
+            for key, value in labels.items()
+        )
+
+    assert _labels_read(always, tmp_path, monkeypatch)
+
+
+def test_mutant_a_label_is_read_without_folding_its_case(tmp_path, monkeypatch):
+    def exact(entry: Any) -> bool:
+        labels = _label_map(entry)
+        return any(
+            key in ("pii", "phi", "sensitive") or value in ("pii", "phi", "sensitive")
+            for key, value in labels.items()
+        ) or any(key == "sensitivity" and value != "none" for key, value in labels.items())
+
+    assert _labels_read(exact, tmp_path, monkeypatch)
+
+
+def test_mutant_labels_as_a_list_are_no_labels(tmp_path, monkeypatch):
+    original = references._labels_name_sensitive
+
+    def only_maps(entry: Any) -> bool:
+        return isinstance(entry.get("labels"), dict) and original(entry)
+
+    assert _labels_read(only_maps, tmp_path, monkeypatch)
+
+
+def test_mutant_no_semantic_type_is_personal(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_typed_personal", lambda entry: False)
+    assert _differs(tmp_path, _SEMANTIC_CASES)
+
+
+def test_mutant_a_semantic_type_is_read_without_folding_its_spelling(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_semantic_name", lambda value: value)
+    assert _differs(tmp_path, _SEMANTIC_CASES)
+
+
+def test_mutant_a_semantic_type_is_read_without_its_separators(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_semantic_name", lambda value: value.strip().casefold())
+    assert _differs(tmp_path, _SEMANTIC_CASES)
+
+
+def test_mutant_every_semantic_type_is_personal(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_typed_personal", lambda entry: "semanticType" in entry)
+    assert _differs(tmp_path, _SEMANTIC_CASES)
+
+
+def test_mutant_no_expose_tag_marks_the_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_exposed_as_personal", lambda expose: False)
+    assert _differs(tmp_path, _EXPOSE_TAG_CASES)
+
+
+def test_mutant_an_expose_tag_is_read_without_folding_its_case(tmp_path, monkeypatch):
+    def exact(expose: Any) -> bool:
+        policy = expose.get("policy") or {}
+        holders = [expose, policy, policy.get("authz") or {}, policy.get("privacy") or {}]
+        return any(
+            tag in ("pii", "phi", "sensitive")
+            for each in holders
+            for tag in (each.get("tags") if isinstance(each.get("tags"), list) else [])
+        )
+
+    monkeypatch.setattr(references, "_exposed_as_personal", exact)
+    assert _differs(tmp_path, _EXPOSE_TAG_CASES)
+
+
+@pytest.mark.parametrize("where", ["expose", "policy", "authz", "privacy"])
+def test_mutant_an_expose_tag_is_not_read_at_one_place(tmp_path, monkeypatch, where):
+    def missing(expose: Any) -> bool:
+        policy = expose.get("policy") or {}
+        holders = {
+            "expose": expose,
+            "policy": policy,
+            "authz": policy.get("authz") or {},
+            "privacy": policy.get("privacy") or {},
+        }
+        del holders[where]
+        return any(references._tagged_sensitive(each) for each in holders.values())
+
+    monkeypatch.setattr(references, "_exposed_as_personal", missing)
+    assert _differs(tmp_path, _EXPOSE_TAG_CASES)
+
+
 def test_mutant_a_versioned_target_is_published(tmp_path, monkeypatch):
     import dataclasses
 
@@ -586,6 +848,47 @@ def test_mutant_a_versioned_target_is_published(tmp_path, monkeypatch):
 
     monkeypatch.setattr(references, "form_references", forgetting)
     assert _differs(tmp_path)
+
+
+# -- the personal semantic types -----------------------------------------------------------------
+
+
+def test_every_class_the_contract_writer_gives_a_semantic_type_is_personal_here():
+    from fluid_build.copilot import pii
+
+    assert set(pii.PII_SENSITIVITY_MAP) <= references.PERSONAL_SEMANTIC_TYPES
+
+
+def test_the_personal_semantic_types_are_spelled_as_they_are_read_and_hold_no_key_or_place():
+    types = references.PERSONAL_SEMANTIC_TYPES
+    assert all(references._semantic_name(each) == each for each in types)
+    assert not types & {"identifier", "primary_key", "id", "key", "uuid", "location", "country"}
+    assert {"email", "phone", "person_name", "national_id", "address", "dob", "ip_address"} <= types
+
+
+@pytest.mark.parametrize("kind", sorted(references.PERSONAL_SEMANTIC_TYPES))
+def test_each_personal_semantic_type_is_refused_in_any_spelling(kind):
+    spellings = {
+        kind,
+        kind.upper(),
+        f" {kind.title()} ",
+        kind.replace("_", "-"),
+        kind.replace("_", " "),
+    }
+    for spelling in spellings:
+        assert references._typed_personal({"semanticType": spelling}), spelling
+        assert references._typed_personal(
+            {"semanticType": "".join(w.title() for w in kind.split("_"))}
+        )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["identifier", "primary_key", "country_code", "currency", "category", "", "emails", 7, None],
+)
+def test_a_harmless_or_malformed_semantic_type_is_no_personal_data(kind):
+    assert not references._typed_personal({"semanticType": kind})
+    assert not references._typed_personal({})
 
 
 def test_the_unmutated_gate_matches_its_expected_outcomes(tmp_path):

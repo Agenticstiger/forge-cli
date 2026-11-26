@@ -16,11 +16,15 @@ the table when it does not:
    of a history needs at most as many levels);
 4. every column is one the profile reads, is spelled as the format spells a cell, and is
    unlabelled: no ``sensitivity`` but ``none``, no tag ``pii``, ``phi`` or ``sensitive`` (any
-   case), no ``columnRestrictions`` and no ``masking``. It is all or none, since the engine needs
-   every contract column of a reference table and a half-published table would be a second state.
+   case), no label that is or names one of those words or a ``sensitivity`` but ``none``, no
+   ``semanticType`` that names personal data (:data:`PERSONAL_SEMANTIC_TYPES`), no
+   ``columnRestrictions`` and no ``masking``. It is all or none, since the engine needs every
+   contract column of a reference table and a half-published table would be a second state.
    The expose also states no row restriction, no ``policy.authz.rowFilters`` and no
    ``policy.privacy.rowLevelPolicy``: a table whose rows a contract limits is not public to all
-   of them;
+   of them. Nor does the expose itself carry a tag ``pii``, ``phi`` or ``sensitive`` (any case) in
+   its ``tags``, ``policy.tags``, ``policy.authz.tags`` or ``policy.privacy.tags``: a table its
+   contract calls personal is not a reference table, whatever its columns say;
 5. each key column a relationship references is one column, never null and unique over the rows.
 
 The rows are sorted by the text of the first key column, in the code-point order of Unicode
@@ -43,6 +47,7 @@ Nothing here names a value: a note names a table and columns, never a key or a c
 from __future__ import annotations
 
 import datetime
+import re
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
@@ -57,6 +62,7 @@ if TYPE_CHECKING:  # the runner imports this module; its names are read inside a
 __all__ = [
     "MOST_REFERENCE_ROWS",
     "NONE",
+    "PERSONAL_SEMANTIC_TYPES",
     "Followed",
     "References",
     "Stage",
@@ -74,8 +80,69 @@ PUBLIC = "Public"
 
 #: The longest cell PROFILE-SPEC section 5b allows, in characters.
 _MOST_CELL_CHARACTERS = 4096
-#: The tags (compared in any case) that mark a column as one a table released whole must not hold.
+#: The words (compared in any case) that, as a tag, a label's key or a label's value, mark data a
+#: table released whole must not hold.
 _SENSITIVE_TAGS = frozenset({"pii", "phi", "sensitive"})
+
+#: The ``semanticType`` values (free text in the schema, which lists none) that name personal data,
+#: after :func:`_semantic_name` has read them: lower case, ``_`` for a space, ``-`` or ``.``. A
+#: column of one of these is not published whole. Two sources, and no more than a reference table
+#: needs to refuse: the classes ``fluid forge`` itself writes into ``semanticType`` for a column
+#: it finds personal (``copilot/pii.py``, which a test pins), and the spellings the established
+#: classifiers use for the same things (Presidio's ``EMAIL_ADDRESS``, ``PHONE_NUMBER``,
+#: ``PERSON``, ``IP_ADDRESS``, ``MAC_ADDRESS``, ``US_SSN``, ``US_PASSPORT``,
+#: ``US_DRIVER_LICENSE``, ``CREDIT_CARD``, ``IBAN_CODE``, ``MEDICAL_LICENSE``, ``NRP``; the cloud
+#: DLP catalogues' ``PERSON_NAME``, ``DATE_OF_BIRTH``, ``STREET_ADDRESS``). ``geo`` is a point's
+#: coordinates, as ``fluid forge`` writes it. A key
+#: (``identifier``, ``primary_key``), a place (``location``, ``country``), a time and a unit are
+#: not here: they are what a reference table holds.
+PERSONAL_SEMANTIC_TYPES = frozenset(
+    {
+        # the classes fluid forge writes
+        "email",
+        "phone",
+        "ssn",
+        "national_id",
+        "payment_card",
+        "dob",
+        "address",
+        "geo",
+        "name",
+        "ip_address",
+        "mac_address",
+        "credentials",
+        "username",
+        "medical",
+        "special_category",
+        # the spellings other classifiers and contracts use
+        "email_address",
+        "phone_number",
+        "person",
+        "person_name",
+        "full_name",
+        "first_name",
+        "last_name",
+        "social_security_number",
+        "passport",
+        "passport_number",
+        "driver_license",
+        "credit_card",
+        "iban",
+        "iban_code",
+        "date_of_birth",
+        "birth_date",
+        "birthdate",
+        "street_address",
+        "postal_address",
+        "home_address",
+        "ip",
+        "mac",
+        "medical_license",
+        "nrp",
+    }
+)
+_CAMEL_JOINT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NAME_SEPARATORS = re.compile(r"[\s.\-]+")
 
 _MS_PER_DAY = 86_400_000
 _EPOCH = datetime.date(1970, 1, 1)
@@ -210,6 +277,55 @@ def _tagged_sensitive(entry: Mapping[str, Any]) -> bool:
     )
 
 
+def _semantic_name(value: str) -> str:
+    """A ``semanticType`` as :data:`PERSONAL_SEMANTIC_TYPES` spells it: ``EmailAddress`` and
+    ``Email-Address`` are ``email_address``."""
+    return _NAME_SEPARATORS.sub("_", _CAMEL_JOINT.sub("_", value.strip())).casefold()
+
+
+def _typed_personal(entry: Mapping[str, Any]) -> bool:
+    """Whether a column's ``semanticType`` names personal data."""
+    semantic = entry.get("semanticType")
+    return isinstance(semantic, str) and _semantic_name(semantic) in PERSONAL_SEMANTIC_TYPES
+
+
+def _labels_name_sensitive(entry: Mapping[str, Any]) -> bool:
+    """Whether a column's ``labels`` call it personal or sensitive.
+
+    A label does when its key or its value is ``pii``, ``phi`` or ``sensitive`` in any case, or
+    when its key is ``sensitivity`` and its value is not ``none``; a ``pii`` key counts whatever its
+    value, since the contract names the subject. A schema-invalid list of labels reads as a list of
+    values.
+    """
+    labels = entry.get("labels")
+    if isinstance(labels, str):
+        labels = [labels]
+    if isinstance(labels, (list, tuple)):
+        return any(
+            isinstance(each, str) and each.strip().casefold() in _SENSITIVE_TAGS for each in labels
+        )
+    if not isinstance(labels, Mapping):
+        return False
+    for key, value in labels.items():
+        if str(key).strip().casefold() in _SENSITIVE_TAGS:
+            return True
+        text = value.strip().casefold() if isinstance(value, str) else None
+        if text in _SENSITIVE_TAGS:
+            return True
+        if str(key).strip().casefold() == "sensitivity" and text != "none":
+            return True
+    return False
+
+
+def _exposed_as_personal(expose: Mapping[str, Any]) -> bool:
+    """Whether the expose itself is tagged ``pii``, ``phi`` or ``sensitive``, in its own ``tags``
+    or in those of its ``policy``, ``policy.authz`` or ``policy.privacy``."""
+    policy = expose.get("policy")
+    policy = policy if isinstance(policy, Mapping) else {}
+    holders = [expose, policy, policy.get("authz"), policy.get("privacy")]
+    return any(isinstance(each, Mapping) and _tagged_sensitive(each) for each in holders)
+
+
 def _restricts_rows(expose: Mapping[str, Any]) -> bool:
     """Whether the contract limits who reads which rows of the expose."""
     policy = expose.get("policy")
@@ -222,13 +338,16 @@ def _restricts_rows(expose: Mapping[str, Any]) -> bool:
 
 
 def _labelled(expose: Mapping[str, Any]) -> FrozenSet[str]:
-    """The columns a contract labels: a sensitivity, a sensitive tag, a restriction or a masking."""
+    """The columns a contract labels: a sensitivity, a sensitive tag or label, a restriction or a
+    masking."""
     found = set()
     contract = expose.get("contract")
     schema = contract.get("schema") if isinstance(contract, Mapping) else None
     for entry in schema if isinstance(schema, list) else ():
         if isinstance(entry, Mapping) and (
-            entry.get("sensitivity", "none") != "none" or _tagged_sensitive(entry)
+            entry.get("sensitivity", "none") != "none"
+            or _tagged_sensitive(entry)
+            or _labels_name_sensitive(entry)
         ):
             found.add(str(entry.get("name")))
     policy = expose.get("policy")
@@ -243,6 +362,17 @@ def _labelled(expose: Mapping[str, Any]) -> FrozenSet[str]:
         if isinstance(masking, Mapping):
             found.add(str(masking.get("column")))
     return frozenset(found)
+
+
+def _typed_personal_columns(expose: Mapping[str, Any]) -> FrozenSet[str]:
+    """The columns whose ``semanticType`` names personal data."""
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    return frozenset(
+        str(entry.get("name"))
+        for entry in (schema if isinstance(schema, list) else ())
+        if isinstance(entry, Mapping) and _typed_personal(entry)
+    )
 
 
 def _columns_named(names: Sequence[str]) -> str:
@@ -291,9 +421,15 @@ def _refusal(
         return f"column {_columns_named([name for name, _ in plan.skipped])} is not read", None
     if _restricts_rows(expose):
         return "a row filter or a row-level policy limits who reads its rows", None
-    labelled = _labelled(expose) & {column.name for column in plan.columns}
+    if _exposed_as_personal(expose):
+        return "its contract tags the table as personal or sensitive data", None
+    held = {column.name for column in plan.columns}
+    labelled = _labelled(expose) & held
     if labelled:
         return f"column {_columns_named(sorted(labelled))} carries a label", None
+    personal = _typed_personal_columns(expose) & held
+    if personal:
+        return f"column {_columns_named(sorted(personal))} is typed as personal data", None
     if read.row_count > MOST_REFERENCE_ROWS:
         return "it holds more rows than a table released whole may", None
     cells, unspellable = _cells(plan, read, backend)
