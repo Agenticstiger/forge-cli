@@ -20,6 +20,7 @@ __all__ = [
     "columns_text",
     "left_out_words",
     "part_words",
+    "query_notes",
     "report",
     "say_not_released",
     "unknown_values_notes",
@@ -36,6 +37,7 @@ _KIND = {
     "pairOrder": "order of the date pair",
     "nullCount": "null count of",
     "history": "history member",
+    "query": "noisy query",
 }
 
 
@@ -80,6 +82,21 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
     return notes
 
 
+def query_notes(plan: Any) -> List[str]:
+    """What the noisy queries of a release count, in words; names no query text and no count."""
+    queries = getattr(plan, "queries", None)
+    if queries is None or not queries.queries:
+        return []
+    return [
+        "Each noisy query counts the records of its unit in two cells for each group, those the "
+        "query does not return and those it does, and the profile states the unit; it is noised "
+        "on its own, joins no clique and is made to agree with no other table, and no group is "
+        "suppressed. The engine cannot check that a query reads only a record's own unit and "
+        "the tables the unit does not reach, nor that an entity's rows lie in one unit; its "
+        "evidence says so."
+    ]
+
+
 def columns_text(table: Any) -> str:
     """The columns of a released table as a report line names them: a date pair reads start to end."""
     joiner = " to " if table.kind in ("pairDays", "pairOrder") else ", "
@@ -91,7 +108,8 @@ def part_words(label: str, table: Optional[str] = None) -> str:
 
     ``[<table>/]pair/<days|order>/<start>/<end>`` is a date pair, ``[<table>/]noise/<column>`` a
     column's histogram, ``[<table>/]nullCount/<column>`` a column's null count,
-    ``[<table>/]history/<member>[/<column>]`` a member of a table's history, and
+    ``[<table>/]history/<member>[/<column>]`` a member of a table's history, ``query/<name>`` a
+    consumer query's rate, and
     ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped through a link; any other
     label is said as it is.
     """
@@ -99,6 +117,8 @@ def part_words(label: str, table: Optional[str] = None) -> str:
     if steps[0] == "link" and len(steps) >= 4 and "." in steps[1]:
         child, column = steps[1].split(".", 1)
         return f"{column} of {child} grouped by {steps[3]}"
+    if steps[0] == "query":
+        return label
     if steps[0] not in ("noise", "pair", "nullCount", "history") and len(steps) > 1:
         table, steps = steps[0], steps[1:]
     where = f" of {table}" if table else ""
@@ -129,7 +149,7 @@ def say_not_released(say: Any, plan: Any, drawn: Any) -> None:
     """Say what the release does not hold, one line for each reason: the plan's and the cap's."""
     by_reason: Dict[str, List[str]] = {}
     left = left_out_words(drawn.left_out, getattr(plan, "table", None))
-    for what, reason in (*plan.not_released, *left):
+    for what, reason in (*plan.not_released, *left, *getattr(drawn, "unanswered", ())):
         by_reason.setdefault(reason, []).append(what)
     for reason, items in by_reason.items():
         say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
@@ -235,6 +255,8 @@ def report(
     )
     say(rests, soft_wrap=True)
     for table in drawn.tables:
+        if table.label in drawn.withheld_labels:
+            continue  # nothing was written for it: the reason is under Not released
         place = f" ({table.table})" if table.table else ""
         if table.kind == "rank":
             first, second = table.columns
@@ -247,7 +269,7 @@ def report(
             continue
         what = (
             table.label
-            if table.kind in ("relationship", "link", "history")
+            if table.kind in ("relationship", "link", "history", "query")
             else columns_text(table)
         )
         say(
@@ -258,6 +280,8 @@ def report(
     for each in (drawn.plan or plan).tables:
         for line in unknown_values_notes(each.plan, each.table):
             say(line, soft_wrap=True)
+    for line in query_notes(drawn.plan or plan):
+        say(line, soft_wrap=True)
     if plan.selects:
         chosen: Dict[str, Any] = dict(drawn.cliques)
         listed = "; ".join(

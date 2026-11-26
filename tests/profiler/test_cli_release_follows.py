@@ -176,18 +176,22 @@ def test_a_follows_release_names_an_ask_fluid_profile_does_not_form(workspace, r
     asked["queries"] = [
         {
             "name": "large_quantities",
-            "sql": "SELECT qty FROM invoice",
+            "sql": "SELECT product_id FROM product WHERE tier = 'hi'",
+            "unit": {"table": "product"},
+        },
+        {
+            "name": "all_quantities",
+            "sql": "SELECT count(*) FROM invoice",
             "unit": {"table": "invoice"},
-        }
+        },
     ]
     (workspace / "billing.profile-request.yml").write_text(yaml.safe_dump(asked), encoding="utf-8")
     assert main(_argv()) == 0
-    out = _out(capsys)
-    assert (
-        "Not released (a private release publishes no query rate: PROFILE-SPEC refuses noise on a query statistic): query large_quantities."
-        in out
-    )
+    out = " ".join(_out(capsys).split())
+    assert "query large_quantities" in out and "query all_quantities" in out
     assert "SELECT" not in out
+    written = json.loads((workspace / "account.profile.json").read_text(encoding="utf-8"))
+    assert "queries" not in written
 
 
 def test_without_follow_the_release_names_no_follows_and_keeps_its_bytes(workspace, registry):

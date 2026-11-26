@@ -53,7 +53,6 @@ __all__ = [
     "check_flags",
     "check_sources",
     "check_tables",
-    "NO_QUERIES_PRIVATE",
     "contract_unformed",
     "decided_by_records",
     "filter_block",
@@ -105,9 +104,6 @@ NO_WORKLOAD = (
 )
 NO_DATES = "a private release forms no relationship dates"
 NO_EXPOSURE = "a private release forms no exposure"
-NO_QUERIES_PRIVATE = (
-    "a private release publishes no query rate: PROFILE-SPEC refuses noise on a query statistic"
-)
 
 
 #: The reasons only the records can give, which ``--strict`` therefore never refuses on.
@@ -487,11 +483,14 @@ def unformed(
     """Each ask of *request* of a kind ``fluid profile`` does not form, with why: ``(what, reason)``.
 
     Decided from the request alone, before any record is read: a workload entry, and, for a
-    *private* release only, a consumer query, a table's calendar and a relationship's dates and
-    exposure (a public profile forms those, and names one it cannot with the reason it has, once
-    it has read the records; which queries it answers needs the contract,
-    :func:`fluid_build.profiler.query_rates.plan_queries`). A private release does form a table's
-    date pairs of DATE columns, and names one it cannot with the contract's reason when it plans.
+    *private* release only, a table's calendar and a relationship's dates and exposure (a public
+    profile forms those, and names one it cannot with the reason it has, once it has read the
+    records). Which consumer queries are answered needs the contract
+    (:func:`fluid_build.profiler.query_rates.plan_queries`): a public profile names the ones it
+    does not, and a private release plans them with
+    :func:`fluid_build.profiler.dp.query_release.plan_noisy_queries`. A private release does form
+    a table's date pairs of DATE columns, and names one it cannot with the contract's reason when
+    it plans.
     *workload* is the reason a workload
     entry is not used, which a private release words its own way. Never a value: only tables,
     columns, names and reasons.
@@ -513,8 +512,6 @@ def unformed(
             )
         for exposure in link.exposure:
             found.append((_exposure_name(link, exposure), NO_EXPOSURE))
-    for query in request.queries if private else ():
-        found.append((f"query {query.name}", NO_QUERIES_PRIVATE))
     return found
 
 

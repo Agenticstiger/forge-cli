@@ -283,7 +283,15 @@ def read_of(
         table: sources.SourceColumns(
             description="rows",
             row_count=len(values[table]),
-            values={column.name: [row[column.name] for row in values[table]] for column in columns},
+            values={
+                name: [row[name] for row in values[table]]
+                for name in dict.fromkeys(
+                    [
+                        *(column.name for column in columns),
+                        *(values[table][0] if values[table] else ()),
+                    ]
+                )
+            },
         )
         for table, columns in plan.reads
     }

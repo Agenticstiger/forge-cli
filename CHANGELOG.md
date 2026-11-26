@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` reads profile request format 1-3-0 and writes profile format 1-5-0 where it needs
+  it.** `flux-stats` is now required at `>=0.13,<1`. A request may ask a table's `history: {}`
+  (optionally with `columns`, the candidate tracked columns) and a column's `nullCount/2`.
+  - An exact profile forms the history of exactly the tables that ask for it, from the contract's
+    natural entity and validity window; a table with no window, or whose history does not form,
+    is named under Not measured with the reason. Without the ask a request still writes none.
+    `nullCount/2` has a noisy form only, so an exact profile names the ask with that reason, and
+    `--strict` refuses it.
+  - A private release writes one `nullCount/2` per asked column it can release: two noisy cells
+    (known, then NULL), charged like any count table of its table (`m_T`, so a followed table's
+    cap counts). A release that asks for none is byte for byte what it was.
+- **A private release writes a table's history with noisy members.** When the request asks a
+  table's history and the unit follows into that table (not the unit's own expose), the release
+  writes `versionsPerEntity`, `firstStart`, `versionLength`, `chain`, `lastVersion`, each tracked
+  column's `initial` and `transitions`, and `reasons` of the table, on the same public ladders
+  the exact history uses. Each member is a count table over the followed table charged `m_T` with
+  an equal share of its own; every cell is published, nothing is withheld. A release whose
+  records put one entity's versions under two parent rows is refused
+  (`profile_release_entity_units`) before anything is written. The expose, an unreached table and
+  a table with no window are named with the reason.
+- **A private release answers the consumer queries of its request, with noise.** A query that
+  passes the same checks as for an exact profile gets a `queries` entry whose rate is two noisy
+  cells (`false`, `true`) per group and which states its `unit`: `{table: T}` (charge `m_T`, for
+  a table or a view that keeps some rows of it) or `{table: T, by: [columns]}` (the child
+  columns of a relationship the unit follows, charge `m_P`, or the table's natural entity when
+  its history is released, charge `m_T`). A query that cannot be charged is named with its
+  reason. A statement that fails on the records withholds every query of the release. The
+  disclosure checks of the exact path do not apply to a noisy release; an exact profile writes no
+  `unit` and is unchanged. The release record re-derives the same bytes.
+
 - **`fluid ship --release-dir DIR --release-archive PATH` also writes the sealed release as one
   `.tgz`**, for a platform that takes a file. It holds every file of the sealed directory at its
   path, with `release.json` at its root and no folder around it, and is written only after the

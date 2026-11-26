@@ -667,15 +667,68 @@ def test_a_grouped_query_with_some_groups_published_is_counted_in_part():
 # ---- a private release names each query it does not release ---------------------------------
 
 
-def test_a_private_release_publishes_no_query_rate():
+def test_a_private_release_plans_its_queries_itself_and_the_request_names_none():
     request = _request(_on_table("north", NORTH), _on_view("heavy", HEAVY_QUERY, HEAVY_VIEW))
-    found = asked_for.unformed(request, private=True)
-    assert found == [
-        ("query north", asked_for.NO_QUERIES_PRIVATE),
-        ("query heavy", asked_for.NO_QUERIES_PRIVATE),
-    ]
-    assert "noise on a query statistic" in asked_for.NO_QUERIES_PRIVATE
+    assert asked_for.unformed(request, private=True) == []
     assert asked_for.unformed(request) == []
+
+
+def _few_in_the_north() -> List[Dict[str, Any]]:
+    stations = _stations()
+    for row in stations:  # two stations are in the north: a cell far below any minimum
+        row["region"] = "NORTH" if row["station_id"] in ("s001", "s002") else "SOUTH"
+    return stations
+
+
+def _station_read(stations: Sequence[Dict[str, Any]], **changed: Any):
+    from fluid_build.profiler import sources
+
+    values = {name: [row[name] for row in stations] for name in ("station_id", "region", "active")}
+    return sources.SourceColumns(
+        description="rows", row_count=len(stations), values={**values, **changed}
+    )
+
+
+BY_REGION = _on_table("by_region", "SELECT region, station_id FROM station", group_by="region")
+
+
+def test_a_noisy_plan_reads_the_exact_cells_of_each_group_and_suppresses_nothing(tmp_path):
+    stations = _few_in_the_north()
+    queries = (_on_table("north", NORTH), BY_REGION)
+    planned = query_rates.plan_queries(
+        CONTRACT, _request(*queries), FakeBackend().enum_levels, noisy=True
+    )
+    measured = query_rates.measure(
+        planned, {"station": _station_read(stations)}, FakeBackend(), None
+    )
+    assert not measured.failed
+    assert measured.raw_cells(0) == [(300, 2)]
+    # every level of the grouping is a group, the records of a level and those the query returns
+    assert measured.raw_cells(1) == [(2, 2), (298, 298), (0, 0)]
+    cells = measured.row_cells(0)
+    assert cells is not None and len(cells) == 300 and cells.count(1) == 2 and cells.count(0) == 298
+    grouped = measured.row_cells(1)
+    assert grouped is not None and query_rates.NO_CELL not in grouped
+    assert sorted(set(grouped)) == [1, 3]  # the north and south groups' returned cells
+    # the exact path withholds that small cell, which a noisy plan has no verdict on
+    result = _profile(tmp_path, _on_table("north", NORTH), stations=stations)
+    assert _withheld(_entry(result, "north"))
+
+
+def test_a_failure_that_depends_on_the_records_withholds_every_query_of_a_noisy_run():
+    stations = _few_in_the_north()
+    planned = query_rates.plan_queries(
+        CONTRACT,
+        _request(_on_table("north", NORTH), BY_REGION),
+        FakeBackend().enum_levels,
+        noisy=True,
+    )
+    regions = [*[row["region"] for row in stations][:-1], 7]
+    stopped = query_rates.measure(
+        planned, {"station": _station_read(stations, region=regions)}, FakeBackend(), None
+    )
+    assert stopped.failed == {each.index: query_rates.RUN_FAILED for each in planned.answerable()}
+    assert stopped.raw_cells(0) is None and stopped.row_cells(0) is None
 
 
 def test_the_reasons_a_profile_gives_before_reading_are_not_the_ones_the_records_give():

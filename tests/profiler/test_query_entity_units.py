@@ -462,11 +462,12 @@ def test_an_entity_that_also_keys_per_entity_statistics_is_refused_before_any_re
     assert plan.reason == query_rates.PER_ENTITY_KEY
 
 
-def test_a_private_release_names_the_query_as_not_released():
+def test_a_private_release_plans_the_entity_query_itself_and_the_request_names_none():
     request = _request(_on_unit("many", MANY))
-    assert asked_for.unformed(request, private=True) == [
-        ("query many", asked_for.NO_QUERIES_PRIVATE)
-    ]
+    assert asked_for.unformed(request, private=True) == []
+    noisy = query_rates.plan_queries(CONTRACT, request, FakeBackend().enum_levels, noisy=True)
+    (plan,) = noisy.plans
+    assert plan.reason is None and plan.entity is not None
 
 
 # ---- the run-wide failure rule covers these statements ----------------------------------------

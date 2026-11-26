@@ -199,7 +199,8 @@ withholds every query of the run. At most 1024 queries run, each limited in time
 memory; a request from a source you do not trust belongs in a container. The
 queries of one unit are checked as a set, with the facts of a table, so that two
 queries differing by a few records give none back; a group the set withholds is
-written as a fact withheld by it (D). A private release publishes no query rate. A boolean
+written as a fact withheld by it (D). A private release (--privacy-unit) answers the queries
+that pass with noisy counts of the same two cells and the unit it counts, and suppresses nothing. A boolean
 column is asked only its counts by `fluxsim init`, so it gets no level
 histogram this way.
 

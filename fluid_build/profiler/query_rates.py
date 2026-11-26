@@ -63,7 +63,24 @@ outcome; the entities' set is checked apart from the table's own rows.
    queries; a decision therefore never depends on the machine, and the queries past the budget
    are named as not checked.
 
-A private release answers none (:data:`fluid_build.profiler.request.NO_QUERIES_PRIVATE`).
+A private release answers the queries that pass with noisy counts of the same two cells and a
+``unit`` of the profile's (:mod:`fluid_build.profiler.dp.query_release`; PROFILE-SPEC section 3a,
+"A noisy query"). It plans with ``noisy=True``, which changes what is refused and nothing that
+protects the query process:
+
+* the rules that exist because exact counts can be differenced are lifted: a table's records are
+  counted one way (:data:`COUNTED_ANOTHER_WAY`), and an entity may not be the natural entity of a
+  versioned table (:data:`HISTORY_ENTITY`), the key of its per-entity statistics
+  (:data:`PER_ENTITY_KEY`) or a key into a versioned parent (:data:`VERSIONED_PARENT`). A noisy
+  statistic is a count table of its own with a share of the budget of its own, so a second
+  statistic over the same records is accounted by composition and gives no exact count to
+  difference;
+* an entity unit is counted over the rows it is given (the kept ones), not joined to its parent's
+  rows, so the parent is neither read nor typed against the entity column;
+* nothing is suppressed: the cell and set checks do not run, and every group is written;
+* kept in both modes: the checker, the shape of a query and of its unit, :data:`CAN_FAIL`, the
+  types the query process loads, every public bound, and :data:`RUN_FAILED` for any failure that
+  depends on the records.
 
 **No request text reaches DuckDB.** What runs is a statement this module builds from the
 checked tree of a query (its ``WHERE`` condition, qualifiers rewritten to the table or to the
@@ -135,7 +152,8 @@ edge. Where the parent table
 repeats a key (records that break its declared key), an entity is counted once for each parent
 row that holds its key, and so is its unit's ``k``. The cost is bounded and public: at most
 :data:`MOST_QUERIES` queries, each statement limited in time and memory, run in a locked
-process. A request from a source that is not trusted belongs in a container.
+process. A request from a source that is not trusted belongs in a container. These items concern
+the exact counts a public profile publishes; a noisy release publishes none.
 
 Nothing printed, logged or written names a count of records: a reason names a query, a table, a
 column or a bound.
@@ -172,6 +190,7 @@ from fluid_build.profiler.consumer_queries import Checked, Refused, Table
 
 __all__ = [
     "CAN_FAIL",
+    "NO_CELL",
     "COUNTED_ANOTHER_WAY",
     "ENTITIES_PAST_BOUND",
     "ENTITY_ONLY",
@@ -282,6 +301,8 @@ _OUTCOMES = (_OUT, _IN)
 _ALL_STATES = (0, _OUT, _IN)
 
 Combination = Tuple[int, ...]
+#: A row that lands in no cell of a noisy query's two cells per group (:meth:`Measured.row_cells`).
+NO_CELL = -1
 
 
 @dataclass(frozen=True)
@@ -409,6 +430,8 @@ class QueryPlans:
     schema: Mapping[str, Table] = field(default_factory=dict)
     #: The column that numbers a table's rows in the query process, by table.
     row_columns: Mapping[str, str] = field(default_factory=dict)
+    #: Planned for a release whose statistics carry noise (:func:`plan_queries`, ``noisy``).
+    noisy: bool = False
 
     def answerable(self) -> List[QueryPlan]:
         return [each for each in self.plans if each.reason is None]
@@ -442,21 +465,37 @@ def plan_queries(
     contract: Mapping[str, Any],
     request: Request,
     enum_levels: Callable[[str], Sequence[str]],
+    *,
+    noisy: bool = False,
 ) -> QueryPlans:
     """Plan each query of *request* against *contract*: answered, or named with why not.
 
     Reads no record. *enum_levels* reads the levels an ``enum(...)`` type declares (the
     registry's reader, :meth:`~fluid_build.profiler._stats.StatisticsBackend.enum_levels`).
+
+    With *noisy* the plan is for a release whose query statistics carry noise (a private release,
+    :mod:`fluid_build.profiler.dp.query_release`). The rules below that exist because exact counts
+    can be differenced are then lifted, since noisy statistics are accounted by composition: a
+    table's records may be counted as rows and as entities by any number of queries
+    (:data:`COUNTED_ANOTHER_WAY`), and an entity may be the natural entity of a versioned table
+    (:data:`HISTORY_ENTITY`), the key of its per-entity statistics (:data:`PER_ENTITY_KEY`) or a
+    key into a versioned parent (:data:`VERSIONED_PARENT`). Everything that protects the query
+    process stays: the checker, :data:`CAN_FAIL`, the types and the public bounds.
     """
     if not request.queries:
-        return QueryPlans()
+        return QueryPlans(noisy=noisy)
     schema = _schema_of(contract, request)
     rows = {table: _row_column(columns) for table, columns in schema.items()}
     planner = _Planner(
-        schema, rows, enum_levels, contract, facts=[fact.table for fact in request.facts]
+        schema,
+        rows,
+        enum_levels,
+        contract,
+        facts=[fact.table for fact in request.facts],
+        noisy=noisy,
     )
     plans = tuple(planner.plan(index, each) for index, each in enumerate(request.queries))
-    return QueryPlans(plans, schema, rows)
+    return QueryPlans(plans, schema, rows, noisy)
 
 
 def _way_of(plan: QueryPlan) -> Tuple[str, ...]:
@@ -531,7 +570,9 @@ class _Planner:
         enum_levels: Callable[[str], Sequence[str]],
         contract: Mapping[str, Any],
         facts: Sequence[str] = (),
+        noisy: bool = False,
     ) -> None:
+        self._noisy = noisy
         self._schema = schema
         self._rows = rows
         self._enum_levels = enum_levels
@@ -762,27 +803,38 @@ class _Planner:
         expose = self._exposes.get(table, {})
         semantics = expose.get("semantics")
         semantics = semantics if isinstance(semantics, Mapping) else {}
+        natural = False
         try:
             window = semantics_builder.version_window(semantics)
         except (KeyError, StopIteration, TypeError, ValueError):
-            return HISTORY_ENTITY  # a window that cannot be read is not shown not to be the key's
+            if not self._noisy:
+                return (
+                    HISTORY_ENTITY  # a window that cannot be read is not shown not to be the key's
+                )
+            window = None
         if window is not None and window.key == key:
-            return HISTORY_ENTITY
+            if not self._noisy:
+                return HISTORY_ENTITY
+            natural = True
         links = [
             raw
             for raw in (semantics.get("relationships") or [])
             if isinstance(raw, Mapping) and _names(raw.get("fromColumns")) == (key,)
         ]
         if len(links) != 1 or links[0].get("cardinality") != "many_to_one":
-            return ENTITY_ONLY
-        if any(source == (key,) for source, _ in per_entity.dependencies(expose)):
+            # a noisy plan counts the natural entity of a versioned table by itself: no
+            # relationship is needed to say which entities they are
+            return None if natural else ENTITY_ONLY
+        if not self._noisy and any(
+            source == (key,) for source, _ in per_entity.dependencies(expose)
+        ):
             return PER_ENTITY_KEY
         target, to_columns = links[0].get("to"), _names(links[0].get("toColumns"))
         if len(to_columns) != 1 or not isinstance(target, str):
-            return ENTITY_ONLY
+            return None if natural else ENTITY_ONLY
         from fluid_build.data_rules._model import declares_validity_window
 
-        if declares_validity_window(self._exposes.get(target, {})):
+        if not self._noisy and declares_validity_window(self._exposes.get(target, {})):
             return VERSIONED_PARENT
         return (target, to_columns[0]) if target in self._schema else None
 
@@ -791,7 +843,7 @@ class _Planner:
         duck = _duck(self.types(table)[key])
         if duck is None or duck.split("(")[0] not in _ENTITY_KEYS:
             return ENTITY_KEY_TYPE
-        if parent is not None:
+        if parent is not None and not self._noisy:  # a noisy plan never joins the parent's rows
             theirs = self.types(parent[0]).get(parent[1])
             if theirs is None or _duck(theirs) != duck:
                 return ENTITY_PARENT_TYPE
@@ -864,7 +916,7 @@ class _Planner:
         if not self._fenced(where, alias, unit.outputs):
             return blank.refused(CAN_FAIL)
         pairs = {*view.columns, (unit.table, unit.key)}
-        if unit.parent is not None:
+        if unit.parent is not None and not self._noisy:
             pairs.add(unit.parent)
         reads = tuple(sorted(pairs))
         why = self._loadable(reads)
@@ -967,7 +1019,7 @@ class _Planner:
         return None
 
     def _room(self, plan: QueryPlan) -> Optional[str]:
-        for claimed, way in _claims(plan):
+        for claimed, way in () if self._noisy else _claims(plan):
             if self._ways.get(claimed, way) != way:
                 return COUNTED_ANOTHER_WAY
         unit = plan.unit
@@ -1649,6 +1701,53 @@ class Measured:
                     self._own[index].verdicts[group] = _SET_VERDICT
         return {layout.fact_of[at] for at in dead if at in layout.fact_of}
 
+    # -- the exact cells of a noisy plan ------------------------------------------------------
+
+    def raw_cells(self, index: int) -> Optional[List[Tuple[int, int]]]:
+        """The exact ``(records, records the query returns)`` of each group of query *index*.
+
+        One pair for a query with no ``groupBy`` and one per level for a grouped one, in the order
+        of :attr:`QueryPlan.levels`. No cell or set check is applied: a release whose statistics
+        carry noise suppresses nothing. ``None`` for a query that was not run (it was refused, or
+        the run failed).
+        """
+        member = self._table_member(index)
+        if member is not None:
+            return list(member.sizes) if member.sizes is not None else [(member.size, member.true)]
+        for population in self.populations:
+            for entity in population.members:
+                if entity.plan.index == index:
+                    return [(entity.k, entity.true)]
+        return None
+
+    def row_cells(self, index: int) -> Optional[List[int]]:
+        """The cell of each row the query ran over, for a query over a table's rows; else ``None``.
+
+        A row lands in cell ``2 * group + returned``: ``returned`` is 1 where the query returns the
+        row and 0 where its unit keeps the row and the query does not, and ``group`` is the level
+        of its ``groupBy`` column (0 for a query with none). A row its unit does not keep, or with
+        no grouping value, is in no cell: :data:`NO_CELL`. A query over entities has no rows of its
+        own and returns ``None``.
+        """
+        member = self._table_member(index)
+        if member is None:
+            return None
+        found: List[int] = []
+        for at, outcome in enumerate(member.outcomes):
+            if member.unit is not None and member.unit[at] != _IN:
+                found.append(NO_CELL)
+                continue
+            group = 0 if member.assigned is None else member.assigned[at]
+            found.append(NO_CELL if group is None else 2 * group + (1 if outcome == _IN else 0))
+        return found
+
+    def _table_member(self, index: int) -> Optional[_Member]:
+        for members in self.tables.values():
+            for each in members:
+                if each.plan.index == index:
+                    return each
+        return None
+
     # -- the entries -------------------------------------------------------------------------
 
     def entries(
@@ -2257,7 +2356,7 @@ def measure(
     plans: QueryPlans,
     reads: Mapping[str, Any],
     backend: StatisticsBackend,
-    rule: disclosure.DisclosureRule,
+    rule: Optional[disclosure.DisclosureRule],
     links: Sequence[CountedLink] = (),
 ) -> Measured:
     """Run every answerable query over the records in one query process and keep what it counted.
@@ -2270,6 +2369,10 @@ def measure(
 
     *links* are the relationships the profile counts, for the queries over a unit that groups
     by the child column of one: their parents are that unit's records.
+
+    For a noisy plan (:attr:`QueryPlans.noisy`) *rule* is ``None``: no cell or set check is made,
+    nothing is suppressed, and the exact cells are read with :meth:`Measured.raw_cells` and
+    :meth:`Measured.row_cells`. A failure withholds every query of the run all the same.
     """
     done = _measure(plans, reads, backend, rule, links)
     if not done.failed:
@@ -2283,7 +2386,7 @@ def _measure(
     plans: QueryPlans,
     reads: Mapping[str, Any],
     backend: StatisticsBackend,
-    rule: disclosure.DisclosureRule,
+    rule: Optional[disclosure.DisclosureRule],
     links: Sequence[CountedLink] = (),
 ) -> Measured:
     """Run every answerable query over the records in one query process and keep what it counted.
@@ -2323,7 +2426,8 @@ def _measure(
             _table_answer(plan, by_id, reads, assigned.get(plan.index), done)
     for population in populations:
         _population_answer(population, by_id, reads, done)
-    done.check_cells(rule)
+    if rule is not None and not plans.noisy:
+        done.check_cells(rule)
     return done
 
 
