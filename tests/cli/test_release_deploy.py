@@ -317,8 +317,8 @@ class DeployS3(FakeS3):
         self.copy_members = {"IfMatch": 1, "IfNoneMatch": 1}
 
         class _Op:
-            def __init__(op, members: Dict[str, int]) -> None:
-                op.input_shape = type("S", (), {"members": members})()
+            def __init__(self, members: Dict[str, int]) -> None:
+                self.input_shape = type("S", (), {"members": members})()
 
         fake = self
 
