@@ -60,9 +60,12 @@
 # release.yml installs its build tools from requirements/release-tools.txt, and
 # a tag cut before that file existed does not have it. Such a tag is dispatched
 # with --ref <tag> instead, which runs the tag's own release.yml (and so cannot
-# skip TestPyPI). The gate refuses a start ref that does not contain the tag's
-# commit, and warns that the provenance names the start ref when it is not the
-# tag.
+# skip TestPyPI). The same holds for a tag whose release-tools.txt has no build
+# backend (v0.41.0 and earlier): main's build job runs `python -m build
+# --no-isolation` and stops, before anything is signed, when the tag's lock
+# lacks setuptools. The gate refuses a start ref that does not contain the
+# tag's commit, and warns that the provenance names the start ref when it is
+# not the tag.
 #
 # verify-pypi (install + smoke from real PyPI) still runs; it is the only
 # index install check on that path.
@@ -255,17 +258,23 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Hash-locked: requirements/release-tools.in names pip, build, twine and
-      # cyclonedx-bom, and release-tools.txt carries every wheel hash.
-      # --require-hashes refuses anything that is not in the file. The SBOM step
-      # below uses cyclonedx-bom from the same file.
+      # Hash-locked: requirements/release-tools.in names pip, build, twine,
+      # cyclonedx-bom and the build backend (setuptools, setuptools-scm, wheel),
+      # and release-tools.txt carries every wheel hash. --require-hashes refuses
+      # anything that is not in the file. The SBOM step below uses cyclonedx-bom
+      # from the same file.
       - name: Install build tools (hash-locked)
         run: python -m pip install --require-hashes -r requirements/release-tools.txt
 
+      # --no-isolation builds with the backend installed above. Without it, build
+      # makes a fresh environment and installs pyproject.toml's [build-system]
+      # requires from PyPI, unpinned and unhashed, on every release. build still
+      # checks those requires against this environment and stops before building
+      # when one is missing or out of bounds.
       - name: Build wheel and sdist
         env:
           FLUID_BUILD_PROFILE: ${{ needs.quality-gate.outputs.profile }}
-        run: python -m build
+        run: python -m build --no-isolation
 
       - name: Strict metadata check
         run: twine check --strict dist/*

@@ -40,10 +40,18 @@ import shutil
 import subprocess
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
 import pytest
 import yaml
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
+REPO = Path(__file__).resolve().parents[1]
+WORKFLOW = REPO / ".github" / "workflows" / "release.yml"
 
 _STATUS_FNS = {"success", "always", "failure", "cancelled"}
 _TESTPYPI_JOBS = {"publish-testpypi", "verify-testpypi"}
@@ -755,3 +763,39 @@ def test_gate_refuses_a_start_ref_that_does_not_contain_the_tag(
         assert part in got["failed"], (part, got["failed"])
     # Refused before the ci.yml lookup: nothing past this point runs.
     assert "listWorkflowRuns" not in [c[0] for c in got["calls"]], got["calls"]
+
+
+# --------------------------------------------------------------------------
+# The build backend comes from the hash lock, never from PyPI at build time.
+# --------------------------------------------------------------------------
+
+
+def _locked(name: str) -> dict[str, str]:
+    """{canonical name: pinned version} of requirements/<name>.txt."""
+    pins: dict[str, str] = {}
+    for line in (REPO / "requirements" / f"{name}.txt").read_text().splitlines():
+        m = re.match(r"([A-Za-z0-9._-]+)==([^\s;\\]+)", line)
+        if m:
+            pins[canonicalize_name(m.group(1))] = m.group(2)
+    return pins
+
+
+def test_the_release_is_built_without_build_isolation() -> None:
+    """With isolation, build installs [build-system] requires fresh from PyPI,
+    unpinned and unhashed, on every release."""
+    (step,) = [s for s in _steps("build") if s.get("name") == "Build wheel and sdist"]
+    assert step["run"].split() == ["python", "-m", "build", "--no-isolation"], step["run"]
+
+
+def test_every_build_requirement_is_hash_locked_for_the_release() -> None:
+    """build --no-isolation stops when a requirement is missing, so a new entry in
+    [build-system] requires that is not in the lock fails the release; this
+    test says so on the pull request instead."""
+    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    pins = _locked("release-tools")
+    for req in map(Requirement, pyproject["build-system"]["requires"]):
+        name = canonicalize_name(req.name)
+        assert name in pins, f"{req} is missing from requirements/release-tools.txt"
+        assert req.specifier.contains(
+            pins[name], prereleases=True
+        ), f"{name}=={pins[name]} vs {req}"

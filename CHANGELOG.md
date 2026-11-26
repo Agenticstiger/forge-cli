@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release; the flag without `--release-dir` is refused. `fluid runs status --release-dir` names
   each external file and its source.
 
+### Changed
+
+- **The release builds with a locked build backend.** `setuptools`, `setuptools-scm` and `wheel`
+  are pinned and hashed in `requirements/release-tools.txt`, and the release runs
+  `python -m build --no-isolation`, so no release installs a build backend from PyPI while it
+  builds. Re-dispatch a tag cut before this change (0.41.0 and earlier) with `--ref <tag>`.
+
 ### Fixed
 
 - **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through
