@@ -38,7 +38,7 @@ import shutil
 import stat
 import tarfile
 from pathlib import Path
-from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.util.release_record import (  # the record's names, which callers read here too
     RELEASE_INDEX,
@@ -174,6 +174,15 @@ def source_revision(env: Mapping[str, str]) -> Optional[Dict[str, str]]:
     return None
 
 
+def _source_names(env: Mapping[str, str]) -> Tuple[str, str]:
+    """The variables the running CI names its commit and its repository in, in the order
+    ``source_revision`` tries them."""
+    for markers, revision, repository, _ref in _SOURCE_VARS:
+        if any(env.get(name) for name in markers):
+            return revision, repository
+    return "the CI's commit variable", "its repository variable"
+
+
 def refusal(
     release_dir: Optional[Path],
     selected: Collection[int],
@@ -188,6 +197,11 @@ def refusal(
     remote = _release_publish.refusal(opts.release_to, release_dir, opts.release_to_require)
     if remote:
         return remote
+    from . import _release_archive
+
+    archive = _release_archive.refusal(opts.release_archive, release_dir)
+    if archive:
+        return archive
     if release_dir is None:
         if opts.artifacts:
             return (
@@ -292,12 +306,14 @@ def _checkout_problem(contract_dir: Path) -> Optional[str]:
     named = source["digest"]["gitCommit"]
     if head is None or head == named:
         return None
+    revision, repository = _source_names(os.environ)
     return (
         f"--release-dir: the CI names commit {named}, and the contract's checkout is at "
         f"{clean(head, 64)}: a release names the commit it was built from. This happens when the "
         "contract sits in a second repository or a submodule, or when a pull-request pipeline "
         "builds a local merge commit (Bitbucket, Jenkins merge-with-target): seal from the "
-        "checkout the CI variable names, or set that variable to the commit checked out"
+        f"checkout {revision} names, or set both {revision} to the commit checked out and "
+        f"{repository} to the repository it is a commit of"
     )
 
 

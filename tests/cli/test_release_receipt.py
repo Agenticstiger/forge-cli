@@ -1174,6 +1174,7 @@ def test_cosign_stderr_is_named_when_it_does_not_verify(
     )
     found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
     assert found.exit_code == 1 and "transparency log or certificate authority" in found.reason
+    assert "a bundle signed by another cosign major" in found.reason
     assert found.reason.endswith(": Error: getting tlog: ?[31mtimeout")
 
 

@@ -1084,6 +1084,7 @@ module = [
     "fluid_build.cli._release_publish",
     "fluid_build.util.s3",
     "fluid_build.util.release_record",
+    "fluid_build.cli._release_archive",
     "fluid_build.util.receipt_record",
     "fluid_build.cli._release_receipt",
     "fluid_build.api.verify_report",
