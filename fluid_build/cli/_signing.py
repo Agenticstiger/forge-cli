@@ -277,8 +277,37 @@ def sign_bundle(
     extension, cosign-not-on-PATH, bad key_ref). A non-zero exit from
     cosign is returned in the dict — callers decide how to react.
     """
-    cosign = _resolve_cosign()
     bundle = _validate_bundle_path(bundle_path)
+    return _sign_file(bundle, sig_out=sig_out, pem_out=pem_out, key_ref=key_ref, timeout=timeout)
+
+
+def sign_blob(
+    path: str,
+    *,
+    key_ref: Optional[str] = None,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> Dict:
+    """Sign any regular file with cosign, as :func:`sign_bundle` signs a bundle (keyless by
+    default, keyed with ``key_ref``), writing ``<file>.sig`` and, keyless, ``<file>.pem``. For a
+    record that is not a bundle, such as a release receipt's in-toto Statement.
+
+    Raises CLIError when ``path`` is not a regular file or cosign is not on PATH.
+    """
+    blob = Path(path).resolve()
+    if not blob.is_file():
+        raise CLIError(2, "signing_blob_not_file", {"path": str(blob)})
+    return _sign_file(blob, sig_out=None, pem_out=None, key_ref=key_ref, timeout=timeout)
+
+
+def _sign_file(
+    bundle: Path,
+    *,
+    sig_out: Optional[str],
+    pem_out: Optional[str],
+    key_ref: Optional[str],
+    timeout: int,
+) -> Dict:
+    cosign = _resolve_cosign()
     sig_path = Path(sig_out).resolve() if sig_out else bundle.with_suffix(bundle.suffix + ".sig")
     pem_path = Path(pem_out).resolve() if pem_out else bundle.with_suffix(bundle.suffix + ".pem")
 
@@ -422,6 +451,7 @@ def verify_bundle(
 
 __all__ = [
     "cosign_available",
+    "sign_blob",
     "sign_bundle",
     "verify_bundle",
 ]
