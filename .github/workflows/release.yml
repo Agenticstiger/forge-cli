@@ -13,7 +13,9 @@
 #      attaches an in-toto SLSA build provenance to the wheel, the sdist and
 #      the GHCR image; the wheel's and sdist's bundles are also attached to the
 #      GitHub Release as `<file>.intoto.jsonl`. All use GitHub OIDC — no
-#      long-lived secrets.
+#      long-lived secrets. Only jobs that run no code fetched at release time
+#      hold the signing token: build and docker install the package's
+#      dependencies, so attest and attest-image sign what they produced.
 #
 #   3. Release notes come from CHANGELOG.md, not git log.
 #      The GitHub Release body is extracted from the matching `## [X.Y.Z]`
@@ -28,12 +30,14 @@
 #
 #   quality-gate
 #       └─ build
-#           └─ publish-testpypi          (every tag; + Sigstore)
-#               └─ verify-testpypi       (install + smoke from TestPyPI)
-#                   └─ publish-pypi      (every tag, stable and pre; + Sigstore)
-#                       ├─ verify-pypi   (final smoke from real PyPI)
-#                       ├─ docker        (only once PyPI accepted the upload)
-#                       └─ github-release
+#           └─ attest                        (SLSA provenance of wheel + sdist)
+#               └─ publish-testpypi          (every tag; + Sigstore)
+#                   └─ verify-testpypi       (install + smoke from TestPyPI)
+#                       └─ publish-pypi      (every tag, stable and pre; + Sigstore)
+#                           ├─ verify-pypi   (final smoke from real PyPI)
+#                           ├─ docker        (only once PyPI accepted the upload)
+#                           │   └─ attest-image  (SLSA provenance of the image)
+#                           └─ github-release
 #
 # All tags (stable and pre-release) promote to PyPI after the TestPyPI
 # install smoke passes. Pre-releases are PEP 440 pre-release versions
@@ -242,13 +246,17 @@ jobs:
     name: Build Package
     needs: quality-gate
     runs-on: ubuntu-latest
+    # Read-only. This job runs code from outside the repository's locks: the
+    # smoke install below resolves the package's dependencies from PyPI and
+    # runs the CLI. So it cannot ask for a signing token; the attest job signs.
     permissions:
       contents: read
-      id-token: write          # Sigstore / OIDC
-      attestations: write      # SLSA build provenance
+    outputs:
+      sha256: ${{ steps.digests.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           # The tag's commit, also on a manual run started from a branch.
           ref: ${{ needs.quality-gate.outputs.sha }}
           # setuptools-scm needs full history + all tags to derive the version.
@@ -279,8 +287,8 @@ jobs:
       - name: Strict metadata check
         run: twine check --strict dist/*
 
-      # Fails before anything is signed if dist/ is not exactly one wheel and one
-      # sdist, so the two attest steps below each match one file.
+      # Fails before anything is uploaded or signed if dist/ is not exactly one
+      # wheel and one sdist, so each attest step matches one file.
       - name: Check dist/ holds one wheel and one sdist
         run: |
           set -euo pipefail
@@ -293,39 +301,24 @@ jobs:
             exit 1
           fi
 
-      # One attestation per distribution file, so each file gets a bundle of its
-      # own that can ride along with it as a release asset. Each is an in-toto
-      # attestation proving the file was built by this workflow / this commit,
-      # verifiable via `gh attestation verify`.
-      - name: Attest build provenance of the wheel (SLSA)
-        id: attest-wheel
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
-        with:
-          subject-path: "dist/*.whl"
-
-      - name: Attest build provenance of the sdist (SLSA)
-        id: attest-sdist
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
-        with:
-          subject-path: "dist/*.tar.gz"
-
-      # The bundle is a Sigstore bundle holding the signed SLSA provenance. It is
-      # named <file>.intoto.jsonl, the name OpenSSF Scorecard's Signed-Releases
-      # check looks for among the release assets, and kept out of dist/ so the
-      # PyPI upload sees only distribution files. Same approach as
-      # pypa/virtualenv's release workflow.
-      - name: Collect the provenance bundles
-        env:
-          WHEEL_BUNDLE: ${{ steps.attest-wheel.outputs.bundle-path }}
-          SDIST_BUNDLE: ${{ steps.attest-sdist.outputs.bundle-path }}
+      # Taken before any step that runs code from outside this repository and
+      # its locks, and the files are uploaded right after, before the smoke
+      # install: the attest job signs only files with exactly these digests.
+      - name: Record the distribution files' digests
+        id: digests
         run: |
           set -euo pipefail
-          wheels=(dist/*.whl)
-          sdists=(dist/*.tar.gz)
-          mkdir provenance
-          cp "${WHEEL_BUNDLE}" "provenance/$(basename "${wheels[0]}").intoto.jsonl"
-          cp "${SDIST_BUNDLE}" "provenance/$(basename "${sdists[0]}").intoto.jsonl"
-          ls -l provenance
+          cd dist
+          sha256sum -- *.whl *.tar.gz
+          echo "sha256=$(sha256sum -- *.whl *.tar.gz | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Isolated wheel install and verify
         run: |
@@ -375,12 +368,84 @@ jobs:
           path: sbom.cdx.json
           retention-days: 30
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+  # ──────────────────────────────────────────────────────────────
+  # 2b. Sign the build provenance of the distribution files.
+  #
+  # A job of its own, the pattern slsa-github-generator follows: the job that
+  # holds the signing token runs nothing but the steps below. The build job
+  # runs the build backend, the package's dependencies and the SBOM tool, and
+  # none of them can ask for a token that signs as this workflow. Nothing is
+  # published unless this job succeeded.
+  # ──────────────────────────────────────────────────────────────
+  attest:
+    name: Attest Build Provenance
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write          # Sigstore / OIDC
+      attestations: write      # SLSA build provenance
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: dist
           path: dist/
-          retention-days: 30
+
+      # Signs nothing unless dist/ is exactly one wheel and one sdist, each the
+      # file the build job recorded before any step ran fetched code.
+      - name: Check dist/ holds one wheel and one sdist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          if [ "${#wheels[@]}" -ne 1 ] || [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel and one sdist in dist/"
+            ls -l dist
+            exit 1
+          fi
+
+      - name: Check the files are the ones the build job made
+        env:
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cd dist
+          printf '%s' "${SHA256}" | base64 -d | sha256sum --check --strict -
+
+      # One attestation per distribution file, so each file gets a bundle of its
+      # own that can ride along with it as a release asset. Each is an in-toto
+      # attestation proving the file was built by this workflow / this commit,
+      # verifiable via `gh attestation verify`.
+      - name: Attest build provenance of the wheel (SLSA)
+        id: attest-wheel
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: "dist/*.whl"
+
+      - name: Attest build provenance of the sdist (SLSA)
+        id: attest-sdist
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      # The bundle is a Sigstore bundle holding the signed SLSA provenance. It is
+      # named <file>.intoto.jsonl, the name OpenSSF Scorecard's Signed-Releases
+      # check looks for among the release assets, and kept out of dist/ so the
+      # PyPI upload sees only distribution files. Same approach as
+      # pypa/virtualenv's release workflow.
+      - name: Collect the provenance bundles
+        env:
+          WHEEL_BUNDLE: ${{ steps.attest-wheel.outputs.bundle-path }}
+          SDIST_BUNDLE: ${{ steps.attest-sdist.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          mkdir provenance
+          cp "${WHEEL_BUNDLE}" "provenance/$(basename "${wheels[0]}").intoto.jsonl"
+          cp "${SDIST_BUNDLE}" "provenance/$(basename "${sdists[0]}").intoto.jsonl"
+          ls -l provenance
 
       - name: Upload provenance bundles
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
@@ -395,7 +460,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────
   publish-testpypi:
     name: Publish to TestPyPI
-    needs: [quality-gate, build]
+    needs: [quality-gate, attest]
     if: needs.quality-gate.outputs.skip_testpypi != 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -494,7 +559,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
-    needs: [quality-gate, build, verify-testpypi]
+    needs: [quality-gate, build, attest, verify-testpypi]
     # All tags promote to PyPI once the TestPyPI install smoke passes.
     # Pre-releases (rc/b/a/dev) are PEP 440 pre-release versions; PyPI
     # treats them as such, and `pip install` skips them by default
@@ -507,6 +572,7 @@ jobs:
       ${{ !cancelled()
       && needs.quality-gate.result == 'success'
       && needs.build.result == 'success'
+      && needs.attest.result == 'success'
       && (needs.verify-testpypi.result == 'success'
       || (needs.verify-testpypi.result == 'skipped' && needs.quality-gate.outputs.skip_testpypi == 'true')) }}
     runs-on: ubuntu-latest
@@ -720,11 +786,15 @@ jobs:
     # version PyPI accepted. Gated like github-release, for the same reasons.
     if: ${{ !cancelled() && needs.quality-gate.result == 'success' && needs.build.result == 'success' && needs.publish-pypi.result == 'success' }}
     runs-on: ubuntu-latest
+    # No signing token here: this job runs code from outside the repository's
+    # locks (the image build installs the package's dependencies, and the
+    # check below runs the image). attest-image signs what it pushed.
     permissions:
       contents: read
-      packages: write          # push the image and its attestation to GHCR
-      id-token: write          # Sigstore / OIDC
-      attestations: write      # SLSA build provenance
+      packages: write          # push the image to GHCR
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.docker-meta.outputs.tags }}
     env:
       REGISTRY: ghcr.io
       IMAGE_NAME: ${{ github.repository }}
@@ -732,6 +802,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ needs.quality-gate.outputs.sha }}
+          persist-credentials: false
 
       # Into the build context: the Dockerfile installs this wheel, the file the
       # build job made and PyPI serves, instead of building the source tree.
@@ -832,6 +903,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # ──────────────────────────────────────────────────────────────
+  # 5b. Sign the build provenance of the pushed image, apart from the job that
+  #     built it, as the attest job does for the distribution files.
+  # ──────────────────────────────────────────────────────────────
+  attest-image:
+    name: Attest Image Provenance
+    needs: docker
+    # Explicit: on the outage path the TestPyPI jobs, ancestors through docker,
+    # are skipped, and the implicit success() is then false.
+    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write          # store the attestation in GHCR beside the image
+      id-token: write          # Sigstore / OIDC
+      attestations: write      # SLSA build provenance
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
       # The attestation subject is the registry name in lowercase, which is how
       # GHCR stores it, while github.repository keeps the owner's capitals.
       - name: Name the image for attestation
@@ -839,6 +929,14 @@ jobs:
         env:
           REGISTRY_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: echo "name=${REGISTRY_IMAGE,,}" >> "${GITHUB_OUTPUT}"
+
+      # push-to-registry writes the attestation to GHCR with this login.
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Signs a SLSA build provenance for the pushed image's digest with the
       # run's OIDC identity and stores it in GHCR beside the image, so
@@ -851,6 +949,6 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-name: ${{ steps.image.outputs.name }}
-          subject-digest: ${{ steps.push.outputs.digest }}
+          subject-digest: ${{ needs.docker.outputs.digest }}
           push-to-registry: true
           create-storage-record: false

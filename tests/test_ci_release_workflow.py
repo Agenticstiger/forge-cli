@@ -458,11 +458,13 @@ def _ok(got: dict[str, str], job: str) -> bool:
 _RUNS_WHEN = {
     "quality-gate": lambda got, skip: True,
     "build": lambda got, skip: _ok(got, "quality-gate"),
-    "publish-testpypi": lambda got, skip: not skip and _ok(got, "build"),
+    "attest": lambda got, skip: _ok(got, "build"),
+    "publish-testpypi": lambda got, skip: not skip and _ok(got, "attest"),
     "verify-testpypi": lambda got, skip: not skip and _ok(got, "publish-testpypi"),
-    "publish-pypi": lambda got, skip: _ok(got, "build") and (skip or _ok(got, "verify-testpypi")),
+    "publish-pypi": lambda got, skip: _ok(got, "attest") and (skip or _ok(got, "verify-testpypi")),
     "verify-pypi": lambda got, skip: _ok(got, "publish-pypi"),
     "docker": lambda got, skip: _ok(got, "publish-pypi"),
+    "attest-image": lambda got, skip: _ok(got, "docker"),
     "github-release": lambda got, skip: _ok(got, "publish-pypi"),
 }
 
@@ -856,3 +858,81 @@ def test_the_docker_job_builds_the_image_around_this_release_s_wheel() -> None:
     step = _steps("docker")[check]
     assert step["env"]["VERSION"] == "${{ needs.quality-gate.outputs.version }}", step
     assert "fluid_build.__version__" in step["run"] and "exit 1" in step["run"], step["run"]
+
+
+# --------------------------------------------------------------------------
+# Signing happens only in jobs that run no code fetched at release time.
+# --------------------------------------------------------------------------
+
+_SIGNERS = {"attest", "attest-image", "publish-testpypi", "publish-pypi"}
+
+
+def test_only_jobs_that_run_no_fetched_code_can_sign() -> None:
+    """A job with `id-token: write` can sign anything as this workflow. The
+    jobs that build, install or run the package (whose dependencies come from
+    PyPI at release time) hold no such token; the jobs that do run pinned
+    actions and shell that installs and runs nothing."""
+    jobs = _jobs()
+    signers = {
+        n for n, j in jobs.items() if (j.get("permissions") or {}).get("id-token") == "write"
+    }
+    assert signers == _SIGNERS, signers
+    runs_code = re.compile(r"pip install|python -m build|docker (build|run)|\bfluid\b|cyclonedx")
+    for name in sorted(signers):
+        for step in jobs[name]["steps"]:
+            assert not runs_code.search(step.get("run", "")), (name, step.get("name"))
+
+
+def _record_and_check(tmp_path: Path, tamper: bool) -> subprocess.CompletedProcess:
+    """Run the build job's digest step, then the attest job's check, as bash."""
+    record = next(s for s in _steps("build") if s.get("id") == "digests")["run"]
+    check = next(
+        s
+        for s in _steps("attest")
+        if s.get("name") == "Check the files are the ones the build job made"
+    )["run"]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+    out = tmp_path / "out"
+    env = {**os.environ, "GITHUB_OUTPUT": str(out)}
+    subprocess.run(["bash", "-c", record], cwd=tmp_path, env=env, check=True, capture_output=True)
+    (line,) = [ln for ln in out.read_text().splitlines() if ln.startswith("sha256=")]
+    if tamper:
+        (dist / "pkg-1.0-py3-none-any.whl").write_bytes(b"other wheel")
+    env["SHA256"] = line.removeprefix("sha256=")
+    return subprocess.run(
+        ["bash", "-c", check], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_the_attest_job_signs_only_the_files_the_build_recorded(tmp_path, tamper: bool) -> None:
+    """The smoke install runs the package's dependencies in the build job, after
+    the digests are taken and the files uploaded; a file changed after that is
+    refused before anything is signed."""
+    got = _record_and_check(tmp_path, tamper)
+    assert (got.returncode != 0) is tamper, got.stdout + got.stderr
+    build = [s.get("name") for s in _steps("build")]
+    order = [
+        build.index("Build wheel and sdist"),
+        build.index("Record the distribution files' digests"),
+        build.index("Upload build artifacts"),
+        build.index("Isolated wheel install and verify"),
+    ]
+    assert order == sorted(order), build
+    assert _jobs()["build"]["outputs"]["sha256"] == "${{ steps.digests.outputs.sha256 }}"
+    attest = _steps("attest")
+    check = next(i for i, s in enumerate(attest) if s.get("env", {}).get("SHA256"))
+    signing = [i for i, s in enumerate(attest) if "attest-build-provenance" in s.get("uses", "")]
+    assert attest[check]["env"]["SHA256"] == "${{ needs.build.outputs.sha256 }}"
+    assert signing and check < min(signing), attest
+
+
+def test_the_image_attestation_signs_the_digest_the_docker_job_pushed() -> None:
+    docker = _jobs()["docker"]
+    assert docker["outputs"]["digest"] == "${{ steps.push.outputs.digest }}"
+    (step,) = [s for s in _steps("attest-image") if "attest-build-provenance" in s.get("uses", "")]
+    assert step["with"]["subject-digest"] == "${{ needs.docker.outputs.digest }}"
+    assert step["with"]["push-to-registry"] is True

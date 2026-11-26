@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are pinned and hashed in `requirements/release-tools.txt`, and the release runs
   `python -m build --no-isolation`, so no release installs a build backend from PyPI while it
   builds. Re-dispatch a tag cut before this change (0.41.0 and earlier) with `--ref <tag>`.
+- **The release signs its provenance in jobs of their own.** The jobs that build the
+  distribution files and the image run the package's dependencies, fetched from PyPI at release
+  time, so they no longer hold the token that signs as the release workflow. `attest` signs the
+  wheel and the sdist after checking they are the files the build recorded before any of that
+  code ran, and `attest-image` signs the pushed image. Nothing is published unless `attest`
+  succeeded.
 
 ### Fixed
 
