@@ -25,6 +25,8 @@ The package has six parts, each its own module:
   ACRO's output-checking defaults.
 * :mod:`~fluid_build.profiler.document` writes the canonical document and its
   digest.
+* :mod:`~fluid_build.profiler.references` releases a small table the contract marks public whole,
+  as a profile's ``references``, and gives a history the keys of a foreign key's levels.
 * :mod:`~fluid_build.profiler.bundle` finds the fidelity block a FLUX bundle's
   Simulation declares for the expose, read the way the engine reads it, for
   ``--bundle``.

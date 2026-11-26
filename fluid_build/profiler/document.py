@@ -17,7 +17,8 @@ is the digest a Simulation pins.
 
 A profile names the least format that holds it (:func:`schema_url_for`): 1-0-0, unless it
 holds a ``quantile/2`` statistic (1-1-0), an ``invariants`` section (1-2-0), a statistic
-grouped by a link (1-3-0), or a rank correlation, a statistic grouped by the bins of a column
+grouped by a link (1-3-0), a table released whole under ``references`` (1-3-0), or a rank
+correlation, a statistic grouped by the bins of a column
 or a relationship's statistic grouped by a parent column (1-4-0). A table's ``datePairs``, ``calendar`` and ``history`` and
 a relationship's ``dates``, ``structural`` and ``exposure`` are forms of 1-3-0. A profile without one of
 them keeps the bytes it had.
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import unicodedata
+from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Sequence
 
 from fluid_build.profiler.disclosure import MAX_COUNT, DisclosureRule
@@ -39,6 +41,7 @@ __all__ = [
     "DocumentError",
     "MAX_FRACTIONAL_BITS",
     "PRODUCER_REPOSITORY",
+    "PUBLIC_RULE",
     "SCHEMA_URL",
     "SCHEMA_URL_1_1_0",
     "SCHEMA_URL_1_2_0",
@@ -76,6 +79,10 @@ _ADDED_IN_1_1_0 = frozenset({"quantile/2"})
 
 #: ``_producer`` names this repository, at the release that wrote the profile.
 PRODUCER_REPOSITORY = "https://github.com/Agenticstiger/forge-cli"
+
+#: The disclosure rule a table released whole names: it applied no check, so its entry is empty
+#: (PROFILE-SPEC section 5b, ``{}`` for "nothing was applied").
+PUBLIC_RULE = "public"
 
 #: The grid a profile declares unless told otherwise: KERNEL-SPEC §12's default,
 #: which a fidelity block that declares no ``encoding`` uses too. ``mean/1`` is
@@ -151,16 +158,19 @@ def schema_url_for(
     invariants: bool = False,
     relationships: Sequence[Mapping[str, Any]] = (),
     queries: Sequence[Mapping[str, Any]] = (),
+    references: bool = False,
 ) -> str:
     """The least format that holds *tables*, *relationships*, any ``invariants`` and ``queries``.
 
-    1-3-0 with a ``groupBy`` on a query's statistic (a query's rate per group); 1-4-0 with a rank correlation, a ``groupByBins``, a ``rowFloor`` or a relationship's
+    1-3-0 with ``references``; 1-3-0 with a ``groupBy`` on a query's statistic (a query's rate per group); 1-4-0 with a rank correlation, a ``groupByBins``, a ``rowFloor`` or a relationship's
     statistic grouped by a parent column (and with cliques of ``cliqueMarginal/2`` or a
     ``cliqueSelection``); 1-3-0 with a ``groupByLink``; 1-2-0 with ``invariants``; 1-1-0
     when any statistic is ``quantile/2``; else 1-0-0. Each format holds everything the
     ones before it do.
     """
     needed = 2 if invariants else 0
+    if references:
+        needed = max(needed, 3)
     if any("groupBy" in statistic for each in queries for statistic in each.get("statistics", ())):
         needed = max(needed, 3)
     for table in tables.values():
@@ -179,8 +189,13 @@ def build_document(
     relationships: Sequence[Mapping[str, Any]] = (),
     invariants: Sequence[Mapping[str, Any]] = (),
     queries: Sequence[Mapping[str, Any]] = (),
+    references: Mapping[str, Mapping[str, Any]] = MappingProxyType({}),
 ) -> Dict[str, Any]:
     """Assemble a document from tables already checked by *rule*, in the format they need.
+
+    *references* are the tables released whole (PROFILE-SPEC section 5b), by expose: each
+    names the rule :data:`PUBLIC_RULE`, which the document then declares as an empty rule. A
+    document that holds any names format 1-3-0.
 
     *invariants* are PROFILE-SPEC §5's facts' shares, checked by *rule*; a document that
     holds any names format 1-2-0. *queries* are §5's consumer queries' rates, checked by
@@ -195,12 +210,20 @@ def build_document(
     built: Dict[str, Any] = {
         "_producer": producer,
         "_schemaURL": schema_url_for(
-            tables, invariants=bool(invariants), relationships=relationships, queries=queries
+            tables,
+            invariants=bool(invariants),
+            relationships=relationships,
+            queries=queries,
+            references=bool(references),
         ),
         "encoding": {"fractionalBits": fractional_bits, "rounding": "floor"},
         "disclosureRules": {rule.name: rule.to_document()},
         "tables": {expose_id: dict(table) for expose_id, table in tables.items()},
     }
+    if references:
+        built["references"] = {expose_id: dict(each) for expose_id, each in references.items()}
+        for each in references.values():
+            built["disclosureRules"][each["disclosure"]] = {}
     if relationships:
         built["relationships"] = [dict(each) for each in relationships]
     if invariants:
