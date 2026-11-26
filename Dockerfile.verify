@@ -42,9 +42,12 @@ RUN python -m pip install --require-hashes -r requirements/verify-image.txt
 # Singer tap-postgres binary for the meltano runner's "embedded Singer"
 # default mode (the runner spawns the tap via subprocess and routes
 # RECORD messages through its built-in target). Kept in its own venv so
-# the tap's older dep pins don't poison the fluid env.
+# the tap's older dep pins don't poison the fluid env. Its packages are named in
+# requirements/singer-tap.in and hash-locked in singer-tap.txt, like the rest.
+COPY requirements/singer-tap.txt /tmp/singer-tap.txt
 RUN python -m venv /opt/singer-venv \
- && /opt/singer-venv/bin/pip install --no-cache-dir "meltanolabs-tap-postgres>=0.5" \
+ && /opt/singer-venv/bin/pip install --no-cache-dir --require-hashes -r /tmp/singer-tap.txt \
+ && rm /tmp/singer-tap.txt \
  && ln -s /opt/singer-venv/bin/tap-postgres /usr/local/bin/tap-postgres
 
 # Editable install happens at runtime against the bind-mounted /repo,
