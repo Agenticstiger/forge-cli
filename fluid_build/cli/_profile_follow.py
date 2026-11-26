@@ -89,6 +89,16 @@ def part_words(label: str, table: Optional[str] = None) -> str:
     return label
 
 
+def say_unread_sources(say: Any, unread: Sequence[Tuple[str, str]]) -> None:
+    """Name each ``--source`` the release left alone, and why: the expose, never its location."""
+    for expose_id, why in unread:
+        say(
+            f"Source not read: --source {expose_id} names exposes[{expose_id}], which this "
+            f"release does not read ({why}); no record of it was read.",
+            soft_wrap=True,
+        )
+
+
 def left_out_words(
     left_out: Sequence[Tuple[str, str]], table: Optional[str] = None
 ) -> List[Tuple[str, str]]:
@@ -151,6 +161,7 @@ def report(
     *,
     request: Tuple[str, Optional[bool]],
     rederived: bool,
+    unread: Sequence[Tuple[str, str]] = (),
 ) -> None:
     """Tell the owner what was released, under which loss, and what was left out."""
     from fluid_build.cli.console import warning
@@ -170,6 +181,7 @@ def report(
         "the tables as stated, nor that noise was drawn, and its evidence says so.",
         soft_wrap=True,
     )
+    say_unread_sources(say, unread)
     for text in plan.warnings:
         warning(text)
     total = release.decimal_text(plan.rho)
