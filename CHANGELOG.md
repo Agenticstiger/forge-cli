@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing if that section is not found. It uploads, signs, pushes and announces nothing, no job it
   runs holds a signing token, and it never shares the release's concurrency group. The release
   notes are now written by a read-only job; the GitHub Release job only posts them.
+- **The release verifies what it published.** Two read-only jobs end a release. One downloads the
+  GitHub Release's files and checks each with `gh attestation verify`, against its
+  `.intoto.jsonl` bundle and against GitHub's attestation store; the other checks that every GHCR
+  tag the push moved resolves to the digest the run pushed, and verifies it and the attestation
+  stored beside it. Every check pins the signer: the release workflow, the ref and commit the run
+  started from, and a GitHub-hosted runner.
 
 ### Fixed
 

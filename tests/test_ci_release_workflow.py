@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -406,6 +407,8 @@ _NOT_IN_A_DRY_RUN = {
     "verify-pypi",
     "attest-image",
     "github-release",
+    "verify-release",
+    "verify-image",
 }
 
 
@@ -489,6 +492,8 @@ _RUNS_WHEN = {
     "attest-image": lambda got, skip, dry: not dry and _ok(got, "docker"),
     "release-notes": lambda got, skip, dry: _ok(got, "quality-gate"),
     "github-release": lambda got, skip, dry: _ok(got, "publish-pypi") and _ok(got, "release-notes"),
+    "verify-release": lambda got, skip, dry: not dry and _ok(got, "github-release"),
+    "verify-image": lambda got, skip, dry: not dry and _ok(got, "attest-image"),
 }
 
 
@@ -1167,3 +1172,146 @@ def test_a_release_still_falls_back_to_git_log_with_a_warning(tmp_path) -> None:
     proc, notes, summary = _notes(tmp_path, _CHANGELOG, publish=True, version="1.3.0")
     assert proc.returncode == 0 and "::warning::" in proc.stdout, proc.stdout + proc.stderr
     assert "- second (" in notes and summary == "", notes
+
+
+# --------------------------------------------------------------------------
+# verify-release and verify-image check what was published, with a fake `gh`.
+# --------------------------------------------------------------------------
+
+_FAKE_GH = """#!{python}
+import json, os, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:2] == ["release", "download"]:
+    out = Path(args[args.index("--dir") + 1])
+    out.mkdir(exist_ok=True)
+    for name in os.environ["FAKE_RELEASE_FILES"].split():
+        (out / name).write_text("x", encoding="utf-8")
+    sys.exit(0)
+if args[:2] == ["attestation", "verify"]:
+    if "--format" in args:
+        digest = os.environ["FAKE_DIGEST"]
+        print(json.dumps([{"verificationResult": {"statement": {"subject": [{"digest": {"sha256": digest}}]}}}]))
+    sys.exit(int(os.environ.get("FAKE_VERIFY_RC", "0")))
+sys.exit(2)
+"""
+
+_POLICY = [
+    "--repo",
+    "o/r",
+    "--signer-workflow",
+    "o/r/.github/workflows/release.yml",
+    "--source-ref",
+    "refs/tags/v1.2.0",
+    "--source-digest",
+    "c0ffee",
+    "--deny-self-hosted-runners",
+    "--predicate-type",
+    "https://slsa.dev/provenance/v1",
+]
+_FILES = "pkg-1.2.0-py3-none-any.whl pkg-1.2.0.tar.gz sbom.cdx.json"
+_BUNDLES = "pkg-1.2.0-py3-none-any.whl.intoto.jsonl pkg-1.2.0.tar.gz.intoto.jsonl"
+
+
+def _verify(tmp_path: Path, job: str, **env: str) -> tuple:
+    """Run a verify job's step under bash; returns (process, gh calls)."""
+    if not shutil.which("jq"):
+        pytest.skip("jq not installed")
+    (step,) = _steps(job)
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    gh = fake / "gh"
+    gh.write_text(_FAKE_GH.replace("{python}", sys.executable), encoding="utf-8")
+    gh.chmod(0o700)
+    log = tmp_path / "gh.log"
+    run_env = {
+        **os.environ,
+        "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_GH_LOG": str(log),
+        "GITHUB_REPOSITORY": "o/r",
+        "GITHUB_REF": "refs/tags/v1.2.0",
+        "GITHUB_SHA": "c0ffee",
+        **env,
+    }
+    proc = subprocess.run(
+        ["bash", "-c", step["run"]], cwd=tmp_path, env=run_env, capture_output=True, text=True
+    )
+    calls = [json.loads(ln) for ln in log.read_text().splitlines()] if log.exists() else []
+    return proc, calls
+
+
+def _pins_the_policy(call: list[str]) -> bool:
+    n = len(_POLICY)
+    return any(call[i : i + n] == _POLICY for i in range(len(call) - n + 1))
+
+
+def test_every_release_file_is_verified_with_its_bundle_and_online(tmp_path) -> None:
+    proc, calls = _verify(
+        tmp_path,
+        "verify-release",
+        TAG="v1.2.0",
+        FAKE_RELEASE_FILES=f"{_FILES} {_BUNDLES}",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert calls[0][:3] == ["release", "download", "v1.2.0"], calls
+    verifies = [c for c in calls if c[:2] == ["attestation", "verify"]]
+    for file in ("pkg-1.2.0-py3-none-any.whl", "pkg-1.2.0.tar.gz"):
+        mine = [c for c in verifies if c[2] == file]
+        assert [("--bundle" in c) for c in mine] == [True, False], mine
+        assert all(_pins_the_policy(c) for c in mine), mine
+        assert mine[0][mine[0].index("--bundle") + 1] == f"{file}.intoto.jsonl"
+    assert len(verifies) == 4, verifies
+
+
+@pytest.mark.parametrize(
+    "files, rc, says",
+    [
+        (
+            f"{_FILES} pkg-1.2.0-py3-none-any.whl.intoto.jsonl",
+            0,
+            "no pkg-1.2.0.tar.gz.intoto.jsonl",
+        ),
+        (f"pkg-1.2.0-py3-none-any.whl {_BUNDLES}", 0, "exactly one wheel and one sdist"),
+        (f"{_FILES} {_BUNDLES}", 1, ""),  # gh attestation verify refuses
+    ],
+)
+def test_a_release_file_that_does_not_verify_fails_the_job(tmp_path, files, rc, says) -> None:
+    proc, _ = _verify(
+        tmp_path,
+        "verify-release",
+        TAG="v1.2.0",
+        FAKE_RELEASE_FILES=files,
+        FAKE_VERIFY_RC=str(rc),
+    )
+    assert proc.returncode != 0 and says in proc.stdout, proc.stdout + proc.stderr
+
+
+_TAGS = "ghcr.io/o/r:1.2.0\nghcr.io/o/r:1.2\nghcr.io/o/r:stable-latest\nghcr.io/o/r:latest\n"
+
+
+@pytest.mark.parametrize("resolves_to, ok", [("aaaa", True), ("bbbb", False)])
+def test_every_moved_image_tag_must_name_the_pushed_digest(tmp_path, resolves_to, ok) -> None:
+    proc, calls = _verify(
+        tmp_path,
+        "verify-image",
+        DIGEST="sha256:aaaa",
+        TAGS=_TAGS,
+        FAKE_DIGEST=resolves_to,
+    )
+    assert (proc.returncode == 0) is ok, proc.stdout + proc.stderr
+    oci = [c for c in calls if c[:2] == ["attestation", "verify"]]
+    assert all(_pins_the_policy(c) for c in oci), oci
+    if ok:
+        tags = [t for t in _TAGS.splitlines() if t]
+        assert [c[2] for c in oci] == [f"oci://{t}" for t in tags] + [f"oci://{tags[0]}"], oci
+        assert "--bundle-from-oci" in oci[-1], oci
+    else:
+        assert "ghcr.io/o/r:1.2.0 resolves to sha256:bbbb" in proc.stdout, proc.stdout
+
+
+def test_an_image_check_with_nothing_pushed_fails(tmp_path) -> None:
+    proc, calls = _verify(tmp_path, "verify-image", DIGEST="", TAGS="", FAKE_DIGEST="x")
+    assert proc.returncode != 0 and not calls, proc.stdout

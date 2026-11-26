@@ -37,7 +37,9 @@
 #                           ├─ verify-pypi   (final smoke from real PyPI)
 #                           ├─ docker        (only once PyPI accepted the upload)
 #                           │   └─ attest-image  (SLSA provenance of the image)
-#                           └─ github-release
+#                           │       └─ verify-image
+#                           └─ github-release    (notes from release-notes)
+#                               └─ verify-release
 #
 # All tags (stable and pre-release) promote to PyPI after the TestPyPI
 # install smoke passes. Pre-releases are PEP 440 pre-release versions
@@ -1068,3 +1070,112 @@ jobs:
           subject-digest: ${{ needs.docker.outputs.digest }}
           push-to-registry: true
           create-storage-record: false
+
+  # ──────────────────────────────────────────────────────────────
+  # 6. Verify what was published, as a user would. Every check also pins what
+  #    signed: this workflow, from the ref and commit this run started from
+  #    (what the provenance records), on a GitHub-hosted runner. Read-only.
+  # ──────────────────────────────────────────────────────────────
+  # 6a. Each file on the GitHub Release, with its .intoto.jsonl bundle and
+  #     with GitHub's attestation store.
+  verify-release:
+    name: Verify Release Provenance
+    needs: [quality-gate, github-release]
+    if: >-
+      ${{ !cancelled()
+      && needs.quality-gate.result == 'success'
+      && needs.quality-gate.outputs.publish == 'true'
+      && needs.github-release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read           # download the GitHub Release's files
+      attestations: read       # read the attestations GitHub stores
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify the release files and their provenance bundles
+        env:
+          TAG: ${{ needs.quality-gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          policy=(
+            --repo "${GITHUB_REPOSITORY}"
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+            --source-ref "${GITHUB_REF}"
+            --source-digest "${GITHUB_SHA}"
+            --deny-self-hosted-runners
+            --predicate-type https://slsa.dev/provenance/v1
+          )
+          mkdir release-files
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir release-files
+          cd release-files
+          shopt -s nullglob
+          wheels=(*.whl)
+          sdists=(*.tar.gz)
+          if [ "${#wheels[@]}" -ne 1 ] || [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::release ${TAG} does not hold exactly one wheel and one sdist"
+            ls -l
+            exit 1
+          fi
+          for file in "${wheels[0]}" "${sdists[0]}"; do
+            if [ ! -f "${file}.intoto.jsonl" ]; then
+              echo "::error::release ${TAG} has no ${file}.intoto.jsonl beside ${file}"
+              exit 1
+            fi
+            gh attestation verify "${file}" --bundle "${file}.intoto.jsonl" "${policy[@]}"
+            gh attestation verify "${file}" "${policy[@]}"
+            echo "${file}: provenance verified, from its bundle and from the attestation store"
+          done
+
+  # 6b. Every GHCR tag the push moved, which must resolve to the digest this
+  #     run pushed, and the attestation stored in GHCR beside it.
+  verify-image:
+    name: Verify Image Provenance
+    needs: [quality-gate, docker, attest-image]
+    if: >-
+      ${{ !cancelled()
+      && needs.quality-gate.result == 'success'
+      && needs.quality-gate.outputs.publish == 'true'
+      && needs.attest-image.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read       # read the attestations GitHub stores
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify every image tag the push moved
+        env:
+          DIGEST: ${{ needs.docker.outputs.digest }}
+          TAGS: ${{ needs.docker.outputs.tags }}
+        run: |
+          set -euo pipefail
+          policy=(
+            --repo "${GITHUB_REPOSITORY}"
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+            --source-ref "${GITHUB_REF}"
+            --source-digest "${GITHUB_SHA}"
+            --deny-self-hosted-runners
+            --predicate-type https://slsa.dev/provenance/v1
+          )
+          refs=()
+          while IFS= read -r ref; do
+            if [ -n "${ref}" ]; then refs+=("${ref}"); fi
+          done <<< "${TAGS}"
+          if [ "${#refs[@]}" -eq 0 ] || [ -z "${DIGEST}" ]; then
+            echo "::error::the docker job reported no pushed tags or digest"
+            exit 1
+          fi
+          for ref in "${refs[@]}"; do
+            # The subject is the digest the tag resolves to now: it must be the
+            # one this run pushed.
+            got=$(gh attestation verify "oci://${ref}" "${policy[@]}" --format json \
+              | jq -r '.[0].verificationResult.statement.subject[0].digest.sha256')
+            if [ "sha256:${got}" != "${DIGEST}" ]; then
+              echo "::error::${ref} resolves to sha256:${got}, not ${DIGEST}, the digest this run pushed"
+              exit 1
+            fi
+            echo "${ref}: ${DIGEST}, provenance verified"
+          done
+          # The attestation attest-image stored in GHCR beside the image.
+          gh attestation verify "oci://${refs[0]}" --bundle-from-oci "${policy[@]}"
