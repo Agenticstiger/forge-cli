@@ -449,9 +449,57 @@ def verify_bundle(
     return result
 
 
+def verify_blob(
+    path: str,
+    *,
+    sig_path: str,
+    pem_path: Optional[str] = None,
+    key_ref: Optional[str] = None,
+    certificate_identity: Optional[str] = None,
+    certificate_oidc_issuer: Optional[str] = None,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> Dict:
+    """Verify a file :func:`sign_blob` signed, with ``cosign verify-blob``: against
+    ``key_ref`` (keyed), or against the certificate ``pem_path`` with the signer pinned exactly
+    (``certificate_identity`` and ``certificate_oidc_issuer``, both required keyless: an
+    identity that is not pinned proves nothing about who signed).
+
+    Returns the :func:`_run_cosign` dict; ``exit_code`` 0 is a valid signature.
+    Raises CLIError on a malformed input or no cosign.
+    """
+    cosign = _resolve_cosign()
+    blob = Path(path).resolve()
+    if not blob.is_file() or not Path(sig_path).is_file():
+        raise CLIError(2, "signing_blob_not_file", {"path": str(blob)})
+    if key_ref is not None:
+        _validate_key_ref(key_ref)
+        argv = [cosign, "verify-blob", "--key", key_ref, "--signature", sig_path, str(blob)]
+    else:
+        if not (pem_path and certificate_identity and certificate_oidc_issuer):
+            raise CLIError(
+                2,
+                "signing_identity_not_pinned",
+                {"hint": "keyless verification needs the certificate, its identity and issuer"},
+            )
+        argv = [
+            cosign,
+            "verify-blob",
+            "--signature",
+            sig_path,
+            "--certificate",
+            pem_path,
+            # one argv element each, so a value that starts with "-" is never read as a flag
+            f"--certificate-identity={certificate_identity}",
+            f"--certificate-oidc-issuer={certificate_oidc_issuer}",
+            str(blob),
+        ]
+    return _run_cosign(argv, timeout=timeout)
+
+
 __all__ = [
     "cosign_available",
     "sign_blob",
+    "verify_blob",
     "sign_bundle",
     "verify_bundle",
 ]

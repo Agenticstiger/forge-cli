@@ -592,3 +592,21 @@ def test_the_flags_are_on_the_parser() -> None:
     ship.register(parser.add_subparsers())
     args = parser.parse_args(["ship", "--release-to", TARGET, "--release-to-require", "versioning"])
     assert (args.release_to, args.release_to_require) == (TARGET, ["versioning"])
+
+
+def test_ship_refuses_a_checkout_at_another_commit_than_the_ci_names(
+    work: Path,
+    bundled: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_ci: None,
+    caplog: Any,
+) -> None:
+    fake = _install(monkeypatch, bundled)
+    monkeypatch.setattr("fluid_build.cli._ship_release.checkout_head", lambda _d: "b" * 40)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 2
+    assert f"the CI names commit {COMMIT}, and the contract's checkout is at {'b' * 40}" in (
+        caplog.text
+    )
+    assert fake.calls == []
+    monkeypatch.setattr("fluid_build.cli._ship_release.checkout_head", lambda _d: COMMIT)
+    assert _ship([*_UNTIL_4, "--release-dir", "../rel"]) == 0

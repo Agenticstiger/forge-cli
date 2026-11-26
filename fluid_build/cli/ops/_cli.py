@@ -212,7 +212,7 @@ def _register_receipt(sub: argparse._SubParsersAction) -> None:
             "it (receipts/<env>/ beside a directory), with the fluid verify report stored "
             "next to it. PASSED when the report's verdict passes and every checked target "
             "reads back; a FAILED receipt is written too. Exit 0 PASSED, 1 FAILED or refused "
-            "(nothing written), 2 cannot decide."
+            "(nothing written), 2 cannot decide or a usage error (nothing written)."
         ),
     )
     rec.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")
@@ -262,8 +262,9 @@ def _register_receipt(sub: argparse._SubParsersAction) -> None:
             "Verifies SRC, then reads the newest receipt of --env for SRC's code digest. Passes "
             "when it is PASSED, the report stored beside it still passes, and the release it "
             "names is there and intact. Never reads a release's gates or provenance. Reports "
-            "whether each object carries an Object Lock. Exit 0 passes, 1 does not, 2 cannot "
-            "decide."
+            "whether each object carries an Object Lock. A receipt is only as trusted as who "
+            "can write receipts/<env>/: keep that to the verifier's identity, or sign receipts "
+            "and pass --require-signed. Exit 0 passes, 1 does not, 2 cannot decide."
         ),
     )
     chk.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")
@@ -274,6 +275,25 @@ def _register_receipt(sub: argparse._SubParsersAction) -> None:
         "--require-locked",
         action="store_true",
         help="Also fail unless every object of the release and the receipt is locked",
+    )
+    chk.add_argument(
+        "--require-signed",
+        action="store_true",
+        help=(
+            "Also fail unless the receipt's Statement verifies with cosign for this signer: "
+            "--verify-key, or --certificate-identity with --certificate-oidc-issuer"
+        ),
+    )
+    chk.add_argument("--verify-key", metavar="REF", help="With --require-signed: a cosign key")
+    chk.add_argument(
+        "--certificate-identity",
+        metavar="ID",
+        help="With --require-signed, keyless: the signer's exact certificate identity",
+    )
+    chk.add_argument(
+        "--certificate-oidc-issuer",
+        metavar="URL",
+        help="With --require-signed, keyless: the signer's exact OIDC issuer",
     )
     chk.add_argument("--json", action="store_true", help="Emit JSON")
     chk.set_defaults(func=_run_receipt_check)
@@ -419,8 +439,28 @@ def _run_receipt_check(args: argparse.Namespace, logger: logging.Logger) -> int:
     if not args.env.strip():
         logger.error("--env needs an environment name")
         return 2
+    signer = None
+    pinned = args.certificate_identity or args.certificate_oidc_issuer
+    if args.require_signed:
+        if args.verify_key and pinned:
+            logger.error("--require-signed takes --verify-key or a certificate identity, not both")
+            return 2
+        if not args.verify_key and not (args.certificate_identity and args.certificate_oidc_issuer):
+            logger.error(
+                "--require-signed needs the signer: --verify-key REF, or --certificate-identity "
+                "and --certificate-oidc-issuer"
+            )
+            return 2
+        signer = receipts.SignerPolicy(
+            key_ref=args.verify_key,
+            certificate_identity=args.certificate_identity,
+            certificate_oidc_issuer=args.certificate_oidc_issuer,
+        )
+    elif args.verify_key or pinned:
+        logger.error("--verify-key and --certificate-* name the signer of --require-signed")
+        return 2
     found = receipts.check_receipt(
-        args.source, environment=args.env, require_locked=args.require_locked
+        args.source, environment=args.env, require_locked=args.require_locked, signer=signer
     )
     if getattr(args, "json", False):
         json.dump(found.as_dict(), sys.stdout, indent=2, sort_keys=True)

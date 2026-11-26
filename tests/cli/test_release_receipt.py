@@ -82,7 +82,7 @@ def _names(s3: FakeS3, env: str) -> List[str]:
         ),
         (
             "git+ssh://git@git.example.com/ops/dags.git@" + "b" * 64,
-            receipts.Target("git+ssh://git@git.example.com/ops/dags.git", commit="b" * 64),
+            receipts.Target("git+ssh://git.example.com/ops/dags.git", commit="b" * 64),
         ),
     ],
 )
@@ -98,7 +98,7 @@ def test_a_target_is_an_object_version_or_a_commit(value: str, want: receipts.Ta
         "git+https://git.example.com/ops/dags@abc1234",  # a short commit
         "git+https://git.example.com/ops/dags",
         "https://git.example.com/ops/dags@" + "a" * 40,
-        "git+https://user:secret@git.example.com/ops/dags@" + "a" * 40,
+        "git+file:///srv/ops/dags@" + "a" * 40,
     ],
 )
 def test_a_target_that_is_not_one_is_refused(value: str) -> None:
@@ -224,6 +224,10 @@ def test_targets_are_recorded_and_checked_when_asked(tmp_path: Path, s3: FakeS3)
         "version_id": version,
         "checked": True,
         "sha256": "sha256:" + hashlib.sha256(b"dag").hexdigest(),
+        "checksums": {
+            "sha256": s3.checksums[("acme-dags", "dags/orders.py")],
+            "type": "FULL_OBJECT",
+        },
         "size": 3,
     }
     assert checked.receipt["targets"][1]["checked"] is False  # a commit is never checked
@@ -387,7 +391,7 @@ def test_a_newest_file_that_is_not_a_receipt_fails_closed(tmp_path: Path, s3: Fa
     uris = _published(tmp_path, s3, "nonprod", "prod")
     done = _record(tmp_path, s3, uris["nonprod"], T0)
     prefix = done.uri.split("/", 3)[3].rsplit("/", 1)[0]
-    s3.put("acme-releases", f"{prefix}/20991231T000000.000000Z-{'0' * 16}.json", b"{}")
+    s3.put("acme-releases", f"{prefix}/20261126T110000.000000Z-{'0' * 16}.json", b"{}")
     found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
     assert (
         found.exit_code == 1
@@ -480,10 +484,15 @@ def test_on_disk_a_receipt_naming_a_release_elsewhere_does_not_pass(tmp_path: Pa
     report = _report(tmp_path / "verify.json", tmp_path / "nonprod")
     done = receipts.record_receipt(str(tmp_path / "nonprod"), report_path=str(report), now=T0)
     path = tmp_path / "receipts" / "nonprod" / done.uri.rsplit("/", 1)[1]
+    # moved: the release is found by its folder's name beside this one
     edited = dict(done.receipt, resource_uri="/elsewhere/nonprod")
     path.write_text(json.dumps(edited, indent=2, sort_keys=True), encoding="utf-8")
+    assert receipts.check_receipt(str(tmp_path / "prod"), environment="nonprod").exit_code == 0
+    # a receipt naming the prod release is no nonprod check
+    edited = dict(done.receipt, resource_uri=str(tmp_path / "prod"))
+    path.write_text(json.dumps(edited, indent=2, sort_keys=True), encoding="utf-8")
     found = receipts.check_receipt(str(tmp_path / "prod"), environment="nonprod")
-    assert found.exit_code == 1 and "names a release outside" in found.reason
+    assert found.exit_code == 1 and "is the release of prod, not nonprod" in found.reason
 
 
 # ---------------------------------------------------------------------------
@@ -591,3 +600,379 @@ def test_a_refused_target_never_echoes_a_password(value: str) -> None:
     with pytest.raises(receipts.ReceiptError) as raised:
         receipts.parse_target(value)
     assert "secret" not in str(raised.value) and "***@" in str(raised.value)
+
+
+# ---------------------------------------------------------------------------
+# Review findings: each fails closed or gives its exit code, never a traceback
+# ---------------------------------------------------------------------------
+
+
+def test_require_locked_covers_the_release_the_receipt_vouches_for(
+    tmp_path: Path, s3: FakeS3
+) -> None:
+    s3.object_lock, s3.retention = True, ("GOVERNANCE", 1)
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    _record(tmp_path, s3, uris["nonprod"], T0)
+    nonprod = uris["nonprod"].split("/", 3)[3]
+    s3.unlocked |= {k for b, k in s3.objects if k.startswith(nonprod)}
+    found = receipts.check_receipt(
+        uris["prod"], environment="nonprod", require_locked=True, clients=s3
+    )
+    assert found.exit_code == 1 and "carry no Object Lock in force" in found.reason
+    assert any(item["uri"].startswith(uris["nonprod"]) for item in found.locks)
+
+
+def test_a_lock_that_cannot_be_read_is_reported_not_raised(
+    tmp_path: Path, s3: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.cli._fake_s3 import S3Error
+
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    _record(tmp_path, s3, uris["nonprod"], T0)
+    head = s3.head_object
+    calls = {"n": 0}
+
+    def flaky(**kw: Any) -> Dict[str, Any]:
+        calls["n"] += 1
+        if "/receipts/" in kw["Key"] and calls["n"] > 1:
+            raise S3Error("InternalError", 500)
+        return head(**kw)
+
+    monkeypatch.setattr(s3, "head_object", flaky)
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
+    assert found.exit_code == 0
+    assert any("InternalError" in str(item.get("error")) for item in found.locks)
+    found = receipts.check_receipt(
+        uris["prod"], environment="nonprod", require_locked=True, clients=s3
+    )
+    assert found.exit_code == 2 and "cannot be read" in found.reason
+
+
+def test_a_listing_past_the_cap_decides_nothing(
+    tmp_path: Path, s3: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    _record(tmp_path, s3, uris["nonprod"], T0)
+    _record(tmp_path, s3, uris["nonprod"], T0 + timedelta(hours=1))
+    monkeypatch.setattr(rr, "MAX_ENTRIES", 3)
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
+    assert found.exit_code == 2 and "the newest receipt cannot be told" in found.reason
+
+
+@pytest.mark.parametrize(
+    "stamp", ["20261399T000000.000000Z", "20260230T000000.000000Z", "00000101T000000.000000Z"]
+)
+def test_a_name_with_no_real_time_is_not_a_receipt(stamp: str) -> None:
+    receipt, problem = rr.parse_receipt(f"{stamp}-{'0' * 16}.json", b"{}")
+    assert receipt is None and problem == "its name carries no real time"
+
+
+def test_deeply_nested_json_is_not_a_receipt_or_a_report(tmp_path: Path) -> None:
+    deep = b"[" * 400_000 + b"]" * 400_000
+    assert rr.parse_receipt(f"20261126T090000.000000Z-{'0' * 16}.json", deep)[1] == (
+        "it is not JSON"
+    )
+    (tmp_path / "deep.json").write_bytes(deep)
+    with pytest.raises(receipts.ReceiptError, match="is not JSON"):
+        receipts._read_report(str(tmp_path / "deep.json"))
+
+
+def test_a_fifo_is_refused_not_waited_on(tmp_path: Path) -> None:
+    import os
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("no FIFOs here")
+    os.mkfifo(tmp_path / "report.json")
+    with pytest.raises(receipts.ReceiptError, match="is not a regular file"):
+        receipts._read_report(str(tmp_path / "report.json"))
+    store = receipts._DirStore(tmp_path)
+    with pytest.raises(receipts.ReceiptError, match="is not a regular file"):
+        store.read("report.json", 100)
+
+
+def test_a_receipts_path_that_is_not_a_folder_is_refused(tmp_path: Path) -> None:
+    sealed(tmp_path / "nonprod", environment="nonprod")
+    report = _report(tmp_path / "verify.json", tmp_path / "nonprod")
+    (tmp_path / "receipts").write_text("a file", encoding="utf-8")
+    with pytest.raises(receipts.ReceiptError, match="reached through a link"):
+        receipts.record_receipt(str(tmp_path / "nonprod"), report_path=str(report))
+
+
+def test_on_disk_a_resource_uri_that_is_not_a_plain_path_does_not_pass(tmp_path: Path) -> None:
+    sealed(tmp_path / "nonprod", environment="nonprod")
+    sealed(tmp_path / "prod", environment="prod")
+    report = _report(tmp_path / "verify.json", tmp_path / "nonprod")
+    done = receipts.record_receipt(str(tmp_path / "nonprod"), report_path=str(report), now=T0)
+    path = tmp_path / "receipts" / "nonprod" / done.uri.rsplit("/", 1)[1]
+    for bad in (f"{tmp_path}/nonprod\u0000x", 7, None):
+        edited = dict(done.receipt, resource_uri=bad)
+        path.write_text(json.dumps(edited), encoding="utf-8")
+        found = receipts.check_receipt(str(tmp_path / "prod"), environment="nonprod")
+        assert found.exit_code == 1 and "names a release outside" in found.reason
+
+
+def test_runs_status_shows_a_bad_newest_receipt_as_the_gate_does(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sealed(tmp_path / "nonprod", environment="nonprod")
+    sealed(tmp_path / "prod", environment="prod")
+    report = _report(tmp_path / "verify.json", tmp_path / "nonprod")
+    receipts.record_receipt(str(tmp_path / "nonprod"), report_path=str(report), now=T0)
+    (tmp_path / "receipts" / "nonprod" / f"20261126T110000.000000Z-{'0' * 16}.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (tmp_path / "receipts" / "odd").write_text("not a folder", encoding="utf-8")
+    parser = argparse.ArgumentParser()
+    ops_cli.register_runs(parser.add_subparsers())
+    args = parser.parse_args(
+        ["runs", "status", "acme.orders", "--release-dir", str(tmp_path / "prod")]
+    )
+    assert args.func(args, logging.getLogger("test")) == 0
+    out = capsys.readouterr().out
+    assert "receipt  nonprod cannot be told: the newest receipt" in out
+    assert "PASSED" not in out
+
+
+def test_an_object_path_over_200_characters_is_kept_whole(tmp_path: Path) -> None:
+    from fluid_build.api.release import verify_release
+
+    long = "reports/" + "r" * 230 + ".json"
+    sealed(tmp_path / "rel", {"reports/ship-report.json": b"{}", long: b"1"})
+    paths = {o["path"] for o in verify_release(tmp_path / "rel").objects}
+    assert long in paths
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "git+https://user:secret@git.example.com/ops/dags",
+        "git+https://ghp_secret@github.com/ops/dags",
+        "git+https://gitlab.com/ops/dags?private_token=glpat-secret",
+        "git+https://gitlab.com/ops/dags#secret",
+    ],
+)
+def test_a_git_target_never_records_a_credential(url: str) -> None:
+    target = receipts.parse_target(f"{url}@{'a' * 40}")
+    assert "secret" not in target.uri and target.uri.startswith("git+https://")
+    with pytest.raises(receipts.ReceiptError) as raised:
+        receipts.parse_target(url)  # no commit: refused, and the message hides the secret
+    assert "secret" not in str(raised.value)
+
+
+def test_a_linked_receipts_folder_is_never_written_or_read(tmp_path: Path) -> None:
+    sealed(tmp_path / "rel" / "nonprod", environment="nonprod")
+    sealed(tmp_path / "rel" / "prod", environment="prod")
+    report = _report(tmp_path / "verify.json", tmp_path / "rel" / "nonprod")
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "rel" / "receipts").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(receipts.ReceiptError, match="reached through a link"):
+        receipts.record_receipt(str(tmp_path / "rel" / "nonprod"), report_path=str(report))
+    assert list((tmp_path / "elsewhere").iterdir()) == []
+    found = receipts.check_receipt(str(tmp_path / "rel" / "prod"), environment="nonprod")
+    assert found.exit_code == 1 and "reached through a link" in found.reason
+
+
+def test_a_receipt_named_in_the_future_is_passed_over(tmp_path: Path, s3: FakeS3) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    failing = {"total": 1, "match": 0, "mismatch": 1, "error": 0}
+    _record(tmp_path, s3, uris["nonprod"], T0, failing)
+    forged = _record(tmp_path, s3, uris["nonprod"], datetime(2099, 1, 1, tzinfo=timezone.utc))
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3)
+    assert found.exit_code == 1 and "receipt for this code failed" in found.reason
+    assert found.ignored == [forged.uri.rsplit("/", 1)[1] + ": named later than now"]
+
+
+def test_an_environment_that_cannot_name_a_folder_is_refused(tmp_path: Path) -> None:
+    index = sealed(tmp_path / "rel", environment="../../x")
+    with pytest.raises(receipts.ReceiptError, match="names no environment a receipts folder"):
+        receipts._verified(str(tmp_path / "rel"), FakeS3(), None)
+    assert index["identity"]["environment"] == "../../x"
+
+
+def test_the_ci_metadata_carries_no_userinfo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import _attestation
+
+    monkeypatch.setattr(
+        _attestation,
+        "_collect_run_metadata",
+        lambda: {"builder": {"id": "https://bot:hunter2@ci.example.com/job/1"}},
+    )
+    sealed(tmp_path / "nonprod", environment="nonprod")
+    report = _report(tmp_path / "verify.json", tmp_path / "nonprod")
+    done = receipts.record_receipt(str(tmp_path / "nonprod"), report_path=str(report))
+    assert done.receipt["ci"] == {"builder": {"id": "https://ci.example.com/job/1"}}
+
+
+def test_a_report_on_one_expose_records_a_failed_receipt(tmp_path: Path) -> None:
+    sealed(tmp_path / "nonprod", environment="nonprod")
+    block = receipts.report_release_block(str(tmp_path / "nonprod"), "acme.orders")
+    block["expose"] = "orders"
+    (tmp_path / "one.json").write_text(
+        json.dumps({"summary": PASSING, "release": block}), encoding="utf-8"
+    )
+    done = receipts.record_receipt(
+        str(tmp_path / "nonprod"), report_path=str(tmp_path / "one.json")
+    )
+    assert done.result == "FAILED" and "checked one expose (orders)" in done.reason
+
+
+def test_a_target_that_cannot_be_read_writes_nothing(tmp_path: Path, s3: FakeS3) -> None:
+    uris = _published(tmp_path, s3, "nonprod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    s3.put("acme-dags", "dags/orders.py", b"dag")
+    s3.deny_get.add("dags/orders.py")
+    original = s3.head_object
+
+    def denied(**kw: Any) -> Dict[str, Any]:
+        from tests.cli._fake_s3 import S3Error
+
+        if kw["Key"] == "dags/orders.py":
+            raise S3Error("SlowDown", 503)
+        return original(**kw)
+
+    s3.head_object = denied  # type: ignore[method-assign]
+    with pytest.raises(
+        receipts.ReceiptError, match="cannot be read \\(SlowDown\\); nothing was written"
+    ) as raised:
+        receipts.record_receipt(
+            uris["nonprod"],
+            report_path=str(report),
+            targets=[f"s3://acme-dags/dags/orders.py#{s3.version_of('dags/orders.py')}"],
+            check_targets=True,
+            clients=s3,
+        )
+    assert raised.value.exit_code == 2 and _names(s3, "nonprod") == []
+
+
+def test_a_bad_sign_key_writes_nothing(
+    tmp_path: Path, s3: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import _signing
+
+    monkeypatch.setattr(_signing, "cosign_available", lambda: True)
+    uris = _published(tmp_path, s3, "nonprod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    with pytest.raises(receipts.ReceiptError, match="--sign-key: not a key path") as raised:
+        receipts.record_receipt(
+            uris["nonprod"], report_path=str(report), sign=True, key_ref="--foo bar", clients=s3
+        )
+    assert raised.value.exit_code == 2 and _names(s3, "nonprod") == []
+
+    def failing(path: str, *, key_ref: Any = None) -> Dict[str, Any]:
+        return {"exit_code": 1}
+
+    monkeypatch.setattr(_signing, "sign_blob", failing)
+    with pytest.raises(receipts.ReceiptError, match="could not sign"):
+        receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    assert _names(s3, "nonprod") == []
+
+
+# ---------------------------------------------------------------------------
+# --require-signed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cosign(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
+    """A fake cosign: signs by writing the blob's sha256 as the signature, and verifies a
+    signature when it is that sha256 and the signer is the one ``state["signer"]`` names."""
+    from fluid_build.cli import _signing
+
+    state: Dict[str, Any] = {
+        "signer": ("ci@example.com", "https://issuer.example.com"),
+        "calls": [],
+    }
+
+    def sign(path: str, *, key_ref: Any = None) -> Dict[str, Any]:
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest().encode()
+        Path(path + ".sig").write_bytes(digest)
+        Path(path + ".pem").write_bytes(b"certificate")
+        return {
+            "exit_code": 0,
+            "sig_path": path + ".sig",
+            "pem_path": None if key_ref else path + ".pem",
+        }
+
+    def verify(path: str, **kw: Any) -> Dict[str, Any]:
+        state["calls"].append(kw)
+        good = (
+            Path(kw["sig_path"]).read_bytes()
+            == hashlib.sha256(Path(path).read_bytes()).hexdigest().encode()
+        )
+        who = (kw.get("certificate_identity"), kw.get("certificate_oidc_issuer"))
+        ok = good and (kw.get("key_ref") == "k" or who == state["signer"])
+        return {"exit_code": 0 if ok else 1}
+
+    monkeypatch.setattr(_signing, "cosign_available", lambda: True)
+    monkeypatch.setattr(_signing, "sign_blob", sign)
+    monkeypatch.setattr(_signing, "verify_blob", verify)
+    return state
+
+
+SIGNER = receipts.SignerPolicy(
+    certificate_identity="ci@example.com", certificate_oidc_issuer="https://issuer.example.com"
+)
+
+
+def test_require_signed_passes_a_receipt_signed_by_the_pinned_signer(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 0, found.reason
+    other = receipts.SignerPolicy(
+        certificate_identity="someone@example.com",
+        certificate_oidc_issuer="https://issuer.example.com",
+    )
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=other, clients=s3)
+    assert found.exit_code == 1 and "does not verify for that signer" in found.reason
+
+
+def test_require_signed_fails_an_unsigned_or_forged_receipt(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3, now=T0)
+    # a newer receipt nobody signed, written by whoever can write the folder
+    receipts.record_receipt(
+        uris["nonprod"], report_path=str(report), clients=s3, now=T0 + timedelta(hours=1)
+    )
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 1 and "the newest receipt is not signed" in found.reason
+    assert receipts.check_receipt(uris["prod"], environment="nonprod", clients=s3).exit_code == 0
+
+
+def test_require_signed_fails_a_receipt_changed_after_it_was_signed(
+    tmp_path: Path, s3: FakeS3, cosign: Dict[str, Any]
+) -> None:
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    done = receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    key = done.uri.split("/", 3)[3]
+    edited = dict(
+        done.receipt, targets=[{"uri": "s3://other/k", "version_id": "v", "checked": False}]
+    )
+    s3.objects[("acme-releases", key)] = json.dumps(edited).encode()
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert (
+        found.exit_code == 1 and "signed Statement's receipt is not the receipt's" in found.reason
+    )
+
+
+def test_require_signed_flags(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: Any
+) -> None:
+    sealed(tmp_path / "prod", environment="prod")
+    for extra, problem in (
+        (["--require-signed"], "--require-signed needs the signer"),
+        (["--require-signed", "--certificate-identity", "x"], "--require-signed needs the signer"),
+        (["--require-signed", "--verify-key", "k", "--certificate-identity", "x"], "not both"),
+        (["--verify-key", "k"], "name the signer of --require-signed"),
+    ):
+        code, _ = _run(capsys, "check", str(tmp_path / "prod"), "--env", "nonprod", *extra)
+        assert code == 2 and problem in caplog.text

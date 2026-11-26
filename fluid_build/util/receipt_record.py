@@ -33,8 +33,10 @@ FAILED = "FAILED"
 #: Bytes of one receipt, and of the ``fluid verify`` report stored beside it.
 MAX_RECEIPT_BYTES = 1_048_576
 MAX_REPORT_BYTES = 16 * 1_048_576
-#: Receipts read from one environment's directory.
-MAX_RECEIPTS = 10_000
+#: Entries one environment's directory may hold: a receipt with its report and, signed, its
+#: Statement, signature and certificate. A listing past this decides nothing, since it could
+#: leave out the newest receipt.
+MAX_ENTRIES = 50_000
 #: What the stored report beside a receipt is called: ``<receipt stem>.report.json``.
 REPORT_SUFFIX = ".report.json"
 
@@ -76,11 +78,16 @@ def parse_receipt(name: str, data: bytes) -> Tuple[Optional[Dict[str, Any]], Opt
     matched = _NAME.fullmatch(name)
     if matched is None:
         return None, "its name is not <utc>-<identity16>.json"
+    try:
+        stamp = datetime.strptime(matched.group("stamp"), _STAMP_FORMAT)
+    except ValueError:
+        return None, "its name carries no real time"
+    stamp = stamp.replace(tzinfo=timezone.utc)
     if len(data) > MAX_RECEIPT_BYTES:
         return None, f"it is larger than {MAX_RECEIPT_BYTES:,} bytes"
     try:
         receipt = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return None, "it is not JSON"
     if not isinstance(receipt, dict):
         return None, "it is not a JSON object"
@@ -96,7 +103,6 @@ def parse_receipt(name: str, data: bytes) -> Tuple[Optional[Dict[str, Any]], Opt
     for key in ("environment", "product_id"):
         if not isinstance(receipt.get(key), str) or not receipt[key]:
             return None, f"it names no {key}"
-    stamp = datetime.strptime(matched.group("stamp"), _STAMP_FORMAT).replace(tzinfo=timezone.utc)
     if receipt.get("time_verified") != iso(stamp):
         return None, "its time_verified is not the time its name carries"
     report = receipt.get("report")

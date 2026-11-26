@@ -33,7 +33,7 @@ import stat
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -53,10 +53,16 @@ PASS, FAIL, UNDECIDED = 0, 1, 2
 _S3_TARGET = re.compile(
     r"s3://(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])/(?P<key>[^#\s]+)#(?P<version>[A-Za-z0-9._-]{1,1024})"
 )
-_GIT_TARGET = re.compile(
-    r"(?P<repo>git\+[a-z][a-z0-9+.-]*://[^\s@]+(?:@[^\s@/:]+)?[^\s@]*)@(?P<commit>[0-9a-f]{40}|[0-9a-f]{64})"
-)
+_GIT_TARGET = re.compile(r"git\+(?P<url>\S+)@(?P<commit>[0-9a-f]{40}|[0-9a-f]{64})")
 _CONFLICT_TRIES = 3
+#: An environment name, as a key segment of the published layout takes it.
+_ENVIRONMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._=+-]{0,254}")
+#: A receipt named later than now by more than this is not taken: a name from the future would
+#: stand as the newest over every receipt written until then.
+_CLOCK_SKEW_S = 300
+#: Read a file without following a link, and without waiting on a FIFO (whose open blocks
+#: until a writer comes): the regular-file check on the open handle then refuses it.
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 
 
 class ReceiptError(Exception):
@@ -66,6 +72,10 @@ class ReceiptError(Exception):
     def __init__(self, message: str, exit_code: int = FAIL) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class NoReceipt(ReceiptError):
+    """No receipt of the environment for the code: the gate fails, and a listing says nothing."""
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +98,10 @@ class Target:
 
 def _shown(value: str) -> str:
     """A target as a message may show it: any ``user:password@`` cut to ``***@``."""
-    return clean(re.sub(r"(://)[^/@\s]*@", r"\1***@", value), 120)
+    text = re.sub(r"(://)[^/@\s]*@", r"\1***@", value)
+    if not text.startswith("s3://"):  # a git URL's query or fragment may hold a token
+        text = re.sub(r"[?#][^@]*", "?***", text)
+    return clean(text, 120)
 
 
 def parse_target(value: str) -> Target:
@@ -115,13 +128,17 @@ def parse_target(value: str) -> Target:
             "git+<repo>@<full commit>",
             UNDECIDED,
         )
-    authority = matched["repo"].split("://", 1)[1].split("/", 1)[0]
-    if "@" in authority and ":" in authority.rsplit("@", 1)[0]:
-        # not echoed: the value holds a password
+    from fluid_build.cli._ship_release import _repository
+
+    # recorded as fluid ship records a repository: no user, password, query or fragment, so a
+    # token in a clone URL never reaches the receipt
+    repository = _repository(matched["url"])
+    if repository is None:
         raise ReceiptError(
-            "--target: a repository URL with a password in it is not recorded", UNDECIDED
+            f"--target {_shown(value)}: the repository is not an https, http, ssh or git URL",
+            UNDECIDED,
         )
-    return Target(matched["repo"], commit=matched["commit"])
+    return Target(f"git+{repository}", commit=matched["commit"])
 
 
 def _target_record(
@@ -144,19 +161,33 @@ def _target_record(
         )
     except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
         code = s3.error_code(exc)
-        missing = s3.is_missing_code(code) or code == "NoSuchVersion"
-        why = "is not there" if missing else f"cannot be read ({code or type(exc).__name__})"
-        out["checked"] = True
-        return out, f"{target.uri}#{target.version_id} {why}"
+        if s3.is_missing_code(code) or code == "NoSuchVersion":
+            out["checked"] = True
+            return out, f"{target.uri}#{target.version_id} is not there"
+        # Not an answer about the target: no receipt, rather than a FAILED one that stays.
+        raise ReceiptError(
+            f"--check-targets: {target.uri}#{target.version_id} cannot be read "
+            f"({code or type(exc).__name__}); nothing was written",
+            UNDECIDED,
+        ) from None
     out["checked"] = True
-    checksum = head.get("ChecksumSHA256")
-    if isinstance(checksum, str) and head.get("ChecksumType", "FULL_OBJECT") == "FULL_OBJECT":
+    sums = {
+        name[len("Checksum") :].lower(): value
+        for name, value in head.items()
+        if name.startswith("Checksum") and name != "ChecksumType" and isinstance(value, str)
+    }
+    if sums:  # as S3 states them (base64), with the checksum type
+        out["checksums"] = dict(sums, type=str(head.get("ChecksumType", "FULL_OBJECT")))
+    checksum = sums.get("sha256")
+    if checksum and head.get("ChecksumType", "FULL_OBJECT") == "FULL_OBJECT":
         import base64
 
         try:
             out["sha256"] = "sha256:" + base64.b64decode(checksum, validate=True).hex()
         except ValueError:
             pass
+    if isinstance(head.get("ETag"), str):
+        out["etag"] = clean(head["ETag"], 80)
     if isinstance(head.get("ContentLength"), int):
         out["size"] = head["ContentLength"]
     return out, None
@@ -181,29 +212,65 @@ class _Store:
     def write_once(self, name: str, data: bytes) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def lock(self, name: str) -> Optional[Tuple[str, datetime]]:
-        """The Object Lock an entry carries, or None (none, or a store without locks)."""
+    #: The S3 VersionId each entry was read at (``read``), so later reads take that version.
+    versions: Dict[str, Optional[str]]
+
+    def lock(self, name: str, version: Optional[str] = None) -> Optional[Tuple[str, datetime]]:
+        """The Object Lock an entry (at ``version``) carries, or None (none, or no locks here)."""
         return None
 
 
+def _within_cap(shown: str, names: List[str]) -> List[str]:
+    """``names``, or a refusal past :data:`~fluid_build.util.receipt_record.MAX_ENTRIES`: a
+    listing cut short could leave out the newest receipt, so it decides nothing."""
+    if len(names) > rr.MAX_ENTRIES:
+        raise ReceiptError(
+            f"{shown} holds more than {rr.MAX_ENTRIES:,} entries, so the newest receipt cannot be "
+            "told: move old receipts aside",
+            UNDECIDED,
+        )
+    return names
+
+
 class _DirStore(_Store):
+    """``<root>/receipts/<env>/``; ``root`` (the release directory's parent) is the reader's own,
+    and ``receipts`` and ``<env>`` must be real directories, never links."""
+
     def __init__(self, directory: Path) -> None:
         self.directory = directory
         self.shown = clean(f"{directory}{os.sep}", keep_end=True)
+        self.versions = {}
+
+    def _linked(self) -> bool:
+        """Whether ``receipts/`` or ``receipts/<env>/`` is a link (or not a directory)."""
+        for part in (self.directory.parent, self.directory):
+            try:
+                mode = os.lstat(part).st_mode
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ReceiptError(f"{self.shown} cannot be read ({type(exc).__name__})", UNDECIDED)
+            if not stat.S_ISDIR(mode):
+                return True
+        return False
 
     def names(self) -> List[str]:
+        if self._linked():
+            raise ReceiptError(f"{self.shown} is reached through a link or is not a folder")
         try:
             listed = os.listdir(self.directory)
         except FileNotFoundError:
             return []
         except OSError as exc:
             raise ReceiptError(f"{self.shown} cannot be listed ({type(exc).__name__})", UNDECIDED)
-        return listed[: rr.MAX_RECEIPTS * 2]
+        return _within_cap(self.shown, listed)
 
     def read(self, name: str, limit: int) -> bytes:
         path = self.directory / name
+        if self._linked():
+            raise ReceiptError(f"{self.shown} is reached through a link or is not a folder")
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(path, _READ_FLAGS)
         except FileNotFoundError:
             raise ReceiptError(f"{self.shown}{name} is missing")
         except OSError as exc:
@@ -219,11 +286,18 @@ class _DirStore(_Store):
         return data
 
     def write_once(self, name: str, data: bytes) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        if (
-            self.directory.is_symlink()
-            or self.directory.resolve() != self.directory.absolute().resolve()
-        ):
+        try:
+            linked = self._linked()
+            for part in (self.directory.parent, self.directory):  # one level at a time
+                if not linked and not os.path.lexists(part):
+                    os.mkdir(part, 0o700)
+            linked = linked or self._linked()
+        except OSError as exc:
+            raise ReceiptError(
+                f"{self.shown} cannot be made ({type(exc).__name__}); nothing was written there",
+                UNDECIDED,
+            ) from None
+        if linked:
             raise ReceiptError(
                 f"{self.shown} is reached through a link; no receipt is written there"
             )
@@ -232,14 +306,24 @@ class _DirStore(_Store):
             fd = os.open(self.directory / name, flags, 0o600)
         except FileExistsError:
             raise ReceiptError(f"{self.shown}{name} already exists: a receipt is written once")
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
+        except OSError as exc:
+            raise ReceiptError(
+                f"{self.shown}{name} cannot be written ({type(exc).__name__})", UNDECIDED
+            ) from None
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        except OSError as exc:
+            raise ReceiptError(
+                f"{self.shown}{name} cannot be written ({type(exc).__name__})", UNDECIDED
+            ) from None
 
 
 class _S3Store(_Store):
     def __init__(self, client: Any, bucket: str, prefix: str) -> None:
         self.client, self.bucket, self.prefix = client, bucket, prefix
         self.shown = f"s3://{bucket}/{prefix}"
+        self.versions = {}
 
     def names(self) -> List[str]:
         from fluid_build.util import s3
@@ -264,7 +348,8 @@ class _S3Store(_Store):
                 ):
                     out.append(key[len(self.prefix) :])
             token = page.get("NextContinuationToken") if page.get("IsTruncated") else None
-            if not token or len(out) >= rr.MAX_RECEIPTS * 2:
+            _within_cap(self.shown, out)
+            if not token:
                 return out
 
     def read(self, name: str, limit: int) -> bytes:
@@ -272,7 +357,12 @@ class _S3Store(_Store):
         from fluid_build.util import s3
 
         try:
-            body = self.client.get_object(Bucket=self.bucket, Key=self.prefix + name)["Body"]
+            pinned = self.versions.get(name)  # a second read takes the version the first did
+            extra = {"VersionId": pinned} if pinned else {}
+            got = self.client.get_object(Bucket=self.bucket, Key=self.prefix + name, **extra)
+            version = got.get("VersionId")
+            self.versions.setdefault(name, version if isinstance(version, str) else None)
+            body = got["Body"]
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
             code = s3.error_code(exc)
             if s3.is_missing_code(code):
@@ -328,12 +418,13 @@ class _S3Store(_Store):
         if head is None or head.get("ChecksumSHA256") != s3.sha256_b64(hex_digest):
             raise ReceiptError(f"{self.shown}{name} does not read back with the sha256 written")
 
-    def _head(self, name: str) -> Optional[Dict[str, Any]]:
+    def _head(self, name: str, version: Optional[str] = None) -> Optional[Dict[str, Any]]:
         from fluid_build.util import s3
 
+        extra = {"VersionId": version} if version else {}
         try:
             head: Dict[str, Any] = self.client.head_object(
-                Bucket=self.bucket, Key=self.prefix + name, ChecksumMode="ENABLED"
+                Bucket=self.bucket, Key=self.prefix + name, ChecksumMode="ENABLED", **extra
             )
             return head
         except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
@@ -344,8 +435,8 @@ class _S3Store(_Store):
                 UNDECIDED,
             ) from None
 
-    def lock(self, name: str) -> Optional[Tuple[str, datetime]]:
-        return _lock_of(self._head(name))
+    def lock(self, name: str, version: Optional[str] = None) -> Optional[Tuple[str, datetime]]:
+        return _lock_of(self._head(name, version or self.versions.get(name)))
 
 
 def _lock_of(head: Optional[Mapping[str, Any]]) -> Optional[Tuple[str, datetime]]:
@@ -448,8 +539,12 @@ def _verified(source: str, clients: ClientFactory, region: Optional[str]) -> Any
             "it in a CI run that names its commit",
             UNDECIDED,
         )
-    if not isinstance(checked.environment, str) or not checked.environment:
-        raise ReceiptError(f"{checked.source} names no environment", UNDECIDED)
+    if not isinstance(checked.environment, str) or not _ENVIRONMENT.fullmatch(checked.environment):
+        raise ReceiptError(
+            f"{checked.source} names no environment a receipts folder can take (letters, digits "
+            "and ._=+-, starting with a letter, digit or _)",
+            UNDECIDED,
+        )
     return checked
 
 
@@ -508,7 +603,7 @@ class Recorded:
 def _read_report(path: str) -> Tuple[bytes, Dict[str, Any]]:
     """The ``fluid verify --out`` report at ``path``: a regular file, not a link, a JSON object."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, _READ_FLAGS)
     except OSError as exc:
         raise ReceiptError(
             f"--report {clean(path, keep_end=True)} cannot be read ({type(exc).__name__})",
@@ -526,7 +621,7 @@ def _read_report(path: str) -> Tuple[bytes, Dict[str, Any]]:
         )
     try:
         report = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise ReceiptError(
             f"--report {clean(path, keep_end=True)} is not JSON", UNDECIDED
         ) from None
@@ -580,10 +675,18 @@ def record_receipt(
 
     parsed = [parse_target(t) for t in targets]
     if sign:
+        from fluid_build._contract_loader import CLIError
         from fluid_build.cli import _signing
 
         if not _signing.cosign_available():
             raise ReceiptError("--sign needs cosign on PATH (https://docs.sigstore.dev)", UNDECIDED)
+        if key_ref is not None:
+            try:
+                _signing._validate_key_ref(key_ref)
+            except CLIError:
+                raise ReceiptError(
+                    "--sign-key: not a key path or a KMS URI cosign takes", UNDECIDED
+                ) from None
     factory = _clients(clients)
     checked = _verified(source, factory, region)
     if environment is not None and environment != checked.environment:
@@ -598,6 +701,12 @@ def record_receipt(
     if other:
         raise ReceiptError(f"--report {clean(report_path, keep_end=True)}: {other}")
     passed, reason = report_verdict(report)
+    expose = report["release"].get("expose")
+    if passed and expose is not None:
+        passed, reason = (
+            False,
+            f"the report checked one expose ({clean(expose, 80)}), not the release",
+        )
     target_records: List[Dict[str, Any]] = []
     for target in parsed:
         record, problem = _target_record(target, factory, region, check_targets)
@@ -637,18 +746,21 @@ def record_receipt(
             "summary": {k: v for k, v in summary.items() if type(v) is int},
         },
         "targets": target_records,
-        "ci": _attestation._collect_run_metadata(),
+        "ci": _no_userinfo(_attestation._collect_run_metadata()),
     }
     store = place.store(checked.environment)
     data = json.dumps(receipt, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    written: List[str] = []
-    # The report first and the receipt last: a reader takes a receipt only with its report.
-    store.write_once(rr.report_name(name), report_bytes)
-    written.append(rr.report_name(name))
+    # Signed before anything is written, so a signing failure leaves nothing behind. Then the
+    # report, the signature files, and the receipt last: a reader takes a receipt only with
+    # its report.
+    entries = [(rr.report_name(name), report_bytes)]
     if sign:
-        written += _sign_and_store(store, name, data, receipt, key_ref)
-    store.write_once(name, data)
-    written.append(name)
+        entries += _signed(name, data, receipt, key_ref)
+    entries.append((name, data))
+    written: List[str] = []
+    for stored, content in entries:
+        store.write_once(stored, content)
+        written.append(stored)
     return Recorded(
         uri=f"{store.shown}{name}",
         result=receipt["result"],
@@ -656,6 +768,18 @@ def record_receipt(
         receipt=receipt,
         written=written,
     )
+
+
+def _no_userinfo(value: Any) -> Any:
+    """``value`` with any ``user:password@`` cut out of every URL in it: a CI's URLs can carry
+    credentials, and a receipt is read by everyone who reads the bucket."""
+    if isinstance(value, Mapping):
+        return {str(k): _no_userinfo(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_no_userinfo(v) for v in value]
+    if isinstance(value, str):
+        return re.sub(r"(://)[^/@\s]*@", r"\1", value)
+    return value
 
 
 def statement(receipt: Mapping[str, Any], receipt_bytes: bytes) -> Dict[str, Any]:
@@ -696,11 +820,12 @@ def statement(receipt: Mapping[str, Any], receipt_bytes: bytes) -> Dict[str, Any
     }
 
 
-def _sign_and_store(
-    store: _Store, name: str, data: bytes, receipt: Mapping[str, Any], key_ref: Optional[str]
-) -> List[str]:
-    """Sign the receipt's Statement with cosign and store it with its signature (and, keyless,
-    its certificate) beside the receipt, write-once."""
+def _signed(
+    name: str, data: bytes, receipt: Mapping[str, Any], key_ref: Optional[str]
+) -> List[Tuple[str, bytes]]:
+    """The receipt's Statement, signed with cosign, and its signature (and, keyless, its
+    certificate): the files stored beside the receipt."""
+    from fluid_build._contract_loader import CLIError
     from fluid_build.cli import _signing
 
     stem = name[: -len(".json")]
@@ -708,19 +833,17 @@ def _sign_and_store(
     with tempfile.TemporaryDirectory(prefix="fluid-receipt-") as scratch:
         path = Path(scratch) / f"{stem}.intoto.jsonl"
         path.write_text(body, encoding="utf-8")
-        result = _signing.sign_blob(str(path), key_ref=key_ref)
+        try:
+            result = _signing.sign_blob(str(path), key_ref=key_ref)
+        except CLIError as exc:
+            raise ReceiptError(f"--sign: {exc.event}; nothing was written", UNDECIDED) from None
         if result.get("exit_code") != 0:
-            raise ReceiptError(
-                "cosign could not sign the receipt; nothing was written beyond the report",
-                UNDECIDED,
-            )
+            raise ReceiptError("cosign could not sign the receipt; nothing was written", UNDECIDED)
         out = [(f"{stem}.intoto.jsonl", path.read_bytes())]
         out.append((f"{stem}.intoto.jsonl.sig", Path(result["sig_path"]).read_bytes()))
         if result.get("pem_path"):
             out.append((f"{stem}.intoto.jsonl.pem", Path(result["pem_path"]).read_bytes()))
-    for stored, content in out:
-        store.write_once(stored, content)
-    return [stored for stored, _ in out]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -752,19 +875,37 @@ class Checked:
 
 def _newest_receipt(
     store: _Store, code_digest: str, ignored: List[str]
-) -> Tuple[str, Dict[str, Any]]:
-    """The newest receipt in ``store`` for ``code_digest``. Fail closed: when the newest file
-    that may be a receipt does not parse, that is the answer, not an older one."""
-    names = rr.newest_first(store.names())[: rr.MAX_RECEIPTS]
-    for name in names:
-        receipt, problem = rr.parse_receipt(name, store.read(name, rr.MAX_RECEIPT_BYTES))
+) -> Tuple[str, Dict[str, Any], bytes]:
+    """The newest receipt in ``store`` for ``code_digest``, with its bytes. Fail closed: when
+    the newest file that may be a receipt does not parse, that is the answer, not an older one.
+    A name later than now (past a few minutes of clock skew) is passed over and noted: it would
+    otherwise stand as the newest over every receipt written until then."""
+    latest = rr.receipt_name(
+        datetime.now(timezone.utc) + timedelta(seconds=_CLOCK_SKEW_S), "sha256:" + "f" * 64
+    )
+    for name in rr.newest_first(store.names()):
+        if name > latest:
+            ignored.append(f"{name}: named later than now")
+            continue
+        data = store.read(name, rr.MAX_RECEIPT_BYTES)
+        receipt, problem = rr.parse_receipt(name, data)
         if receipt is None:
             raise ReceiptError(f"the newest receipt, {store.shown}{name}, is not one: {problem}")
         if receipt["code_digest"] != code_digest:
             ignored.append(f"{name}: a receipt of other code")
             continue
-        return name, receipt
-    raise ReceiptError(f"{store.shown} holds no receipt for code {code_digest}")
+        return name, receipt, data
+    raise NoReceipt(f"{store.shown} holds no receipt for code {code_digest}")
+
+
+@dataclass(frozen=True)
+class SignerPolicy:
+    """Who must have signed the receipt (``--require-signed``): a cosign key, or a keyless
+    signer pinned by its certificate identity and OIDC issuer."""
+
+    key_ref: Optional[str] = None
+    certificate_identity: Optional[str] = None
+    certificate_oidc_issuer: Optional[str] = None
 
 
 def check_receipt(
@@ -772,6 +913,7 @@ def check_receipt(
     *,
     environment: str,
     require_locked: bool = False,
+    signer: Optional[SignerPolicy] = None,
     clients: Optional[ClientFactory] = None,
     region: Optional[str] = None,
 ) -> Checked:
@@ -787,8 +929,15 @@ def check_receipt(
         code = str(checked.code_digest)
         place = _place(source, code.split(":", 1)[1], str(checked.environment), factory, region)
         store = place.store(environment)
-        name, receipt = _newest_receipt(store, code, ignored)
-        reason = _receipt_problem(store, name, receipt, environment, place, factory, region)
+        name, receipt, data = _newest_receipt(store, code, ignored)
+        reason, there = _receipt_problem(store, name, receipt, environment, place, factory, region)
+        if reason is None and signer is not None:
+            reason = _signature_problem(store, name, receipt, data, there, signer)
+        locks = (
+            _locks(place, checked, there, environment, store, name)
+            if place.client is not None
+            else []
+        )
     except ReceiptError as exc:
         return Checked(shown, environment, exc.exit_code, str(exc), ignored=ignored)
     out = Checked(
@@ -802,9 +951,13 @@ def check_receipt(
         ignored=ignored,
     )
     if place.client is not None:
-        out.locks = _locks(place, checked, store, name)
-        unlocked = [item["uri"] for item in out.locks if item["lock"] is None]
-        if require_locked and unlocked and out.exit_code == PASS:
+        out.locks = locks
+        unlocked = [item["uri"] for item in locks if item["lock"] is None]
+        unread = [item["uri"] for item in locks if item.get("error")]
+        if require_locked and unread and out.exit_code == PASS:
+            out.exit_code = UNDECIDED
+            out.reason = f"--require-locked: the lock of {len(unread)} object(s) cannot be read"
+        elif require_locked and unlocked and out.exit_code == PASS:
             out.exit_code = FAIL
             out.reason = (
                 f"--require-locked: {len(unlocked)} object(s) carry no Object Lock in force"
@@ -823,34 +976,41 @@ def _receipt_problem(
     place: _Place,
     factory: ClientFactory,
     region: Optional[str],
-) -> Optional[str]:
-    """Why the newest receipt does not let the release on, or None. Raises ReceiptError (2)
-    when something it names cannot be read."""
+) -> Tuple[Optional[str], Any]:
+    """Why the newest receipt does not let the release on (None when it does), and the
+    environment's release it was checked against, once read. Raises ReceiptError (2) when
+    something it names cannot be read."""
     from fluid_build.api import release as api_release
     from fluid_build.api.verify_report import report_verdict
 
     if receipt["environment"] != environment:
-        return f"the newest receipt names environment {clean(receipt['environment'], 40)}"
+        return (f"the newest receipt names environment {clean(receipt['environment'], 40)}"), None
     if receipt["result"] != rr.PASSED:
-        return f"the newest {environment} receipt for this code failed: {clean(receipt.get('reason'), 300)}"
+        return (
+            f"the newest {environment} receipt for this code failed: {clean(receipt.get('reason'), 300)}"
+        ), None
     stored = store.read(rr.report_name(name), rr.MAX_REPORT_BYTES)
     if "sha256:" + hashlib.sha256(stored).hexdigest() != receipt["report"]["sha256"]:
-        return "the report stored beside the newest receipt is not the one it names"
+        return ("the report stored beside the newest receipt is not the one it names"), None
     try:
         report = json.loads(stored.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return "the report stored beside the newest receipt is not JSON"
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return ("the report stored beside the newest receipt is not JSON"), None
     passed, why = report_verdict(report if isinstance(report, Mapping) else {})
     if not passed:
-        return f"the report the newest receipt names does not pass: {why}"
+        return (f"the report the newest receipt names does not pass: {why}"), None
+    release: Any
     if place.client is not None:
         release = place.release_of(environment)
     else:  # on disk: the release the receipt names, and only beside this one
-        release = str(receipt.get("resource_uri", ""))
-        if not release or Path(release).parent != Path(place.parent):
+        named = receipt.get("resource_uri")
+        base = Path(named).name if isinstance(named, str) and named.isprintable() else ""
+        # the release by its folder's name beside this one: the folder may have moved since
+        release = str(Path(place.parent) / base)
+        if base in ("", ".", ".."):
             return (
-                f"the newest receipt names a release outside {clean(place.parent, keep_end=True)}"
-            )
+                (f"the newest receipt names a release outside {clean(place.parent, keep_end=True)}")
+            ), None
     there = api_release.verify_release(release, clients=factory, region=region)
     if there.status == api_release.UNDECIDED:
         raise ReceiptError(
@@ -859,38 +1019,132 @@ def _receipt_problem(
             UNDECIDED,
         )
     if not there.intact:
-        return f"the {environment} release {there.source} is not intact: " + "; ".join(
-            there.problems
-        )
+        return (
+            f"the {environment} release {there.source} is not intact: " + "; ".join(there.problems)
+        ), there
+    if there.environment != environment:
+        return (
+            f"the release the newest receipt names, {there.source}, is the release of "
+            f"{clean(there.environment, 40)}, not {environment}"
+        ), there
     if (
         there.identity_digest != receipt["identity_digest"]
         or there.code_digest != receipt["code_digest"]
     ):
         return (
-            f"the {environment} release {there.source} is not the release the newest receipt names"
-        )
+            (
+                f"the {environment} release {there.source} is not the release the newest receipt names"
+            )
+        ), there
     block = report.get("release") if isinstance(report, Mapping) else None
     if not isinstance(block, Mapping) or block.get("identity_digest") != receipt["identity_digest"]:
-        return "the report the newest receipt names is not a report on its release"
+        return ("the report the newest receipt names is not a report on its release"), there
+    return None, there
+
+
+def _signature_problem(
+    store: _Store,
+    name: str,
+    receipt: Mapping[str, Any],
+    data: bytes,
+    there: Any,
+    signer: SignerPolicy,
+) -> Optional[str]:
+    """Why the newest receipt's signature does not hold, or None: the Statement beside it
+    verifies with cosign against ``signer`` and says what the receipt says (its sha256, its
+    environment, code and identity, PASSED, and the release.json the environment's release
+    was read at). SLSA's checks of a verification summary, minus the levels."""
+    from fluid_build._contract_loader import CLIError
+    from fluid_build.cli import _signing
+
+    stem = name[: -len(".json")]
+    keyless = signer.key_ref is None
+    wanted = [f"{stem}.intoto.jsonl", f"{stem}.intoto.jsonl.sig"]
+    if keyless:
+        wanted.append(f"{stem}.intoto.jsonl.pem")
+    try:
+        files = {w: store.read(w, rr.MAX_RECEIPT_BYTES) for w in wanted}
+    except ReceiptError as exc:
+        if exc.exit_code == UNDECIDED:
+            raise
+        return f"--require-signed: the newest receipt is not signed ({exc})"
+    if not _signing.cosign_available():
+        raise ReceiptError("--require-signed needs cosign on PATH", UNDECIDED)
+    with tempfile.TemporaryDirectory(prefix="fluid-receipt-") as scratch:
+        paths = {}
+        for stored, content in files.items():
+            paths[stored] = Path(scratch) / stored
+            paths[stored].write_bytes(content)
+        try:
+            result = _signing.verify_blob(
+                str(paths[wanted[0]]),
+                sig_path=str(paths[wanted[1]]),
+                pem_path=str(paths[wanted[2]]) if keyless else None,
+                key_ref=signer.key_ref,
+                certificate_identity=signer.certificate_identity,
+                certificate_oidc_issuer=signer.certificate_oidc_issuer,
+            )
+        except CLIError as exc:
+            raise ReceiptError(f"--require-signed: {exc.event}", UNDECIDED) from None
+    if result.get("exit_code") != 0:
+        return "--require-signed: the newest receipt's signature does not verify for that signer"
+    try:
+        signed = json.loads(files[wanted[0]].decode("utf-8"))
+        predicate = signed["predicate"]
+        extension = predicate[RECEIPT_EXTENSION]
+        subject = signed["subject"][0]["digest"]["sha256"]
+    except (UnicodeDecodeError, ValueError, RecursionError, KeyError, IndexError, TypeError):
+        return "--require-signed: the signed Statement is not one a receipt is signed as"
+    index: Mapping[str, Any] = next(
+        (o for o in there.objects if o.get("path") == "release.json"), {}
+    )
+    expected = {
+        "type": (signed.get("_type"), INTOTO_STATEMENT_TYPE),
+        "predicate type": (signed.get("predicateType"), VSA_PREDICATE_TYPE),
+        "result": (predicate.get("verificationResult"), rr.PASSED),
+        "receipt": (extension.get("receipt_sha256"), hashlib.sha256(data).hexdigest()),
+        "environment": (extension.get("environment"), receipt["environment"]),
+        "code digest": (extension.get("code_digest"), receipt["code_digest"]),
+        "identity digest": (extension.get("identity_digest"), receipt["identity_digest"]),
+        "subject": (subject, index.get("sha256")),
+    }
+    for what, (got, want) in expected.items():
+        if got != want or want is None:
+            return f"--require-signed: the signed Statement's {what} is not the receipt's"
     return None
 
 
-def _locks(place: _Place, checked: Any, store: _Store, name: str) -> List[Dict[str, Optional[str]]]:
-    """The lock each object of the release and of the receipt carries."""
+def _locks(
+    place: _Place, checked: Any, there: Any, environment: str, store: _Store, name: str
+) -> List[Dict[str, Optional[str]]]:
+    """The lock each object carries: of the release checked, of the environment's release its
+    receipt names, and of the receipt and its report. ``lock`` is None for an object without
+    one in force; ``error`` says why one could not be read."""
     out: List[Dict[str, Optional[str]]] = []
-    release = _S3Store(place.client, place.bucket, place.release_uri.split("/", 3)[3])
-    entries: List[Tuple[_Store, str]] = [(release, str(o["path"])) for o in checked.objects]
+    entries: List[Tuple[_Store, str]] = []
+    # the uris these releases were read from (a result's ``source`` is cut for display)
+    for release, uri in ((checked, place.release_uri), (there, place.release_of(environment))):
+        if release is None:
+            continue
+        objects = _S3Store(place.client, place.bucket, uri.split("/", 3)[3])
+        for o in release.objects:
+            objects.versions[str(o["path"])] = o.get("version_id")
+        entries += [(objects, str(o["path"])) for o in release.objects]
     entries += [(store, name), (store, rr.report_name(name))]
     for where, rel in entries:
-        held = where.lock(rel)
-        out.append(
-            {
-                "uri": f"{where.shown}{rel}",
-                "lock": (
-                    f"{held[0]} until {held[1].strftime('%Y-%m-%dT%H:%M:%SZ')}" if held else None
-                ),
-            }
-        )
+        item: Dict[str, Optional[str]] = {
+            "uri": f"{where.shown}{rel}",
+            "version_id": where.versions.get(rel),
+            "lock": None,
+        }
+        try:
+            held = where.lock(rel)
+        except ReceiptError as exc:
+            item["error"] = str(exc)
+            held = None
+        if held:
+            item["lock"] = f"{held[0]} until {held[1].strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        out.append(item)
     return out
 
 
@@ -903,8 +1157,10 @@ def newest_by_environment(
     release_dir: Path, code_digest: Optional[str]
 ) -> Dict[str, Dict[str, Any]]:
     """For ``fluid runs status``: the newest receipt of each environment beside a release on
-    disk, for its code digest, as ``{env: {"result", "time_verified", "identity_digest"}}``.
-    A receipt that does not parse, and every receipt of other code, is left out."""
+    disk, for its code digest, as ``{env: {"result", "time_verified", "identity_digest"}}``,
+    picked as ``receipt check`` picks it: when the newest file there is not a receipt, or the
+    directory cannot be read, the entry is ``{"problem": ...}``. An environment with no
+    receipt for the code is left out."""
     out: Dict[str, Dict[str, Any]] = {}
     if code_digest is None:
         return out
@@ -914,20 +1170,21 @@ def newest_by_environment(
     except OSError:
         return out
     for env in environments:
-        if env.startswith(".") or not stat.S_ISDIR(os.lstat(root / env).st_mode):
-            continue
-        store = _DirStore(root / env)
         try:
-            names = rr.newest_first(store.names())[: rr.MAX_RECEIPTS]
-            for name in names:
-                receipt, _ = rr.parse_receipt(name, store.read(name, rr.MAX_RECEIPT_BYTES))
-                if receipt is not None and receipt["code_digest"] == code_digest:
-                    out[clean(env, 40)] = {
-                        "result": receipt["result"],
-                        "time_verified": receipt["time_verified"],
-                        "identity_digest": receipt["identity_digest"],
-                    }
-                    break
-        except ReceiptError:
+            if env.startswith(".") or not stat.S_ISDIR(os.lstat(root / env).st_mode):
+                continue
+        except OSError:
             continue
+        try:
+            _name, receipt, _data = _newest_receipt(_DirStore(root / env), code_digest, [])
+        except NoReceipt:
+            continue
+        except ReceiptError as exc:
+            out[clean(env, 40)] = {"problem": clean(str(exc), 300)}
+            continue
+        out[clean(env, 40)] = {
+            "result": receipt["result"],
+            "time_verified": receipt["time_verified"],
+            "identity_digest": receipt["identity_digest"],
+        }
     return out

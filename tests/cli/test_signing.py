@@ -478,3 +478,31 @@ class TestVerifyBundleKeyedMode:
             # Should NOT raise signing_pem_missing.
             result = _signing.verify_bundle(str(fake_bundle), key_ref=str(key))
         assert result["exit_code"] == 0
+
+
+def test_verify_blob_pins_the_signer_in_single_argv_elements(tmp_path, monkeypatch) -> None:
+    """Keyless verification needs an exact identity and issuer, each one argv element, so a
+    value that starts with '-' is never read as a flag."""
+    import pytest
+
+    blob, sig, pem = tmp_path / "s.intoto.jsonl", tmp_path / "s.sig", tmp_path / "s.pem"
+    for path in (blob, sig, pem):
+        path.write_bytes(b"x")
+    seen = {}
+    monkeypatch.setattr(_signing, "_resolve_cosign", lambda: "cosign")
+    monkeypatch.setattr(
+        _signing,
+        "_run_cosign",
+        lambda argv, timeout=0: seen.setdefault("argv", argv) and {"exit_code": 0},
+    )
+    _signing.verify_blob(
+        str(blob),
+        sig_path=str(sig),
+        pem_path=str(pem),
+        certificate_identity="-x@example.com",
+        certificate_oidc_issuer="https://issuer.example.com",
+    )
+    assert "--certificate-identity=-x@example.com" in seen["argv"]
+    assert "--certificate-oidc-issuer=https://issuer.example.com" in seen["argv"]
+    with pytest.raises(_signing.CLIError):
+        _signing.verify_blob(str(blob), sig_path=str(sig), pem_path=str(pem))

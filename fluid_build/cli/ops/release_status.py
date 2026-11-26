@@ -425,6 +425,9 @@ def describe(release: Release) -> List[str]:
             + (f"  from {built}" if built else "  (the record names no source)")
         )
     for env, receipt in sorted(release.receipts.items()):
+        if "problem" in receipt:
+            lines.append(f"  receipt  {env} cannot be told: {receipt['problem']}")
+            continue
         mine = " (this release)" if receipt.get("identity_digest") == release.release_id else ""
         lines.append(
             f"  receipt  {env} {receipt.get('result')} {receipt.get('time_verified')}{mine}"

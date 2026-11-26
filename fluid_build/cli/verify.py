@@ -345,6 +345,8 @@ def _release_block(args: argparse.Namespace, contract_id: Any) -> Optional[Dict[
         block = _release_receipt.report_release_block(source, str(contract_id))
     except _release_receipt.ReceiptError as exc:
         raise CLIError(exc.exit_code, "verify_release_refused", {"message": str(exc)}) from None
+    # a report on one expose is no check of the release: receipt record fails it
+    block["expose"] = getattr(args, "expose_id", None)
     cprint(f"Release: {block['identity_digest']} ({block['environment']})", markup=False)
     return block
 
