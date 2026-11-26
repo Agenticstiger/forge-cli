@@ -203,7 +203,7 @@ def test_a_filter_on_the_version_compares_the_joined_column_as_a_parameter() -> 
 
 
 def test_a_column_read_twice_is_projected_once() -> None:
-    compiled = _compile(filters={"station_on_date.sensor_model": "m1"})
+    compiled = _compile(filters={"station_on_date.sensor_model": "B200"})
     assert compiled.sql.count("sensor_model AS fluid_c1_") == 1
     assert "WHERE ((fluid_l1.fluid_c1_1) = :p_0)" in compiled.sql
 
@@ -494,6 +494,21 @@ def _timestamp_target(base: Dict[str, Any], target: Dict[str, Any]) -> None:
 
 def _validity(target: Dict[str, Any], **params: Any) -> None:
     target["semantics"]["dimensions"][1]["typeParams"]["validityParams"].update(params)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [_no_window, _wrong_to_columns, _two_from_columns, _timestamp_target],
+    ids=["no-window", "to-columns", "from-columns", "bounds"],
+)
+def test_a_caller_the_target_policy_does_not_name_learns_nothing_of_its_shape(edit: Any) -> None:
+    # The target's identity check comes before anything about its shape is read, so a
+    # caller its row filters do not name gets the identity refusal, never a message
+    # naming the target's key, window or bounds.
+    base, target = _base(), _target(policy=TARGET_POLICY)
+    edit(base, target)
+    with pytest.raises(RowFilterIdentityMissing):
+        _compile(base, _related(target), caller_attributes={"principal": "network:9"})
 
 
 REFUSED = {

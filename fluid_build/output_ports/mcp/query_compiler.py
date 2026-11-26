@@ -1658,6 +1658,13 @@ class _AsOfJoins:
         to = declared.get("to")
         if not isinstance(target, Mapping) or target.get("exposeId") != to:
             raise refuse(f"the table supplied is not the expose it targets ({to!r})")
+        # The target's row filter is resolved for this caller before anything about the
+        # target's shape is read: a caller its filters do not name (or a filter that cannot
+        # be applied) refuses the whole call, and no message tells that caller the target's
+        # key, window or bounds.
+        predicate = row_filter_predicate(
+            target, self._caller_attributes, dialect=self._dialect, contract=self._contract
+        )
         semantics = target.get("semantics")
         try:
             window = (
@@ -1748,15 +1755,11 @@ class _AsOfJoins:
         validate_sql_expression_allowlist(supplied.table_reference)
         # The target is read through its own governed projection, as the base expose is:
         # its declared columns less the restricted ones, and the rows its row filter
-        # leaves this caller. A target filter that cannot be resolved for the caller (no
-        # principal it names, a filter that cannot be applied) refuses the whole call.
+        # leaves this caller (``predicate``, resolved above).
         readable = tuple(readable_columns(target, restricted))
         for name in (key, start, end):
             if name not in readable:
                 raise refuse(f"column {name!r} is not one its contract.schema lets a query read")
-        predicate = row_filter_predicate(
-            target, self._caller_attributes, dialect=self._dialect, contract=self._contract
-        )
         number = len(self._reaches) + 1
         join_type = declared.get("joinType", "left")
         if join_type not in ("left", "inner"):
