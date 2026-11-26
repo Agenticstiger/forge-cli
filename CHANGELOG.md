@@ -26,9 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<prefix>/<product>/<env>/<identity hex>/` as one single-part PutObject with `ChecksumSHA256`
   and `If-None-Match: *`, read back with `HeadObject` (`ChecksumMode=ENABLED`), and
   `release.json` goes last. An object already at a key counts as published only when its
-  SHA-256 is ours, so a re-run of the same release finishes or repeats the upload; other bytes,
-  a `release.json` another run sealed for the same identity, a denied write or a bad read-back
-  refuse the run (exit 1, or 3 after an apply) and the sealed directory stays as it is. Files
+  SHA-256 is ours, so a re-run of the same release finishes or repeats the upload. When another
+  run already published this identity and that release verifies intact, it stands and nothing is
+  written (`already-published`). Other bytes, a release there that does not verify, a denied
+  write or a bad read-back refuse the run (exit 1, or 3 after an apply) and the sealed directory
+  stays as it is. Files
   over 5 GiB are refused before any write. `--release-to-require versioning,object-lock` refuses
   a bucket without them. The run report's `release.remote` says where the release went, or why
   not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
@@ -36,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid runs verify-release SRC` checks a sealed release, read-only.** SRC is a release
   directory or the `s3://` prefix `--release-to` wrote. It checks that `release.json` is a
   `fluid-release/1` record whose `identity_digest` is the digest of its `identity`, that an S3 key
-  ending in an identity's hex is this one's, and that every file listed has the sha256 named.
+  ending in an identity's hex is this one's, that every file listed has the sha256 named, and that
+  the files `identity` pins (the bundle, each external file, the artifacts MANIFEST and what it
+  lists, the plan) are listed with those digests, so a swapped file with its entry rewritten is
+  not intact.
   Exit 0 intact, 1 not intact, 2 cannot decide (unreadable, access denied, or boto3 missing for
   `s3://`); `--json` prints the result. The check is public as `fluid_build.api.verify_release`
   (API 1.3), and `fluid runs status --release-dir` shares its identity check.

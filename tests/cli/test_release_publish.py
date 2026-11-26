@@ -159,18 +159,32 @@ def test_an_object_uploaded_without_a_checksum_is_not_taken_as_ours(tmp_path: Pa
         publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
 
 
-def test_another_index_for_this_identity_writes_nothing(tmp_path: Path) -> None:
+def test_another_run_of_this_identity_stands_and_nothing_is_written(tmp_path: Path) -> None:
     first = sealed(tmp_path / "one", run_id="run-1")
     sealed(tmp_path / "two", run_id="run-2")  # same identity, other provenance
     s3 = FakeS3()
     publish.publish_release(tmp_path / "one", TARGET, clients=s3)
     before = list(s3.writes)
+    again = publish.publish_release(tmp_path / "two", TARGET, clients=s3)
+    assert again == publish.Published(
+        f"s3://acme-releases/{_prefix(first)}", written=0, already=0, by_another_run=True
+    )
+    assert s3.writes == before
+
+
+def test_another_release_there_that_is_not_intact_writes_nothing(tmp_path: Path) -> None:
+    first = sealed(tmp_path / "one", run_id="run-1")
+    sealed(tmp_path / "two", run_id="run-2")
+    s3 = FakeS3()
+    publish.publish_release(tmp_path / "one", TARGET, clients=s3)
+    s3.objects[("acme-releases", f"{_prefix(first)}bundle.tgz")] = b"swapped"
+    before = list(s3.writes)
     with pytest.raises(publish.PublishError) as raised:
         publish.publish_release(tmp_path / "two", TARGET, clients=s3)
-    assert "release.json already holds another release of this identity" in str(raised.value)
-    assert "nothing was written" in str(raised.value)
-    assert s3.writes == before
-    assert api_release.verify_release(f"s3://acme-releases/{_prefix(first)}", clients=s3).intact
+    message = str(raised.value)
+    assert "release.json already holds another release that does not verify as this one" in message
+    assert "bundle.tgz: its bytes are not the sha256 the index names" in message
+    assert "nothing was written" in message and s3.writes == before
 
 
 def test_a_denied_write_is_refused_and_says_what_was_written(tmp_path: Path) -> None:

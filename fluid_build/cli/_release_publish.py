@@ -12,9 +12,10 @@ replace an object). ``release.json`` goes last: a reader that finds it finds eve
 
 A key that already holds an object (HTTP 412) is published when its SHA-256, read back with
 ``HeadObject`` and ``ChecksumMode=ENABLED``, is ours, so a re-run of the same release finishes
-or repeats the upload; any other object refuses the run. ``release.json`` is checked first, so a
-second run that sealed the same identity with other bytes (another run id, other reports)
-uploads nothing. Every object written is read back the same way. A write that raced a delete of
+or repeats the upload; any other object refuses the run. ``release.json`` is checked first: when
+another run sealed this identity (another run id, other reports) and its release verifies intact
+(``fluid_build.api.verify_release``, which ties the bundle, external files, artifacts and plan to
+``identity``), that release stands and nothing is written; one that does not verify refuses. Every object written is read back the same way. A write that raced a delete of
 its key (HTTP 409) is tried again, as S3 allows.
 
 The rule is rclone's ``--immutable`` (a changed file is refused, an identical one is not),
@@ -72,6 +73,9 @@ class Published:
     uri: str
     written: int
     already: int
+    #: Another run sealed this identity and published it, intact, before this one: nothing was
+    #: written, and the published release (other run times, other reports) stands.
+    by_another_run: bool = False
 
 
 def parse_target(value: str) -> Target:
@@ -179,7 +183,8 @@ def publish_release(
     upload = _Upload(client, where.bucket, prefix, uri)
     for check in require:
         upload.require(check)
-    upload.check_index(files[-1])
+    if upload.check_index(files[-1], identity_hex):
+        return Published(uri=uri, written=0, already=0, by_another_run=True)
     for item in files:
         upload.put(item)
     return Published(uri=uri, written=upload.written, already=upload.already)
@@ -330,16 +335,26 @@ class _Upload:
             and head.get("ContentLength", item.size) == item.size
         )
 
-    def check_index(self, index: _File) -> None:
-        """Refuse, before any write, a target whose ``release.json`` is another release's."""
+    def check_index(self, index: _File, identity_hex: str) -> bool:
+        """Before any write: False when this release's ``release.json`` is not there or is ours;
+        True when another run published this identity and the release there verifies intact
+        (``identity`` pins the files that matter, so it holds what this run sealed). Raises
+        otherwise: a release that is not intact, or whose identity is another one, is never
+        taken as published."""
+        from fluid_build.api import release as api_release
+
         head = self._head(self.prefix + index.rel)
         self.index_there = head is not None
-        if head is not None and not self._same(head, index):
-            raise PublishError(
-                f"{self.uri}release.json already holds another release of this identity (other "
-                "bytes: another run sealed it). A published release never changes; nothing was "
-                "written"
-            )
+        if head is None or self._same(head, index):
+            return False
+        there = api_release.verify_release(self.uri, clients=lambda _service, _region: self.client)
+        if there.intact and there.identity_digest == f"sha256:{identity_hex}":
+            return True
+        why = "; ".join(there.problems) or "it is another identity's"
+        raise PublishError(
+            f"{self.uri}release.json already holds another release that does not verify as this "
+            f"one ({why}). A published release never changes; nothing was written"
+        )
 
     def put(self, item: _File) -> None:
         """Write one object, or find it already there; then read it back."""

@@ -1244,15 +1244,21 @@ def _publish_remote(
         return failed
     block["remote"] = {
         "uri": done.uri,
-        "status": "published",
+        "status": "already-published" if done.by_another_run else "published",
         "written": done.written,
         "already_there": done.already,
     }
     _write_reports(ctx, merged, exit_code, block)
-    ctx.ci.info(
-        f"Release published to {done.uri} ({done.written} object(s) written, "
-        f"{done.already} already there)"
-    )
+    if done.by_another_run:
+        ctx.ci.info(
+            f"Release already published to {done.uri} by another run of this identity, and "
+            "intact: nothing written"
+        )
+    else:
+        ctx.ci.info(
+            f"Release published to {done.uri} ({done.written} object(s) written, "
+            f"{done.already} already there)"
+        )
     return exit_code
 
 
