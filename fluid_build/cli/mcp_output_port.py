@@ -404,7 +404,7 @@ def _run_serve(args, logger: logging.Logger) -> int:
     # Before anything else reads the expose's policy: a policy every call would
     # refuse (or one that is not a mapping) stops here with the reason.
     rows_unsatisfiable = _row_filter_gate_unsatisfiable(
-        expose, transport=transport, http_auth=http_auth
+        expose, transport=transport, http_auth=http_auth, contract=contract
     )
     if rows_unsatisfiable is not None:
         sys.stderr.write(rows_unsatisfiable)
@@ -903,7 +903,11 @@ def _cert_identity_gate_unsatisfiable(
 
 
 def _row_filter_gate_unsatisfiable(
-    expose: Mapping[str, Any], *, transport: str, http_auth: Optional[AuthValidator]
+    expose: Mapping[str, Any],
+    *,
+    transport: str,
+    http_auth: Optional[AuthValidator],
+    contract: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
     """Refuse at startup an expose whose row filters no request could satisfy.
 
@@ -927,7 +931,12 @@ def _row_filter_gate_unsatisfiable(
     try:
         # Parsed as the first call would be, with no principal: a policy with row
         # filters then ends in RowFilterIdentityMissing, one without them in None.
-        if row_filter_predicate(expose, {}, dialect=registered_driver_name(expose)) is None:
+        if (
+            row_filter_predicate(
+                expose, {}, dialect=registered_driver_name(expose), contract=contract
+            )
+            is None
+        ):
             return None
     except RowFilterIdentityMissing:
         # Every filter applies once a request names a principal; whether a request can

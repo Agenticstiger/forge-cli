@@ -123,6 +123,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
   `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
   environment sealed from one commit and one lock, and absent without a source commit.
+- **The MCP `query` tool reads a column of the version an as-of relationship reaches.** A
+  dimension or a filter key `<relationship>.<column>` on a `semantics.relationships[]` entry that
+  declares `asOf` reads `column` of the version of the target valid on the row's `asOf` value
+  (`joinType: inner` drops rows that reach none; a row that reaches none reads NULL). The target is
+  read only through its own governed projection: its declared columns that no policy restricts and
+  the rows its `policy.authz.rowFilters` leave the same caller, so a version the caller may not read
+  never bounds a visible one; a caller its filters do not name is refused. A restricted target
+  column cannot be read, filtered on or joined on, and a PII column is redacted under its
+  `<relationship>_<column>` name. It works where the gateway reads the target in the same statement:
+  DuckDB (the same database; the target's file must be inside `--readable-paths`), BigQuery (the
+  same project), Snowflake (the same database and schema), PostgreSQL (the same connection
+  settings and database) and Athena (the same workgroup, region and output location). A target
+  with another `agentPolicy`, on another platform, outside the readable paths or whose table name
+  another file holds is refused, and a relationship that is not a well-formed as-of reading is
+  refused with the reason.
 
 ### Changed
 
@@ -168,6 +183,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4.3.1 (the pip-audit dependency chain had no bound) and, through overrides until the scanner pins
   fixed releases itself, `opentelemetry` 1.45.2 and `wcmatch` 12.0.4. The OSV scan of the lock
   went from 20 advisories to none, and the scanner's output on this repository is unchanged.
+- **Who reads every row of a row-filtered expose through the MCP gateway.** On an expose that
+  declares `policy.authz.rowFilters`, the principals that read every row are those in
+  `policy.authz.readers` and, for a library caller that passes `contract=`, the principal of each
+  `accessPolicy` grant that reads (`read`, `select`, `query` or `admin`), has no condition and
+  covers the expose. A grant that only writes, has a condition, is scoped to another expose or to a
+  resource the gateway cannot evaluate, or whose principal `binding.principals` maps to `[]` never
+  counts, and neither does a reader mapped to `[]`. Nor does a grant whose only read is `owner`: it
+  reads on BigQuery but holds no table privilege on Databricks, and the gateway counts only what
+  reads on every platform. A principal a row filter names never reads every row, whatever its
+  spelling (the type prefix, which an unprefixed address leaves to be inferred, and the case are
+  folded for that comparison, an AWS role is one whatever its path, and two principals that
+  `binding.principals` maps to one identity are one). A caller's verified principals match as
+  written and are never translated through `binding.principals`. Without `contract=` only
+  `policy.authz.readers` read every row, narrowed the same ways. An `accessPolicy` or
+  `binding.principals` that cannot be read as written, an `accessPolicy` that holds an unresolved
+  `$ref`, a `binding` that is itself a `$ref`, or a `binding.principals` that holds one, is
+  refused with `RowFilterUnavailable`. `row_filter_predicate`, `compile_semantic_query` and
+  `compile_free_form_sql` take the keyword, and the `sample` read uses the contract its driver
+  was built with; the gateway's own tools pass the session's contract.
+- **`declares_row_filters` decides from the expose's policy alone.** A `$ref` left in an expose's
+  `contract` or columns is no longer refused there, so a library caller that reads the contract
+  as written no longer has to work around a refusal. With `contract=` (the whole document as
+  written) it first resolves the document's same-document pointers, so a policy kept behind one is
+  read; a pointer in the expose or its policy that cannot be resolved (another file, say) is still
+  refused. The read paths (`row_filter_predicate`, `compile_semantic_query`,
+  `compile_free_form_sql` and the `sample` read) still refuse any unresolved pointer in the expose
+  itself, its `policy`, its `contract`, its `contract.schema` or a column, with or without
+  `contract=`, and in `accessPolicy` when `contract=` reads it: the column
+  restrictions and sensitivity flags they apply are computed from the expose as passed, so they
+  need the document resolved first.
 
 ### Fixed
 
@@ -183,6 +228,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose package reports another version, and the image's pip, setuptools and wheel come from the
   hash-locked `requirements/release-image.txt`. A local image build runs `python -m build --wheel`
   first.
+
+### Security
+
+- **On BigQuery, a principal a row filter names stays out of the every-row policy whatever its
+  case.** When an `accessPolicy` grant or `policy.authz.readers` spelled a principal that a
+  `policy.authz.rowFilters` entry names in another case, `fluid apply` could also make it a grantee
+  of `fluid_all_rows`, the row access policy that reads every row. It now compares the identities
+  with their case folded. Present since 0.19.0.
 
 ## [0.41.0] — 2026-11-25
 
