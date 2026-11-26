@@ -45,9 +45,10 @@ _FLAGS = (
 HELP = """\
 With --request FILE, --privacy-unit EXPOSE, --rho R and --release-record PATH the profile
 is a release under differential privacy: the noisy counts of one table, and the noisy rank
-correlations and date pairs the request asks for, in profile format 1-2-0 (1-3-0 when it holds
-a date pair, 1-4-0 when it holds a rank correlation, a clique with a binned column, a clique
-selection or a unit that follows its child rows), which flux-engine grades
+correlations, date pairs and null counts the request asks for, in profile format 1-2-0 (1-3-0
+when it holds a date pair, 1-4-0 when it holds a rank correlation, a clique with a binned column,
+a clique selection or a unit that follows its child rows, 1-5-0 when it holds a null count),
+which flux-engine grades
 P3. Nothing else of the request is released.
 
 What it releases, from the release table (the privacy unit's expose, or with
@@ -58,7 +59,10 @@ of the unit's expose that name one entity by COL[,COL]):
     lists, on the bins the contract's declared range gives (else the type's ladder);
   - for a column the contract does not declare required, the same histogram over the column's
     known values: a record with no value lands in no cell, the column has a share of its own and
-    joins no clique, and no null count or share of nulls is released;
+    joins no clique;
+  - for each column whose nullCount/2 the request lists (a request of format 1-3-0; any column
+    that is not a key), a noisy count of its known and its NULL records, two cells of a table of
+    its own with a share of its own, which joins no clique;
   - for each date pair of two DATE columns the request lists (a table the release holds), a
     noisy histogram of the days from start to end on the whole public ladder of days, never
     trimmed, and a noisy order (after, before, same), both over the records where both dates
@@ -904,6 +908,7 @@ _KIND = {
     "rank": "rank correlation",
     "pairDays": "days of the date pair",
     "pairOrder": "order of the date pair",
+    "nullCount": "null count of",
 }
 
 

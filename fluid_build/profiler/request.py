@@ -77,6 +77,10 @@ MOST_CONTRACT_BYTES = 8 * 1024 * 1024 + 64 * 1024
 _NOT_MEASURED_RELATIONSHIP = (
     "children per parent is formed as a histogram on fixed bins (marginalHistogram/1) only"
 )
+NO_NULL_COUNT_EXACT = (
+    "an exact profile states the count and nullCount metrics, and nullCount/2 is released with "
+    "noise only"
+)
 _KEY_COLUMN = "a key column of a counted relationship, which its children per parent describe"
 _NO_RECORD = "no non-null record to form it over"
 _NO_RECORD_FORMS = "no record forms it"
@@ -697,6 +701,8 @@ def _why(
     """Why a listed statistic of a column is not in the profile."""
     if column in keys:
         return _KEY_COLUMN
+    if identifier == "nullCount/2":
+        return NO_NULL_COUNT_EXACT
     if identifier == "mean/1":
         if domain != "number":
             return "a mean is formed for a number column only"

@@ -1,7 +1,8 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""A release under differential privacy whose unit follows its child rows (profile format 1-4-0).
+"""A release under differential privacy whose unit follows its child rows (profile format 1-4-0, or
+1-5-0 when it holds a column's ``nullCount/2``).
 
 With ``--follow`` the privacy unit is one row of the unit's expose together with the rows of
 child tables that follow it (:mod:`~fluid_build.profiler.dp.follows`; PROFILE-SPEC section 3a), and
@@ -11,6 +12,8 @@ before anything is measured, from the seed and from each parent's own children, 
 * a count table of a table ``T`` (levels, bins, cliques) moves by at most ``m_T`` rows, so its
   squared L2 sensitivity is ``m_T**2`` and its noise is
   :func:`~fluid_build.profiler.dp.release.scale_units` of that, in exact integers;
+* a column's ``nullCount/2`` of ``T`` (two cells: the rows kept where it holds a value and where
+  it holds none) is a count table of ``T`` like the others: squared L2 sensitivity ``m_T**2``;
 * a rank correlation of ``T`` has the sensitivity of the registry's, times ``m_T``;
 * a relationship's children-per-parent histogram, ungrouped or grouped by a parent column, has
   the sensitivity of PROFILE-SPEC "What a noisy statistic is charged": ``m_P`` when the unit
@@ -83,6 +86,7 @@ from fluid_build.profiler.dp.release import (
     LEVELS,
     LINK,
     NO_CELL,
+    NULLCOUNT,
     PAIR_DAYS,
     PAIRS,
     RANK,
@@ -114,6 +118,8 @@ from fluid_build.profiler.dp.release import (
     fit_prefix,
     left_out_reason,
     noise_label,
+    null_cells,
+    null_count_label,
     other_table_pairs,
     pair_cells,
     pair_label,
@@ -888,6 +894,7 @@ def plan_follow_release(
             set(each.name for each in released)
             | set(extra_read.get(table, ()))
             | set(paired_columns(found.date_pairs))
+            | set(found.null_counts)
         )
         read = tuple(column for column in found.expose_plan.columns if column.name in needed)
         asked = found.asked
@@ -921,12 +928,18 @@ def plan_follow_release(
             reach=m,
             date_pairs=found.date_pairs,
             date_required=found.date_required,
+            null_counts=found.null_counts,
         )
         tables.append(TablePlan(table, m, table_plan, asked is not None))
         if asked is not None:
             not_released.extend(
                 _table_not_released(
-                    asked, table, frozenset(c.name for c in released), found.why_not, found.skipped
+                    asked,
+                    table,
+                    frozenset(c.name for c in released),
+                    found.why_not,
+                    found.skipped,
+                    frozenset(found.null_counts),
                 )
             )
             not_released.extend(found.rank_left_out)
@@ -1116,7 +1129,8 @@ def admit(
     are admitted in this order while the release's cells stay within
     ``selection.MOST_RELEASE_CELLS``: every date pair (the tables in the plan's order, the pairs
     in the request's), then every column that may hold a null (tables, then columns, in the plan's
-    order), then every link statistic whose counted child column may hold a null. The first that
+    order), then every null count (tables, then columns, in the plan's order), then every link
+    statistic whose counted child column may hold a null. The first that
     does not fit is left out and so is every one after it. A left-out part is named by its label
     and the reason, never a count. The decision reads the cliques only, which are released under the
     selection's share. The plan comes back as it was when every added part fits.
@@ -1125,15 +1139,16 @@ def admit(
     by_label = {each.part.label: each.part for each in parts}
     pairs: List[Tuple[Part, ...]] = []
     columns: List[Tuple[Part, ...]] = []
+    nulls: List[Tuple[Part, ...]] = []
     for each in plan.tables:
         mine = release_parts(each.plan, cliques.get(each.table, ()))
-        own_pairs, own_columns = added_units(each.plan, mine)
-        for found, into in ((own_pairs, pairs), (own_columns, columns)):
+        own_pairs, own_columns, own_nulls = added_units(each.plan, mine)
+        for found, into in ((own_pairs, pairs), (own_columns, columns), (own_nulls, nulls)):
             into.extend(
                 tuple(by_label[f"{each.table}/{part.label}"] for part in unit) for unit in found
             )
     links = [(by_label[link.label],) for link in plan.links if link.column.nullable]
-    units = [*pairs, *columns, *links]
+    units = [*pairs, *columns, *nulls, *links]
     if not units:
         return plan, ()
     added = {part.label for unit in units for part in unit}
@@ -1158,6 +1173,11 @@ def admit(
                 pair
                 for pair in inner.date_pairs
                 if f"{each.table}/{pair_label(PAIR_DAYS, *pair)}" not in gone
+            ),
+            null_counts=tuple(
+                name
+                for name in inner.null_counts
+                if f"{each.table}/{null_count_label(name)}" not in gone
             ),
         )
         tables.append(replace(each, plan=kept))
@@ -1362,6 +1382,7 @@ def encode_follow_rows(
             levels=levels,
             grid=grid,
             pairs=pair_cells(each.plan, exact[table], table=table),
+            nulls=null_cells(each.plan.null_counts, exact[table]),
         )
     return FollowRows(counts=counts, tables=encoded, contents=contents, keys=keys, placed=placed)
 
@@ -1689,7 +1710,7 @@ def draw_follow(
     )
 
 
-_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK, *PAIRS)
+_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK, NULLCOUNT, *PAIRS)
 
 
 def measure_counts(
@@ -1708,7 +1729,7 @@ def measure_counts(
     relations = {relation.label: relation for relation in plan.relations}
     links = {link.label: link for link in plan.links}
     for table in tables:
-        if table.kind in (CLIQUE, LEVELS, BINS, *PAIRS):
+        if table.kind in (CLIQUE, LEVELS, BINS, NULLCOUNT, *PAIRS):
             cells = table_cells(table, rows.tables[table.table], kept[table.table])
             counts = [0] * table.cells
             for value in cells:
@@ -1731,7 +1752,8 @@ def _count_values(
     """The noisy counts of one table's count tables as decimal text.
 
     The cliques and the histograms of required columns are made to agree; a histogram of a column
-    that may hold a null and the days and the order of a date pair are noised on their own
+    that may hold a null, the days and the order of a date pair and a column's null count are noised
+    on their own
     (:func:`~fluid_build.profiler.dp.release.agrees`).
     """
     count_tables: List[consistency.CountTable] = []
@@ -1835,6 +1857,19 @@ def _link_entry(link: LinkStat, item: ReleasedTable, cells: Sequence[str]) -> Di
     return entry
 
 
+def _format_of(
+    tables: Mapping[str, Mapping[str, Any]], relationships: Sequence[Mapping[str, Any]]
+) -> str:
+    """Format 1-4-0, which a release that follows its child rows always wrote, or 1-5-0 when the
+    tables hold a form only that holds (a column's ``nullCount/2``)."""
+    needed = document.schema_url_for(tables, relationships=relationships)
+    return (
+        document.SCHEMA_URL_1_5_0
+        if needed == document.SCHEMA_URL_1_5_0
+        else document.SCHEMA_URL_1_4_0
+    )
+
+
 def _document(
     plan: FollowReleasePlan,
     tables: Sequence[ReleasedTable],
@@ -1882,7 +1917,7 @@ def _document(
         producer = document.producer_uri(__version__)
     return {
         "_producer": producer,
-        "_schemaURL": document.SCHEMA_URL_1_4_0,
+        "_schemaURL": _format_of(out_tables, relationships),
         "encoding": {"fractionalBits": plan.fractional_bits, "rounding": "floor"},
         "disclosureRules": {RULE_NAME: {}},
         "privacy": {
@@ -2023,7 +2058,7 @@ def check_follow_record(
             or not isinstance(owner, str)
         ):
             raise _mismatch("a table's columns are not names")
-        if stated.get("kind") in (RANK, RELATION, LINK, *PAIRS):
+        if stated.get("kind") in (RANK, RELATION, LINK, NULLCOUNT, *PAIRS):
             continue
         if len(columns) >= 2:
             by_table[owner] = (*by_table.get(owner, ()), tuple(columns))

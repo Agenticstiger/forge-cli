@@ -77,6 +77,7 @@ __all__ = [
     "RequestEnd",
     "RequestExposure",
     "RequestFact",
+    "RequestHistory",
     "RequestLinked",
     "RequestRankCorrelation",
     "RequestRefused",
@@ -212,6 +213,18 @@ class RequestWorkload:
 
 
 @dataclass(frozen=True)
+class RequestHistory:
+    """The history of a table a request of format 1-3-0 asks for.
+
+    The entity, start and end are the contract's. ``columns`` are the candidate columns the history
+    may track, or ``None`` to leave them to the profiler, which then takes the contract's
+    categorical columns of the table other than those three.
+    """
+
+    columns: Optional[Tuple[str, ...]] = None
+
+
+@dataclass(frozen=True)
 class RequestTable:
     """One table (an exposeId) a request lists, whether it asks the row count, and its columns.
 
@@ -220,7 +233,8 @@ class RequestTable:
     values are asked by month, day of week and hour of week, and the column sets the
     consumers' queries read together. ``rank_correlations`` and ``clique_columns`` are the
     additions of format 1-2-0: the rank correlations asked of the table's column pairs, and
-    the columns a profile may relate in pairs or cliques.
+    the columns a profile may relate in pairs or cliques. ``history`` is the addition of format
+    1-3-0: the table's history, asked for (a column may also ask ``nullCount/2`` there).
     """
 
     expose_id: str
@@ -231,6 +245,7 @@ class RequestTable:
     date_pairs: Tuple[RequestDatePair, ...] = ()
     calendar: Tuple[str, ...] = ()
     workload: Tuple[RequestWorkload, ...] = ()
+    history: Optional[RequestHistory] = None
 
     def column(self, name: str) -> Optional[RequestColumn]:
         return next((each for each in self.columns if each.name == name), None)
@@ -973,6 +988,7 @@ class _FluxStatsBackend:
                         RequestWorkload(tuple(each.columns), each.weight)
                         for each in _asked(table, "workload")
                     ),
+                    history=_history_asked(table),
                 )
                 for table in asked.tables
             ),
@@ -1541,8 +1557,10 @@ def load_backend() -> StatisticsBackend:
 #: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
 #: From 0.9 on flux-stats is versioned by its own formats and API, so the range runs to the
 #: next major. 0.11.0 is the first release that holds request format 1-2-0, rank correlations,
-#: the follows reach of a release and profile format 1-4-0.
-FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.11,<1"
+#: the follows reach of a release and profile format 1-4-0; 0.13.0 the first that holds request
+#: format 1-3-0 and profile format 1-5-0 (noisy history members, ``nullCount/2``, noisy query
+#: rates with a unit).
+FLUX_STATS_REQUIREMENT = "flux-stats[yaml]>=0.13,<1"
 #: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
 #: placeholder, or a release newer than this module knows).
 FLUX_STATS_INSTALL_COMMAND = "pip install 'data-product-forge[profile]'"
@@ -1580,6 +1598,19 @@ def _asked(owner: Any, name: str) -> Tuple[Any, ...]:
     """
     held = getattr(owner, name, None)
     return () if held is None else tuple(held)
+
+
+def _history_asked(table: Any) -> Optional[RequestHistory]:
+    """The history a request reader's table asks for, or ``None``.
+
+    Only a reader of request format 1-3-0 has the member; an earlier reader's tables lack it, and
+    a request it accepts asks for no history.
+    """
+    held = getattr(table, "history", None)
+    if held is None:
+        return None
+    columns = getattr(held, "columns", None)
+    return RequestHistory(None if columns is None else tuple(columns))
 
 
 def _needs_newer(feature: str) -> StatisticsUnavailable:

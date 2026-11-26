@@ -34,13 +34,15 @@ _KIND = {
     "link": "histogram grouped through a link,",
     "pairDays": "days of the date pair",
     "pairOrder": "order of the date pair",
+    "nullCount": "null count of",
 }
 
 
 def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
     """What the histograms of columns that may hold a null and of date pairs count, in words.
 
-    Names columns and pairs only: the format holds no noisy null count, so none is released, and a
+    Names columns and pairs only. A column whose ``nullCount/2`` the request lists has it released,
+    two noisy cells of a table of their own; without that ask no null count is released, and a
     share of nulls is never stated.
     """
     place = "" if table is None else f" of exposes[{table}]"
@@ -50,7 +52,14 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
         notes.append(
             f"The histogram of {', '.join(nullable)}{place}, which the contract does not declare "
             "required, counts the column's known values: a record with no value lands in no cell. "
-            "It joins no clique, and no null count or share of nulls is released."
+            "It joins no clique"
+            + ("." if plan.null_counts else ", and no null count or share of nulls is released.")
+        )
+    if plan.null_counts:
+        notes.append(
+            f"The null count of {', '.join(plan.null_counts)}{place} is two cells, the records "
+            "where the column holds a value and where it holds none, noised on its own: it joins "
+            "no clique, and a share of nulls formed from its two cells is as noisy as they are."
         )
     if plan.date_pairs:
         notes.append(
@@ -72,20 +81,22 @@ def part_words(label: str, table: Optional[str] = None) -> str:
     """A release part's label in the words the other items it leaves out are named with.
 
     ``[<table>/]pair/<days|order>/<start>/<end>`` is a date pair, ``[<table>/]noise/<column>`` a
-    column's histogram, and ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped
+    column's histogram, ``[<table>/]nullCount/<column>`` a column's null count, and ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped
     through a link; any other label is said as it is.
     """
     steps = label.split("/")
     if steps[0] == "link" and len(steps) >= 4 and "." in steps[1]:
         child, column = steps[1].split(".", 1)
         return f"{column} of {child} grouped by {steps[3]}"
-    if steps[0] not in ("noise", "pair") and len(steps) > 1:
+    if steps[0] not in ("noise", "pair", "nullCount") and len(steps) > 1:
         table, steps = steps[0], steps[1:]
     where = f" of {table}" if table else ""
     if steps[0] == "pair" and len(steps) == 4:
         return f"date pair {steps[2]} to {steps[3]}{where}"
     if steps[0] == "noise" and len(steps) == 2:
         return f"{steps[1]}{where}"
+    if steps[0] == "nullCount" and len(steps) == 2:
+        return f"null count of {steps[1]}{where}"
     return label
 
 
