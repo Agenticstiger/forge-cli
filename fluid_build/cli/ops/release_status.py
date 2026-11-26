@@ -427,11 +427,21 @@ def describe(release: Release) -> List[str]:
     for env, receipt in sorted(release.receipts.items()):
         if "problem" in receipt:
             lines.append(f"  receipt  {env} cannot be told: {receipt['problem']}")
-            continue
         mine = " (this release)" if receipt.get("identity_digest") == release.release_id else ""
-        lines.append(
-            f"  receipt  {env} {receipt.get('result')} {receipt.get('time_verified')}{mine}"
-        )
+        if "result" in receipt:
+            lines.append(
+                f"  receipt  {env} {receipt.get('result')} {receipt.get('time_verified')}{mine}"
+            )
+        deployed = receipt.get("deploy")
+        if isinstance(deployed, dict) and "problem" in deployed:
+            lines.append(f"  deployed {env} cannot be told: {deployed['problem']}")
+        elif isinstance(deployed, dict):
+            ours = (
+                " (this release)" if deployed.get("identity_digest") == release.release_id else ""
+            )
+            lines.append(
+                f"  deployed {env} {deployed.get('result')} {deployed.get('time_verified')}{ours}"
+            )
     if not release.intact:
         lines.append(
             "  NOT INTACT: its identity_digest is not the digest of its identity; the record "

@@ -134,12 +134,12 @@ def _add_release_flags(p: argparse.ArgumentParser) -> None:
 
 
 def register_runs(subparsers: argparse._SubParsersAction) -> None:
-    """Register ``fluid runs {status,verify-release,receipt,logs,diff}``."""
+    """Register ``fluid runs {status,verify-release,receipt,deploy,logs,diff}``."""
     p = subparsers.add_parser(
         "runs",
         help=(
             "Inspect run history and sealed releases "
-            "(status / verify-release / receipt / logs / diff)"
+            "(status / verify-release / receipt / deploy / logs / diff)"
         ),
     )
     sub = p.add_subparsers(dest="runs_subcmd", required=True)
@@ -174,6 +174,7 @@ def register_runs(subparsers: argparse._SubParsersAction) -> None:
     v.set_defaults(func=_run_verify_release)
 
     _register_receipt(sub)
+    _register_deploy(sub)
 
     lg = sub.add_parser("logs", help="Fetch component logs for a product/run")
     lg.add_argument("product_id", help="Product id")
@@ -280,28 +281,79 @@ def _register_receipt(sub: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Also fail unless every object of the release and the receipt is locked",
     )
-    chk.add_argument(
+    _add_signer_flags(chk, "the receipt's")
+    chk.add_argument("--json", action="store_true", help="Emit JSON")
+    chk.set_defaults(func=_run_receipt_check)
+
+
+def _add_signer_flags(p: argparse.ArgumentParser, what: str) -> None:
+    """``--require-signed`` and the signer it names, for ``receipt check`` and ``deploy``."""
+    p.add_argument(
         "--require-signed",
         action="store_true",
         help=(
-            "Also fail unless the receipt's Statement verifies with cosign for this signer "
+            f"Also fail unless {what} Statement verifies with cosign for this signer "
             "(--verify-key, or --certificate-identity with --certificate-oidc-issuer); implies "
             "--require-locked, needs Object Lock, and decides nothing on disk"
         ),
     )
-    chk.add_argument("--verify-key", metavar="REF", help="With --require-signed: a cosign key")
-    chk.add_argument(
+    p.add_argument("--verify-key", metavar="REF", help="With --require-signed: a cosign key")
+    p.add_argument(
         "--certificate-identity",
         metavar="ID",
         help="With --require-signed, keyless: the signer's exact certificate identity",
     )
-    chk.add_argument(
+    p.add_argument(
         "--certificate-oidc-issuer",
         metavar="URL",
         help="With --require-signed, keyless: the signer's exact OIDC issuer",
     )
-    chk.add_argument("--json", action="store_true", help="Emit JSON")
-    chk.set_defaults(func=_run_receipt_check)
+
+
+def _register_deploy(sub: argparse._SubParsersAction) -> None:
+    """``fluid runs deploy``."""
+    dep = sub.add_parser(
+        "deploy",
+        help="Copy a sealed release's external files to its deploy targets, then record it",
+        description=(
+            "Verifies SRC, that it is the release of --env, and that the credentials are the "
+            "account its deploy targets (fluid ship --deploy-targets) belong to; in S3 also "
+            "that the bucket has versioning Enabled and release.json one version. Then copies "
+            "each target, every Airflow DAG last: a target that already has the file's SHA-256 "
+            "is left alone; otherwise the release object at its verified version is copied "
+            "with If-Match the target's ETag, or If-None-Match * for a new one, and read back. "
+            "Records a deploy receipt in deploys/<env>/ beside the release, which never gates "
+            "(only a verify receipt in receipts/<env>/ does). Exit 0 deployed or nothing to "
+            "change, 1 refused or failed (a FAILED deploy receipt), 2 cannot decide before any "
+            "target."
+        ),
+    )
+    dep.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")
+    dep.add_argument(
+        "--env", required=True, metavar="NAME", help="The environment the release was sealed for"
+    )
+    dep.add_argument(
+        "--require-receipt",
+        metavar="ENV",
+        help="First pass `fluid runs receipt check SRC --env ENV` (a verify receipt of ENV)",
+    )
+    dep.add_argument(
+        "--require-locked",
+        action="store_true",
+        help="With --require-receipt: also every object it relies on is locked",
+    )
+    _add_signer_flags(dep, "the --require-receipt receipt's")
+    dep.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check everything and say what would be copied; write nothing",
+    )
+    dep.add_argument(
+        "--sign", action="store_true", help="Also sign the deploy receipt with cosign (keyless)"
+    )
+    dep.add_argument("--sign-key", metavar="REF", help="With --sign: a cosign key")
+    dep.add_argument("--json", action="store_true", help="Emit JSON")
+    dep.set_defaults(func=_run_deploy)
 
 
 # ── `fluid retention` umbrella ─────────────────────────────────────────
@@ -444,25 +496,8 @@ def _run_receipt_check(args: argparse.Namespace, logger: logging.Logger) -> int:
     if not args.env.strip():
         logger.error("--env needs an environment name")
         return 2
-    signer = None
-    pinned = args.certificate_identity or args.certificate_oidc_issuer
-    if args.require_signed:
-        if args.verify_key and pinned:
-            logger.error("--require-signed takes --verify-key or a certificate identity, not both")
-            return 2
-        if not args.verify_key and not (args.certificate_identity and args.certificate_oidc_issuer):
-            logger.error(
-                "--require-signed needs the signer: --verify-key REF, or --certificate-identity "
-                "and --certificate-oidc-issuer"
-            )
-            return 2
-        signer = receipts.SignerPolicy(
-            key_ref=args.verify_key,
-            certificate_identity=args.certificate_identity,
-            certificate_oidc_issuer=args.certificate_oidc_issuer,
-        )
-    elif args.verify_key or pinned:
-        logger.error("--verify-key and --certificate-* name the signer of --require-signed")
+    ok, signer = _signer(args, logger)
+    if not ok:
         return 2
     found = receipts.check_receipt(
         args.source, environment=args.env, require_locked=args.require_locked, signer=signer
@@ -492,6 +527,84 @@ def _run_receipt_check(args: argparse.Namespace, logger: logging.Logger) -> int:
     for note in found.ignored:
         cprint_literal(f"  ignored  {note}", soft_wrap=True)
     return found.exit_code
+
+
+def _signer(args: argparse.Namespace, logger: logging.Logger) -> Any:
+    """``(True, SignerPolicy or None)`` from ``--require-signed`` and its signer, or
+    ``(False, None)`` after logging a usage error."""
+    from fluid_build.cli import _release_receipt as receipts
+
+    pinned = args.certificate_identity or args.certificate_oidc_issuer
+    if not args.require_signed:
+        if args.verify_key or pinned:
+            logger.error("--verify-key and --certificate-* name the signer of --require-signed")
+            return False, None
+        return True, None
+    if args.verify_key and pinned:
+        logger.error("--require-signed takes --verify-key or a certificate identity, not both")
+        return False, None
+    if not args.verify_key and not (args.certificate_identity and args.certificate_oidc_issuer):
+        logger.error(
+            "--require-signed needs the signer: --verify-key REF, or --certificate-identity "
+            "and --certificate-oidc-issuer"
+        )
+        return False, None
+    return True, receipts.SignerPolicy(
+        key_ref=args.verify_key,
+        certificate_identity=args.certificate_identity,
+        certificate_oidc_issuer=args.certificate_oidc_issuer,
+    )
+
+
+def _run_deploy(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """``fluid runs deploy SRC --env E``: 0 deployed, 1 refused or failed, 2 cannot decide."""
+    from fluid_build.cli import _release_deploy as deploys
+
+    for flag, value in (("--env", args.env), ("--require-receipt", args.require_receipt)):
+        if value is not None and not value.strip():
+            logger.error("%s needs an environment name", flag)
+            return 2
+    ok, signer = _signer(args, logger)
+    if not ok:
+        return 2
+    if (signer is not None or args.require_locked) and args.require_receipt is None:
+        logger.error("--require-locked and --require-signed apply to --require-receipt ENV")
+        return 2
+    if args.sign_key and not args.sign:
+        logger.error("--sign-key signs the deploy receipt: add --sign")
+        return 2
+    if args.sign and args.dry_run:
+        logger.error("--dry-run writes no receipt to sign")
+        return 2
+    done = deploys.deploy_release(
+        args.source,
+        environment=args.env,
+        require_receipt=args.require_receipt,
+        require_locked=args.require_locked,
+        signer=signer,
+        dry_run=args.dry_run,
+        sign=args.sign,
+        key_ref=args.sign_key,
+    )
+    if getattr(args, "json", False):
+        json.dump(done.as_dict(), sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return done.exit_code
+    head = {deploys.PASS: "deployed", deploys.FAIL: "NOT DEPLOYED"}.get(
+        done.exit_code, "cannot decide"
+    )
+    if done.dry_run and done.exit_code == deploys.PASS:
+        head = "dry run"
+    cprint_literal(f"{done.source}: {head} ({done.environment})", soft_wrap=True)
+    cprint_literal(f"  - {done.reason}", soft_wrap=True)
+    if done.account:
+        cprint_literal(f"  account  {done.account}", soft_wrap=True)
+    for t in done.targets:
+        version = f"#{t['version_id']}" if t.get("version_id") else ""
+        cprint_literal(f"  {t['action']:<11} {t['to']}{version}", soft_wrap=True)
+    if done.receipt:
+        cprint_literal(f"  receipt  {done.receipt}", soft_wrap=True)
+    return done.exit_code
 
 
 def _run_runs_status(args: argparse.Namespace, logger: logging.Logger) -> int:

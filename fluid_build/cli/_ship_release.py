@@ -208,11 +208,21 @@ def refusal(
                 f"--artifacts {opts.artifacts} names files to seal into a release, and this run "
                 "publishes none: add --release-dir DIR"
             )
+        if opts.deploy_targets:
+            return (
+                f"--deploy-targets {opts.deploy_targets} names where a release's files go, and "
+                "this run publishes none: add --release-dir DIR"
+            )
         return None
     if os.path.lexists(release_dir):
         return (
             f"--release-dir {release_dir} already exists: a release goes into a new "
             "directory, never one an earlier run wrote"
+        )
+    if opts.env in ("receipts", "deploys"):
+        return (
+            f"--env {opts.env}: a release's environment names its folder beside receipts/ and "
+            "deploys/, so it cannot be one of those"
         )
     for num in REQUIRED_STAGES:
         if num not in selected:
@@ -225,11 +235,18 @@ def refusal(
             "--release-dir needs stages 1-4 (bundle to validate-artifacts) in this "
             f"invocation, and stage {num} {st.STAGE_NAMES[num]} does not run ({why})"
         )
+    if opts.deploy_targets and not opts.artifacts:
+        return (
+            f"--deploy-targets {opts.deploy_targets} sends the external files a release seals, "
+            "and this run seals none: add --artifacts LOCK"
+        )
     if opts.artifacts:
-        from . import _release_lock
+        from . import _deploy_targets, _release_lock
 
         try:
-            _release_lock.load(opts.artifacts)
+            external = _release_lock.load(opts.artifacts)
+            if opts.deploy_targets:
+                _deploy_targets.load(opts.deploy_targets, external)
         except ReleaseError as exc:
             return str(exc)
     return None
@@ -401,12 +418,15 @@ def build_identity(
     with_plan: bool,
     applied: bool = False,
     external: Sequence[Any] = (),
+    deploy: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """What identifies the release: the same for two clean runs of the same
     contract, environment, emit set and Forge version. Reads only local files.
     ``applied``: stage 7 ran, so its mode (a dry run, or a real apply) is part of it.
     ``external``: the files the ``--artifacts`` lock lists (``_release_lock.ExternalArtifact``),
-    recorded by name, digest and source, never by where they sit on this machine."""
+    recorded by name, digest and source, never by where they sit on this machine.
+    ``deploy``: where ``fluid runs deploy`` sends them in this environment (``_deploy_targets``),
+    so it is part of the identity digest and not of the code digest."""
     import fluid_build
 
     manifest = _bundle_manifest(root)
@@ -452,6 +472,8 @@ def build_identity(
         identity["apply_mode"] = opts.mode
     if external:
         identity["external"] = [a.entry.identity() for a in external]
+    if deploy:
+        identity["deploy"] = dict(deploy)
     source = source_identity(os.environ)
     if source:
         identity["source"] = source
