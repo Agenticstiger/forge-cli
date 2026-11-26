@@ -304,14 +304,14 @@ def _check_bound(
     if not isinstance(external, list):
         problems.append("its identity's external entry is not a list")
         external = []
-    pinned_external = set()
+    pinned_external: Dict[str, Any] = {}
     for item in external:
         item = item if isinstance(item, Mapping) else {}
         digest = item.get("digest")
         hex_digest = digest.get("sha256") if isinstance(digest, Mapping) else None
         path = item.get("path")
         rel = str(path) if isinstance(path, str) else "external/?"
-        pinned_external.add(rel)
+        pinned_external[rel] = hex_digest
         listed(
             rel,
             f"sha256:{hex_digest}" if isinstance(hex_digest, str) else None,
@@ -320,6 +320,8 @@ def _check_bound(
     for rel in sorted(files):
         if rel.startswith("external/") and rel not in pinned_external:
             problems.append(f"{_clean(rel)}: the index lists it and the identity does not")
+    if "deploy" in identity:
+        problems.extend(_deploy_problems(identity["deploy"], pinned_external))
     artifacts = identity.get("artifacts")
     root = artifacts.get("manifest_digest") if isinstance(artifacts, Mapping) else None
     _check_artifacts(reader, root, files, problems, undecided)
@@ -328,6 +330,35 @@ def _check_bound(
         _check_plan(reader, plan, files, problems, undecided)
     elif "plan.json" in files:
         problems.append("plan.json: the index lists it and the identity pins no plan")
+
+
+def _deploy_problems(deploy: Any, pinned: Mapping[str, Any]) -> List[str]:
+    """Why ``identity["deploy"]`` (``fluid ship --deploy-targets``) is not one a release seals:
+    an account, and each target an external file of this release, by its path and sha256, sent
+    to one ``s3://bucket/key``."""
+    if not isinstance(deploy, Mapping) or not isinstance(deploy.get("targets"), list):
+        return ["its identity's deploy entry is not an account with a targets list"]
+    found: List[str] = []
+    account = deploy.get("account")
+    if not isinstance(account, str) or re.fullmatch(r"[0-9]{12}", account) is None:
+        found.append("its identity's deploy entry names no 12-digit account")
+    seen = set()
+    for item in deploy["targets"]:
+        item = item if isinstance(item, Mapping) else {}
+        path, to = item.get("path"), item.get("to")
+        digest = item.get("digest")
+        hex_digest = digest.get("sha256") if isinstance(digest, Mapping) else None
+        shown = _clean(path) if isinstance(path, str) else "a deploy target"
+        if not isinstance(to, str) or not to.startswith("s3://") or to in seen:
+            found.append(f"{shown}: its deploy target names no s3:// object of its own")
+        seen.add(to)
+        if (
+            not isinstance(hex_digest, str)
+            or not isinstance(path, str)
+            or pinned.get(path) != hex_digest
+        ):
+            found.append(f"{shown}: the identity deploys it, and pins no external file so")
+    return found
 
 
 def _read_json_member(

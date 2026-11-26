@@ -178,6 +178,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes, 1 does not, 2 cannot decide (a release with no code digest included).
   `fluid runs status --release-dir` lists the newest receipt of each environment under each
   release, picked as the check picks it.
+- **`fluid ship --release-dir DIR --artifacts LOCK --deploy-targets FILE` seals where each
+  external file goes.** The file names the AWS account and one `s3://bucket/key` per lock entry
+  (`$RELEASE_DEPLOY_TARGETS` when the flag is absent, read only beside `--release-dir`). The
+  release records them in `identity["deploy"]` with each file's kind, release path and sha256,
+  every Airflow DAG last, so they change the identity digest and not the code digest. Refused
+  before stage 1: a field the format does not allow, an account that is not 12 digits, a name
+  the lock does not list, a `to` that is not one object, two targets with one `to`, or a file
+  over 5 GiB. `fluid runs verify-release` checks each target is a sealed external file.
+
+- **`fluid runs deploy SRC --env E` copies a sealed release's external files to its targets.**
+  It verifies the release and its environment, optionally passes `--require-receipt ENV` (as
+  `fluid runs receipt check`, with `--require-locked` and `--require-signed`), and checks that
+  the credentials are the release's account (STS). Then each target, every DAG last: one that
+  already has the file's full-object SHA-256 is left alone; otherwise CopyObject copies the
+  release object at the version that was verified (`CopySourceIfMatch` its ETag) with `If-Match`
+  the target's ETag, or `If-None-Match: *` for a new key, `ExpectedBucketOwner` on every call to
+  it and a SHA-256 checksum, and reads it back. A target changed meanwhile (412) stops the
+  deploy before the DAGs; a race (409) is tried three times; a bucket policy that enforces
+  conditional writes (501) is named and refused. A release directory is put with the same
+  conditions. It writes a deploy receipt (`"check": "deploy"`) with each target's VersionId,
+  and the deploy log as its report; a failure once a target was reached writes a FAILED one.
+  `--dry-run` writes nothing. Exit 0 deployed, 1 refused or failed, 2 cannot decide.
+
+- **Only a verify receipt gates.** A receipt now states `check`, `verify` or `deploy` (absent:
+  verify). `fluid runs receipt check` takes the newest verify receipt and passes deploy receipts
+  by, while the folder's rules still hold for them; with only deploy receipts it says a verify
+  receipt is needed. `fluid runs status --release-dir` lists the newest deploy receipt as
+  `deployed`. `--require-locked` says that a reader without `s3:GetObjectRetention` sees no lock.
+
 - **A release is sealed only from the commit the CI names.** When the contract sits in a git
   checkout at another commit than the CI's variable names (the contract in a second repository
   or a submodule, or a pull-request pipeline that builds a local merge commit, as Bitbucket and
@@ -230,8 +259,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The `aws` extra needs boto3 and botocore 1.35.2 or later**, the first release whose PutObject
-  takes `IfNoneMatch`.
+- **The `aws` extra needs boto3 and botocore 1.40.61 or later**, the first release whose
+  CopyObject takes `IfMatch` and `IfNoneMatch` on the destination (PutObject took `IfNoneMatch`
+  from 1.35.2). `fluid runs deploy` refuses an older botocore with exit 2.
+- **`fluid ship --help` words `--require-artifacts` and the stage switches more briefly.** Same
+  meaning and behaviour.
 - **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
   and behaviour.
 - **The release builds with a locked build backend.** `setuptools`, `setuptools-scm` and `wheel`

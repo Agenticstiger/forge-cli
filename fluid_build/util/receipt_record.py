@@ -30,6 +30,11 @@ RECEIPT_SCHEMA = "fluid-receipt/1"
 RECEIPTS_DIR = "receipts"
 PASSED = "PASSED"
 FAILED = "FAILED"
+#: What a receipt records: a ``fluid verify`` check (the gate takes only these), or a ``fluid
+#: runs deploy`` (a record of what was copied where, never a check). Absent: a check.
+VERIFY = "verify"
+DEPLOY = "deploy"
+CHECKS = (VERIFY, DEPLOY)
 #: Bytes of one receipt, and of the ``fluid verify`` report stored beside it.
 MAX_RECEIPT_BYTES = 1_048_576
 MAX_REPORT_BYTES = 16 * 1_048_576
@@ -108,7 +113,14 @@ def parse_receipt(name: str, data: bytes) -> Tuple[Optional[Dict[str, Any]], Opt
     report = receipt.get("report")
     if not isinstance(report, Mapping) or not is_digest(report.get("sha256")):
         return None, "it names no report with its sha256"
+    if receipt.get("check", VERIFY) not in CHECKS:
+        return None, f"its check is not {' or '.join(CHECKS)}"
     return receipt, None
+
+
+def check_of(receipt: Mapping[str, Any]) -> str:
+    """What a parsed receipt records: :data:`VERIFY` or :data:`DEPLOY`."""
+    return str(receipt.get("check", VERIFY))
 
 
 def newest_first(names: Sequence[str]) -> List[str]:

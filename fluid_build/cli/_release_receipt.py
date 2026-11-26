@@ -765,19 +765,63 @@ def record_receipt(
         target_records.append(record)
         if problem and passed:
             passed, reason = False, problem
+    raw_summary = report.get("summary")
+    summary: Mapping[str, Any] = raw_summary if isinstance(raw_summary, Mapping) else {}
+    return write_receipt(
+        source,
+        checked,
+        check=rr.VERIFY,
+        passed=passed,
+        reason=reason,
+        report_bytes=report_bytes,
+        report_meta={
+            "contract_id": clean(report.get("contract_id"), 120),
+            "summary": {k: v for k, v in summary.items() if type(v) is int},
+        },
+        targets=target_records,
+        sign=sign,
+        key_ref=key_ref,
+        clients=factory,
+        region=region,
+        now=now,
+    )
+
+
+def write_receipt(
+    source: str,
+    checked: Any,
+    *,
+    check: str,
+    passed: bool,
+    reason: str,
+    report_bytes: bytes,
+    report_meta: Mapping[str, Any],
+    targets: Sequence[Mapping[str, Any]],
+    sign: bool = False,
+    key_ref: Optional[str] = None,
+    clients: ClientFactory,
+    region: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Recorded:
+    """Write the receipt of ``check`` (``verify`` or ``deploy``) on the release ``checked``
+    (verified, from :func:`_verified`) beside it, write-once: the report it stands on first,
+    then the signed Statement when ``sign``, the receipt last. A deploy's report is its log.
+
+    Raises:
+        ReceiptError: nothing was written (a signing failure), or a write failed.
+    """
     from fluid_build.cli import _attestation
 
     place = _place(
-        source, checked.code_digest.split(":", 1)[1], checked.environment, factory, region
+        source, checked.code_digest.split(":", 1)[1], checked.environment, clients, region
     )
     moment = now or datetime.now(timezone.utc)
     name = rr.receipt_name(moment, checked.identity_digest)
-    raw_summary = report.get("summary")
-    summary: Mapping[str, Any] = raw_summary if isinstance(raw_summary, Mapping) else {}
     import fluid_build
 
     receipt: Dict[str, Any] = {
         "schema": rr.RECEIPT_SCHEMA,
+        "check": check,
         "product_id": checked.product_id,
         "environment": checked.environment,
         "code_digest": checked.code_digest,
@@ -794,10 +838,9 @@ def record_receipt(
         "report": {
             "name": rr.report_name(name),
             "sha256": "sha256:" + hashlib.sha256(report_bytes).hexdigest(),
-            "contract_id": clean(report.get("contract_id"), 120),
-            "summary": {k: v for k, v in summary.items() if type(v) is int},
+            **dict(report_meta),
         },
-        "targets": target_records,
+        "targets": [dict(t) for t in targets],
         "ci": _no_userinfo(_attestation._collect_run_metadata()),
     }
     store = place.store(checked.environment)
@@ -864,6 +907,7 @@ def statement(receipt: Mapping[str, Any], receipt_bytes: bytes) -> Dict[str, Any
             "verifiedLevels": ["SLSA_BUILD_LEVEL_UNEVALUATED"],
             RECEIPT_EXTENSION: {
                 "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+                "check": receipt.get("check", rr.VERIFY),
                 "environment": receipt["environment"],
                 "code_digest": receipt["code_digest"],
                 "identity_digest": receipt["identity_digest"],
@@ -933,12 +977,15 @@ class Checked:
 
 
 def _newest_receipt(
-    store: _Store, code_digest: str, ignored: List[str]
+    store: _Store, code_digest: str, ignored: List[str], check: Optional[str] = rr.VERIFY
 ) -> Tuple[str, Dict[str, Any], bytes]:
-    """The newest receipt in ``store`` for ``code_digest``, with its bytes. Fail closed: when
-    the newest file that may be a receipt does not parse, that is the answer, not an older one.
-    A receipt of this code named later than now (past a few minutes of clock skew) decides
-    nothing; another entry named so is passed over and noted."""
+    """The newest receipt in ``store`` for ``code_digest`` that records ``check`` (None: any),
+    with its bytes. Fail closed: when the newest file that may be a receipt does not parse,
+    that is the answer, not an older one, and the folder rules hold for every receipt read on
+    the way, deploy receipts too. A receipt of this code named later than now (past a few
+    minutes of clock skew) decides nothing; another entry named so is passed over and noted.
+    Only a check gates: a deploy receipt records a copy, not a check of what was copied."""
+    passed_over = 0
     # ``<code hex>/receipts/`` in S3 holds one code's receipts only; on disk one ``receipts/``
     # beside several releases holds several codes' receipts.
     shared = isinstance(store, _DirStore)
@@ -968,7 +1015,16 @@ def _newest_receipt(
                 )
             ignored.append(f"{name}: a receipt of other code")
             continue
+        if check is not None and rr.check_of(receipt) != check:
+            passed_over += 1
+            continue
         return name, receipt, data
+    if passed_over and check == rr.VERIFY:
+        raise NoReceipt(
+            f"{store.shown} holds deploy receipts and no verify receipt for code {code_digest}; "
+            "a deploy is no check: a verify receipt is needed (fluid verify --release SRC --out "
+            "R, then fluid runs receipt record SRC --report R)"
+        )
     raise NoReceipt(f"{store.shown} holds no receipt for code {code_digest}")
 
 
@@ -1038,8 +1094,9 @@ def check_receipt(
             out.exit_code = FAIL
             out.reason = (
                 f"--require-locked: {len(unlocked)} object(s) carry no Object Lock in force "
-                f"(none, or it ran out; {unlocked[0]} first). A receipt whose lock ran out "
-                f"gates nothing: record a fresh {environment} receipt"
+                f"(none, or it ran out; {unlocked[0]} first; a reader without "
+                "s3:GetObjectRetention sees no lock, since S3 leaves it out of the read). A "
+                f"receipt whose lock ran out gates nothing: record a fresh {environment} receipt"
             )
     elif require_locked and out.exit_code == PASS:
         out.exit_code = FAIL
@@ -1303,11 +1360,12 @@ def _locks(
 def newest_by_environment(
     release_dir: Path, code_digest: Optional[str]
 ) -> Dict[str, Dict[str, Any]]:
-    """For ``fluid runs status``: the newest receipt of each environment beside a release on
-    disk, for its code digest, as ``{env: {"result", "time_verified", "identity_digest"}}``,
-    picked as ``receipt check`` picks it: when the newest file there is not a receipt, or the
-    directory cannot be read, the entry is ``{"problem": ...}``. An environment with no
-    receipt for the code is left out."""
+    """For ``fluid runs status``: the newest verify receipt of each environment beside a release
+    on disk, for its code digest, as ``{env: {"result", "time_verified", "identity_digest"}}``,
+    picked as ``receipt check`` picks it, and under ``"deploy"`` the newest deploy receipt in the
+    same shape: when the newest file there is not a receipt, or the directory cannot be read, the
+    entry is ``{"problem": ...}``. An environment with neither receipt for the code is left
+    out."""
     out: Dict[str, Dict[str, Any]] = {}
     if code_digest is None:
         return out
@@ -1322,16 +1380,26 @@ def newest_by_environment(
                 continue
         except OSError:
             continue
-        try:
-            _name, receipt, _data = _newest_receipt(_DirStore(root / env), code_digest, [])
-        except NoReceipt:
-            continue
-        except ReceiptError as exc:
-            out[clean(env, 40)] = {"problem": clean(str(exc), 300)}
-            continue
-        out[clean(env, 40)] = {
-            "result": receipt["result"],
-            "time_verified": receipt["time_verified"],
-            "identity_digest": receipt["identity_digest"],
-        }
+        entry: Dict[str, Any] = {}
+        for check in (rr.VERIFY, rr.DEPLOY):
+            try:
+                _name, receipt, _data = _newest_receipt(
+                    _DirStore(root / env), code_digest, [], check
+                )
+            except NoReceipt:
+                continue
+            except ReceiptError as exc:
+                entry = {"problem": clean(str(exc), 300)}
+                break
+            found = {
+                "result": receipt["result"],
+                "time_verified": receipt["time_verified"],
+                "identity_digest": receipt["identity_digest"],
+            }
+            if check == rr.VERIFY:
+                entry.update(found)
+            else:
+                entry["deploy"] = found
+        if entry:
+            out[clean(env, 40)] = entry
     return out
