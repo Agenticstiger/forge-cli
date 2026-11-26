@@ -286,3 +286,50 @@ def test_the_grid_lies_from_0_to_128_bits(bits):
 def test_a_document_needs_a_table():
     with pytest.raises(DocumentError):
         _document(tables={})
+
+
+_NOISY_HISTORY = {"history": {"versionsPerEntity": {"noise": {}}}}
+_NULL_COUNT_TABLE = _with_statistic("nullCount/2")
+_NOISY_QUERY = {"statistics": [{"noise": {}}]}
+
+
+def _with_forms(base, **forms):
+    return {**base, **forms}
+
+
+@pytest.mark.parametrize(
+    ("tables", "queries"),
+    [
+        ({"t": _with_forms(_table(), **_NOISY_HISTORY, cliqueSelection={})}, ()),
+        (
+            {
+                "t": _with_forms(
+                    _table(), **_NOISY_HISTORY, cliques=[{"definition": "cliqueMarginal/2"}]
+                )
+            },
+            (),
+        ),
+        (
+            {
+                "t": _with_forms(
+                    _table(),
+                    **_NOISY_HISTORY,
+                    columnPairs=_with_pair("kendallTau/1")["columnPairs"],
+                )
+            },
+            (),
+        ),
+        (
+            {
+                "t": _with_forms(
+                    _NULL_COUNT_TABLE, columnPairs=_with_pair("kendallTau/1")["columnPairs"]
+                )
+            },
+            (),
+        ),
+        ({"t": _with_forms(_NULL_COUNT_TABLE, cliqueSelection={})}, ()),
+        ({"t": _with_forms(_table(), cliqueSelection={})}, [_NOISY_QUERY]),
+    ],
+)
+def test_a_form_of_format_1_4_0_never_lowers_a_form_of_format_1_5_0(tables, queries):
+    assert schema_url_for(tables, queries=queries) == SCHEMA_URL_1_5_0

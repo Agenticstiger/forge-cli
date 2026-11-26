@@ -363,7 +363,7 @@ def test_a_natural_entity_the_contract_does_not_require_is_named():
     assert _named(plan) == {"query cards_with_two": query_release.ENTITY_MAY_BE_NULL}
 
 
-def test_a_record_with_no_natural_entity_refuses_the_release_naming_a_column_and_a_row():
+def test_a_record_with_no_natural_entity_refuses_the_release_naming_a_column_and_no_row():
     plan = _plan(gq.CARDS_WITH_TWO, history={})
     rows = gym.versions()
     rows[3] = dict(rows[3], card_no=None)
@@ -372,7 +372,8 @@ def test_a_record_with_no_natural_entity_refuses_the_release_naming_a_column_and
     with pytest.raises(release.ReleaseRefused) as refused:
         gym.draw(plan, gym.tables(rows))
     assert refused.value.event == "profile_release_null"
-    assert "'card_no'" in str(refused.value) and "row 3" in str(refused.value)
+    assert "'card_no'" in str(refused.value) and TABLE in str(refused.value)
+    assert "row" not in str(refused.value).replace("every row", "")
     assert encoded.raw  # the records were read for the queries
 
 

@@ -1019,7 +1019,7 @@ def _report(
         )
     for line in _profile_follow.unknown_values_notes(drawn.plan or plan):
         say(line, soft_wrap=True)
-    for line in _profile_follow.query_notes(drawn.plan or plan):
+    for line in _profile_follow.query_notes(drawn.plan or plan, drawn):
         say(line, soft_wrap=True)
     if ranked:
         say(

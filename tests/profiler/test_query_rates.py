@@ -715,6 +715,16 @@ def test_a_noisy_plan_reads_the_exact_cells_of_each_group_and_suppresses_nothing
     assert _withheld(_entry(result, "north"))
 
 
+def test_an_exact_run_with_no_disclosure_rule_is_refused_not_left_unchecked():
+    stations = _few_in_the_north()
+    planned = query_rates.plan_queries(
+        CONTRACT, _request(_on_table("north", NORTH)), FakeBackend().enum_levels
+    )
+    assert not planned.noisy
+    with pytest.raises(ValueError, match="disclosure rule"):
+        query_rates.measure(planned, {"station": _station_read(stations)}, FakeBackend(), None)
+
+
 def test_a_failure_that_depends_on_the_records_withholds_every_query_of_a_noisy_run():
     stations = _few_in_the_north()
     planned = query_rates.plan_queries(

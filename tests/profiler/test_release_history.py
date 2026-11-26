@@ -395,6 +395,16 @@ def test_the_report_names_each_member_and_the_asks_left_out_and_prints_no_count(
     assert any(each.get("kind") == "history" for each in record["tables"])
 
 
+def test_the_report_names_the_format_the_document_names(workspace, capsys):
+    assert main(_argv()) == 0
+    seen = capsys.readouterr()
+    flat = " ".join((seen.out + seen.err).split())
+    written = json.loads((workspace / "member.profile.json").read_text(encoding="utf-8"))
+    assert written["_schemaURL"] == document.SCHEMA_URL_1_5_0
+    assert "its privacy unit (format 1-5-0, PROFILE-SPEC section 3a)" in flat
+    assert "format 1-4-0" not in flat
+
+
 def test_rederive_draws_the_same_release_again_with_a_history(workspace, capsys):
     assert main(_argv()) == 0
     capsys.readouterr()
@@ -427,3 +437,60 @@ def test_a_release_whose_records_put_an_entity_under_two_parents_is_refused_and_
     assert not (workspace / "member.profile.json").exists()
     seen = capsys.readouterr()
     assert "profile_release_entity_units" in seen.out + seen.err
+
+
+def test_a_noisy_history_beside_a_clique_selection_names_format_1_5_0_and_the_engine_reads_it():
+    # Selection itself needs OpenDP; a re-derivation hands the cliques in, which is what the
+    # document is written from. The document holds both forms and the reader must accept it.
+    asked = gym.request(history={})
+    asked["tables"][TABLE]["columns"]["access"]["statistics"] = ["levelHistogram/1"]
+    plan = gym.follow_plan(asked)
+    assert plan.selects
+    backend = FakeBackend()
+    rows = fr.encode_follow_rows(plan, gym.read_of(plan), backend)
+    drawn = fr.draw_follow(
+        plan,
+        rows,
+        SEED,
+        backend,
+        cliques={TABLE: (("tier", "access"),)},
+        producer=gym.PRODUCER,
+        selection_version="1.0.0",
+    )
+    table = drawn.document["tables"][TABLE]
+    assert "cliqueSelection" in table and "history" in table
+    assert drawn.document["_schemaURL"] == document.SCHEMA_URL_1_5_0
+    FakeBackend().check_document(drawn.canonical.decode("utf-8"))
+
+
+def test_a_tracked_column_named_several_leaves_reasons_out_and_the_engine_reads_the_rest():
+    contract = gym.contract()
+    for each in contract["exposes"][1]["contract"]["schema"]:
+        if each["name"] == "access":
+            each["name"] = "several"
+    asked = gym.request(history={})
+    asked["tables"][TABLE]["columns"]["several"] = asked["tables"][TABLE]["columns"].pop("access")
+    plan = gym.follow_plan(asked, contract_=contract)
+    held = gym.tables()
+    held[TABLE] = [
+        {("several" if name == "access" else name): value for name, value in row.items()}
+        for row in held[TABLE]
+    ]
+    drawn, _ = gym.draw(plan, held)
+    written = gym.history_of(drawn)
+    assert set(written["columns"]) == {"tier", "several"}
+    assert "reasons" not in written
+    assert any(
+        what == f"history of {TABLE} reasons" and "several" in why
+        for what, why in plan.not_released
+    )
+    FakeBackend().check_document(drawn.canonical.decode("utf-8"))
+
+
+def test_the_history_note_says_a_truncated_entity_is_described_by_what_is_kept():
+    from fluid_build.cli import _profile_follow
+
+    notes = " ".join(_profile_follow.unknown_values_notes(_plan().table(TABLE).plan, TABLE))
+    assert "more versions than the cap under one parent row is described by the versions kept" in (
+        notes
+    )

@@ -41,6 +41,10 @@ The history is released whole or not at all: the five core members are one unit,
 (its ``initial`` and ``transitions``) is one unit, and ``reasons`` is the last. The units are fitted
 under the cell cap in that order, after the null counts and before the statistics grouped through a
 link (:func:`~fluid_build.profiler.dp.follow_release.admit`).
+
+Truncation is per row of the parent table, not per entity: a release that follows keeps at most the
+cap of an entity's versions under one parent row, so an entity with more versions than the cap under
+one parent row is described by the versions kept.
 """
 
 from __future__ import annotations
@@ -69,8 +73,8 @@ from fluid_build.profiler.dp.release import (
     Part,
     ReleasedColumn,
     ReleasedTable,
+    ReleaseRefused,
     _noise_block,
-    _row_error,
     place_known,
 )
 
@@ -259,6 +263,17 @@ def plan_history(
             notes.append((what, f"a history follows at most {history.MOST_COLUMNS} columns"))
         else:
             tracked.append(replace(made, nullable=True))
+    # ``reasons`` names a tracked column as a level beside ``several``; a column of that name would
+    # make the two levels one, so ``reasons`` is left out.
+    reasons = len(tracked) >= 2
+    if reasons and history._SEVERAL in (column.name for column in tracked):
+        reasons = False
+        notes.append(
+            (
+                f"history of {table} reasons",
+                f"a tracked column is named {history._SEVERAL}, which is also a level of reasons",
+            )
+        )
     plan = HistoryPlan(
         table=table,
         entity=window.key,
@@ -267,7 +282,7 @@ def plan_history(
         date=bool(start.date),
         open_end=open_end,
         columns=tuple(tracked),
-        with_reasons=len(tracked) >= 2,
+        with_reasons=reasons,
     )
     return plan, notes
 
@@ -356,11 +371,19 @@ def _instants(
     plan: HistoryPlan, name: str, values: Sequence[Any], table: Optional[str]
 ) -> List[Optional[int]]:
     found: List[Optional[int]] = []
-    for index, value in enumerate(values):
+    for value in values:
         if value is None:
             found.append(None)
         elif plan.date and value % _MS_PER_DAY:
-            raise _row_error(_OUTSIDE, name, index, "a value that is not a whole day", table)
+            where = f"column {name!r}" if table is None else f"table {table!r} column {name!r}"
+            raise ReleaseRefused(
+                _OUTSIDE,
+                f"{where}: a value that is not a whole day",
+                {
+                    "next": "fix the records, or the contract's column type, enum levels or "
+                    "validationRules range, then release"
+                },
+            )
         else:
             found.append(int(value))
     return found
@@ -376,9 +399,9 @@ def encode_history(
 ) -> HistoryRows:
     """Read the columns of the history of every row of its table; refuse what it cannot hold.
 
-    *exact* are the values read of each column. A value of a DATE column that is no whole day, or a
-    tracked column's value outside its declared levels, refuses, naming the column and the row and
-    never the value. A NULL is no refusal: a row with no entity or no start is no version, a NULL end
+    *exact* are the values read of each column. A value of a DATE column that is no whole day
+    refuses, naming the table and the column; a tracked column's value outside its declared levels
+    refuses, naming the column and the row. Neither names a value. A NULL is no refusal: a row with no entity or no start is no version, a NULL end
     is an open one, and a tracked column that is NULL holds no level.
     """
     return HistoryRows(

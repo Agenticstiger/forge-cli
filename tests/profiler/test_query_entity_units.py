@@ -617,6 +617,21 @@ def test_a_population_past_the_bound_is_cut_at_plan_time_in_request_order():
     assert 8 * 2 ** (1 + len(answered)) <= MAX_GROUPS < 8 * 2 ** (2 + len(answered))
 
 
+def test_a_noisy_plan_sizes_a_population_as_one_whose_parent_is_never_joined():
+    from fluid_build.profiler.consumer_queries import MAX_GROUPS
+
+    queries = _many_queries(40)
+    exact = query_rates.plan_queries(CONTRACT, _request(*queries), FakeBackend().enum_levels)
+    noisy = query_rates.plan_queries(
+        CONTRACT, _request(*queries), FakeBackend().enum_levels, noisy=True
+    )
+    held = len(noisy.answerable())
+    assert held > len(exact.answerable())
+    # no bin factor: two to the units and queries stay inside the child's cap
+    assert 2 ** (1 + held) <= MAX_GROUPS < 2 ** (2 + held)
+    assert {each.reason for each in noisy.plans if each.reason} <= {query_rates.ENTITIES_PAST_BOUND}
+
+
 def test_a_request_past_the_bound_is_refused_by_strict_before_any_read(tmp_path):
     with pytest.raises(ProfileError) as refused:
         _profile(tmp_path, *_many_queries(40), strict=True, gone=True)

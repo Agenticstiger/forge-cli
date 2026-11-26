@@ -14,7 +14,7 @@ never the seed. Only the standard library is imported at module scope.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import AbstractSet, Any, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "columns_text",
@@ -70,7 +70,8 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
             "versions of an entity, member by member, on public ladders that are never trimmed to "
             "the records: each member is noised on its own and joins no clique. An entity's "
             "versions follow one row of the parent table; the engine cannot check that, and its "
-            "evidence says so."
+            "evidence says so. An entity with more versions than the cap under one parent row is "
+            "described by the versions kept."
         )
     if plan.date_pairs:
         notes.append(
@@ -82,10 +83,16 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
     return notes
 
 
-def query_notes(plan: Any) -> List[str]:
-    """What the noisy queries of a release count, in words; names no query text and no count."""
+def query_notes(plan: Any, drawn: Any = None) -> List[str]:
+    """What the noisy queries of a release count, in words; names no query text and no count.
+
+    With the *drawn* release, nothing is said when every query was withheld: none was written.
+    """
     queries = getattr(plan, "queries", None)
     if queries is None or not queries.queries:
+        return []
+    held: AbstractSet[str] = getattr(drawn, "withheld_labels", frozenset())
+    if all(each.label in held for each in queries.queries):
         return []
     return [
         "Each noisy query counts the records of its unit in two cells for each group, those the "
@@ -93,7 +100,8 @@ def query_notes(plan: Any) -> List[str]:
         "on its own, joins no clique and is made to agree with no other table, and no group is "
         "suppressed. The engine cannot check that a query reads only a record's own unit and "
         "the tables the unit does not reach, nor that an entity's rows lie in one unit; its "
-        "evidence says so."
+        "evidence says so. An entity with more rows than the cap under one parent row is "
+        "described by the rows kept."
     ]
 
 
@@ -200,8 +208,10 @@ def report(
 ) -> None:
     """Tell the owner what was released, under which loss, and what was left out."""
     from fluid_build.cli.console import warning
+    from fluid_build.profiler import document
     from fluid_build.profiler.dp import release
 
+    format_text = document.format_name(str(drawn.document["_schemaURL"]))
     say(
         f"Released exposes[{plan.unit}] and the tables its unit follows into under differential "
         f"privacy: noisy counts, discrete Gaussian noise, answering the request {request[0]}"
@@ -212,8 +222,8 @@ def report(
         say(line, soft_wrap=True)
     say(
         f"The profile names exposes[{plan.unit}] and its follows as its privacy unit (format "
-        "1-4-0, PROFILE-SPEC section 3a); the engine cannot check that the profiler truncated "
-        "the tables as stated, nor that noise was drawn, and its evidence says so.",
+        f"{format_text}, PROFILE-SPEC section 3a); the engine cannot check that the profiler "
+        "truncated the tables as stated, nor that noise was drawn, and its evidence says so.",
         soft_wrap=True,
     )
     for text in plan.warnings:
@@ -280,7 +290,7 @@ def report(
     for each in (drawn.plan or plan).tables:
         for line in unknown_values_notes(each.plan, each.table):
             say(line, soft_wrap=True)
-    for line in query_notes(drawn.plan or plan):
+    for line in query_notes(drawn.plan or plan, drawn):
         say(line, soft_wrap=True)
     if plan.selects:
         chosen: Dict[str, Any] = dict(drawn.cliques)

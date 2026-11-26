@@ -237,6 +237,33 @@ def test_a_plain_release_writes_its_queries_and_the_engine_reads_them():
         assert read.unit.by == () and read.statistics[0].noise is not None
 
 
+def _only_queries_plan(*queries: Mapping[str, Any]) -> release.ReleasePlan:
+    backend = FakeBackend()
+    asked = gq.asked(*queries)
+    for column in asked["tables"][TABLE]["columns"].values():
+        column.pop("statistics", None)
+    built = backend.read_request(json.dumps(asked), name="gym.profile-request.yml")
+    return release.plan_release(
+        gym.CONTRACT, built, backend, unit=TABLE, rho=release.parse_rho("1")
+    )
+
+
+def test_a_plain_release_of_one_answerable_query_and_no_statistics_writes_the_query():
+    plan = _only_queries_plan(gq.PLUS_ROWS)
+    drawn, _ = _plain_draw(plan)
+    FakeBackend().check_document(drawn.canonical.decode("utf-8"))
+    assert list(_entries(drawn)) == ["plus_rows"]
+    assert [each.kind for each in drawn.tables] == ["query"]
+
+
+def test_a_plain_release_with_no_statistics_and_no_answerable_query_is_still_refused():
+    unreached = gq.query("members", "SELECT member_id FROM member", table="member")
+    for queries in ((), (unreached,)):
+        with pytest.raises(release.ReleaseRefused) as refused:
+            _only_queries_plan(*queries)
+        assert refused.value.event == "profile_release_nothing_to_release"
+
+
 def test_a_plain_release_counts_its_own_rows_by_hand():
     plan = _plain_plan(*PLAIN)
     backend = FakeBackend()
@@ -508,3 +535,90 @@ def test_a_document_of_the_gym_with_a_query_over_a_table_it_does_not_hold_is_ref
     del only["queries"][0]["unit"]
     with pytest.raises(Exception):
         FakeBackend().check_document(json.dumps(only))
+
+
+def test_the_notes_say_a_truncated_entity_is_described_by_what_is_kept_and_name_no_count():
+    from fluid_build.cli import _profile_follow
+
+    plan = _plan(gq.PLUS_ROWS)
+    (note,) = _profile_follow.query_notes(plan)
+    assert "more rows than the cap under one parent row is described by the rows kept" in note
+    assert not any(ch.isdigit() for ch in note)
+
+
+def test_the_query_note_is_printed_only_when_a_query_was_written():
+    from types import SimpleNamespace
+
+    from fluid_build.cli import _profile_follow
+
+    plan = _plan(gq.PLUS_ROWS)
+    (each,) = plan.queries.queries
+    withheld = SimpleNamespace(withheld_labels=frozenset({each.label}))
+    written = SimpleNamespace(withheld_labels=frozenset())
+    assert _profile_follow.query_notes(plan, withheld) == []
+    assert len(_profile_follow.query_notes(plan, written)) == 1
+
+
+def test_the_unreached_reason_says_plainly_what_it_means():
+    assert "no charge" not in query_release.NOT_REACHED
+    assert "does not answer a query over it" in query_release.NOT_REACHED
+
+
+# ---- the rows kept do not depend on the order the rows are read in ---------------------------------
+
+_LATE_CARDS = f"SELECT card_no FROM {TABLE} WHERE card_no >= 205"
+
+
+def _crowded_versions() -> List[Dict[str, Optional[str]]]:
+    """Eight versions of one member that tie on every column but ``card_no``."""
+    return [
+        {
+            "card_no": str(200 + at),
+            "member_id": "1",
+            "tier": "basic",
+            "access": "day",
+            "valid_from": "2026-01-01",
+            "valid_to": None,
+        }
+        for at in range(1, 9)
+    ]
+
+
+def test_a_follow_release_with_a_query_draws_the_same_bytes_whatever_the_order_of_the_rows():
+    late = gq.query("late_cards", _LATE_CARDS)
+    asked = gq.asked(late)
+    plan = gym.follow_plan(asked)
+    assert "card_no" not in {each.name for each in dict(plan.reads)[TABLE]}
+    drawn = []
+    for rows in (_crowded_versions(), list(reversed(_crowded_versions()))):
+        held = gym.tables(rows)
+        drawn.append(gym.draw(plan, held)[0].canonical)
+    assert drawn[0] == drawn[1]
+
+
+def test_a_keyed_plain_release_with_a_query_draws_the_same_bytes_whatever_the_order_of_the_rows():
+    backend = FakeBackend()
+    asked = gq.asked(gq.query("late_cards", _LATE_CARDS))
+    built = backend.read_request(json.dumps(asked), name="gym.profile-request.yml")
+    plan = release.plan_release(
+        gym.CONTRACT,
+        built,
+        backend,
+        unit="member",
+        rho=release.parse_rho("1"),
+        release_table=TABLE,
+        max_rows_per_unit=4,
+    )
+    assert "card_no" not in {each.name for each in plan.read}
+    drawn = []
+    for rows in (_crowded_versions(), list(reversed(_crowded_versions()))):
+        read = sources.SourceColumns(
+            description="rows",
+            row_count=len(rows),
+            values={name: [row[name] for row in rows] for name in gym.VERSION_COLUMNS},
+        )
+        encoded = release.encode_rows(plan, read, backend)
+        drawn.append(
+            release.draw(plan, encoded, SEED, backend, cliques=(), producer=gym.PRODUCER).canonical
+        )
+    assert drawn[0] == drawn[1]

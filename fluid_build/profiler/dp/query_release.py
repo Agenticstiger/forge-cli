@@ -50,6 +50,10 @@ not load, rows that are not the unit's records) withholds every query of the rel
 written, each is named with :data:`~fluid_build.profiler.query_rates.RUN_FAILED`, the other parts
 of the release are unaffected (the parts and their shares were fixed before any record was read)
 and the same run draws the same bytes again.
+
+Truncation is per row of the parent table, not per entity: a release that follows keeps at most the
+cap of an entity's rows under one parent row, so an entity with more rows than the cap under one
+parent row is described by the rows kept, and a query by entity counts the entity so.
 """
 
 from __future__ import annotations
@@ -109,8 +113,7 @@ __all__ = [
 FORM_ROWS, FORM_FOLLOWED, FORM_HISTORY = "rows", "followed", "history"
 
 NOT_REACHED = (
-    "the unit of privacy does not reach its table, so its rows are the same in every neighbouring "
-    "data set and a record of it has no charge"
+    "the unit of privacy does not reach its table, so fluid profile does not answer a query over it"
 )
 ENTITY_OF_EXPOSE = (
     "its unit groups the rows of the unit's own expose, where one unit is one row and removing it "
@@ -369,6 +372,33 @@ def withheld(queries: Optional[QueryRelease]) -> Tuple[Tuple[str, str], ...]:
 # ---------------------------------------------------------------------------
 
 
+def query_content(
+    queries: Optional[QueryRelease], table: str, raw: sources.SourceColumns, rows: int
+) -> Optional[List[bytes]]:
+    """Each row's bytes of the columns the queries read from *table*, for the rows kept to break ties.
+
+    Rows that differ only in a column a query reads must not be told apart by their position, or
+    the rows kept (and so the answer) would depend on the order the records were read in: these
+    bytes are added to the row's content, which keys the priority. ``None`` when no answered query
+    reads *table*, so a release with no query keeps its bytes.
+    """
+    if queries is None or not queries.queries:
+        return None
+    names = queries.read.get(table, ())
+    if not names:
+        return None
+    columns = [raw.values[name] for name in names]
+    return [
+        bounding.encode_values(
+            [
+                None if each[at] is None else f"{type(each[at]).__name__}:{each[at]}"
+                for each in columns
+            ]
+        )
+        for at in range(rows)
+    ]
+
+
 def _subset(
     read: sources.SourceColumns, rows: Sequence[int], names: Iterable[str]
 ) -> sources.SourceColumns:
@@ -386,8 +416,8 @@ def _refuse_missing_entities(
         if values[at] is None:
             raise ReleaseRefused(
                 "profile_release_null",
-                f"table {each.table!r} column {column!r} row {at}: no value, and the release needs "
-                "one in every row",
+                f"table {each.table!r} column {column!r}: no value, and the release needs one in "
+                "every row",
                 {"next": "fix the records, or the contract's column type, then release"},
             )
 

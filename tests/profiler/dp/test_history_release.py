@@ -636,3 +636,19 @@ def test_the_truncation_keeps_an_entity_s_versions_together_by_a_rule_over_its_p
     roomy = _plan()
     encoded = gym.encode(roomy)
     assert fr.truncated(roomy, encoded, SEED)[TABLE] == list(range(len(rows)))
+
+
+def test_a_value_that_is_no_whole_day_refuses_naming_the_column_and_no_row():
+    held = _history_plan()
+    assert held.date
+    exact = {
+        held.entity: [1, 2],
+        held.start: [0, 3_600_000],
+        held.end: [None, None],
+        **{column.name: [None, None] for column in held.columns},
+    }
+    with pytest.raises(release.ReleaseRefused) as refused:
+        history_release.encode_history(held, exact, FakeBackend(), 16, table=TABLE)
+    text = str(refused.value)
+    assert held.start in text and TABLE in text
+    assert "row" not in text.replace("rows", "")

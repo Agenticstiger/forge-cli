@@ -1524,6 +1524,9 @@ def encode_follow_rows(
             bounding.encode_values([exact[table][name][index] for name in read_names])
             for index in range(counts[table])
         ]
+        tied = query_release.query_content(plan.queries, table, read[table], counts[table])
+        if tied is not None:
+            rows_bytes = [mine + more for mine, more in zip(rows_bytes, tied, strict=True)]
         contents[table] = rows_bytes
         encoded[table] = EncodedRows(
             cells=cells_of,

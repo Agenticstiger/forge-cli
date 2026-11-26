@@ -1037,7 +1037,9 @@ class _Planner:
                 return f"past the {MOST_SET_PARTS} parts one table's set check holds"
             held = self._entity_units.setdefault(population, set())
             wider = len(held | {plan.view or ""}) + self._entity_queries.get(population, 0) + 1
-            if not _counts_combinations(plan.entity.parent is not None, wider):
+            # a noisy plan never joins the parent's rows, so there is no bin factor to count
+            parented = plan.entity.parent is not None and not self._noisy
+            if not _counts_combinations(parented, wider):
                 return ENTITIES_PAST_BOUND
             held.add(plan.view or "")
             self._entity_queries[population] = self._entity_queries.get(population, 0) + 1
@@ -2426,7 +2428,11 @@ def _measure(
             _table_answer(plan, by_id, reads, assigned.get(plan.index), done)
     for population in populations:
         _population_answer(population, by_id, reads, done)
-    if rule is not None and not plans.noisy:
+    if not plans.noisy:
+        if rule is None:
+            raise ValueError(
+                "an exact run is checked against a disclosure rule, and none was given"
+            )
         done.check_cells(rule)
     return done
 

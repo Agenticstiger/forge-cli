@@ -156,12 +156,12 @@ def _table_format(table: Mapping[str, Any]) -> int:
     if "cliqueSelection" in table or any(
         each.get("definition") == "cliqueMarginal/2" for each in table.get("cliques", ())
     ):
-        needed = 4
+        needed = max(needed, 4)
     for column in table.get("columns", {}).values():
         needed = max([needed, *(_statistic_format(each) for each in column.get("statistics", ()))])
     for pair in table.get("columnPairs", ()):
         if any(each.get("definition") in _RANK_DEFINITIONS for each in pair.get("statistics", ())):
-            needed = 4
+            needed = max(needed, 4)
     return needed
 
 
@@ -221,6 +221,12 @@ def schema_url_for(
     for relationship in relationships:
         needed = max(needed, _relationship_format(relationship))
     return _FORMATS[needed]
+
+
+def format_name(schema_url: str) -> str:
+    """The format a ``_schemaURL`` names, as ``1-5-0``: its second last path step."""
+    steps = schema_url.rstrip("/").split("/")
+    return steps[-2] if len(steps) >= 2 else schema_url
 
 
 def build_document(

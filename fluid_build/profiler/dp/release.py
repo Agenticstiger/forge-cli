@@ -819,7 +819,19 @@ def plan_release(
         max_rows_per_cell=max_rows_per_cell,
     )
     table = unit_plan.release_table
-    found = _plan_columns(contract, request, backend, table, unit_plan.key_columns)
+    # The consumer queries the release answers: decided before any record is read, as the parts. A
+    # release of answered queries alone holds no column.
+    queries = _queries().plan_noisy_queries(
+        contract, request, backend, unit=table, reach={table: 1}
+    )
+    found = _plan_columns(
+        contract,
+        request,
+        backend,
+        table,
+        unit_plan.key_columns,
+        nothing_ok=queries is not None and bool(queries.queries),
+    )
     asked, skipped, released = found.asked, found.skipped, list(found.released)
     why_not, eligible, selects = found.why_not, found.eligible, found.selects
     rank_pairs, rank_left_out = found.rank_pairs, list(found.rank_left_out)
@@ -844,10 +856,6 @@ def plan_release(
         (definition, rows_per_unit * backend.rank_sensitivity(definition, floor or 2))
         for definition in RANK_DEFINITIONS
         if any(each[0] == definition for each in rank_pairs)
-    )
-    # The consumer queries the release answers: decided before any record is read, as the parts.
-    queries = _queries().plan_noisy_queries(
-        contract, request, backend, unit=table, reach={table: 1}
     )
     # At most one part per released column and rank pair, so no part gets a share below the least
     # check.
@@ -1405,6 +1413,9 @@ def encode_rows(
     contents = [
         bounding.encode_values([exact[name][index] for name in order]) for index in range(rows)
     ]
+    tied = _queries().query_content(plan.queries, plan.table, read, rows)
+    if tied is not None:
+        contents = [mine + more for mine, more in zip(contents, tied, strict=True)]
     return EncodedRows(
         cells=cells,
         units=keyed,
