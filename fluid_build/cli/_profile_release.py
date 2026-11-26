@@ -47,7 +47,8 @@ With --request FILE, --privacy-unit EXPOSE, --rho R and --release-record PATH th
 is a release under differential privacy: the noisy counts of one table, and the noisy rank
 correlations, date pairs and null counts the request asks for, in profile format 1-2-0 (1-3-0
 when it holds a date pair, 1-4-0 when it holds a rank correlation, a clique with a binned column,
-a clique selection or a unit that follows its child rows, 1-5-0 when it holds a null count),
+a clique selection or a unit that follows its child rows, 1-5-0 when it holds a null count or
+a noisy history),
 which flux-engine grades
 P3. Nothing else of the request is released.
 
@@ -110,7 +111,14 @@ relationship asked by the request in a fixed public ladder when its child is rea
 parent is not (or the reverse), grouped by the parent columns the request names (a category by
 its levels, a number or timestamp by public bins); and the child columns the request asks to be
 grouped through a relationship (groupByLink) by the parent column's levels, when the unit
-follows the relationship or does not reach the parent. Before anything is measured, at most MAX
+follows the relationship or does not reach the parent; and, for a table the unit follows into
+(not the unit's own expose) whose history the request asks (a request of format 1-3-0, the
+contract declaring a validity window), a noisy history in format 1-5-0: its versionsPerEntity,
+firstStart, versionLength, chain and lastVersion, each tracked column's initial and transitions
+and the table's reasons, every one a count table of its own with a share of its own and the
+sensitivity of the rows one unit contributes (m_T), counted on public ladders that are never
+trimmed to the records. An entity's versions must follow one parent row (above), or the release
+is refused. Before anything is measured, at most MAX
 children of each parent row are kept by a keyed priority that reads only that parent's own
 children, so what a unit keeps never depends on another unit or on the order of the records;
 children beyond the cap and rows that follow no kept row are dropped. A table the unit does not

@@ -60,6 +60,7 @@ from dataclasses import dataclass, field, replace
 from decimal import ROUND_CEILING, Decimal, localcontext
 from fractions import Fraction
 from typing import (
+    TYPE_CHECKING,
     AbstractSet,
     Any,
     Callable,
@@ -84,10 +85,14 @@ from fluid_build.profiler.dp.randomness import SeededSource
 from fluid_build.profiler.dp.record import ReleaseRecord
 from fluid_build.profiler.runner import ProfileError
 
+if TYPE_CHECKING:  # the history's module reads this one
+    from fluid_build.profiler.dp.history_release import HistoryPlan
+
 __all__ = [
     "DELTA_TEXT",
     "EncodedRows",
     "DEFAULT_ROW_FLOOR",
+    "HISTORY",
     "MECHANISM",
     "LINK",
     "NO_CELL",
@@ -163,6 +168,10 @@ RHO_WARN = Fraction(1)
 DELTA_TEXT = "1e-6"
 
 _NOT_NOISY = "format 1-2-0 holds no noisy form of it"
+_HISTORY_OWN_ROWS = (
+    "a history is released only for a table the privacy unit follows into (--follow), which is "
+    "not the unit's own expose"
+)
 #: Why a request's workload entry is not used: a release chooses the column pairs it joins by
 #: weighing them with the contract's dimensions (:func:`_pair_weights`).
 WORKLOAD_UNUSED = (
@@ -399,6 +408,8 @@ class ReleasePlan:
     date_required: FrozenSet[str] = frozenset()
     #: The columns whose ``nullCount/2`` the release holds, in the contract's order.
     null_counts: Tuple[str, ...] = ()
+    #: The noisy history the release holds of this table (a table the unit follows into only).
+    history: Optional["HistoryPlan"] = None
 
     @property
     def categorical(self) -> Tuple[ReleasedColumn, ...]:
@@ -952,15 +963,19 @@ def _table_not_released(
     why_not: Mapping[str, str],
     skipped: Mapping[str, str],
     null_counts: FrozenSet[str] = frozenset(),
+    history: Optional[str] = None,
 ) -> List[Tuple[str, str]]:
     """Each requested item of the listed table *each* the release does not hold, with why.
 
     A ``nullCount/2`` of a column in *null_counts* is held; of any other readable column it is a
-    key's, which *why_not* names.
+    key's, which *why_not* names. A history the request asks is named with *history*, the reason
+    the table's release holds none; ``None`` leaves it to the caller.
     """
     found: List[Tuple[str, str]] = []
     if each.row_count:
         found.append((f"rowCount of {table}", _NOT_NOISY))
+    if history is not None and getattr(each, "history", None) is not None:
+        found.append((f"history of {table}", history))
     for column in each.columns:
         where = f"{table}.{column.name}"
         if column.name in skipped:
@@ -1007,7 +1022,11 @@ def _not_released(
                 other_table_pairs(each, f"the release holds the statistics of one table, {table}")
             )
             continue
-        found.extend(_table_not_released(each, table, released, why_not, skipped, null_counts))
+        found.extend(
+            _table_not_released(
+                each, table, released, why_not, skipped, null_counts, history=_HISTORY_OWN_ROWS
+            )
+        )
     for link in request.relationships:
         found.append(
             (
@@ -1025,11 +1044,14 @@ def _not_released(
 
 
 def other_table_pairs(each: Any, reason: str) -> List[Tuple[str, str]]:
-    """The date pairs of a listed table the release does not hold, each with *reason*."""
-    return [
+    """The date pairs and the history of a listed table the release does not hold, each with *reason*."""
+    found = [
         (f"date pair {pair.start} to {pair.end} of {each.expose_id}", reason)
         for pair in each.date_pairs
     ]
+    if getattr(each, "history", None) is not None:
+        found.append((f"history of {each.expose_id}", reason))
+    return found
 
 
 def check_selection_available(plan: ReleasePlan) -> None:
@@ -1370,6 +1392,10 @@ def encode_rows(
 CLIQUE, LEVELS, BINS, RANK = "clique", "levels", "bins", "rank"
 #: A column's noisy count of its known and NULL rows (``nullCount/2``): two cells, in that order.
 NULLCOUNT = "nullCount"
+#: A member of a table's noisy history (``versionsPerEntity``, ``firstStart``, ``versionLength``,
+#: ``chain``, ``lastVersion``, a tracked column's ``initial`` and ``transitions``, ``reasons``): a
+#: count table over the table's kept rows, drawn on its own. Only a release that follows has one.
+HISTORY = "history"
 NULL_COUNT_LEVELS = ("known", "null")
 NULL_COUNT_DEFINITION = "nullCount/2"
 #: The two parts of a date pair: the days from start to end on the public ladder, and the order
@@ -1440,7 +1466,7 @@ class ReleasedTable:
             found["table"] = self.table
         if self.kind == RANK:
             found.update({"kind": RANK, "definition": self.definition, "rowFloor": self.row_floor})
-        elif self.kind in (RELATION, LINK, NULLCOUNT, *PAIRS):
+        elif self.kind in (RELATION, LINK, NULLCOUNT, HISTORY, *PAIRS):
             found["kind"] = self.kind
         return found
 
@@ -1651,10 +1677,11 @@ def agrees(plan: ReleasePlan, table: "ReleasedTable") -> bool:
 
     A histogram of a column that may hold a null counts that column's known values, which are not
     the records the other tables count, and the days and the order of a date pair count the rows
-    where both dates are known, and a null count has two cells of its own that no other table
-    shares; none is made to agree with another table, and each is noised on its own.
+    where both dates are known, a null count has two cells of its own that no other table shares,
+    and a member of a history counts versions and pairs of versions; none is made to agree with
+    another table, and each is noised on its own.
     """
-    if table.kind in (NULLCOUNT, *PAIRS):
+    if table.kind in (NULLCOUNT, HISTORY, *PAIRS):
         return False
     if table.kind in (LEVELS, BINS):
         return not plan.column(table.columns[0]).nullable
@@ -2329,7 +2356,7 @@ def check_record(plan: ReleasePlan, record: ReleaseRecord) -> Tuple[Tuple[str, .
         columns = each.get("columns") if isinstance(each, Mapping) else None
         if not isinstance(columns, list) or not all(isinstance(name, str) for name in columns):
             raise _mismatch("a table's columns are not names")
-        if each.get("kind") in (RANK, NULLCOUNT, *PAIRS):
+        if each.get("kind") in (RANK, NULLCOUNT, HISTORY, *PAIRS):
             continue
         if len(columns) >= 2:
             cliques.append(tuple(columns))

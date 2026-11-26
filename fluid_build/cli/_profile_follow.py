@@ -35,6 +35,7 @@ _KIND = {
     "pairDays": "days of the date pair",
     "pairOrder": "order of the date pair",
     "nullCount": "null count of",
+    "history": "history member",
 }
 
 
@@ -61,6 +62,14 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
             "where the column holds a value and where it holds none, noised on its own: it joins "
             "no clique, and a share of nulls formed from its two cells is as noisy as they are."
         )
+    if getattr(plan, "history", None) is not None:
+        notes.append(
+            f"The history of {plan.history.table} counts entities and pairs of consecutive "
+            "versions of an entity, member by member, on public ladders that are never trimmed to "
+            "the records: each member is noised on its own and joins no clique. An entity's "
+            "versions follow one row of the parent table; the engine cannot check that, and its "
+            "evidence says so."
+        )
     if plan.date_pairs:
         notes.append(
             f"The days and the order of each date pair{place} count the records where both dates "
@@ -81,14 +90,16 @@ def part_words(label: str, table: Optional[str] = None) -> str:
     """A release part's label in the words the other items it leaves out are named with.
 
     ``[<table>/]pair/<days|order>/<start>/<end>`` is a date pair, ``[<table>/]noise/<column>`` a
-    column's histogram, ``[<table>/]nullCount/<column>`` a column's null count, and ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped
-    through a link; any other label is said as it is.
+    column's histogram, ``[<table>/]nullCount/<column>`` a column's null count,
+    ``[<table>/]history/<member>[/<column>]`` a member of a table's history, and
+    ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped through a link; any other
+    label is said as it is.
     """
     steps = label.split("/")
     if steps[0] == "link" and len(steps) >= 4 and "." in steps[1]:
         child, column = steps[1].split(".", 1)
         return f"{column} of {child} grouped by {steps[3]}"
-    if steps[0] not in ("noise", "pair", "nullCount") and len(steps) > 1:
+    if steps[0] not in ("noise", "pair", "nullCount", "history") and len(steps) > 1:
         table, steps = steps[0], steps[1:]
     where = f" of {table}" if table else ""
     if steps[0] == "pair" and len(steps) == 4:
@@ -97,6 +108,10 @@ def part_words(label: str, table: Optional[str] = None) -> str:
         return f"{steps[1]}{where}"
     if steps[0] == "nullCount" and len(steps) == 2:
         return f"null count of {steps[1]}{where}"
+    if steps[0] == "history" and len(steps) == 2:
+        return f"history {steps[1]}{where}"
+    if steps[0] == "history" and len(steps) == 3:
+        return f"history {steps[1]} of {steps[2]}{where}"
     return label
 
 
@@ -230,7 +245,11 @@ def report(
                 soft_wrap=True,
             )
             continue
-        what = table.label if table.kind in ("relationship", "link") else columns_text(table)
+        what = (
+            table.label
+            if table.kind in ("relationship", "link", "history")
+            else columns_text(table)
+        )
         say(
             f"  {_KIND[table.kind]} {what}{place}: noise scale {table.scale}, share rho "
             f"{table.share}, squared L2 sensitivity {table.sensitivity} for one unit",

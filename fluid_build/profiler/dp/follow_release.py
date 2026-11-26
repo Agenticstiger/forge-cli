@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """A release under differential privacy whose unit follows its child rows (profile format 1-4-0, or
-1-5-0 when it holds a column's ``nullCount/2``).
+1-5-0 when it holds a column's ``nullCount/2`` or a table's noisy history).
 
 With ``--follow`` the privacy unit is one row of the unit's expose together with the rows of
 child tables that follow it (:mod:`~fluid_build.profiler.dp.follows`; PROFILE-SPEC section 3a), and
@@ -14,6 +14,8 @@ before anything is measured, from the seed and from each parent's own children, 
   :func:`~fluid_build.profiler.dp.release.scale_units` of that, in exact integers;
 * a column's ``nullCount/2`` of ``T`` (two cells: the rows kept where it holds a value and where
   it holds none) is a count table of ``T`` like the others: squared L2 sensitivity ``m_T**2``;
+* a member of a table's noisy history (:mod:`~fluid_build.profiler.dp.history_release`) is a count
+  table of ``T`` as well, charged ``m_T`` for one row and so ``m_T**2``, the pair members too;
 * a rank correlation of ``T`` has the sensitivity of the registry's, times ``m_T``;
 * a relationship's children-per-parent histogram, ungrouped or grouped by a parent column, has
   the sensitivity of PROFILE-SPEC "What a noisy statistic is charged": ``m_P`` when the unit
@@ -67,7 +69,13 @@ from typing import (
 from fluid_build.policy._common import iter_exposes
 from fluid_build.profiler import defaults, document, runner, sources
 from fluid_build.profiler._stats import Request, StatisticsBackend
-from fluid_build.profiler.dp import bounding, consistency, rank_noise, selection
+from fluid_build.profiler.dp import (
+    bounding,
+    consistency,
+    history_release,
+    rank_noise,
+    selection,
+)
 from fluid_build.profiler.dp.bounding import ROWS, UnitPlan
 from fluid_build.profiler.dp.discrete_gaussian import sample_discrete_gaussian
 from fluid_build.profiler.dp.follows import (
@@ -83,6 +91,7 @@ from fluid_build.profiler.dp.release import (
     BINS,
     CLIQUE,
     DEFAULT_ROW_FLOOR,
+    HISTORY,
     LEVELS,
     LINK,
     NO_CELL,
@@ -879,6 +888,43 @@ def plan_follow_release(
         not_released.append((f"fact {fact.name}", _NOT_NOISY))
     not_released.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED, private=True))
 
+    # -- the histories the request asks of the tables the unit follows into
+    histories: Dict[str, history_release.HistoryPlan] = {}
+    for table in tree.order[1:]:
+        found = columns[table]
+        asked_history = getattr(found.asked, "history", None)
+        if asked_history is None:
+            continue
+        planned, history_notes = history_release.plan_history(
+            table,
+            found.expose,
+            found.expose_plan,
+            asked_history,
+            _structure_of(contract, backend, table, bits, keyed.get(table, frozenset())),
+            backend,
+        )
+        not_released.extend(history_notes)
+        into = tree.edge_into(table)
+        if planned is None or into is None:
+            continue
+        histories[table] = planned
+        extra_read.setdefault(table, []).extend(planned.read)
+        if (planned.entity,) != into.spec.child_columns:
+            # an entity lies in one unit by construction when its key is the followed one; else the
+            # records are checked (profile_release_entity_units)
+            item = (
+                table,
+                (planned.entity,),
+                into.parent,
+                into.spec.parent_columns,
+                into.spec.child_columns,
+            )
+            if item not in entity_units:
+                entity_units.append(item)
+                note_keys(into.parent, into.spec.parent_columns)
+                note_keys(into.child, into.spec.child_columns)
+                note_keys(table, (planned.entity,))
+
     # -- each reached table's plan, now that its keys and structure columns are known
     tables: List[TablePlan] = []
     for table in tree.order:
@@ -929,6 +975,7 @@ def plan_follow_release(
             date_pairs=found.date_pairs,
             date_required=found.date_required,
             null_counts=found.null_counts,
+            history=histories.get(table),
         )
         tables.append(TablePlan(table, m, table_plan, asked is not None))
         if asked is not None:
@@ -940,6 +987,7 @@ def plan_follow_release(
                     found.why_not,
                     found.skipped,
                     frozenset(found.null_counts),
+                    history=history_release.EXPOSE_REASON if table == unit else None,
                 )
             )
             not_released.extend(found.rank_left_out)
@@ -1005,6 +1053,21 @@ def plan_follow_release(
         )
     split_budget(rho, plan.selects, len(parts))
     return plan
+
+
+def _structure_of(
+    contract: Mapping[str, Any],
+    backend: StatisticsBackend,
+    table: str,
+    bits: int,
+    keys: FrozenSet[str],
+) -> Callable[[str], Tuple[Optional[ReleasedColumn], str]]:
+    """The public cells of a column of *table*, as a history's tracked columns are placed."""
+
+    def structure(name: str) -> Tuple[Optional[ReleasedColumn], str]:
+        return _group_structure(contract, backend, table, name, bits, keys=keys)
+
+    return structure
 
 
 def request_tables(request: Request) -> List[str]:
@@ -1075,8 +1138,8 @@ def follow_parts(
     """Every noisy statistic of the release, once, in document order. The one source of the parts.
 
     The parts of each table the unit reaches (:func:`~fluid_build.profiler.dp.release.release_parts`
-    with the table's cliques), table by table, then each relationship's histogram, then each
-    statistic grouped through a link. Every label names its table, so no two parts share a stream.
+    with the table's cliques, then the members of its history), table by table, then each
+    relationship's histogram, then each statistic grouped through a link. Every label names its table, so no two parts share a stream.
     """
     parts: List[FollowPart] = []
     for each in plan.tables:
@@ -1089,6 +1152,16 @@ def follow_parts(
                     each.reach,
                 )
             )
+        if each.plan.history is not None:
+            for part in history_release.history_parts(each.plan.history):
+                parts.append(
+                    FollowPart(
+                        each.table,
+                        replace(part, label=f"{each.table}/{part.label}"),
+                        each.reach**2,
+                        each.reach,
+                    )
+                )
     for relation in plan.relations:
         parts.append(
             FollowPart(
@@ -1129,8 +1202,9 @@ def admit(
     are admitted in this order while the release's cells stay within
     ``selection.MOST_RELEASE_CELLS``: every date pair (the tables in the plan's order, the pairs
     in the request's), then every column that may hold a null (tables, then columns, in the plan's
-    order), then every null count (tables, then columns, in the plan's order), then every link
-    statistic whose counted child column may hold a null. The first that
+    order), then every null count (tables, then columns, in the plan's order), then every history
+    (the tables in the plan's order; for each, its core members, then each tracked column, then
+    ``reasons``), then every link statistic whose counted child column may hold a null. The first that
     does not fit is left out and so is every one after it. A left-out part is named by its label
     and the reason, never a count. The decision reads the cliques only, which are released under the
     selection's share. The plan comes back as it was when every added part fits.
@@ -1147,8 +1221,15 @@ def admit(
             into.extend(
                 tuple(by_label[f"{each.table}/{part.label}"] for part in unit) for unit in found
             )
+    histories: List[Tuple[Part, ...]] = []
+    for each in plan.tables:
+        if each.plan.history is not None:
+            histories.extend(
+                tuple(by_label[f"{each.table}/{label}"] for label in unit)
+                for unit in history_release.history_units(each.plan.history)
+            )
     links = [(by_label[link.label],) for link in plan.links if link.column.nullable]
-    units = [*pairs, *columns, *nulls, *links]
+    units = [*pairs, *columns, *nulls, *histories, *links]
     if not units:
         return plan, ()
     added = {part.label for unit in units for part in unit}
@@ -1178,6 +1259,11 @@ def admit(
                 name
                 for name in inner.null_counts
                 if f"{each.table}/{null_count_label(name)}" not in gone
+            ),
+            history=(
+                None
+                if inner.history is None
+                else history_release.admitted(inner.history, gone, f"{each.table}/")
             ),
         )
         tables.append(replace(each, plan=kept))
@@ -1266,6 +1352,8 @@ class FollowRows:
     keys: Mapping[Tuple[str, Tuple[str, ...]], Sequence[Optional[bytes]]]
     #: The cell of each row of a group or link column; ``None``: a null, in no group.
     placed: Mapping[Tuple[str, str], Sequence[Optional[int]]]
+    #: What the history of each table that holds one reads of its rows.
+    histories: Mapping[str, history_release.HistoryRows] = field(default_factory=dict)
 
 
 def encode_follow_rows(
@@ -1353,6 +1441,7 @@ def encode_follow_rows(
         placed[(table, name)] = full
     encoded: Dict[str, EncodedRows] = {}
     contents: Dict[str, List[bytes]] = {}
+    histories: Dict[str, history_release.HistoryRows] = {}
     for each in plan.tables:
         table = each.table
         released = {column.name: column for column in each.plan.columns}
@@ -1384,7 +1473,18 @@ def encode_follow_rows(
             pairs=pair_cells(each.plan, exact[table], table=table),
             nulls=null_cells(each.plan.null_counts, exact[table]),
         )
-    return FollowRows(counts=counts, tables=encoded, contents=contents, keys=keys, placed=placed)
+        if each.plan.history is not None:
+            histories[table] = history_release.encode_history(
+                each.plan.history, exact[table], backend, plan.fractional_bits, table=table
+            )
+    return FollowRows(
+        counts=counts,
+        tables=encoded,
+        contents=contents,
+        keys=keys,
+        placed=placed,
+        histories=histories,
+    )
 
 
 def _one_unit_each(
@@ -1671,7 +1771,9 @@ def draw_follow(
     measured = measure_counts(plan, rows, kept, tables, backend)
     values_of: Dict[str, Tuple[str, ...]] = {}
     for each in plan.tables:
-        mine = [item for item in tables if item.table == each.table and item.kind in _TABLE_KINDS]
+        mine = [
+            item for item in tables if item.table == each.table and item.kind in _MEASURED_KINDS
+        ]
         counted = [item for item in mine if item.kind != RANK]
         if counted:
             values_of.update(_count_values(counted, measured, seed, each.plan))
@@ -1711,6 +1813,8 @@ def draw_follow(
 
 
 _TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK, NULLCOUNT, *PAIRS)
+#: The kinds drawn table by table: those of the table's own block and the members of its history.
+_MEASURED_KINDS = (*_TABLE_KINDS, HISTORY)
 
 
 def measure_counts(
@@ -1728,8 +1832,17 @@ def measure_counts(
     found: Dict[str, List[int]] = {}
     relations = {relation.label: relation for relation in plan.relations}
     links = {link.label: link for link in plan.links}
+    history_counts: Dict[str, Dict[str, List[int]]] = {}
     for table in tables:
-        if table.kind in (CLIQUE, LEVELS, BINS, NULLCOUNT, *PAIRS):
+        if table.kind == HISTORY:
+            held = plan.table(table.table).plan.history
+            assert held is not None  # a member of a history is a part of a plan that holds it
+            if table.table not in history_counts:
+                history_counts[table.table] = history_release.history_counts(
+                    held, rows.histories[table.table], kept[table.table]
+                )
+            found[table.label] = history_counts[table.table][table.label[len(table.table) + 1 :]]
+        elif table.kind in (CLIQUE, LEVELS, BINS, NULLCOUNT, *PAIRS):
             cells = table_cells(table, rows.tables[table.table], kept[table.table])
             counts = [0] * table.cells
             for value in cells:
@@ -1884,6 +1997,14 @@ def _document(
     for each in plan.tables:
         mine = [item for item in tables if item.table == each.table and item.kind in _TABLE_KINDS]
         block = _table_block(each.plan, mine, values_of, selection_version, states_selection=True)
+        if each.plan.history is not None:
+            prefix = f"{each.table}/"
+            members = {
+                item.label[len(prefix) :]: item
+                for item in tables
+                if item.table == each.table and item.kind == HISTORY
+            }
+            block["history"] = history_release.history_block(each.plan.history, members, values_of)
         for name, domain in domains.get(each.table, {}).items():
             block["columns"].setdefault(name, {"domain": domain})
         out_tables[each.table] = block
@@ -2058,7 +2179,7 @@ def check_follow_record(
             or not isinstance(owner, str)
         ):
             raise _mismatch("a table's columns are not names")
-        if stated.get("kind") in (RANK, RELATION, LINK, NULLCOUNT, *PAIRS):
+        if stated.get("kind") in (RANK, RELATION, LINK, NULLCOUNT, HISTORY, *PAIRS):
             continue
         if len(columns) >= 2:
             by_table[owner] = (*by_table.get(owner, ()), tuple(columns))

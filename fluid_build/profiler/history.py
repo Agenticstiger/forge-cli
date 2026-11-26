@@ -143,7 +143,10 @@ __all__ = [
     "MOST_COLUMNS",
     "MOST_LEVELS",
     "asked_plan",
+    "chain_level",
     "form_histories",
+    "length_ladder",
+    "order_versions",
 ]
 
 #: The most tracked columns a history holds, and the most levels one of them has (public caps).
@@ -577,6 +580,34 @@ def _window(context: _Context, expose: Mapping[str, Any]) -> Any:
     return window
 
 
+def order_versions(
+    keys: Sequence[Optional[Any]],
+    starts: Sequence[Optional[int]],
+    ends: Sequence[Optional[int]],
+    literal: Optional[int],
+) -> Tuple[Dict[Any, List[_Version]], List[int]]:
+    """Each entity's versions in order, and the position of each row used.
+
+    A row is used when its entity (*keys*, ``None`` where it holds none) and its start are known.
+    The versions of an entity are ordered by start, then end (an open end last), then row position.
+    An end is open when it is ``None`` or equals the ``openEnd`` *literal* of the contract.
+    """
+    held: Dict[Any, List[Tuple[_Key, _Version]]] = {}
+    used: List[int] = []
+    for position, (key, start, end) in enumerate(zip(keys, starts, ends, strict=True)):
+        if key is None or start is None:
+            continue
+        used.append(position)
+        closed = end is not None and end != literal
+        version = _Version(start, end if closed else None, position)
+        order = (start, 0 if closed else 1, end if closed and end is not None else 0, position)
+        held.setdefault(key, []).append((order, version))
+    return {
+        key: [version for _, version in sorted(versions, key=lambda each: each[0])]
+        for key, versions in held.items()
+    }, used
+
+
 def _ordered(
     context: _Context, window: Any
 ) -> Tuple[Dict[Tuple[Any, ...], List[_Version]], List[int]]:
@@ -590,22 +621,12 @@ def _ordered(
     starts = _instants(context, window.start_column, date_column)
     ends = _instants(context, window.end_column, date_column)
     literal = _open_literal(context, window.end_column, date_column, window.open_end)
-    held: Dict[Tuple[Any, ...], List[Tuple[_Key, _Version]]] = {}
-    used: List[int] = []
-    for position, (key, start, end) in enumerate(zip(keys, starts, ends, strict=True)):
-        if None in key or start is None:
-            continue
-        used.append(position)
-        closed = end is not None and end != literal
-        version = _Version(start, end if closed else None, position)
-        order = (start, 0 if closed else 1, end if closed and end is not None else 0, position)
-        held.setdefault(key, []).append((order, version))
+    held, used = order_versions(
+        [None if None in key else key for key in keys], starts, ends, literal
+    )
     if not held:
         raise _Unformed(_NO_ROWS)
-    return {
-        key: [version for _, version in sorted(versions, key=lambda each: each[0])]
-        for key, versions in held.items()
-    }, used
+    return held, used
 
 
 # ---------------------------------------------------------------------------
@@ -950,8 +971,13 @@ def _start_extremes(context: _Context, window: Any) -> Tuple[Optional[int], Opti
     return low, high
 
 
+def length_ladder() -> Tuple[int, ...]:
+    """The public ladder of the whole days from a version's start to the next version's start."""
+    return dates.DAY_LADDER[dates.DAY_LADDER.index(0) :]
+
+
 def _version_length(context: _Context, window: Any, lengths: "Counter[int]") -> Dict[str, Any]:
-    ladder = dates.DAY_LADDER[dates.DAY_LADDER.index(0) :]
+    ladder = length_ladder()
     name = f"{context.expose_id} version length"
     days = list(lengths.elements())
     low, high = _start_extremes(context, window)
@@ -961,20 +987,28 @@ def _version_length(context: _Context, window: Any, lengths: "Counter[int]") -> 
     return _written(context, coded, ladder)
 
 
+def chain_level(current: _Version, following: _Version) -> str:
+    """How *current* ends where *following*, the next version of its entity, begins.
+
+    The end is the next start (``nextStart``), the day before it (``dayBefore``), earlier than that
+    (``gap``), or later, or open (``overlap``).
+    """
+    if current.end is None or current.end > following.start:
+        return "overlap"
+    if current.end == following.start:
+        return "nextStart"
+    if following.start - current.end == _MS_PER_DAY:
+        return "dayBefore"
+    return "gap"
+
+
 def _chain(
     context: _Context, window: Any, stations: Mapping[Tuple[Any, ...], Sequence[_Version]]
 ) -> Dict[str, Any]:
     levels: Counter[str] = Counter()
     for held in stations.values():
         for current, following in zip(held, held[1:], strict=False):
-            if current.end is None or current.end > following.start:
-                levels["overlap"] += 1
-            elif current.end == following.start:
-                levels["nextStart"] += 1
-            elif following.start - current.end == _MS_PER_DAY:
-                levels["dayBefore"] += 1
-            else:
-                levels["gap"] += 1
+            levels[chain_level(current, following)] += 1
     counts = [levels[each] for each in _CHAIN_LEVELS]
     emptied = _EMPTIED.get(window.chain, frozenset())
     empty = frozenset(
