@@ -155,7 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on that key's children, so the foreign key's shares are withheld whole (neither `initial` nor
   `transitions` writes a size or a cell) when the per-key counts would bound the
   children-per-parent histogram's withheld bins. A numeric key is published, and its
-  foreign key is named as not followed.
+  foreign key is named as not followed. A foreign key to a table that is not published whole is
+  no longer tracked by the levels its contract declares: it is named as not followed, as the
+  table it references is not declared public.
 
 ### Changed
 

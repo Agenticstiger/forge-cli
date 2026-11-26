@@ -1350,9 +1350,11 @@ def _published_ceilings(
     that follow a first version, *rest* of them in all, wherever they fall: at most the cell
     plus *rest*. A published cell is read at the top of its band. A withheld cell is at most the
     group's *entities* less what the other cells hold at least. The group's size and the rows
-    that are no first version are the exact counts, which a reader holds no tighter than: a
-    ceiling of the exact count is at least as low as any a reader forms, so the guard pins at
-    least what a reader does. An entry withheld whole gives no ceiling.
+    that are no first version are the exact counts, which a reader holds no tighter than. A
+    reader can lower a ceiling further by the published changes into the other keys; that
+    cannot pin a cell here, since a published change into another key leaves at least
+    ``minimumCell`` withheld changes that may land on this one. An entry withheld whole gives no
+    ceiling.
     """
     levels = initial["levels"]
     (group,) = initial["groups"]
