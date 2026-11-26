@@ -37,6 +37,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another file holds is refused, and a relationship that is not a well-formed as-of reading is
   refused with the reason.
 
+### Changed
+
+- **Who reads every row of a row-filtered expose through the MCP gateway.** On an expose that
+  declares `policy.authz.rowFilters`, the principals that read every row are those in
+  `policy.authz.readers` and, for a library caller that passes `contract=`, the principal of each
+  `accessPolicy` grant that reads (`read`, `select`, `query`, `admin` or `owner`), has no condition
+  and covers the expose. A grant that only writes, has a condition, is scoped to another expose or
+  to a resource the gateway cannot evaluate, or whose principal `binding.principals` maps to `[]`
+  never counts, and neither does a reader mapped to `[]`. A principal a row filter names never
+  reads every row, whatever its spelling (the type prefix and the case are folded for that
+  comparison). A caller's verified principals match as written and are never translated through
+  `binding.principals`. Without `contract=` only `policy.authz.readers` read every row, narrowed
+  the same two ways. An `accessPolicy` or `binding.principals` that cannot be read as written is
+  refused with `RowFilterUnavailable`. `row_filter_predicate`, `compile_semantic_query`,
+  `compile_free_form_sql` and the `sample` read take the keyword; the gateway's own tools pass the
+  session's contract.
+
 ### Fixed
 
 - **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through

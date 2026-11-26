@@ -272,6 +272,8 @@ def tool_query(
         # An as-of relationship the request names: the version of its target the row's
         # date falls in, read through the target's own governed projection.
         related=_related_tables(state, driver, args),
+        # The contract's accessPolicy read grants read every row of a filtered expose.
+        contract=getattr(state, "contract", None),
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)
@@ -317,6 +319,7 @@ def tool_query_sql(
         # A filtered caller's comparisons are typed by contract.schema; the driver reads
         # the table's own types once, so a declared type the table does not hold is refused.
         physical_types=getattr(driver, "physical_column_types", None),
+        contract=getattr(state, "contract", None),
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)

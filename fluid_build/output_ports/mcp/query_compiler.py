@@ -85,6 +85,7 @@ from typing import (
 
 from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
 from fluid_build.output_ports.mcp.auth import PRINCIPAL_ATTR
+from fluid_build.providers._access_grants import ReaderRuleError, every_row_readers
 from fluid_build.providers._row_filters import (
     RowFilter,
     RowFilterError,
@@ -775,14 +776,6 @@ def _verified_principals(caller_attributes: Optional[Mapping[str, Any]]) -> Froz
     return _principal_names(value) if isinstance(value, (list, tuple)) else frozenset()
 
 
-def _declared_readers(authz: Mapping[str, Any], at: str) -> FrozenSet[str]:
-    """``policy.authz.readers``; anything but a list of principals is refused."""
-    raw = authz.get("readers")
-    if raw is not None and not isinstance(raw, list):
-        raise RowFilterUnavailable(f"{at}.authz.readers must be a list of principals.")
-    return _principal_names(raw or ())
-
-
 def _qualified_predicate(row_filter: RowFilter, at: str, read: Optional[str]) -> str:
     """``row_filter.where`` as this engine runs it: every column qualified with
     :data:`ROW_FILTER_ALIAS`, after checking the engine reads it as declared.
@@ -870,6 +863,7 @@ def row_filter_predicate(
     caller_attributes: Optional[Mapping[str, Any]],
     *,
     dialect: Optional[str] = None,
+    contract: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
     """The predicate that limits a caller to its rows, or ``None`` for every row.
 
@@ -879,14 +873,24 @@ def row_filter_predicate(
     (:data:`~fluid_build.output_ports.mcp.auth.PRINCIPAL_ATTR`, one or a list):
 
     * no row filter declared: ``None``;
-    * a principal of the caller is in ``policy.authz.readers`` and no filter names
-      it: ``None``, every row;
+    * a principal of the caller is one that reads every row (see below): ``None``,
+      every row;
     * otherwise the union of the predicates of the filters that name the caller's
       principals, as BigQuery combines the row access policies naming one principal:
       ``((p1) OR (p2))``, each column qualified with :data:`ROW_FILTER_ALIAS`;
     * no filter and no reader names a principal of the caller, or it has none:
       :class:`RowFilterIdentityMissing`. The gateway cannot tell an unfiltered
       reader from a filtered principal it does not know, so it serves neither.
+
+    The principals that read every row are ``policy.authz.readers`` and, when the
+    caller passes ``contract=`` (the contract the expose belongs to), the principal of
+    each unconditional ``accessPolicy`` read grant that covers the expose
+    (:func:`fluid_build.providers._access_grants.every_row_readers`, the reading the
+    BigQuery emitter shares). Neither set ever holds a principal that
+    ``binding.principals`` maps to ``[]`` or that a row filter names, whatever its
+    spelling. A caller's principals match as written; they are never translated
+    through ``binding.principals``. Without ``contract=`` only the readers count. The
+    schema has no explicit deny for rows, so there is none to apply.
 
     Every filter is parsed by :mod:`fluid_build.providers._row_filters`, the parse the
     IaC emitters write platform policies from, and checked against ``dialect`` (the
@@ -915,9 +919,12 @@ def row_filter_predicate(
         )
         for position, row_filter in enumerate(filters)
     }
-    unfiltered_readers = _declared_readers(authz, at) - set(predicates)
+    try:
+        every_row = every_row_readers(expose, contract=contract, filtered=predicates)
+    except ReaderRuleError as exc:
+        raise RowFilterUnavailable(f"{at}: {exc}") from exc
     principals = _verified_principals(caller_attributes)
-    if principals & unfiltered_readers:
+    if principals & every_row:
         return None
     mine = [
         predicates[row_filter.principal]
@@ -1481,6 +1488,7 @@ class _AsOfJoins:
         caller_attributes: Optional[Mapping[str, Any]],
         dialect: Optional[str],
         taken: Iterable[str],
+        contract: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if related is not None and not isinstance(related, Mapping):
             raise QueryValidationError("related must map a relationship name to its table")
@@ -1490,6 +1498,7 @@ class _AsOfJoins:
         self._restricted = restricted
         self._caller_attributes = caller_attributes
         self._dialect = dialect
+        self._contract = contract
         self._taken: Set[str] = {name.casefold() for name in taken if isinstance(name, str)}
         self._reaches: Dict[str, _Reach] = {}
 
@@ -1691,7 +1700,9 @@ class _AsOfJoins:
         for name in (key, start, end):
             if name not in readable:
                 raise refuse(f"column {name!r} is not one its contract.schema lets a query read")
-        predicate = row_filter_predicate(target, self._caller_attributes, dialect=self._dialect)
+        predicate = row_filter_predicate(
+            target, self._caller_attributes, dialect=self._dialect, contract=self._contract
+        )
         number = len(self._reaches) + 1
         join_type = declared.get("joinType", "left")
         if join_type not in ("left", "inner"):
@@ -1781,6 +1792,7 @@ def compile_semantic_query(
     restricted_columns: Iterable[str] = (),
     redacted_columns: Iterable[str] = (),
     related: Optional[Mapping[str, RelatedTable]] = None,
+    contract: Optional[Mapping[str, Any]] = None,
 ) -> CompiledQuery:
     """Compile one ``query`` payload into a :class:`CompiledQuery`.
 
@@ -1868,6 +1880,10 @@ def compile_semantic_query(
     it never bounds a visible version. A relationship that cannot be joined is refused with
     the reason. With ``related`` empty or ``None`` the statement is what it always was and a
     dotted name is refused like any unknown name.
+
+    ``contract`` is the contract the expose belongs to, when the caller has it: its
+    ``accessPolicy`` read grants then read every row alongside ``policy.authz.readers``
+    (:func:`row_filter_predicate`).
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
@@ -1877,7 +1893,9 @@ def compile_semantic_query(
 
     # Row-level security first: a caller the policy does not name, or a filter that
     # cannot be applied, is refused before the payload is looked at.
-    row_predicate = row_filter_predicate(expose, caller_attributes, dialect=dialect)
+    row_predicate = row_filter_predicate(
+        expose, caller_attributes, dialect=dialect, contract=contract
+    )
 
     restricted = _clean_column_names(restricted_columns)
     redacted = _clean_column_names(redacted_columns)
@@ -1945,6 +1963,7 @@ def compile_semantic_query(
         restricted=restricted,
         caller_attributes=caller_attributes,
         dialect=dialect,
+        contract=contract,
         taken=[
             *index.columns,
             *index.dimensions,
@@ -4313,6 +4332,7 @@ def compile_free_form_sql(
     caller_attributes: Optional[Mapping[str, Any]] = None,
     dialect: Optional[str] = None,
     physical_types: Optional[Callable[[], Mapping[str, Optional[ColumnType]]]] = None,
+    contract: Optional[Mapping[str, Any]] = None,
 ) -> CompiledQuery:
     """Compile a caller-supplied SQL ``query_sql`` payload.
 
@@ -4413,7 +4433,9 @@ def compile_free_form_sql(
     validate_sql_expression_allowlist(table_reference)
     # Row-level security first: a caller the policy does not name, or a filter that
     # cannot be applied, is refused before the statement is looked at further.
-    row_predicate = row_filter_predicate(expose or {}, caller_attributes, dialect=dialect)
+    row_predicate = row_filter_predicate(
+        expose or {}, caller_attributes, dialect=dialect, contract=contract
+    )
     # Column-mask enforcement — see the ``restricted_columns`` bullet
     # in the docstring above. Strip quoted string literals first so
     # ``WHERE label = 'email'`` doesn't false-positive when ``email``

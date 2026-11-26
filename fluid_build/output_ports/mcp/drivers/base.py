@@ -446,7 +446,9 @@ class EngineDriver(ABC):
         if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
-        predicate = row_filter_predicate(self.expose, caller_attributes, dialect=descriptor.dialect)
+        predicate = row_filter_predicate(
+            self.expose, caller_attributes, dialect=descriptor.dialect, contract=self.contract
+        )
         # Refuses an expose that declares no column, or only restricted ones: empty rows
         # would still count the table's rows.
         unrestricted_columns(self.expose, self._restricted_columns)

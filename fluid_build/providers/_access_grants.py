@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, FrozenSet, Iterable, Tuple
+from typing import Any, FrozenSet, Iterable, Mapping, Tuple
 
 #: Permission verbs that read (lower-cased, as ``accessPolicy`` permissions are read).
 READ_VERBS = frozenset({"read", "select", "query", "admin", "owner"})
@@ -95,10 +95,141 @@ def logical_key(raw: Any) -> str:
     return text
 
 
+class ReaderRuleError(ValueError):
+    """The policy that decides who reads every row cannot be read as written."""
+
+
+def _principal_names(values: Iterable[Any]) -> FrozenSet[str]:
+    """The non-blank strings among ``values``, trimmed."""
+    return frozenset(item.strip() for item in values if isinstance(item, str) and item.strip())
+
+
+def _declared_readers(authz: Mapping[str, Any]) -> FrozenSet[str]:
+    raw = authz.get("readers")
+    if raw is not None and not isinstance(raw, list):
+        raise ReaderRuleError("policy.authz.readers must be a list of principals.")
+    return _principal_names(raw or ())
+
+
+def _unmapped_keys(expose: Mapping[str, Any]) -> FrozenSet[str]:
+    """The logical keys (case folded) that ``binding.principals`` maps to ``[]``.
+
+    The shapes read are the ones ``fluid_build.iac.principals.principal_map`` accepts;
+    any other is refused, as the emitters refuse it. Only an empty list means "no
+    identity on this cloud": a principal mapped to an identity is not translated here.
+    """
+    binding = expose.get("binding")
+    raw = binding.get("principals") if isinstance(binding, Mapping) else None
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, Mapping):
+        raise ReaderRuleError(
+            f"binding.principals must be a mapping of logical principal to identity, got "
+            f"{type(raw).__name__}."
+        )
+    empty: set[str] = set()
+    for key, value in raw.items():
+        name = logical_key(key)
+        if not name:
+            raise ReaderRuleError("binding.principals has an empty key.")
+        if isinstance(value, str):
+            identities: Tuple[Any, ...] = (value.strip(),)
+        elif isinstance(value, (list, tuple)):
+            identities = tuple(item.strip() for item in value if isinstance(item, str))
+            if len(identities) != len(value):
+                identities = identities + ("",)
+        else:
+            identities = ("",)
+        if any(not identity for identity in identities):
+            raise ReaderRuleError(
+                f"binding.principals[{name!r}] must be an identity, a list of identities, or "
+                "[] for none on this cloud."
+            )
+        if not identities:
+            empty.add(name.casefold())
+    return frozenset(empty)
+
+
+def _verbs(raw: Any) -> FrozenSet[str]:
+    """A grant's permissions, normalized as ``fluid_build.iac.access`` reads them."""
+    try:
+        return frozenset(v for v in (str(i or "").strip().lower() for i in raw or ()) if v)
+    except TypeError:
+        return frozenset()
+
+
+def _read_grantees(expose: Mapping[str, Any], contract: Mapping[str, Any]) -> FrozenSet[str]:
+    """The principal of each unconditional read grant of ``accessPolicy`` covering ``expose``."""
+    if not isinstance(contract, Mapping):
+        raise ReaderRuleError("the contract is not a mapping, so its accessPolicy cannot be read.")
+    policy = contract.get("accessPolicy")
+    if policy is None:
+        return frozenset()
+    if not isinstance(policy, Mapping) or "$ref" in policy:
+        raise ReaderRuleError("accessPolicy is not a mapping, so its grants cannot be read.")
+    grants = policy.get("grants")
+    if grants is None:
+        return frozenset()
+    if not isinstance(grants, list):
+        raise ReaderRuleError("accessPolicy.grants is not a list, so its grants cannot be read.")
+    expose_id = expose.get("exposeId")
+    found: set[str] = set()
+    for entry in grants:
+        if not isinstance(entry, Mapping):
+            continue
+        principal = entry.get("principal")
+        if not isinstance(principal, str) or not principal.strip():
+            continue
+        if not READ_VERBS & _verbs(entry.get("permissions")):
+            continue
+        conditions = entry.get("conditions")
+        if conditions is not None and not (isinstance(conditions, Mapping) and not conditions):
+            continue
+        try:
+            resources = tuple(str(r) for r in (entry.get("resources") or ()))
+        except TypeError:
+            continue
+        if parse_grant_scope(resources).covers(expose_id):
+            found.add(principal.strip())
+    return frozenset(found)
+
+
+def every_row_readers(
+    expose: Mapping[str, Any],
+    *,
+    contract: Any = None,
+    filtered: Iterable[Any] = (),
+) -> FrozenSet[str]:
+    """The principals, as written, that read every row of an expose with row filters.
+
+    ``policy.authz.readers``, and, only when ``contract`` is given, the principal of each
+    ``accessPolicy.grants[]`` entry that has a permission in :data:`READ_VERBS`, no
+    condition (``conditions`` absent, ``None`` or empty) and a scope that covers the
+    expose. Less every principal ``binding.principals`` maps to ``[]`` and every
+    principal in ``filtered`` (the principals a row filter names), both compared by
+    :func:`logical_key` with the case folded: both subtractions only narrow the set.
+
+    The schema has no explicit deny for rows, so there is none to apply. A caller's
+    principals match the result as written; nothing here translates a principal
+    through ``binding.principals``, which is read only for the exclusion above.
+    Raises :class:`ReaderRuleError` for a policy that cannot be read as written.
+    """
+    policy = expose.get("policy")
+    authz = policy.get("authz") if isinstance(policy, Mapping) else None
+    candidates = set(_declared_readers(authz) if isinstance(authz, Mapping) else ())
+    if contract is not None:
+        candidates |= _read_grantees(expose, contract)
+    out = _unmapped_keys(expose)
+    named = {logical_key(item).casefold() for item in filtered} | out
+    return frozenset(c for c in candidates if logical_key(c).casefold() not in named)
+
+
 __all__ = [
     "CANONICAL_PREFIXES",
     "GrantScope",
     "READ_VERBS",
+    "ReaderRuleError",
+    "every_row_readers",
     "logical_key",
     "parse_grant_scope",
 ]
