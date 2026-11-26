@@ -286,6 +286,32 @@ def test_two_principals_mapped_to_one_iam_role_are_one_principal(filtered_arn, r
     assert "branch" in _predicate(contract, BRANCH)
 
 
+@pytest.mark.parametrize("shape", ["binding", "principals", "principals-entry"])
+def test_an_unresolved_pointer_under_binding_is_never_read_as_no_mapping(shape):
+    # Resolved, the mapping removes a principal mapped to [] and one mapped to the filtered
+    # identity from the readers. A pointer left unresolved must not read as "no mapping":
+    # both principals would then read every row.
+    contractors = "group:contractors@library.test"
+    analysts = "group:analysts@library.test"
+    contract = _contract(
+        [_grant(contractors), _grant(analysts)],
+        principals={
+            contractors: [],
+            analysts: "group:north@library.test",
+            BRANCH: "group:north@library.test",
+        },
+    )
+    binding = contract["exposes"][0]["binding"]
+    if shape == "binding":
+        contract["exposes"][0]["binding"] = {"$ref": "#/x-shared/binding"}
+    elif shape == "principals":
+        binding["principals"] = {"$ref": "#/x-shared/principals"}
+    else:
+        binding["principals"][contractors] = {"$ref": "#/x-shared/none"}
+    for who in (contractors, analysts):
+        assert _refused(lambda: _predicate(contract, who)) == "RowFilterUnavailable"
+
+
 def test_principals_mapped_to_different_identities_stay_apart():
     contract = _contract(
         [_grant(GRANTEE)],

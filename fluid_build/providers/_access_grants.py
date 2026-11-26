@@ -185,6 +185,13 @@ def _mapped_identities(
     translated for a caller: the mapping only tells which principals are one.
     """
     binding = expose.get("binding")
+    if isinstance(binding, Mapping) and (
+        "$ref" in binding or _holds_ref(binding.get("principals"))
+    ):
+        raise ReaderRuleError(
+            "binding or binding.principals holds an unresolved $ref, so the principals it "
+            "maps cannot be read as written; resolve the document's pointers first."
+        )
     raw = binding.get("principals") if isinstance(binding, Mapping) else None
     if raw is None:
         return {}, frozenset()
