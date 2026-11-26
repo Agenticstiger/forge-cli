@@ -21,7 +21,9 @@ from typing import Any, Dict, List, Tuple
 import pytest
 import yaml
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "update-model-catalog.yml"
+WORKFLOW = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "update-model-catalog.yml"
+)
 
 
 @pytest.fixture(scope="module")
@@ -70,7 +72,7 @@ def test_the_job_that_runs_fetched_code_cannot_write(doc):
 
 
 def test_the_write_job_installs_and_runs_nothing_it_fetched(doc):
-    (_, job), = _write_jobs(doc)
+    ((_, job),) = _write_jobs(doc)
     assert job["needs"] == "update-catalog"
     for step in _steps(job):
         assert _uses(step) in {"", "actions/checkout", "actions/download-artifact"}
@@ -80,7 +82,7 @@ def test_the_write_job_installs_and_runs_nothing_it_fetched(doc):
 
 
 def test_the_proposed_file_is_checked_before_it_replaces_anything(doc):
-    (_, job), = _write_jobs(doc)
+    ((_, job),) = _write_jobs(doc)
     names = [s.get("name") for s in _steps(job)]
     check = names.index("Check and place the proposed catalog")
     push = names.index("Push the proposed catalog to a branch")
@@ -90,7 +92,7 @@ def test_the_proposed_file_is_checked_before_it_replaces_anything(doc):
 
 
 def test_the_token_reaches_only_the_pushing_step_and_not_argv(doc):
-    (_, job), = _write_jobs(doc)
+    ((_, job),) = _write_jobs(doc)
     holders = [s for s in _steps(job) if "github.token" in yaml.safe_dump(s)]
     assert [s["name"] for s in holders] == ["Push the proposed catalog to a branch"]
     run = holders[0]["run"]
