@@ -432,6 +432,13 @@ def test_a_target_that_is_not_an_expose_of_the_contract_is_refused(world: Any) -
     _refused(w)
 
 
+def test_a_relationship_entry_without_a_name_is_passed_over(world: Any) -> None:
+    w = world()
+    w.base["semantics"]["relationships"].insert(0, {"to": "elsewhere"})
+    result = w.query(measure="reading_count", dimensions=["station_on_date.sensor_model"], limit=50)
+    assert _grouped(result, "reading_count") == _expect(UNFILTERED, "reading_count")
+
+
 def test_a_driver_that_cannot_read_another_expose_refuses_a_relationship_only(
     world: Any, caplog: pytest.LogCaptureFixture
 ) -> None:

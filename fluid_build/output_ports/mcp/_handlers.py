@@ -183,7 +183,7 @@ def _related_tables(
     served_policy = (served.get("agentPolicy") if isinstance(served, Mapping) else None) or {}
     by_name: Dict[str, Mapping[str, Any]] = {}
     for entry in expose["semantics"]["relationships"]:
-        if isinstance(entry, Mapping):
+        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
             by_name.setdefault(entry["name"], entry)
     related: Dict[str, RelatedTable] = {}
     for relationship in named:
