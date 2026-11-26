@@ -949,9 +949,10 @@ def pinned_children_cells(
 def parents_at_or_above(lower_edges: Sequence[int], floors: Iterable[int]) -> List[int]:
     """For each bin of a children-per-parent table, the parents known to lie in it or above it.
 
-    *floors* are the children each parent is known to hold at least: a public key's published
-    cells, each of which counts distinct child rows of that key. A parent whose floor reaches a
-    bin's lower edge holds at least that many children, so it lies in that bin or in one above.
+    *floors* are the children each parent is known to hold at least: what a public key's published
+    cells, changes and group sizes each show of its distinct child rows. A parent whose floor
+    reaches a bin's lower edge holds at least that many children, so it lies in that bin or in
+    one above.
     """
     held = list(floors)
     return [sum(1 for floor in held if floor >= edge) for edge in lower_edges]

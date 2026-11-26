@@ -15,9 +15,12 @@ the table when it does not:
 3. it holds at most :data:`MOST_REFERENCE_ROWS` rows, a cap of its own (the tracked foreign key
    of a history needs at most as many levels);
 4. every column is one the profile reads, is spelled as the format spells a cell, and is
-   unlabelled: no ``sensitivity`` but ``none``, no ``columnRestrictions`` and no ``masking``. It
-   is all or none, since the engine needs every contract column of a reference table and a
-   half-published table would be a second state;
+   unlabelled: no ``sensitivity`` but ``none``, no tag ``pii``, ``phi`` or ``sensitive`` (any
+   case), no ``columnRestrictions`` and no ``masking``. It is all or none, since the engine needs
+   every contract column of a reference table and a half-published table would be a second state.
+   The expose also states no row restriction, no ``policy.authz.rowFilters`` and no
+   ``policy.privacy.rowLevelPolicy``: a table whose rows a contract limits is not public to all
+   of them;
 5. each key column a relationship references is one column, never null and unique over the rows.
 
 The rows are sorted by the text of the first key column, in the code-point order of Unicode
@@ -71,6 +74,8 @@ PUBLIC = "Public"
 
 #: The longest cell PROFILE-SPEC section 5b allows, in characters.
 _MOST_CELL_CHARACTERS = 4096
+#: The tags (compared in any case) that mark a column as one a table released whole must not hold.
+_SENSITIVE_TAGS = frozenset({"pii", "phi", "sensitive"})
 
 _MS_PER_DAY = 86_400_000
 _EPOCH = datetime.date(1970, 1, 1)
@@ -197,13 +202,33 @@ def _marked_public(expose: Mapping[str, Any]) -> bool:
     return isinstance(policy, Mapping) and policy.get("classification") == PUBLIC
 
 
+def _tagged_sensitive(entry: Mapping[str, Any]) -> bool:
+    tags = entry.get("tags")
+    return isinstance(tags, list) and any(
+        isinstance(tag, str) and tag.casefold() in _SENSITIVE_TAGS for tag in tags
+    )
+
+
+def _restricts_rows(expose: Mapping[str, Any]) -> bool:
+    """Whether the contract limits who reads which rows of the expose."""
+    policy = expose.get("policy")
+    policy = policy if isinstance(policy, Mapping) else {}
+    authz = policy.get("authz")
+    privacy = policy.get("privacy")
+    return bool(authz.get("rowFilters") if isinstance(authz, Mapping) else None) or (
+        isinstance(privacy, Mapping) and privacy.get("rowLevelPolicy") is not None
+    )
+
+
 def _labelled(expose: Mapping[str, Any]) -> FrozenSet[str]:
-    """The columns a contract labels: a sensitivity but ``none``, a restriction or a masking."""
+    """The columns a contract labels: a sensitivity, a sensitive tag, a restriction or a masking."""
     found = set()
     contract = expose.get("contract")
     schema = contract.get("schema") if isinstance(contract, Mapping) else None
     for entry in schema if isinstance(schema, list) else ():
-        if isinstance(entry, Mapping) and entry.get("sensitivity", "none") != "none":
+        if isinstance(entry, Mapping) and (
+            entry.get("sensitivity", "none") != "none" or _tagged_sensitive(entry)
+        ):
             found.add(str(entry.get("name")))
     policy = expose.get("policy")
     policy = policy if isinstance(policy, Mapping) else {}
@@ -263,6 +288,8 @@ def _refusal(
         return "it is a versioned table, whose keys repeat", None
     if plan.skipped:
         return f"column {_columns_named([name for name, _ in plan.skipped])} is not read", None
+    if _restricts_rows(expose):
+        return "a row filter or a row-level policy limits who reads its rows", None
     labelled = _labelled(expose) & {column.name for column in plan.columns}
     if labelled:
         return f"column {_columns_named(sorted(labelled))} carries a label", None

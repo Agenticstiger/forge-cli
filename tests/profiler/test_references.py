@@ -126,6 +126,36 @@ def _cases() -> Dict[str, Dict[str, Any]]:
             },
             "expect": False,
         },
+        "row filter": {
+            "contract": {
+                "policy": {
+                    "authz": {
+                        "rowFilters": [{"principal": "group:staff", "where": "city = 'north'"}]
+                    }
+                }
+            },
+            "expect": False,
+        },
+        "row level policy": {
+            "contract": {"policy": {"privacy": {"rowLevelPolicy": {"expression": "true"}}}},
+            "expect": False,
+        },
+        "no row filter": {"contract": {"policy": {"authz": {"rowFilters": []}}}, "expect": True},
+    }
+    for tag in ("pii", "PHI", "Sensitive", "phi"):
+        cases[f"tag {tag}"] = {
+            "contract": {
+                "branch_columns": [{"name": "label", "type": "string", "tags": ["geo", tag]}]
+            },
+            "branch_rows": [{**row, "label": "x"} for row in library.branches(BRANCHES)],
+            "expect": False,
+        }
+    cases["tag that is no label"] = {
+        "contract": {
+            "branch_columns": [{"name": "label", "type": "string", "tags": ["geo", "reference"]}]
+        },
+        "branch_rows": [{**row, "label": "x"} for row in library.branches(BRANCHES)],
+        "expect": True,
     }
     for level in (
         "internal",
@@ -462,6 +492,58 @@ def test_mutant_only_some_sensitivity_values_are_labels(tmp_path, monkeypatch):
 
     monkeypatch.setattr(references, "_labelled", partly)
     assert _differs(tmp_path)
+
+
+def test_mutant_a_row_filter_is_no_restriction(tmp_path, monkeypatch):
+    def only_a_policy(expose: Any) -> bool:
+        privacy = (expose.get("policy") or {}).get("privacy") or {}
+        return privacy.get("rowLevelPolicy") is not None
+
+    monkeypatch.setattr(references, "_restricts_rows", only_a_policy)
+    assert _differs(tmp_path)
+
+
+def test_mutant_a_row_level_policy_is_no_restriction(tmp_path, monkeypatch):
+    def only_filters(expose: Any) -> bool:
+        authz = (expose.get("policy") or {}).get("authz") or {}
+        return bool(authz.get("rowFilters"))
+
+    monkeypatch.setattr(references, "_restricts_rows", only_filters)
+    assert _differs(tmp_path)
+
+
+def test_mutant_no_tag_marks_a_column(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "_tagged_sensitive", lambda entry: False)
+    assert _differs(tmp_path)
+
+
+def test_mutant_a_tag_is_read_without_folding_its_case(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        references,
+        "_tagged_sensitive",
+        lambda entry: any(tag in ("pii", "phi", "sensitive") for tag in entry.get("tags", ())),
+    )
+    assert _differs(tmp_path)
+
+
+def test_a_table_with_a_restricted_row_or_a_sensitive_tag_is_named_without_a_value(tmp_path):
+    for number, contract in enumerate(
+        (
+            {"policy": {"authz": {"rowFilters": [{"principal": "g", "where": "city = 'north'"}]}}},
+            {"policy": {"privacy": {"rowLevelPolicy": {"expression": "city = 'north'"}}}},
+            {"branch_columns": [{"name": "label", "type": "string", "tags": ["PII"]}]},
+        )
+    ):
+        rows = [{**row, "label": "x"} for row in library.branches(BRANCHES)]
+        result = library.profile(
+            _folder(tmp_path, str(number)),
+            library.contract(**contract),
+            rows,
+            library.cards(MEMBERS),
+        )
+        assert "references" not in result.document
+        said = _notes(result)["reference table branch"]
+        assert "north" not in said and "PII" not in said and said
 
 
 def test_mutant_a_versioned_target_is_published(tmp_path, monkeypatch):

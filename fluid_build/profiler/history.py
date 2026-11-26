@@ -78,12 +78,12 @@ withholds its group: its bins then say nothing of where records lie.
   the profile releases the table it references whole
   (:mod:`fluid_build.profiler.references`): its levels are that table's keys, in the order it
   publishes them. A value that is no key, a table that is not published and a key that is not
-  text are named and the column is not tracked. A published cell of ``initial`` (and of a change
-  into the key) is also a floor on the children of that key's parent, so beside the relationship's
-  children per parent it can give back a bin that relationship withholds
-  (:func:`disclosure.parents_at_or_above`); while it does, the published ``initial`` cell whose
-  key sits highest is withheld, and ``transitions`` whole where changes into the keys still
-  would (:func:`_guarded`).
+  text are named and the column is not tracked. A published cell of ``initial``, a group's size
+  and a published change into or out of a key are each a floor on the children of that key's
+  parent, so beside the relationship's children per parent they can give back a bin that
+  relationship withholds (:func:`disclosure.parents_at_or_above`). Where they would, the foreign
+  key's ``initial`` and its ``transitions`` are each withheld whole, at the level of the group,
+  so neither a size nor a cell is written for them (:func:`_guarded`).
 * ``reasons`` (with at least two tracked columns): the changes by the one tracked column that moves,
   or ``several``. Its cells and the transitions' group totals are linked: with two tracked columns
   ``several = M_a + M_b - k``, with ``M_a`` the changes of ``a`` (the sum of its transitions' group
@@ -1107,14 +1107,17 @@ def _initial(
     context: _Context,
     column: _Tracked,
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
-    withheld: FrozenSet[int] = frozenset(),
+    *,
+    whole: bool = False,
 ) -> Dict[str, Any]:
+    """The first level of each entity; with *whole*, withheld whole: no size and no cell."""
+    if whole:
+        return context.withheld("levelHistogram/1", {"levels": list(column.levels)}, [""])
     return _levels_entry(
         context,
         f"{context.expose_id}.{column.name} initial",
         column.levels,
         _initial_counts(column, stations),
-        withheld=withheld,
     )
 
 
@@ -1260,45 +1263,82 @@ def _reasons(
 # ---------------------------------------------------------------------------
 
 
-def _published_cells(entry: Mapping[str, Any]) -> List[List[bool]]:
-    """Which cells of each group of a written level histogram are published."""
-    size = len(entry["levels"])
-    return [
-        (
-            [count is not None for count in group["levelCounts"]]
-            if group["status"] == _FREE
-            else [False] * size
-        )
-        for group in entry["groups"]
-    ]
-
-
 def _floor(count: int, rule: disclosure.DisclosureRule) -> int:
-    """The records a reader knows a published cell holds at least: its band's lower end."""
+    """The records a reader knows a published number holds at least: its band's lower end."""
     return disclosure.sample_size(count, rule)["min"]
 
 
-def _incoming_floors(
-    column: _Tracked,
-    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
-    transitions: Mapping[str, Any],
-    rule: disclosure.DisclosureRule,
-) -> List[int]:
-    """The child rows each key is known to hold from the published changes into it.
+def _ceiling(count: int, rule: disclosure.DisclosureRule) -> int:
+    """The records a published number holds at most: its band's upper end."""
+    return disclosure.sample_size(count, rule)["max"]
 
-    The next version of every change into a key is a row of its own, and it holds that key.
+
+def _hidden_mass(
+    group: Mapping[str, Any], skip: Optional[int], rule: disclosure.DisclosureRule
+) -> Tuple[List[int], int]:
+    """The cells a published group withholds, and the records they hold together at least.
+
+    The group's size less the most each cell it publishes can hold: the size (and the cells) are
+    rounded, so the lower end of the size's band and the upper end of each cell's are used. The
+    cell at *skip* is the group's own, zero by the contract and no cell of the check. Whatever the
+    size says, the check's complementary suppression holds that the cells it withholds are not a
+    small count together: they hold at least the rule's minimum cell.
     """
-    moves, _ = _move_counts(column, stations)
-    shown = _published_cells(transitions)
-    size = len(column.levels)
-    return [
-        sum(
-            _floor(moves[before][after], rule)
-            for before in range(size)
-            if before != after and shown[before][after]
-        )
-        for after in range(size)
-    ]
+    cells = group["levelCounts"]
+    hidden = [at for at, count in enumerate(cells) if count is None and at != skip]
+    shown = sum(
+        _ceiling(count, rule) for at, count in enumerate(cells) if count is not None and at != skip
+    )
+    size = group.get("k")
+    sized = (_floor(size, rule) if isinstance(size, int) else 0) - shown
+    return hidden, max(sized, rule.minimum_cell) if hidden else 0
+
+
+def _changes_out(group: Mapping[str, Any], summed: int, rule: disclosure.DisclosureRule) -> int:
+    """The changes out of a key a published group shows: its size, or its cells if more."""
+    size = group.get("k")
+    return max(summed, _floor(size, rule) if isinstance(size, int) else 0)
+
+
+def _published_floors(
+    initial: Mapping[str, Any], transitions: Mapping[str, Any], rule: disclosure.DisclosureRule
+) -> List[int]:
+    """The child rows each key is known to hold, read from the entries as they are written.
+
+    A key's parent holds a row for each entity that starts at the key and for each change into it
+    (the next version of a change is a row of its own), and a row for each change out of it (the
+    version before the change is a row of its own). The first two are rows of the key's own
+    ``initial`` cell and of the cells of the other groups; the last is the group's size (or its
+    cells, where they sum to more). Where a group withholds cells but publishes its size, the
+    withheld cells hold at least that size less what the published ones can: that much is placed
+    on the withheld key already floored highest. A reader cannot tell which withheld key holds
+    it, and a bin it derives from every placement it derives from this one.
+    """
+    levels = initial["levels"]
+    held = [0] * len(levels)
+    left = [0] * len(levels)
+    masses: List[Tuple[List[int], int]] = []
+    (group,) = initial["groups"]
+    if group["status"] == _FREE:
+        for at, count in enumerate(group["levelCounts"]):
+            if count is not None:
+                held[at] += _floor(count, rule)
+        masses.append(_hidden_mass(group, None, rule))
+    for group in transitions["groups"]:
+        if group["status"] != _FREE:
+            continue
+        source = levels.index(group["group"])
+        summed = 0
+        for at, count in enumerate(group["levelCounts"]):
+            if count is not None and at != source:
+                held[at] += _floor(count, rule)
+                summed += _floor(count, rule)
+        left[source] = _changes_out(group, summed, rule)
+        masses.append(_hidden_mass(group, source, rule))
+    for hidden, mass in masses:
+        if hidden and mass:
+            held[max(hidden, key=lambda at: (max(held[at], left[at]), -at))] += mass
+    return [max(rows, changes) for rows, changes in zip(held, left, strict=True)]
 
 
 def _guarded(
@@ -1306,24 +1346,27 @@ def _guarded(
     window: Any,
     column: _Tracked,
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
-) -> Tuple[FrozenSet[int], bool]:
-    """The cells of a foreign key's ``initial`` to withhold, and whether its ``transitions`` go.
+) -> bool:
+    """Whether a foreign key's ``initial`` and ``transitions`` are both withheld whole.
 
-    A published cell of ``initial`` for a key says that key's parent holds at least that many child
-    rows (each entity's first version is a row of its own), and so does a published change into
-    it. Every key is a parent of the relationship that keys the column, so beside the relationship's
-    published children per parent a reader forms, for each bin, the parents that lie in it or above
-    it (:func:`disclosure.parents_at_or_above`). The bins the relationship withheld, which no other
-    count gave back, may be pinned by that. While they are, the published cell of ``initial`` whose
-    key sits highest is withheld too; a ``transitions`` that still pins one is withheld whole.
-    Nothing here reads a value: it reads counts the profiler formed.
+    A published number of either says that a key's parent holds at least that many child rows
+    (:func:`_published_floors`: a cell of ``initial``, a change into a key, a group's size, which
+    is the changes out of it). Every key is a parent of the relationship that keys the column, so
+    beside the relationship's published children per parent a reader forms, for each bin, the
+    parents that lie in it or above it (:func:`disclosure.parents_at_or_above`). The bins the
+    relationship withheld, which no other count gave back, may be pinned by that. Where they are,
+    both entries are withheld whole, at the level of the group, so neither a size, a
+    ``sampleSize`` nor a cell of them is written: a number written beside a withheld cell gives
+    that cell back (by the group's size) as much as the cell does. The check is run again on
+    what is written, so it holds as it stands. Nothing here reads a value: it reads counts the
+    profiler formed.
     """
     from fluid_build.profiler import runner
 
     stage = context.stage
     shown = stage.children_shown.get((context.expose_id, (column.name,)))
     if shown is None:
-        return frozenset(), False
+        return False
     edges = runner.CHILDREN_EDGES
     lower = list(edges[:-1])
     per_key = [0] * len(column.levels)
@@ -1342,27 +1385,19 @@ def _guarded(
         context.read,
         context.expose_id,
     )
-    incoming = _incoming_floors(
-        column, stations, _transitions(trial, window, column, stations), rule
-    )
-    counts = _initial_counts(column, stations)
-    held_back: FrozenSet[int] = frozenset()
-    while True:
-        shown_initial = _published_cells(_initial(trial, column, stations, held_back))[0]
-        floors = [
-            incoming[at] + (_floor(count, rule) if shown_initial[at] else 0)
-            for at, count in enumerate(counts)
-        ]
+    for whole in (False, True):
+        floors = _published_floors(
+            _initial(trial, column, stations, whole=whole),
+            _transitions(trial, window, column, stations, whole=whole),
+            rule,
+        )
         known = disclosure.parents_at_or_above(lower, floors)
         pinned = disclosure.pinned_children_cells(
             lower, cells, shown, children, rule, 0, None, known
         )
         if not pinned - base:
-            return held_back, False
-        open_ = [at for at, published in enumerate(shown_initial) if published]
-        if not open_:
-            return held_back, True
-        held_back |= {max(open_, key=lambda at: (bisect_right(lower, floors[at]), floors[at], -at))}
+            return whole
+    return True  # pragma: no cover - a withheld entry holds no floor
 
 
 def _entries(
@@ -1372,11 +1407,9 @@ def _entries(
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
 ) -> Dict[str, Any]:
     """The ``initial`` and the ``transitions`` of one tracked column."""
-    held, whole = (
-        _guarded(context, window, column, stations) if column.followed else (frozenset(), False)
-    )
+    whole = _guarded(context, window, column, stations) if column.followed else False
     return {
-        "initial": _initial(context, column, stations, held),
+        "initial": _initial(context, column, stations, whole=whole),
         "transitions": _transitions(context, window, column, stations, whole=whole),
     }
 

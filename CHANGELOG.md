@@ -141,17 +141,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid profile` publishes a small public table whole, and a history follows a foreign key to
   it.** An expose whose `policy.classification` is `Public` is written under `references`
   (format 1-3-0) when a relationship the profile counts reaches it, it is not versioned, holds at
-  most 64 rows and has no labelled column (no `sensitivity` but `none`, no column restriction,
-  no masking), and its referenced key is one column, never null and unique. The rows are sorted
+  most 64 rows, states no row restriction (no `policy.authz.rowFilters`, no
+  `policy.privacy.rowLevelPolicy`) and has no labelled column (no `sensitivity` but `none`, no tag
+  `pii`, `phi` or `sensitive` in any case, no column restriction, no masking), and its referenced
+  key is one column, never null and unique. The rows are sorted
   by the key's text and the columns keep the contract's order, so the bytes do not follow the
   source's row order. A private release, a profile request and a bundle's table never write it.
   A table marked `Public` that is left out is named with the reason under Not measured, and the
   report names each table published whole, so a mislabelled table is never published silently.
   A history tracks a foreign key to a published table, its levels the table's keys: its `initial`
-  and `transitions` cells are checked as any column's, and a published cell is also a floor on the
-  key's children, so a published cell is withheld where the floors would give back a bin the
-  children per parent withheld. A numeric key is published, and its foreign key is named as not
-  followed.
+  and `transitions` cells are checked as any column's. Each count they publish for a key (a cell of
+  `initial`, a change into the key, a group's size, which is the changes out of it) is also a floor
+  on that key's children, so the foreign key's shares are withheld whole (neither `initial` nor
+  `transitions` writes a size or a cell) when the per-key counts would bound the
+  children-per-parent histogram's withheld bins. A numeric key is published, and its
+  foreign key is named as not followed.
 
 ### Changed
 
