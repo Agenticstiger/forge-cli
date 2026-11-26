@@ -594,6 +594,7 @@ def test_a_target_bucket_of_another_account_is_refused(tmp_path: Path, s3: Deplo
     s3.owner["acme-jobs"] = "999999999999"
     done = _deploy(uri, s3)
     assert done.exit_code == 1 and f"not account {ACCOUNT}'s" in done.reason
+    assert "s3:ListBucket on the bucket" in done.reason
     assert _target_writes(s3) == []
     assert all(h for h in s3.targets_head)  # ExpectedBucketOwner on every target read
 
@@ -1115,7 +1116,7 @@ def test_objects_written_while_versioning_was_suspended_are_named(tmp_path: Path
     assert done.exit_code == 2 and "written while the bucket's versioning was off or " in (
         done.reason
     )
-    assert "publish the release again" in done.reason and _target_writes(s3) == []
+    assert "publish from a new commit" in done.reason and _target_writes(s3) == []
 
 
 def test_an_object_read_with_no_etag_is_named(
@@ -1150,3 +1151,19 @@ def test_a_dry_run_that_cannot_read_a_target_decides_nothing(
     assert done.exit_code == 2 and done.receipt is None
     done = _deploy(uri, s3)  # a real deploy that stopped: exit 1 and a FAILED receipt
     assert done.exit_code == 1 and done.receipt is not None
+
+
+def test_a_read_back_refused_names_s3_get_object_version(
+    tmp_path: Path, s3: DeployS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uri = _published(tmp_path, s3)
+    real = DeployS3.head_object
+
+    def no_versions(self: Any, **kw: Any) -> Dict[str, Any]:
+        if kw.get("ExpectedBucketOwner") and kw.get("VersionId"):
+            raise S3Error("AccessDenied", 403)
+        return real(self, **kw)
+
+    monkeypatch.setattr(DeployS3, "head_object", no_versions)
+    done = _deploy(uri, s3)
+    assert done.exit_code == 1 and "lack s3:GetObjectVersion on it" in done.reason

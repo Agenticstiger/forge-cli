@@ -331,7 +331,9 @@ def _pinned(
         raise DeployError(
             f"{checked.source}{clean(unpinned[0], 200)} was written while the bucket's versioning "
             "was off or Suspended (version null), which the next write replaces in place, so it "
-            "pins nothing: publish the release again now that versioning is Enabled",
+            "pins nothing. A publish of the same code finds those objects already there: publish "
+            "from a new commit (a new code digest), or have an admin remove the null versions "
+            "first",
             UNDECIDED,
         )
     untagged = [o["path"] for o in checked.objects if not o.get("etag")]
@@ -517,9 +519,15 @@ class _Copier:
             if s3.is_missing_code(code) and not version:
                 return None
             if s3.is_denied_code(code):
+                need = (
+                    "s3:GetObjectVersion on it"
+                    if version
+                    else "s3:GetObject on the key and s3:ListBucket on the bucket (without "
+                    "s3:ListBucket, S3 answers a key not written yet as denied)"
+                )
                 raise DeployError(
                     f"{shown}: reading it is refused ({code}): the bucket is not account "
-                    f"{self.account}'s, or these credentials lack s3:GetObject on it"
+                    f"{self.account}'s, or these credentials lack {need}"
                 ) from None
             raise DeployError(
                 f"{shown} cannot be read ({code or type(exc).__name__})", UNDECIDED
