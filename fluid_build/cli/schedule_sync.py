@@ -1673,7 +1673,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
                     )
                 },
             )
-        from fluid_build.cli._signing import cosign_available, verify_bundle
+        from fluid_build.cli._signing import cosign_available, stderr_last_line, verify_bundle
 
         if not cosign_available():
             raise CLIError(
@@ -1698,7 +1698,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
             cprint(
                 "[schedule-sync] \u2718 bundle signature verification FAILED "
                 f"(exit {verify_result['exit_code']}): "
-                f"{verify_result.get('stderr_tail', '')[:500]}",
+                f"{stderr_last_line(verify_result)}",
                 markup=False,
             )
             logger.error(

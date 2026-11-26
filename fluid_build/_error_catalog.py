@@ -934,6 +934,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "supply-chain",
     ),
+    "signing_sigstore_bundle_missing": (
+        [
+            "Sign the bundle first ('fluid bundle <contract> --format tgz --sign'): it writes "
+            "<bundle>.sigstore.json beside it",
+            "Or name the Sigstore bundle with --bundle PATH",
+        ],
+        "supply-chain",
+    ),
     "signing_key_ref_empty": (
         [
             "Provide a signing key reference (e.g. a cosign key or KMS key URI)",

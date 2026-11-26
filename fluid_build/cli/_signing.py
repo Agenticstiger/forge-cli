@@ -5,10 +5,14 @@
 
 Three operations exposed:
 
-- :func:`sign_bundle`   — ``cosign sign-blob`` → produces
-  ``<bundle>.sig`` + ``<bundle>.pem`` next to the bundle.
-- :func:`verify_bundle` — ``cosign verify-blob`` → returns success/
-  failure + (on success) the OIDC identity that signed.
+- :func:`sign_bundle`   — ``cosign sign-blob --bundle`` → produces one Sigstore bundle,
+  ``<bundle>.sigstore.json``, next to the bundle: the signature, the certificate (keyless)
+  and the transparency-log proof.
+- :func:`verify_bundle` — ``cosign verify-blob --bundle`` → returns success/failure.
+
+One ``--bundle`` file is the only output cosign 3.x writes for a blob (``--output-signature``
+and ``--output-certificate`` are gone there); cosign 2.x writes its own bundle format and 3.x
+the Sigstore one, so sign and verify with the same major version.
 - :func:`cosign_available` — ``shutil.which("cosign")`` guard used
   by callers that want to soft-fail when the binary is absent.
 
@@ -236,12 +240,10 @@ def _run_cosign(argv: List[str], *, timeout: int = _DEFAULT_TIMEOUT) -> Dict:
 def sign_bundle(
     bundle_path: str,
     *,
-    sig_out: Optional[str] = None,
-    pem_out: Optional[str] = None,
     key_ref: Optional[str] = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> Dict:
-    """Sign a tgz bundle with Sigstore cosign.
+    """Sign a tgz bundle with Sigstore cosign into ``<bundle>.sigstore.json``.
 
     **Mode selection:**
     - ``key_ref=None`` (default) → keyless OIDC via ambient environment
@@ -254,31 +256,21 @@ def sign_bundle(
       var for encrypted local keys. Use on Bitbucket Pipelines (no
       native Sigstore OIDC federation) or air-gapped environments.
 
-    Arguments:
-      bundle_path: Path to the .tgz bundle to sign. Validated — must
-        exist, be a regular file, and have a .tgz / .tar.gz extension.
-      sig_out: Destination for the signature. Defaults to
-        ``<bundle>.sig``.
-      pem_out: Destination for the signing certificate (keyless mode
-        only — ignored in keyed mode, which produces no cert).
-        Defaults to ``<bundle>.pem``.
-      key_ref: Optional key reference for keyed mode (see above).
-        Strict whitelist applied: must be a file path OR a URI with
-        scheme in {``awskms``, ``gcpkms``, ``hashivault``, ``k8s``,
-        ``pkcs11``, ``file``}. Rejects anything else to prevent
-        argument-injection via a crafted ``key_ref`` value.
-      timeout: Per-subprocess cap (seconds). Default 120.
+    ``bundle_path`` must exist, be a regular file and have a .tgz / .tar.gz extension;
+    ``key_ref`` passes the strict whitelist of :func:`_validate_key_ref`.
 
-    Returns a dict with ``exit_code``, ``sig_path``, ``pem_path``,
-    ``key_mode`` (``"keyless"`` or ``"keyed"``), plus the redacted
-    argv + stdout/stderr tails for logging.
+    Returns the :func:`sign_blob` dict: ``exit_code``, ``bundle_path`` (the Sigstore bundle
+    written), ``key_mode`` (``"keyless"`` or ``"keyed"``), plus the redacted argv and
+    stdout/stderr tails, and ``signed_path``, the tgz.
 
     Raises CLIError for malformed inputs (missing bundle, wrong
     extension, cosign-not-on-PATH, bad key_ref). A non-zero exit from
     cosign is returned in the dict — callers decide how to react.
     """
     bundle = _validate_bundle_path(bundle_path)
-    return _sign_file(bundle, sig_out=sig_out, pem_out=pem_out, key_ref=key_ref, timeout=timeout)
+    result = sign_blob(str(bundle), key_ref=key_ref, timeout=timeout)
+    result["signed_path"] = str(bundle)
+    return result
 
 
 def sign_blob(
@@ -314,153 +306,56 @@ def sign_blob(
     return result
 
 
-def _sign_file(
-    bundle: Path,
-    *,
-    sig_out: Optional[str],
-    pem_out: Optional[str],
-    key_ref: Optional[str],
-    timeout: int,
-) -> Dict:
-    cosign = _resolve_cosign()
-    sig_path = Path(sig_out).resolve() if sig_out else bundle.with_suffix(bundle.suffix + ".sig")
-    pem_path = Path(pem_out).resolve() if pem_out else bundle.with_suffix(bundle.suffix + ".pem")
-
-    # Build argv. The shape differs between keyless and keyed modes:
-    #   keyless: cosign sign-blob --yes --output-signature --output-certificate <bundle>
-    #   keyed:   cosign sign-blob --key <ref> --output-signature <bundle>  (no cert)
-    if key_ref is None:
-        # Keyless OIDC — Fulcio ephemeral cert.
-        # --yes bypasses the confirmation prompt (we're non-interactive).
-        argv = [
-            cosign,
-            "sign-blob",
-            "--yes",
-            "--output-signature",
-            str(sig_path),
-            "--output-certificate",
-            str(pem_path),
-            str(bundle),
-        ]
-        key_mode = "keyless"
-    else:
-        # Keyed mode — validate key_ref against the whitelist before
-        # it reaches argv. Prevents a crafted value like ``--foo bar``
-        # from being parsed as a cosign flag (though cosign itself
-        # would treat it as a path; defence-in-depth).
-        _validate_key_ref(key_ref)
-        argv = [
-            cosign,
-            "sign-blob",
-            "--yes",
-            "--key",
-            key_ref,
-            "--output-signature",
-            str(sig_path),
-            str(bundle),
-        ]
-        key_mode = "keyed"
-    result = _run_cosign(argv, timeout=timeout)
-    result["sig_path"] = str(sig_path)
-    result["pem_path"] = str(pem_path) if key_ref is None else None
-    result["bundle_path"] = str(bundle)
-    result["key_mode"] = key_mode
-    return result
-
-
 def verify_bundle(
     bundle_path: str,
     *,
-    sig_path: Optional[str] = None,
-    pem_path: Optional[str] = None,
+    sigstore_bundle: Optional[str] = None,
     key_ref: Optional[str] = None,
+    certificate_identity: Optional[str] = None,
+    certificate_oidc_issuer: Optional[str] = None,
     identity_regexp: str = ".*",
     oidc_issuer_regexp: str = ".*",
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> Dict:
-    """Verify a signed tgz bundle via ``cosign verify-blob``.
+    """Verify a signed tgz bundle from its Sigstore bundle via ``cosign verify-blob --bundle``.
 
     **Mode selection mirrors :func:`sign_bundle`:**
-    - ``key_ref=None`` → keyless verify against Fulcio cert chain.
-      Matches keyless-signed bundles; requires ``.pem`` file + Fulcio
-      network access (or ``SIGSTORE_TRUST_REKOR_API_PUBLIC_KEY`` /
-      ``COSIGN_EXPERIMENTAL=1`` in air-gapped setups).
-    - ``key_ref="<path-or-kms-uri>"`` → keyed verify against a public
-      key. Matches keyed-signed bundles. No ``.pem`` involved.
+    - ``key_ref=None`` → keyless: the certificate in the Sigstore bundle must chain to
+      Fulcio and name the signer. ``certificate_identity`` with ``certificate_oidc_issuer``
+      pins it exactly; otherwise ``identity_regexp`` and ``oidc_issuer_regexp`` match it
+      (default ``.*``, permissive: tighten in production).
+    - ``key_ref="<path-or-kms-uri>"`` → keyed verify against a public key.
 
-    Arguments:
-      bundle_path: Path to the .tgz bundle.
-      sig_path: Path to the .sig. Defaults to ``<bundle>.sig``.
-      pem_path: Path to the .pem (keyless mode only). Defaults to
-        ``<bundle>.pem``. Ignored in keyed mode.
-      key_ref: Optional public-key reference for keyed verification
-        (path or KMS URI). Same whitelist as :func:`sign_bundle`.
-      identity_regexp: Regexp matching the acceptable OIDC subject
-        (keyless mode only). Default permissive (``.*``) — tighten
-        in production to pin signer identity.
-      oidc_issuer_regexp: Regexp matching the acceptable OIDC issuer
-        (keyless mode only). Default permissive.
-      timeout: Per-subprocess cap.
-
-    Returns a dict with ``exit_code`` (0 = signature valid), argv,
-    ``key_mode`` (``"keyless"`` or ``"keyed"``), and stdout/stderr
-    tails. CLIError on malformed inputs (missing bundle/sig/pem,
-    cosign not on PATH, bad key_ref).
+    ``sigstore_bundle`` defaults to ``<bundle>.sigstore.json``, what :func:`sign_bundle`
+    writes. Returns the :func:`_run_cosign` dict (``exit_code`` 0 = signature valid) with
+    ``key_mode`` and ``sigstore_bundle``. CLIError on malformed inputs (a missing bundle or
+    Sigstore bundle, cosign not on PATH, a bad key_ref).
     """
-    cosign = _resolve_cosign()
     bundle = _validate_bundle_path(bundle_path)
-    sig = Path(sig_path).resolve() if sig_path else bundle.with_suffix(bundle.suffix + ".sig")
-    if not sig.exists():
+    signed = (
+        Path(sigstore_bundle).resolve()
+        if sigstore_bundle
+        else bundle.with_name(bundle.name + ".sigstore.json")
+    )
+    if not signed.is_file():
         raise CLIError(
             2,
-            "signing_sig_missing",
-            {"sig_path": str(sig), "hint": "did bundle --sign run?"},
+            "signing_sigstore_bundle_missing",
+            {"sigstore_bundle": str(signed), "hint": "did bundle --sign run?"},
         )
-
-    if key_ref is None:
-        # Keyless verification — needs .pem + identity/issuer regexps.
-        pem = Path(pem_path).resolve() if pem_path else bundle.with_suffix(bundle.suffix + ".pem")
-        if not pem.exists():
-            raise CLIError(
-                2,
-                "signing_pem_missing",
-                {"pem_path": str(pem), "hint": "did bundle --sign run?"},
-            )
-        argv = [
-            cosign,
-            "verify-blob",
-            "--signature",
-            str(sig),
-            "--certificate",
-            str(pem),
-            "--certificate-identity-regexp",
-            identity_regexp,
-            "--certificate-oidc-issuer-regexp",
-            oidc_issuer_regexp,
-            str(bundle),
-        ]
-        key_mode = "keyless"
-        pem_str: Optional[str] = str(pem)
-    else:
-        # Keyed verification — public key only, no Fulcio.
-        _validate_key_ref(key_ref)
-        argv = [
-            cosign,
-            "verify-blob",
-            "--key",
-            key_ref,
-            "--signature",
-            str(sig),
-            str(bundle),
-        ]
-        key_mode = "keyed"
-        pem_str = None
-
-    result = _run_cosign(argv, timeout=timeout)
-    result["sig_path"] = str(sig)
-    result["pem_path"] = pem_str
+    result = verify_blob(
+        str(bundle),
+        bundle_path=str(signed),
+        key_ref=key_ref,
+        certificate_identity=certificate_identity,
+        certificate_oidc_issuer=certificate_oidc_issuer,
+        identity_regexp=None if certificate_identity else identity_regexp,
+        oidc_issuer_regexp=None if certificate_oidc_issuer else oidc_issuer_regexp,
+        timeout=timeout,
+    )
+    result["sigstore_bundle"] = str(signed)
     result["bundle_path"] = str(bundle)
-    result["key_mode"] = key_mode
+    result["key_mode"] = "keyless" if key_ref is None else "keyed"
     return result
 
 
@@ -471,12 +366,15 @@ def verify_blob(
     key_ref: Optional[str] = None,
     certificate_identity: Optional[str] = None,
     certificate_oidc_issuer: Optional[str] = None,
+    identity_regexp: Optional[str] = None,
+    oidc_issuer_regexp: Optional[str] = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> Dict:
     """Verify a file :func:`sign_blob` signed, from its bundle, with ``cosign verify-blob``:
-    against ``key_ref`` (keyed), or with the signer pinned exactly (``certificate_identity``
-    and ``certificate_oidc_issuer``, both required keyless: an identity that is not pinned
-    proves nothing about who signed).
+    against ``key_ref`` (keyed), or keyless with the signer named: exactly
+    (``certificate_identity`` and ``certificate_oidc_issuer``) or, where a caller asks for
+    it, by regular expressions (``identity_regexp`` and ``oidc_issuer_regexp``). Keyless
+    needs one of the two for both the identity and the issuer.
 
     Returns the :func:`_run_cosign` dict; ``exit_code`` 0 is a valid signature.
     Raises CLIError on a malformed input or no cosign.
@@ -490,19 +388,40 @@ def verify_blob(
         _validate_key_ref(key_ref)
         argv += ["--key", key_ref]
     else:
-        if not (certificate_identity and certificate_oidc_issuer):
+        identity = (
+            f"--certificate-identity={certificate_identity}"
+            if certificate_identity
+            else (
+                f"--certificate-identity-regexp={identity_regexp}"
+                if identity_regexp is not None
+                else None
+            )
+        )
+        issuer = (
+            f"--certificate-oidc-issuer={certificate_oidc_issuer}"
+            if certificate_oidc_issuer
+            else (
+                f"--certificate-oidc-issuer-regexp={oidc_issuer_regexp}"
+                if oidc_issuer_regexp is not None
+                else None
+            )
+        )
+        if identity is None or issuer is None:
             raise CLIError(
                 2,
                 "signing_identity_not_pinned",
                 {"hint": "keyless verification needs the signer's identity and issuer"},
             )
         # one argv element each, so a value that starts with "-" is never read as a flag
-        argv += [
-            f"--certificate-identity={certificate_identity}",
-            f"--certificate-oidc-issuer={certificate_oidc_issuer}",
-        ]
+        argv += [identity, issuer]
     argv.append(str(blob))
     return _run_cosign(argv, timeout=timeout)
+
+
+def stderr_last_line(result: Dict, limit: int = 300) -> str:
+    """The last line cosign wrote to stderr, cut to ``limit``: its error, after any warnings."""
+    lines = [line for line in str(result.get("stderr_tail") or "").splitlines() if line.strip()]
+    return lines[-1][:limit] if lines else ""
 
 
 __all__ = [

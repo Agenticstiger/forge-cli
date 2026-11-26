@@ -112,9 +112,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "CircleCI, and GCP WIF out-of-the-box (cosign auto-detects). "
             "For Bitbucket Pipelines / air-gapped / regulatory setups, "
             "pair with ``--sign-key <path-or-kms-uri>``. "
-            "Writes ``<bundle>.sig`` (+ ``<bundle>.pem`` in keyless mode) "
-            "next to the bundle. Requires the ``cosign`` binary on PATH; "
-            "fails loud if absent. Ignored for yaml/json output."
+            "Writes one Sigstore bundle, ``<bundle>.sigstore.json`` (the "
+            "signature, the certificate in keyless mode, the log proof), "
+            "next to the bundle. Requires the ``cosign`` binary on PATH "
+            "(sign and verify with the same major version); fails loud if "
+            "absent. Ignored for yaml/json output."
         ),
     )
     p.add_argument(
@@ -610,17 +612,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                     f"{sig_result.get('stderr_tail', '')[:500]}\n"
                 )
                 return 1
-            # Keyless mode emits sig + cert; keyed mode emits sig only.
-            if sig_result.get("key_mode") == "keyed":
-                sys.stderr.write(
-                    f"✅ Bundle signed (keyed mode)\n   signature: {sig_result['sig_path']}\n"
-                )
-            else:
-                sys.stderr.write(
-                    f"✅ Bundle signed (keyless OIDC)\n"
-                    f"   signature:   {sig_result['sig_path']}\n"
-                    f"   certificate: {sig_result['pem_path']}\n"
-                )
+            mode = "keyed mode" if sig_result.get("key_mode") == "keyed" else "keyless OIDC"
+            sys.stderr.write(
+                f"✅ Bundle signed ({mode})\n   sigstore bundle: {sig_result['bundle_path']}\n"
+            )
 
         # ── Optional: SLSA L2 in-toto attestation ─────────────────────
         # Emitted AFTER signing so a combined --sign --attest run

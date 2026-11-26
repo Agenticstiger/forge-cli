@@ -125,6 +125,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_MISSING_BLUEPRINT_PARAMETER` | The blueprint requires a parameter — pass it with --param key=value. | advanced/production-troubleshooting.html |
 | `ERR_SIGNING_BUNDLE_MISSING` | Produce the bundle first ('fluid bundle <contract> --format tgz'), then sign it. | cli/verify-signature.html |
 | `ERR_SIGNING_BUNDLE_NOT_FILE` | The signing target must be a bundle file, not a directory. Produce one with 'fluid bundle <contract> --format tgz', then sign that .tgz. | cli/verify-signature.html |
+| `ERR_SIGNING_SIGSTORE_BUNDLE_MISSING` | Sign the bundle first ('fluid bundle <contract> --format tgz --sign'): it writes <bundle>.sigstore.json beside it. Or name the Sigstore bundle with --bundle PATH. | cli/verify-signature.html |
 | `ERR_SIGNING_KEY_REF_EMPTY` | Provide a signing key reference (e.g. a cosign key or KMS key URI). See the signing setup in the supply-chain docs. | cli/verify-signature.html |
 | `ERR_VALIDATE_ARTIFACTS_INPUT_MISSING` | Pass the generated-artifacts path produced by 'fluid generate artifacts'. | advanced/production-troubleshooting.html |
 | `ERR_SCHEDULE_SYNC_DAGS_DIR_MISSING` | Pass --dags-dir pointing at your Airflow DAGs directory. | advanced/production-troubleshooting.html |
