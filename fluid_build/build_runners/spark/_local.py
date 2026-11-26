@@ -647,7 +647,8 @@ def read_failed(host: LocalHost, run: DesiredRun, config_hash: str) -> Optional[
             refused too, or reads (``job_config_readable``), which leaves a missing marker and
             a refused one indistinguishable.
     """
-    from fluid_build.build_runners.spark._adapters import MarkerReadDenied, is_denied_code
+    from fluid_build.build_runners.spark._adapters import MarkerReadDenied
+    from fluid_build.util.s3 import is_denied_code
 
     job_uri = bound_job_uri(host, run)
     uri = failed_release_uri(job_uri, config_hash)
@@ -809,13 +810,15 @@ def _s3_client(env: Mapping[str, str]) -> Any:
 
 def _put_s3(files: Any, env: Mapping[str, str]) -> None:
     """Upload ``files`` (``(uri, body)`` pairs) to an ``s3://`` root (:func:`_s3_client`)."""
+    from fluid_build.util.s3 import error_code
+
     client = _s3_client(env)
     for uri, body in files:
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
             client.put_object(Bucket=bucket, Key=key, Body=body)
         except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
-            code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+            code = error_code(exc)
             raise SparkRunError(
                 f"s3://{bucket}/{key} cannot be written: {code or type(exc).__name__}"
             ) from exc

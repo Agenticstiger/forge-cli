@@ -731,7 +731,14 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
     CoreCommand("forge", "forge", (_cmd("forge", "🔨 Create a new data product with AI Copilot"),)),
     CoreCommand("contract", "contract", (_cmd("contract", "Inspect / mutate FLUID contracts"),)),
     CoreCommand(
-        "runs", "runs", (_cmd("runs", "Inspect acquisition run history (status / logs / diff)"),)
+        "runs",
+        "runs",
+        (
+            _cmd(
+                "runs",
+                "Inspect run history and sealed releases (status / verify-release / logs / diff)",
+            ),
+        ),
     ),
     CoreCommand(
         "retention", "retention", (_cmd("retention", "Retention sweep over the state directory"),)

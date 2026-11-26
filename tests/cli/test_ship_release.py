@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from fluid_build.cli import _ship_report as report
 from fluid_build.cli import _ship_stages as st
 from fluid_build.cli import ship
 from fluid_build.forge.core import bundle as bundle_mod
+from fluid_build.util import release_record
 
 LOG = logging.getLogger("test_ship_release")
 REPO_ROOT = Path(fluid_build.__file__).resolve().parent.parent
@@ -114,10 +116,9 @@ class FakeStages:
             out.mkdir(parents=True, exist_ok=True)
             (out / "product.odcs.orders.yaml").write_text("x")
             digest = release._sha256(out / "product.odcs.orders.yaml")
+            listed = {"odcs/product.odcs.orders.yaml": digest}
             Path(st.ARTIFACTS_MANIFEST).write_text(
-                json.dumps(
-                    {"digest": "sha256:m", "files": {"odcs/product.odcs.orders.yaml": digest}}
-                )
+                json.dumps({"digest": bundle_mod.merkle_root(listed), "files": listed})
             )
         elif stage == "validate":
             Path(st.VALIDATE_REPORT).write_text("{}")
@@ -255,7 +256,12 @@ def test_a_passing_run_publishes_the_release(
     assert index["identity"]["fluid_version"] == "0.7.5"
     assert index["identity"]["forge_version"] == fluid_build.__version__
     assert index["identity"]["emit"] == list(release._emit_set(st.ShipOptions(contract="c")))
-    assert index["identity"]["artifacts"] == {"manifest_digest": "sha256:m"}
+    listed = {
+        "odcs/product.odcs.orders.yaml": release._sha256(
+            rel / "artifacts/odcs/product.odcs.orders.yaml"
+        )
+    }
+    assert index["identity"]["artifacts"] == {"manifest_digest": bundle_mod.merkle_root(listed)}
     assert "plan" not in index["identity"]  # stage 6 did not run
     assert index["identity_digest"] == release.identity_digest(index["identity"])
     assert [g["status"] for g in index["gates"]][:5] == ["passed"] * 4 + ["not-run"]
@@ -300,8 +306,18 @@ def test_a_release_records_the_versions_of_the_exposes_and_the_code_it_was_built
         "repository": "https://github.com/org/orders",
         "ref": "refs/tags/v1.4.0",
     }
-    # the code's revision describes the run: it is not in what identifies the release
-    assert sha not in json.dumps(index["identity"])
+    # the commit is part of what identifies the release (SLSA: a resolved dependency); the
+    # ref is not, so a branch build and a tag build of one commit are one release
+    assert index["identity"]["source"] == {
+        "uri": "git+https://github.com/org/orders",
+        "digest": {"gitCommit": sha},
+    }
+    assert "refs/tags" not in json.dumps(index["identity"])
+    # the code digest: the same for every environment sealed from this commit and lock
+    assert index["code_digest"] == release.code_digest(index["identity"])
+    code = {k: index["identity"].get(k) for k in release_record.CODE_KEYS}
+    canonical = release_record.canonical(code)
+    assert index["code_digest"] == "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 def test_the_release_names_its_bundles_source_contract_from_where_it_sits(
@@ -833,3 +849,23 @@ def test_a_plan_made_from_the_release_applies_with_its_dbt_project(tmp_path: Pat
     edited = _cli(moved, *apply_argv)
     assert edited.returncode == 1
     assert "changed models/orders.sql" in edited.stdout + edited.stderr
+
+
+def test_without_a_ci_commit_the_identity_names_no_source_and_no_code_digest() -> None:
+    assert release.source_identity({}) is None
+    assert release.source_identity({"GITHUB_RUN_ID": "1", "GITHUB_SHA": "main"}) is None
+    assert release.code_digest({"product_id": "p"}) is None
+    source = release.source_identity(
+        {"CI_JOB_ID": "1", "CI_COMMIT_SHA": "a" * 40, "CI_COMMIT_REF_NAME": "main"}
+    )
+    assert source == {"digest": {"gitCommit": "a" * 40}}  # no repository: no uri
+
+
+def test_the_code_digest_is_the_same_in_every_environment() -> None:
+    base = {"product_id": "p", "source": {"digest": {"gitCommit": "a" * 40}}, "forge_version": "1"}
+    dev = {**base, "environment": "dev", "bundle": {"sha256": "sha256:" + "1" * 64}}
+    prod = {**base, "environment": "prod", "bundle": {"sha256": "sha256:" + "2" * 64}}
+    assert release.identity_digest(dev) != release.identity_digest(prod)
+    assert release.code_digest(dev) == release.code_digest(prod)
+    changed = {**prod, "source": {"digest": {"gitCommit": "b" * 40}}}
+    assert release.code_digest(changed) != release.code_digest(prod)

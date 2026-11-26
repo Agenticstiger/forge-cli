@@ -76,14 +76,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A lock lists the files a product runs that Forge does not build (a Spark package, an Airflow
   DAG, any other file), each with its sha256 and the repository, commit and optional ref it was
   built from. Before any stage runs, ship refuses a lock it cannot seal: an unknown field or kind,
-  a path that is absolute, hidden or leads out of the lock's directory (by `..` or a linked
-  directory), a link, or bytes that are not the sha256 named (the message never shows the digest
-  the file has). The release copies each file to `external/<name>/<file>`, hashes the copy again
+  a path that names no file, is absolute, is hidden or leads out of the lock's directory by `..`,
+  a path through any linked directory, a link, or bytes that are not the sha256 named (the message
+  never shows the digest the file has). The release copies each file to `external/<name>/<file>`, hashes the copy again
   and records the entries in its `identity`, sorted by name and with no path on the machine that
   ran it, so two clean runs give one identity and changed bytes give a new one.
   `$RELEASE_ARTIFACTS` names the lock when the flag is absent, read only by a run that seals a
   release; the flag without `--release-dir` is refused. `fluid runs status --release-dir` names
   each external file and its source.
+- **`fluid ship --release-dir DIR --release-to s3://bucket/prefix/` publishes the sealed release
+  to S3, write-once.** After the local seal, every file goes under
+  `<prefix>/<product>/<code hex>/<env>/`, so each environment's release of one commit and one
+  lock sits under one code digest. Each file is one single-part PutObject with `ChecksumSHA256`
+  and `If-None-Match: *`, read back with `HeadObject` (`ChecksumMode=ENABLED`), and
+  `release.json` goes last. An object already at a key counts as published only when its
+  SHA-256 is ours, so a re-run of the same release finishes or repeats the upload. When another
+  run already published this identity and that release verifies intact, it stands and nothing is
+  written (`already-published`). Other bytes, a release there that does not verify, a denied
+  write or a bad read-back refuse the run (exit 1, or 3 after an apply) and the sealed directory
+  stays as it is. Files
+  over 5 GiB are refused before any write. `--release-to-require versioning` refuses a bucket
+  without versioning; `--release-to-require object-lock` refuses one without Object Lock and a
+  default retention (a mode and a period: an enabled lock with no rule locks nothing), and then
+  checks that every object reads back with a lock mode and a retain-until date still to come.
+  GOVERNANCE retention yields to `s3:BypassGovernanceRetention`; COMPLIANCE yields to no one. The run report's `release.remote` says where the release went, or why
+  not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
+  boto3 is refused before stage 1 (exit 2), and so is a run whose CI names no commit: without one
+  the release has no code digest.
+- **`fluid runs verify-release SRC` checks a sealed release, read-only.** SRC is a release
+  directory or the `s3://` prefix `--release-to` wrote. It checks that `release.json` is a
+  `fluid-release/1` record whose `identity_digest` is the digest of its `identity`, that an S3 key
+  ending in an identity's hex is this one's, that every file listed has the sha256 named, and that
+  the files `identity` pins (the bundle, each external file, the artifacts MANIFEST and what it
+  lists, the plan) are listed with those digests, so a swapped file with its entry rewritten is
+  not intact.
+  It recomputes `code_digest` and checks that an S3 key's code hex and environment are this
+  release's. Exit 0 intact, 1 not intact, 2 cannot decide (unreadable, access denied, or boto3
+  missing for `s3://`); `--json` prints the result with each object's path, sha256 and S3
+  VersionId, so a consumer can record the exact versions it checked. The check is public as `fluid_build.api.verify_release`
+  (API 1.3), and `fluid runs status --release-dir` shares its identity check.
+
+- **A release names the commit it was built from, and the digest of its code.** `identity`
+  gains `source` (`{uri: git+<repo>, digest: {gitCommit}}`), from the CI's own variables, when
+  the CI names a full commit (40 or 64 hex characters; a short one would give one commit two code
+  digests); until now the commit sat only in `provenance`, outside
+  `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
+  `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
+  environment sealed from one commit and one lock, and absent without a source commit.
+
+### Changed
+
+- **The `aws` extra needs boto3 and botocore 1.35.2 or later**, the first release whose PutObject
+  takes `IfNoneMatch`.
+- **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
+  and behaviour.
 
 ### Fixed
 
