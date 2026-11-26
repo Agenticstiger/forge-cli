@@ -746,39 +746,38 @@ def _authz_block(
     return authz
 
 
-def _resolve_document(
+def _resolved_expose(
     expose: Mapping[str, Any], contract: Optional[Mapping[str, Any]]
-) -> Tuple[Mapping[str, Any], Optional[Mapping[str, Any]]]:
-    """``expose`` and ``contract`` with the document's same-document pointers resolved.
+) -> Mapping[str, Any]:
+    """``expose`` with the document's same-document pointers resolved, for a decision only.
 
-    ``contract`` is the whole document as written. It is resolved only when the expose or
-    ``accessPolicy`` holds a ``$ref``, and the expose is read at its own position in the
-    resolved document (found by identity, then by equality). A document that cannot be
-    resolved (a pointer to nothing, to another file, or in a cycle) leaves both as
-    written, so a pointer left in the policy is still refused where it is read.
+    ``contract`` is the whole document as written. It is resolved only when the expose
+    holds a ``$ref``, and the expose is read at its own position in the resolved document
+    (found by identity, then by equality). A document that cannot be resolved (a pointer
+    to nothing, to another file, or in a cycle) leaves the expose as written, so a pointer
+    left in its policy is still refused. Only :func:`declares_row_filters` reads through
+    this: a read applies column sets its caller computed from the expose as passed, so the
+    read paths refuse an unresolved pointer instead of resolving it for themselves.
     """
-    if not isinstance(contract, Mapping):
-        return expose, contract
-    held = _first_ref(expose, "") is not None or _first_ref(contract.get("accessPolicy"), "")
-    if not held:
-        return expose, contract
+    if not isinstance(contract, Mapping) or _first_ref(expose, "") is None:
+        return expose
     from fluid_build import contract_refs
     from fluid_build.util.ref_confinement import RefResolutionError
 
     try:
         resolved = contract_refs.resolve_pointer_refs(contract)
     except RefResolutionError:
-        return expose, contract
-    if not isinstance(resolved, Mapping):
-        return expose, contract
-    listed, found = contract.get("exposes"), resolved.get("exposes")
+        return expose
+    listed = contract.get("exposes")
+    found = resolved.get("exposes") if isinstance(resolved, Mapping) else None
     if isinstance(listed, list) and isinstance(found, list) and len(listed) == len(found):
         position = next((i for i, e in enumerate(listed) if e is expose), None)
         if position is None:
             position = next((i for i, e in enumerate(listed) if e == expose), None)
-        if position is not None and isinstance(found[position], Mapping):
-            return found[position], resolved
-    return expose, resolved
+        at_position: Any = found[position] if position is not None else None
+        if isinstance(at_position, Mapping):
+            return at_position
+    return expose
 
 
 def declares_row_filters(
@@ -792,7 +791,7 @@ def declares_row_filters(
     pointer left in the expose itself or its ``policy`` (another file, say) raises
     :class:`RowFilterUnavailable`, as do the old ``policy.rowFilters`` key and a ``policy``
     or ``authz`` that is not a mapping, as every read path does."""
-    expose, _ = _resolve_document(expose, contract)
+    expose = _resolved_expose(expose, contract)
     authz = _authz_block(expose, policy_only=True)
     return bool(authz.get("rowFilters")) if authz is not None else False
 
@@ -947,12 +946,11 @@ def row_filter_predicate(
     does the old ``policy.rowFilters`` key. The predicate binds no parameter: every
     value in it is the contract's own literal.
 
-    With ``contract=`` the document's same-document pointers are resolved first
-    (:func:`declares_row_filters`); without it, or when they cannot be resolved, any
-    unresolved ``$ref`` in the expose is refused, since the read needs the declared
-    columns and the sensitivity flags behind it.
+    Any unresolved ``$ref`` in the expose is refused, with or without ``contract=``: the
+    column restrictions and sensitivity flags a read applies are computed by its caller
+    from the expose as passed, so a read needs the document with its pointers resolved
+    (forge's loader resolves them). Only :func:`declares_row_filters` resolves them first.
     """
-    expose, contract = _resolve_document(expose, contract)
     authz = _authz_block(expose)
     raw = None if authz is None else authz.get("rowFilters")
     if authz is None or raw is None:
@@ -1940,8 +1938,8 @@ def compile_semantic_query(
 
     ``contract`` is the contract the expose belongs to, when the caller has it: its
     ``accessPolicy`` read grants then read every row alongside ``policy.authz.readers``
-    (:func:`row_filter_predicate`), and its same-document pointers are resolved first,
-    so ``expose`` is read as resolved.
+    (:func:`row_filter_predicate`). An unresolved ``$ref`` in the expose is refused either
+    way, since ``restricted_columns`` and ``redacted_columns`` were computed from it.
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
@@ -1949,7 +1947,6 @@ def compile_semantic_query(
         raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
 
-    expose, contract = _resolve_document(expose, contract)
     # Row-level security first: a caller the policy does not name, or a filter that
     # cannot be applied, is refused before the payload is looked at.
     row_predicate = row_filter_predicate(
@@ -4490,8 +4487,6 @@ def compile_free_form_sql(
     if not isinstance(table_reference, str) or not table_reference.strip():
         raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
-    if expose is not None:
-        expose, contract = _resolve_document(expose, contract)
     # Row-level security first: a caller the policy does not name, or a filter that
     # cannot be applied, is refused before the statement is looked at further.
     row_predicate = row_filter_predicate(

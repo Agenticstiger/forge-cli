@@ -165,6 +165,20 @@ def _verbs(raw: Any) -> FrozenSet[str]:
         return frozenset()
 
 
+def _holds_ref(node: Any) -> bool:
+    """Whether ``node`` holds a ``$ref`` anywhere."""
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            if "$ref" in item:
+                return True
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return False
+
+
 def _read_grantees(expose: Mapping[str, Any], contract: Mapping[str, Any]) -> FrozenSet[str]:
     """The principal of each unconditional read grant of ``accessPolicy`` covering ``expose``."""
     if not isinstance(contract, Mapping):
@@ -172,8 +186,13 @@ def _read_grantees(expose: Mapping[str, Any], contract: Mapping[str, Any]) -> Fr
     policy = contract.get("accessPolicy")
     if policy is None:
         return frozenset()
-    if not isinstance(policy, Mapping) or "$ref" in policy:
+    if not isinstance(policy, Mapping):
         raise ReaderRuleError("accessPolicy is not a mapping, so its grants cannot be read.")
+    if _holds_ref(policy):
+        raise ReaderRuleError(
+            "accessPolicy holds an unresolved $ref, so its grants cannot be read as written; "
+            "resolve the document's pointers first."
+        )
     grants = policy.get("grants")
     if grants is None:
         return frozenset()

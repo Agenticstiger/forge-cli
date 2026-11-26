@@ -8,8 +8,9 @@ contract, schema or a column is not read as a row filter. With ``contract=`` (th
 document as written) the same-document pointers are resolved first, so a policy kept
 behind ``#/x-shared/...`` is read; a pointer left in the expose or its policy (another
 file, say) is still refused. The read paths (``row_filter_predicate``,
-``compile_semantic_query``, ``compile_free_form_sql``) need the declared columns and
-resolve the same way, and still refuse any unresolved pointer without ``contract=``.
+``compile_semantic_query``, ``compile_free_form_sql``) apply column sets their caller
+computed from the expose as passed, so they refuse any unresolved pointer, with or
+without ``contract=``.
 """
 
 from __future__ import annotations
@@ -110,61 +111,90 @@ def test_a_document_that_cannot_be_resolved_leaves_the_expose_as_written():
         qc.declares_row_filters(expose, contract=document)
 
 
-def test_row_filter_predicate_resolves_the_columns_a_filter_needs_with_the_contract():
-    expose = _expose(
-        policy=copy.deepcopy(_POLICY), contract={"schema": {"$ref": "#/x-shared/cols"}}
-    )
+# -- the read paths refuse a pointer, with or without contract= ---------------------------
+#
+# A read applies the column restrictions and sensitivity flags its caller computed from the
+# expose as passed. A pointer the read resolved for itself would leave those behind, so
+# every read path refuses an unresolved pointer and wants the document resolved first.
+
+POINTER_READS = {
+    "policy": {"policy": {"$ref": "#/x-shared/policy"}},
+    "columns": {
+        "policy": copy.deepcopy(_POLICY),
+        "contract": {"schema": {"$ref": "#/x-shared/cols"}},
+    },
+}
+
+
+@pytest.mark.parametrize("name", sorted(POINTER_READS))
+def test_row_filter_predicate_refuses_a_pointer_even_with_the_contract(name):
+    expose = _expose(**copy.deepcopy(POINTER_READS[name]))
     document = _document(expose)
-    predicate = qc.row_filter_predicate(expose, {"principal": BRANCH}, contract=document)
-    assert predicate is not None and "branch" in predicate
+    for contract in (document, None):
+        with pytest.raises(qc.RowFilterUnavailable, match="unresolved"):
+            qc.row_filter_predicate(expose, {"principal": BRANCH}, contract=contract)
+
+
+def test_a_policy_behind_a_pointer_is_never_served_without_its_column_restrictions():
+    # The caller computed no restricted column from the expose as passed, where the policy
+    # is only a pointer; the read is refused rather than served without the restriction.
+    shared = copy.deepcopy(_POLICY)
+    shared["authz"]["columnRestrictions"] = [{"columns": ["email"], "access": "deny"}]
+    expose = _expose(policy={"$ref": "#/x-shared/policy"})
+    document = _document(expose, policy=shared)
     with pytest.raises(qc.RowFilterUnavailable):
-        qc.row_filter_predicate(expose, {"principal": BRANCH})
+        qc.compile_free_form_sql(
+            sql="SELECT email, amount FROM orders",
+            table_reference="orders",
+            limit=10,
+            expose=expose,
+            caller_attributes={"principal": BRANCH},
+            dialect="duckdb",
+            restricted_columns=(),
+            contract=document,
+        )
+    with pytest.raises(qc.RowFilterUnavailable):
+        qc.compile_semantic_query(
+            expose=expose,
+            measure="total",
+            dimensions=["email"],
+            limit=10,
+            table_reference="orders",
+            dialect="duckdb",
+            caller_attributes={"principal": BRANCH},
+            contract=document,
+        )
 
 
-def test_compile_semantic_query_resolves_the_columns_and_redacts_the_one_they_declare():
+def test_compile_semantic_query_refuses_columns_behind_a_pointer_even_with_the_contract():
+    # The sensitivity flag on ``email`` sits behind the pointer, where the caller's
+    # redacted columns cannot see it.
     expose = _expose(contract={"schema": {"$ref": "#/x-shared/cols"}})
     document = _document(expose)
-    kwargs: Dict[str, Any] = dict(
-        measure="total",
-        dimensions=["email"],
-        limit=10,
-        table_reference="orders",
-        dialect="duckdb",
-        redacted_columns=["email"],
-    )
-    compiled = qc.compile_semantic_query(expose=expose, contract=document, **kwargs)
-    assert "email" in compiled.redacted_columns
-    with pytest.raises(qc.RowFilterUnavailable):
-        qc.compile_semantic_query(expose=expose, **kwargs)
+    for contract in (document, None):
+        with pytest.raises(qc.RowFilterUnavailable):
+            qc.compile_semantic_query(
+                expose=expose,
+                measure="total",
+                dimensions=["email"],
+                limit=10,
+                table_reference="orders",
+                dialect="duckdb",
+                contract=contract,
+            )
 
 
-def test_compile_free_form_sql_resolves_a_filtered_expose_behind_pointers():
-    expose = _expose(
-        policy={"$ref": "#/x-shared/policy"}, contract={"schema": {"$ref": "#/x-shared/cols"}}
-    )
-    document = _document(expose)
-    kwargs: Dict[str, Any] = dict(
-        sql="SELECT id FROM orders",
-        table_reference="orders",
-        limit=10,
-        expose=expose,
-        caller_attributes={"principal": BRANCH},
-        dialect="duckdb",
-    )
-    compiled = qc.compile_free_form_sql(contract=document, **kwargs)
-    assert "branch" in compiled.sql
-    with pytest.raises(qc.RowFilterUnavailable):
-        qc.compile_free_form_sql(**kwargs)
-
-
-def test_a_same_document_pointer_to_the_access_policy_is_resolved():
+@pytest.mark.parametrize(
+    "access",
+    [{"$ref": "#/x-shared/access"}, {"grants": [{"$ref": "#/x-shared/access/grants/0"}]}],
+    ids=["policy", "grant"],
+)
+def test_an_access_policy_behind_a_pointer_is_refused(access):
     expose = _expose(
         policy={"authz": {"readers": [], "rowFilters": [{"principal": BRANCH, "where": "id = 1"}]}}
     )
     document = _document(expose)
-    document["accessPolicy"] = {"$ref": "#/x-shared/access"}
     document["x-shared"]["access"] = {"grants": [{"principal": ANALYST, "permissions": ["read"]}]}
-    assert qc.row_filter_predicate(expose, {"principal": ANALYST}, contract=document) is None
-    document["accessPolicy"] = {"$ref": "other.yaml#/access"}
+    document["accessPolicy"] = access
     with pytest.raises(qc.RowFilterUnavailable):
         qc.row_filter_predicate(expose, {"principal": ANALYST}, contract=document)

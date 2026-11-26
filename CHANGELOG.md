@@ -56,13 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compile_free_form_sql` and the `sample` read take the keyword; the gateway's own tools pass the
   session's contract.
 - **`declares_row_filters` decides from the expose's policy alone.** A `$ref` left in an expose's
-  `contract` or columns no longer reads as filtered. With `contract=` (the whole document as
-  written), `declares_row_filters`, `row_filter_predicate`, `compile_semantic_query` and
-  `compile_free_form_sql` first resolve the document's same-document pointers, so a policy or an
-  `accessPolicy` kept behind one is read, and a library caller that reads the contract as written
-  no longer has to work around a refusal. A pointer left in the expose or its policy (another file,
-  say) is still refused. Without `contract=`, `row_filter_predicate` and the two compile functions
-  still refuse any unresolved pointer in the expose, since a read needs the columns behind it.
+  `contract` or columns no longer reads as filtered, so a library caller that reads the contract
+  as written no longer has to work around a refusal there. With `contract=` (the whole document as
+  written) it first resolves the document's same-document pointers, so a policy kept behind one is
+  read; a pointer in the expose or its policy that cannot be resolved (another file, say) is still
+  refused. The read paths (`row_filter_predicate`, `compile_semantic_query`,
+  `compile_free_form_sql` and the `sample` read) still refuse any unresolved pointer in the expose
+  or in `accessPolicy`, with or without `contract=`: the column restrictions and sensitivity flags
+  they apply are computed from the expose as passed, so they need the document resolved first.
 
 ### Fixed
 
