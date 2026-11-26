@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid ship --release-dir DIR --release-archive PATH` also writes the sealed release as one
+  `.tgz`**, for a platform that takes a file. It holds the sealed directory as it is, with
+  `release.json` at its root and no folder around it, and is written only after the seal
+  succeeds and before any `--release-to` upload, so a failed upload keeps it. Its bytes are the
+  same for the same sealed release (sorted entries, a fixed mtime, owner 0 with no names, modes
+  0644 and 0755, a gzip header with no time or name, as `bundle.tgz`), so its SHA-256, which ship
+  prints and the run report records under `release.archive`, holds across reruns. It is written
+  to a temporary file beside PATH and renamed into place: a failure leaves no archive, keeps the
+  sealed directory, and fails the run (exit 1, or 3 after an apply). Refused before stage 1
+  (exit 2): no `--release-dir`, a blank value, a path inside the release directory, a folder or
+  a link. Without the flag nothing changes. `bundle.tgz` is written by the same writer, now
+  streaming, and its bytes are unchanged.
 - **`fluid profile` publishes a date column's min and max rounded to a calendar unit when too
   few records hold the exact value.** Where fewer than `minimumCell` records hold a DATE or
   timestamp column's smallest or largest value, the end is now the first (min) or last (max)

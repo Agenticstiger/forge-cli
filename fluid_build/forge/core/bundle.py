@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import gzip
 import hashlib
 import io
@@ -52,7 +53,7 @@ import tempfile
 import unicodedata
 from importlib import import_module
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -218,9 +219,9 @@ def merkle_root(per_file: Mapping[str, str]) -> str:
 
 
 def write_tgz(out_path: Path, files: Dict[str, bytes]) -> None:
-    """Write a deterministic gzipped tar.
+    """Write a deterministic gzipped tar of ``files`` (path to bytes) to ``out_path``.
 
-    Header normalization applied to every entry:
+    Header normalization applied to every entry (:func:`write_tgz_stream`):
 
     * ``mtime`` = ``SOURCE_DATE_EPOCH`` env var or 0
     * ``uid`` = ``gid`` = 0; ``uname`` = ``gname`` = ``""``
@@ -232,51 +233,57 @@ def write_tgz(out_path: Path, files: Dict[str, bytes]) -> None:
     payload. Two calls with the same ``files`` dict produce byte-identical
     output.
     """
-    # Build the uncompressed tar in memory with sorted entries and normalized
-    # headers, then gzip-compress the result with a fixed header. Doing the
-    # two layers separately is the only reliable way to control the gzip
-    # header — tarfile.open(mode="w:gz") delegates to the default gzip
-    # which stamps the current mtime into the header.
-    tar_buf = io.BytesIO()
-    with tarfile.open(fileobj=tar_buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
-        # Track parent dirs we've emitted so we don't duplicate. Sorted file
-        # order guarantees parent directory emission precedes children.
-        emitted_dirs: set = set()
-        for path in sorted(files.keys()):
-            # Emit parent directories first (deterministic).
-            parts = path.split("/")
-            for i in range(1, len(parts)):
-                dir_path = "/".join(parts[:i])
-                if dir_path and dir_path not in emitted_dirs:
-                    emitted_dirs.add(dir_path)
-                    info = tarfile.TarInfo(name=dir_path)
-                    info.type = tarfile.DIRTYPE
-                    info.mode = _DIR_MODE
-                    info.mtime = _DEFAULT_MTIME
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = ""
-                    tar.addfile(info)
-
-            data = files[path]
-            info = tarfile.TarInfo(name=path)
-            info.size = len(data)
-            info.mode = _FILE_MODE
-            info.mtime = _DEFAULT_MTIME
-            info.uid = info.gid = 0
-            info.uname = info.gname = ""
-            tar.addfile(info, io.BytesIO(data))
-
     # Compress in memory first, then write to disk. This keeps gzip from
     # reading ``out_path`` basename off the file handle and stamping it into
     # the FNAME header field — that's the #1 source of accidental
     # non-determinism across two bundle calls that differ only in output
     # path. ``filename=""`` makes gzip clear the FNAME flag entirely.
     gz_buf = io.BytesIO()
-    with gzip.GzipFile(filename="", fileobj=gz_buf, mode="wb", compresslevel=6, mtime=0) as gz:
-        gz.write(tar_buf.getvalue())
-
+    write_tgz_stream(
+        gz_buf,
+        ((path, len(data), functools.partial(io.BytesIO, data)) for path, data in files.items()),
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(gz_buf.getvalue())
+
+
+def write_tgz_stream(
+    out: BinaryIO, entries: Iterable[Tuple[str, int, Callable[[], BinaryIO]]]
+) -> None:
+    """Write a deterministic gzipped tar to ``out``, one entry at a time: each entry is a
+    path, its size and an opener for its bytes, read in chunks, so an entry of several GiB is
+    never held in memory. The rules of :func:`write_tgz`: sorted paths, each parent directory
+    first, fixed mtime, owner 0 and no owner names, 0o644 and 0o755, USTAR headers, and a gzip
+    header with mtime 0 and no file name (the rules the Reproducible Builds project gives for
+    archives). Raises ``ValueError`` for a path a USTAR header cannot hold."""
+    with gzip.GzipFile(filename="", fileobj=out, mode="wb", compresslevel=6, mtime=0) as gz:
+        # The tar goes through the gzip stream it is written to: tarfile.open(mode="w:gz")
+        # would stamp the current time into the gzip header.
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+            # Track parent dirs we've emitted so we don't duplicate. Sorted file
+            # order guarantees parent directory emission precedes children.
+            emitted_dirs: set = set()
+            for path, size, opener in sorted(entries, key=lambda entry: entry[0]):
+                parts = path.split("/")
+                for i in range(1, len(parts)):
+                    dir_path = "/".join(parts[:i])
+                    if dir_path and dir_path not in emitted_dirs:
+                        emitted_dirs.add(dir_path)
+                        info = tarfile.TarInfo(name=dir_path)
+                        info.type = tarfile.DIRTYPE
+                        info.mode = _DIR_MODE
+                        info.mtime = _DEFAULT_MTIME
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ""
+                        tar.addfile(info)
+                info = tarfile.TarInfo(name=path)
+                info.size = size
+                info.mode = _FILE_MODE
+                info.mtime = _DEFAULT_MTIME
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                with opener() as body:
+                    tar.addfile(info, body)
 
 
 # Bundles are caller-supplied (federation, marketplace, CI artifact
@@ -1040,4 +1047,5 @@ __all__ = [
     "resolve_bundle_source_contract",
     "validate_manifest",
     "write_tgz",
+    "write_tgz_stream",
 ]

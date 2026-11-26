@@ -187,6 +187,11 @@ def refusal(
     remote = _release_publish.refusal(opts.release_to, release_dir, opts.release_to_require)
     if remote:
         return remote
+    from . import _release_archive
+
+    archive = _release_archive.refusal(opts.release_archive, release_dir)
+    if archive:
+        return archive
     if release_dir is None:
         if opts.artifacts:
             return (
