@@ -112,7 +112,9 @@ _GRANT_CASES = [
     ("select", [_grant(permissions=["Select"])], True),
     ("query", [_grant(permissions=["query"])], True),
     ("admin", [_grant(permissions=[" admin "])], True),
-    ("owner", [_grant(permissions=["owner"])], True),
+    # ``owner`` reads on BigQuery but holds no table privilege on Databricks.
+    ("owner", [_grant(permissions=["owner"])], False),
+    ("owner-and-read", [_grant(permissions=["owner", "read"])], True),
     ("write-only", [_grant(permissions=["write"])], False),
     ("no-permissions", [_grant(permissions=[])], False),
     ("conditions-absent", [_grant()], True),

@@ -24,6 +24,13 @@ from typing import Any, FrozenSet, Iterable, Mapping, Tuple
 #: Permission verbs that read (lower-cased, as ``accessPolicy`` permissions are read).
 READ_VERBS = frozenset({"read", "select", "query", "admin", "owner"})
 
+#: The verbs that read on every platform whose emitter grants from ``accessPolicy``, the
+#: ones :func:`every_row_readers` counts. BigQuery reads ``owner``
+#: (``roles/bigquery.dataOwner``), but the Unity Catalog table map gives it no privilege,
+#: so a grant whose only read verb is ``owner`` reads nothing on Databricks; counting it
+#: would let the gateway serve every row to a principal an emitter grants none.
+EVERY_ROW_VERBS = frozenset({"read", "select", "query", "admin"})
+
 #: IAM member prefixes, lower-cased, to the spelling IAM expects.
 CANONICAL_PREFIXES = {
     "user": "user",
@@ -180,7 +187,7 @@ def _read_grantees(expose: Mapping[str, Any], contract: Mapping[str, Any]) -> Fr
         principal = entry.get("principal")
         if not isinstance(principal, str) or not principal.strip():
             continue
-        if not READ_VERBS & _verbs(entry.get("permissions")):
+        if not EVERY_ROW_VERBS & _verbs(entry.get("permissions")):
             continue
         conditions = entry.get("conditions")
         if conditions is not None and not (isinstance(conditions, Mapping) and not conditions):
@@ -203,7 +210,7 @@ def every_row_readers(
     """The principals, as written, that read every row of an expose with row filters.
 
     ``policy.authz.readers``, and, only when ``contract`` is given, the principal of each
-    ``accessPolicy.grants[]`` entry that has a permission in :data:`READ_VERBS`, no
+    ``accessPolicy.grants[]`` entry that has a permission in :data:`EVERY_ROW_VERBS`, no
     condition (``conditions`` absent, ``None`` or empty) and a scope that covers the
     expose. Less every principal ``binding.principals`` maps to ``[]`` and every
     principal in ``filtered`` (the principals a row filter names), both compared by
@@ -226,6 +233,7 @@ def every_row_readers(
 
 __all__ = [
     "CANONICAL_PREFIXES",
+    "EVERY_ROW_VERBS",
     "GrantScope",
     "READ_VERBS",
     "ReaderRuleError",

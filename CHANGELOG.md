@@ -42,10 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Who reads every row of a row-filtered expose through the MCP gateway.** On an expose that
   declares `policy.authz.rowFilters`, the principals that read every row are those in
   `policy.authz.readers` and, for a library caller that passes `contract=`, the principal of each
-  `accessPolicy` grant that reads (`read`, `select`, `query`, `admin` or `owner`), has no condition
-  and covers the expose. A grant that only writes, has a condition, is scoped to another expose or
-  to a resource the gateway cannot evaluate, or whose principal `binding.principals` maps to `[]`
-  never counts, and neither does a reader mapped to `[]`. A principal a row filter names never
+  `accessPolicy` grant that reads (`read`, `select`, `query` or `admin`), has no condition and
+  covers the expose. A grant that only writes, has a condition, is scoped to another expose or to a
+  resource the gateway cannot evaluate, or whose principal `binding.principals` maps to `[]` never
+  counts, and neither does a reader mapped to `[]`. Nor does a grant whose only read is `owner`: it
+  reads on BigQuery but holds no table privilege on Databricks, and the gateway counts only what
+  reads on every platform. A principal a row filter names never
   reads every row, whatever its spelling (the type prefix and the case are folded for that
   comparison). A caller's verified principals match as written and are never translated through
   `binding.principals`. Without `contract=` only `policy.authz.readers` read every row, narrowed

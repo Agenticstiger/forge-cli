@@ -3,13 +3,15 @@
 
 """The gateway never lets a principal read every row that a platform policy filters.
 
-One contract, seven kinds of principal, three bindings. For each platform the emitter
+One contract, eight kinds of principal, three bindings. For each platform the emitter
 writes the policy that decides who reads every row, and the gateway
 (``query_compiler.row_filter_predicate``) decides the same from the contract:
 
 * ``reader``: in ``policy.authz.readers``;
 * ``grantee``: an unconditional read grant covering the expose;
 * ``writer``: a write-only grant;
+* ``owner``: a grant whose only read verb is ``owner``, which reads on BigQuery but holds
+  no table privilege on Databricks, so the gateway does not count it;
 * ``conditional``: a read grant with a condition;
 * ``elsewhere``: a read grant scoped to another expose;
 * ``unmapped``: a read grant whose principal ``binding.principals`` maps to ``[]``;
@@ -41,6 +43,7 @@ from fluid_build.output_ports.mcp import query_compiler as qc
 READER = "group:readers@library.test"
 GRANTEE = "group:analysts@library.test"
 WRITER = "group:loaders@library.test"
+OWNER = "group:stewards@library.test"
 CONDITIONAL = "group:auditors@library.test"
 ELSEWHERE = "group:returns-team@library.test"
 UNMAPPED = "group:contractors@library.test"
@@ -52,6 +55,7 @@ _NAMES = {
     READER: "readers",
     GRANTEE: "analysts",
     WRITER: "loaders",
+    OWNER: "stewards",
     CONDITIONAL: "auditors",
     ELSEWHERE: "returns-team",
     UNMAPPED: "contractors",
@@ -64,6 +68,7 @@ def _base(*, with_conditional: bool = False) -> Dict[str, Any]:
     grants: List[Dict[str, Any]] = [
         {"principal": GRANTEE, "permissions": ["read"]},
         {"principal": WRITER, "permissions": ["write"]},
+        {"principal": OWNER, "permissions": ["owner"]},
         {
             "principal": ELSEWHERE,
             "permissions": ["read"],
@@ -160,7 +165,7 @@ def _reads_every_row(contract, who, *, with_contract=True) -> bool:
 def _gateway_readers(contract) -> set:
     return {
         who
-        for who in (READER, GRANTEE, WRITER, CONDITIONAL, ELSEWHERE, UNMAPPED, FILTERED)
+        for who in (READER, GRANTEE, WRITER, OWNER, CONDITIONAL, ELSEWHERE, UNMAPPED, FILTERED)
         if _reads_every_row(contract, who)
     }
 
@@ -169,7 +174,7 @@ def test_the_gateway_lets_exactly_the_readers_and_unconditional_read_grants_read
     contract = _bind(_base(with_conditional=True), "gcp")
     assert _gateway_readers(contract) == {READER, GRANTEE}
     assert "branch" in _gateway(contract, FILTERED)
-    for who in (WRITER, CONDITIONAL, ELSEWHERE, UNMAPPED):
+    for who in (WRITER, OWNER, CONDITIONAL, ELSEWHERE, UNMAPPED):
         with pytest.raises(qc.RowFilterIdentityMissing):
             _gateway(contract, who)
     # Without the contract, only policy.authz.readers read every row.
@@ -191,6 +196,8 @@ def test_bigquery_every_row_policy_holds_the_readers_and_grantees_and_never_a_fi
     gateway = _gateway_readers(contract)
     assert {identity(READER), identity(GRANTEE)} <= every
     assert {identity(w) for w in gateway} <= every, "the gateway is never wider than BigQuery"
+    # BigQuery reads an owner-only grant; the gateway, held to every emitter, does not.
+    assert identity(OWNER) in every and OWNER not in gateway
     assert identity(UNMAPPED) not in every | mine
     assert {g.casefold() for g in every}.isdisjoint({g.casefold() for g in mine})
     assert identity(FILTERED) in mine and identity(FILTERED) not in every
@@ -221,6 +228,7 @@ def test_databricks_grants_select_to_readers_and_grantees_and_the_filter_names_o
     select = {p for p, privileges in held.items() if "SELECT" in privileges}
     assert {"readers-group", "analysts-group"} <= select
     assert "loaders-group" not in select
+    assert "stewards-group" not in held, "Unity Catalog grants an owner-only grant nothing"
     assert "returns-team-group" not in held
     assert "contractors-group" not in held
 
@@ -268,3 +276,16 @@ def test_lake_formation_grants_the_filtered_role_through_the_filter_and_no_other
     assert not _reads_every_row(contract, FILTERED_GRANT)
     assert not _reads_every_row(contract, arn[READER])
     assert _gateway_readers(contract) == {READER, GRANTEE}
+
+
+def test_the_gateway_counts_only_the_verbs_that_read_on_every_emitter():
+    """Each verb the gateway counts reads on BigQuery and holds SELECT on Databricks."""
+    from fluid_build.providers._access_grants import EVERY_ROW_VERBS, READ_VERBS
+
+    databricks_reads = {
+        verb
+        for verb, privilege in dbx._TABLE_PRIVILEGES.items()
+        if privilege in {"SELECT", "ALL_PRIVILEGES"}
+    }
+    assert EVERY_ROW_VERBS <= READ_VERBS
+    assert EVERY_ROW_VERBS <= databricks_reads

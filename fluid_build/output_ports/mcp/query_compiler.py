@@ -932,8 +932,9 @@ def row_filter_predicate(
     The principals that read every row are ``policy.authz.readers`` and, when the
     caller passes ``contract=`` (the contract the expose belongs to), the principal of
     each unconditional ``accessPolicy`` read grant that covers the expose
-    (:func:`fluid_build.providers._access_grants.every_row_readers`, the reading the
-    BigQuery emitter shares). Neither set ever holds a principal that
+    (:func:`fluid_build.providers._access_grants.every_row_readers`, with the grant
+    scopes the emitters share, counting only the verbs that read on every platform).
+    Neither set ever holds a principal that
     ``binding.principals`` maps to ``[]`` or that a row filter names, whatever its
     spelling. A caller's principals match as written; they are never translated
     through ``binding.principals``. Without ``contract=`` only the readers count. The
