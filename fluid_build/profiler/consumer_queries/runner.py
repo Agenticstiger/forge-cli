@@ -491,6 +491,33 @@ def _zero_bytes(text: str) -> bool:
         return False
 
 
+#: The units DuckDB reads a size back in: binary ones, and the decimal ones it also spells.
+_SIZE_UNITS: Dict[str, int] = {
+    "byte": 1,
+    "bytes": 1,
+    **{unit: 1 << (10 * power) for power, unit in enumerate(("kib", "mib", "gib", "tib"), 1)},
+    **{unit: 1000**power for power, unit in enumerate(("kb", "mb", "gb", "tb"), 1)},
+}
+
+
+def _reads_as(text: str, memory: int) -> bool:
+    """Whether DuckDB's reading of a size, such as ``512.0 mib``, is *memory* bytes.
+
+    DuckDB writes a size in its largest whole unit with one decimal it truncates, so a reading
+    holds every size from its decimal up to the next one.
+    """
+    number, _, unit = text.strip().partition(" ")
+    whole, point, tenth = number.partition(".")
+    scale = _SIZE_UNITS.get(unit.strip())
+    if scale is None or not (whole.isascii() and whole.isdigit()):
+        return False
+    if point and not (len(tenth) == 1 and tenth.isascii() and tenth.isdigit()):
+        return False
+    tenths = int(whole) * 10 + (int(tenth) if point else 0)
+    step = scale if point else scale * 10
+    return tenths * scale <= memory * 10 < tenths * scale + step
+
+
 class _Run:
     """One run: a child at a time, the tables to send it, and the statements to ask."""
 
@@ -612,7 +639,7 @@ class _Run:
                 "A lock that is not confirmed is a lock that is not held.",
                 "Reinstall the profile extra: pip install --force-reinstall 'data-product-forge[profile]'",
             )
-        self._confirm_locks(reply.get("readBack"))
+        self._confirm_locks(reply.get("readBack"), self._memory)
         if not isinstance(reply.get("limits"), dict):
             raise _Gone("its hello does not report its limits")
         environment = reply.get("environment")
@@ -621,14 +648,16 @@ class _Run:
         return reply
 
     @staticmethod
-    def _confirm_locks(read_back: Any) -> None:
-        expected = _child.settings_read_back()
+    def _confirm_locks(read_back: Any, memory: int) -> None:
+        expected = _child.settings_read_back(memory)
         ok = isinstance(read_back, dict) and set(read_back) == set(expected)
         if ok:
             for key, want in expected.items():
                 got = str(read_back[key]).lower()
                 if key == "max_temp_directory_size":
                     ok = ok and _zero_bytes(got)
+                elif key == "memory_limit":
+                    ok = ok and _reads_as(got, memory)
                 else:
                     ok = ok and got == want
         if not ok:

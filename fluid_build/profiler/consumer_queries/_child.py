@@ -301,13 +301,17 @@ _EXPECTED_READ_BACK: Dict[str, str] = {
 }
 
 
-def settings_read_back() -> Dict[str, str]:
-    """What the child must read back from DuckDB for each lock; the parent compares."""
-    return dict(_EXPECTED_READ_BACK)
+def settings_read_back(memory: int) -> Dict[str, str]:
+    """What the child must read back from DuckDB for each lock; the parent compares.
+
+    ``memory_limit`` is the child's budget of *memory* bytes, which DuckDB reads back in a unit
+    of its own with one decimal it truncates (``512.0 MiB``), so the parent compares its bytes.
+    """
+    return {**_EXPECTED_READ_BACK, "memory_limit": _memory_text(memory)}
 
 
 def _read_back(connection: Any) -> Dict[str, str]:
-    names = sorted(_EXPECTED_READ_BACK)
+    names = sorted([*_EXPECTED_READ_BACK, "memory_limit"])
     marks = ",".join("?" for _ in names)
     rows = connection.execute(
         f"SELECT name, CAST(value AS VARCHAR) FROM duckdb_settings() WHERE name IN ({marks})",

@@ -648,12 +648,46 @@ def test_a_missing_duckdb_is_unavailable_with_the_fix(monkeypatch: pytest.Monkey
 
 
 def test_a_lock_that_does_not_read_back_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    expected = _child.settings_read_back()
-    expected["enable_external_access"] = "true"
-    monkeypatch.setattr(_child, "settings_read_back", lambda: expected)
+    held = _child.settings_read_back
+    monkeypatch.setattr(
+        _child,
+        "settings_read_back",
+        lambda memory: {**held(memory), "enable_external_access": "true"},
+    )
     with pytest.raises(ChildUnavailable) as caught:
         run([Statement("s", "SELECT 1", "count")])
     assert "locks" in caught.value.what
+
+
+def test_the_memory_limit_is_read_back_and_compared_with_the_budget() -> None:
+    read_back = {**_child.settings_read_back(512 * MIB), "memory_limit": "512.0 MiB"}
+    runner._Run._confirm_locks(read_back, 512 * MIB)
+    with pytest.raises(ChildUnavailable) as caught:
+        runner._Run._confirm_locks(read_back, 1024 * MIB)
+    assert "locks" in caught.value.what
+    missing = {key: value for key, value in read_back.items() if key != "memory_limit"}
+    with pytest.raises(ChildUnavailable):
+        runner._Run._confirm_locks(missing, 512 * MIB)
+
+
+@pytest.mark.parametrize(
+    ("text", "memory", "holds"),
+    [
+        ("512.0 mib", 512 * MIB, True),
+        ("1.5 gib", 1536 * MIB, True),
+        ("1.1 mib", 1_234_567, True),
+        ("1.0 gib", 512 * MIB, False),
+        ("512.0 mib", 513 * MIB, False),
+        ("0 bytes", 0, True),
+        ("1.0 mb", 1_000_000, True),
+        ("512.00 mib", 512 * MIB, False),
+        ("512 mib", 512 * MIB, True),
+        ("five mib", 5 * MIB, False),
+        ("512.0", 512 * MIB, False),
+    ],
+)
+def test_a_size_reads_as_the_bytes_duckdb_truncates_it_from(text, memory, holds) -> None:
+    assert runner._reads_as(text, memory) is holds
 
 
 def test_nothing_is_written_to_the_parents_output(capfd: pytest.CaptureFixture[str]) -> None:
