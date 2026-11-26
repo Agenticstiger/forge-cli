@@ -297,6 +297,26 @@ class PostgresDriver(EngineDriver):
         self._connection = connection
         return connection
 
+    def _exposes_read_over_this_connection(self) -> List[Mapping[str, Any]]:
+        """The served expose and each other expose of the contract that one of its as-of
+        relationships reaches: a query reads all of them over the one connection."""
+        found: List[Mapping[str, Any]] = [self.expose]
+        semantics = self.expose.get("semantics")
+        relationships = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+        exposes = self.contract.get("exposes") if isinstance(self.contract, Mapping) else None
+        for relationship in relationships if isinstance(relationships, list) else []:
+            if not isinstance(relationship, Mapping) or not relationship.get("asOf"):
+                continue
+            for candidate in exposes if isinstance(exposes, list) else []:
+                if (
+                    isinstance(candidate, Mapping)
+                    and candidate.get("exposeId") == relationship.get("to")
+                    and candidate is not self.expose
+                    and not any(candidate is seen for seen in found)
+                ):
+                    found.append(candidate)
+        return found
+
     def _check_the_role(self, connection: Any) -> None:
         """Refuse to serve an expose with row filters as a role that reaches past the
         tables (a superuser or a member of :data:`PRIVILEGED_ROLES`), and warn on any
@@ -308,7 +328,10 @@ class PostgresDriver(EngineDriver):
         held = (["superuser"] if superuser else []) + [str(r) for r in memberships or []]
         if not held:
             return
-        if declares_row_filters(self.expose, contract=self.contract):
+        if any(
+            declares_row_filters(expose, contract=self.contract)
+            for expose in self._exposes_read_over_this_connection()
+        ):
             raise RowFilterUnavailable(
                 f"the gateway connects to Postgres as a role that is {', '.join(held)}. Such a "
                 "role can read a table's files and the write-ahead log, so the rows a row "

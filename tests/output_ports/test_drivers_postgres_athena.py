@@ -337,6 +337,25 @@ def test_postgres_refuses_to_serve_row_filters_as_a_privileged_role(monkeypatch,
     assert driver._connection is None
 
 
+def test_postgres_refuses_a_privileged_role_when_an_as_of_target_has_row_filters(monkeypatch):
+    """A relationship reads its target over the same connection, past the target's filter."""
+    from fluid_build.output_ports.mcp.query_compiler import RowFilterUnavailable
+
+    driver, connection = _connecting(monkeypatch, (False, ["pg_read_all_data"]), filtered=False)
+    target = _pg_expose()
+    target["exposeId"] = "versions"
+    target["policy"] = {
+        "authz": {"rowFilters": [{"principal": "group:eu@x.example", "where": "id > 0"}]}
+    }
+    driver.expose["semantics"] = {
+        "relationships": [{"name": "v", "to": "versions", "asOf": {"asOf": "d"}}]
+    }
+    driver.contract = {"exposes": [driver.expose, target]}
+    with pytest.raises(RowFilterUnavailable, match="pg_read_all_data"):
+        driver._get_connection()
+    assert driver._connection is None
+
+
 def test_the_privileged_roles_are_pinned():
     """A role dropped from this tuple would serve row filters it can read past."""
     from fluid_build.output_ports.mcp.drivers.postgres import PRIVILEGED_ROLES
