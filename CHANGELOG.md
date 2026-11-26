@@ -61,8 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compile_free_form_sql` first resolve the document's same-document pointers, so a policy or an
   `accessPolicy` kept behind one is read, and a library caller that reads the contract as written
   no longer has to work around a refusal. A pointer left in the expose or its policy (another file,
-  say) is still refused, and without `contract=` any unresolved pointer in the expose is refused
-  as before.
+  say) is still refused. Without `contract=`, `row_filter_predicate` and the two compile functions
+  still refuse any unresolved pointer in the expose, since a read needs the columns behind it.
 
 ### Fixed
 
@@ -74,12 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **A principal a row filter names never reads every row through BigQuery, whatever its case.** A
-  principal that a `policy.authz.rowFilters` entry names, spelled in another case in an
-  `accessPolicy` grant or in `policy.authz.readers`, could also be a grantee of the BigQuery
-  every-row policy (`fluid_all_rows`), so it could read every row; whether BigQuery treats the two
-  spellings as one principal is not documented. Present since 0.19.0. `fluid apply` now leaves
-  every identity a filter names out of that policy whatever its case.
+- **On BigQuery, a principal a row filter names stays out of the every-row policy whatever its
+  case.** When an `accessPolicy` grant or `policy.authz.readers` spelled a principal that a
+  `policy.authz.rowFilters` entry names in another case, `fluid apply` could also make it a grantee
+  of `fluid_all_rows`, the row access policy that reads every row. It now compares the identities
+  with their case folded. Present since 0.19.0.
 
 ## [0.41.0] — 2026-11-25
 
