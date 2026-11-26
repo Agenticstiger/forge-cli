@@ -80,6 +80,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
+from ...providers._access_grants import READ_VERBS
 from .. import column_types
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
@@ -160,9 +161,6 @@ _CLUSTERING_COLUMN_TYPES = frozenset(
         "TIMESTAMP",
     }
 )
-
-#: ``accessPolicy`` verbs that read the rows; their principals are the expose's readers.
-READ_VERBS = frozenset({"read", "select", "query", "admin", "owner"})
 
 _MS_PER_DAY = 86_400_000
 

@@ -54,20 +54,14 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
+from ..providers._access_grants import CANONICAL_PREFIXES as _GCP_PREFIXES
+from ..providers._access_grants import logical_key
 from .access import AccessGrant, _split_principal
 from .base import UnsupportedBindingError
 
 #: Top-level domains reserved for documentation and testing: RFC 2606 section 2
 #: and RFC 6761 section 6. No registrar issues them, so no identity has one.
 RESERVED_TLDS = frozenset({"example", "test", "invalid", "localhost"})
-
-#: IAM member prefixes, lower-cased, to the spelling IAM expects.
-_GCP_PREFIXES = {
-    "user": "user",
-    "group": "group",
-    "serviceaccount": "serviceAccount",
-    "domain": "domain",
-}
 
 #: An email-shaped IAM member, and a ``domain:`` member.
 _GCP_EMAIL_MEMBER_RE = re.compile(r"(user|group|serviceAccount):[^@\s:]+@[A-Za-z0-9.-]+")
@@ -128,21 +122,6 @@ _LAKEKEEPER_PREFIXES = {
 _LAKEKEEPER_BAD_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 PrincipalMap = Dict[str, Tuple[str, ...]]
-
-
-def logical_key(raw: Any) -> str:
-    """A principal as written, with its type prefix spelled one way.
-
-    ``serviceaccount:x`` and ``serviceAccount:x`` name the same principal, as
-    ``accessPolicy`` has always read them (``iac/access.py``); the rest of the
-    string is kept exactly, since the mapping is looked up by it.
-    """
-    text = str(raw or "").strip()
-    head, sep, rest = text.partition(":")
-    canonical = _GCP_PREFIXES.get(head.strip().lower())
-    if sep and canonical and rest.strip():
-        return f"{canonical}:{rest.strip()}"
-    return text
 
 
 def grant_key(grant: AccessGrant) -> str:
