@@ -6,7 +6,8 @@
 The principals that read every row are ``policy.authz.readers`` and, when the caller
 passes ``contract=``, the principal of each unconditional ``accessPolicy`` read grant
 that covers the expose, less every principal ``binding.principals`` maps to ``[]`` and
-every principal a row filter names (compared by logical key with the case folded).
+every principal a row filter names (compared by address, without the type prefix and with
+the case folded, and by the identity ``binding.principals`` maps it to).
 A caller's verified principals match that set as written; nothing is translated through
 ``binding.principals``. The schema has no explicit deny for rows, so there is none to
 read here.
@@ -228,6 +229,52 @@ def test_a_grant_or_reader_spelled_in_another_case_than_a_filter_never_reads_eve
         assert _refused(lambda: _predicate(contract, spelling)) == "RowFilterIdentityMissing"
     # The filtered principal as written still reads its rows.
     assert "branch" in _predicate(contract, BRANCH)
+
+
+@pytest.mark.parametrize(
+    ("filter_principal", "grant_principal"),
+    [
+        ("alice@library.test", "user:alice@library.test"),
+        ("user:alice@library.test", "alice@library.test"),
+        ("Alice@Library.test", "user:alice@library.test"),
+        ("etl@proj.iam.gserviceaccount.com", "serviceAccount:etl@proj.iam.gserviceaccount.com"),
+        ("serviceAccount:etl@proj.iam.gserviceaccount.com", "etl@proj.iam.gserviceaccount.com"),
+        ("analysts@library.test", "group:analysts@library.test"),
+    ],
+)
+def test_a_filter_and_a_grant_that_differ_only_in_the_type_prefix_name_one_principal(
+    filter_principal, grant_principal
+):
+    # A platform emitter reads an unprefixed principal as a member of the type it infers,
+    # so a filter on one spelling filters the other; the grant never makes a reader.
+    contract = _contract([_grant(grant_principal)], filter_principal=filter_principal)
+    assert _refused(lambda: _predicate(contract, grant_principal)) == "RowFilterIdentityMissing"
+    assert "branch" in _predicate(contract, filter_principal)
+
+
+def test_a_reader_that_differs_from_a_filter_only_in_the_type_prefix_is_not_a_reader():
+    contract = _contract(readers=["user:alice@library.test"], filter_principal="alice@library.test")
+    assert _refused(lambda: _predicate(contract, "user:alice@library.test")) == (
+        "RowFilterIdentityMissing"
+    )
+
+
+def test_two_principals_that_binding_principals_maps_to_one_identity_are_one_principal():
+    identity = "group:shared@library.test"
+    contract = _contract(
+        [_grant(GRANTEE)],
+        principals={BRANCH: identity, GRANTEE: identity.upper().replace("GROUP", "group")},
+    )
+    assert _refused(lambda: _predicate(contract, GRANTEE)) == "RowFilterIdentityMissing"
+    assert "branch" in _predicate(contract, BRANCH)
+
+
+def test_principals_mapped_to_different_identities_stay_apart():
+    contract = _contract(
+        [_grant(GRANTEE)],
+        principals={BRANCH: "group:north@library.test", GRANTEE: "group:analysts@library.test"},
+    )
+    assert _predicate(contract, GRANTEE) is None
 
 
 def test_the_prefix_spelling_is_one_key_for_the_filter_subtraction():

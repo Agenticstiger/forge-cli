@@ -289,3 +289,48 @@ def test_the_gateway_counts_only_the_verbs_that_read_on_every_emitter():
     }
     assert EVERY_ROW_VERBS <= READ_VERBS
     assert EVERY_ROW_VERBS <= databricks_reads
+
+
+@pytest.mark.parametrize(
+    ("filter_principal", "grant_principal", "identity"),
+    [
+        (
+            "alice@fluid-fake.test-corp.com",
+            "user:alice@fluid-fake.test-corp.com",
+            "user:alice@fluid-fake.test-corp.com",
+        ),
+        (
+            "user:alice@fluid-fake.test-corp.com",
+            "alice@fluid-fake.test-corp.com",
+            "user:alice@fluid-fake.test-corp.com",
+        ),
+        (
+            "etl@proj.iam.gserviceaccount.com",
+            "serviceAccount:etl@proj.iam.gserviceaccount.com",
+            "serviceAccount:etl@proj.iam.gserviceaccount.com",
+        ),
+    ],
+)
+def test_an_unmapped_filter_and_grant_that_differ_in_the_prefix_are_one_member_on_bigquery(
+    filter_principal, grant_principal, identity
+):
+    # With no binding.principals, BigQuery reads an unprefixed principal as the member of
+    # the type it infers, so the two spellings are one member and it is filtered, never in
+    # the every-row policy; the gateway must not let the grant's spelling read every row.
+    contract = _base()
+    contract["accessPolicy"] = {"grants": [{"principal": grant_principal, "permissions": ["read"]}]}
+    orders = contract["exposes"][0]
+    orders["policy"]["authz"] = {
+        "rowFilters": [{"principal": filter_principal, "where": "branch = 'north'"}]
+    }
+    orders["binding"] = {
+        "platform": "gcp",
+        "format": "bigquery_table",
+        "location": {"project": "demo", "dataset": "sales", "table": "orders"},
+    }
+    policies = row_policies(contract, orders, "c", "orders")
+    every = {g for p in policies if p.policy_id == ALL_ROWS_POLICY_ID for g in p.grantees}
+    mine = {g for p in policies if p.policy_id != ALL_ROWS_POLICY_ID for g in p.grantees}
+    assert identity in mine and identity not in every
+    assert not _reads_every_row(contract, grant_principal)
+    assert not _reads_every_row(contract, filter_principal)

@@ -48,8 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts, and neither does a reader mapped to `[]`. Nor does a grant whose only read is `owner`: it
   reads on BigQuery but holds no table privilege on Databricks, and the gateway counts only what
   reads on every platform. A principal a row filter names never
-  reads every row, whatever its spelling (the type prefix and the case are folded for that
-  comparison). A caller's verified principals match as written and are never translated through
+  reads every row, whatever its spelling (the type prefix, which an unprefixed address leaves
+  to be inferred, and the case are folded for that comparison, and two principals that
+  `binding.principals` maps to one identity are one). A caller's verified principals match as written and are never translated through
   `binding.principals`. Without `contract=` only `policy.authz.readers` read every row, narrowed
   the same two ways. An `accessPolicy` or `binding.principals` that cannot be read as written is
   refused with `RowFilterUnavailable`. `row_filter_predicate`, `compile_semantic_query`,

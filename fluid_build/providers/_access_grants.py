@@ -102,6 +102,23 @@ def logical_key(raw: Any) -> str:
     return text
 
 
+def identity_key(raw: Any) -> str:
+    """The address a principal names, to tell whether two spellings are one principal.
+
+    :func:`logical_key` without any type prefix, case folded. An emitter reads an
+    unprefixed principal as a member of the type it infers (``user:`` for an address,
+    ``serviceAccount:`` for a service-account address), so ``alice@x`` and
+    ``user:alice@x`` are one member there; keying by the address alone puts them
+    together here. It is for comparison only and only ever groups more principals, so
+    a subtraction that uses it narrows.
+    """
+    text = logical_key(raw)
+    head, sep, rest = text.partition(":")
+    if sep and head.strip().lower() in CANONICAL_PREFIXES and rest.strip():
+        text = rest.strip()
+    return text.casefold()
+
+
 class ReaderRuleError(ValueError):
     """The policy that decides who reads every row cannot be read as written."""
 
@@ -118,23 +135,29 @@ def _declared_readers(authz: Mapping[str, Any]) -> FrozenSet[str]:
     return _principal_names(raw or ())
 
 
-def _unmapped_keys(expose: Mapping[str, Any]) -> FrozenSet[str]:
-    """The logical keys (case folded) that ``binding.principals`` maps to ``[]``.
+def _mapped_identities(
+    expose: Mapping[str, Any],
+) -> Tuple[Mapping[str, Tuple[str, ...]], FrozenSet[str]]:
+    """What ``binding.principals`` maps each principal to, keyed by :func:`identity_key`.
 
-    The shapes read are the ones ``fluid_build.iac.principals.principal_map`` accepts;
-    any other is refused, as the emitters refuse it. Only an empty list means "no
-    identity on this cloud": a principal mapped to an identity is not translated here.
+    The value is every identity (as :func:`identity_key`) that principal maps to. The
+    second item is the keys of the principals mapped to ``[]``: no identity on this
+    cloud, so no one to read. The shapes
+    read are the ones ``fluid_build.iac.principals.principal_map`` accepts; any other is
+    refused, as the emitters refuse it. A principal mapped to an identity is not
+    translated for a caller: the mapping only tells which principals are one.
     """
     binding = expose.get("binding")
     raw = binding.get("principals") if isinstance(binding, Mapping) else None
     if raw is None:
-        return frozenset()
+        return {}, frozenset()
     if not isinstance(raw, Mapping):
         raise ReaderRuleError(
             f"binding.principals must be a mapping of logical principal to identity, got "
             f"{type(raw).__name__}."
         )
-    empty: set[str] = set()
+    found: dict[str, Tuple[str, ...]] = {}
+    nobody: set[str] = set()
     for key, value in raw.items():
         name = logical_key(key)
         if not name:
@@ -152,9 +175,11 @@ def _unmapped_keys(expose: Mapping[str, Any]) -> FrozenSet[str]:
                 f"binding.principals[{name!r}] must be an identity, a list of identities, or "
                 "[] for none on this cloud."
             )
+        slot = identity_key(name)
         if not identities:
-            empty.add(name.casefold())
-    return frozenset(empty)
+            nobody.add(slot)
+        found[slot] = found.get(slot, ()) + tuple(identity_key(i) for i in identities)
+    return found, frozenset(nobody)
 
 
 def _verbs(raw: Any) -> FrozenSet[str]:
@@ -232,8 +257,10 @@ def every_row_readers(
     ``accessPolicy.grants[]`` entry that has a permission in :data:`EVERY_ROW_VERBS`, no
     condition (``conditions`` absent, ``None`` or empty) and a scope that covers the
     expose. Less every principal ``binding.principals`` maps to ``[]`` and every
-    principal in ``filtered`` (the principals a row filter names), both compared by
-    :func:`logical_key` with the case folded: both subtractions only narrow the set.
+    principal in ``filtered`` (the principals a row filter names), compared by
+    :func:`identity_key`: the address with the type prefix dropped and the case folded,
+    and a principal is also the one that ``binding.principals`` maps it to, so two
+    principals that map to one identity are one. Each subtraction only narrows the set.
 
     The schema has no explicit deny for rows, so there is none to apply. A caller's
     principals match the result as written; nothing here translates a principal
@@ -245,9 +272,19 @@ def every_row_readers(
     candidates = set(_declared_readers(authz) if isinstance(authz, Mapping) else ())
     if contract is not None:
         candidates |= _read_grantees(expose, contract)
-    out = _unmapped_keys(expose)
-    named = {logical_key(item).casefold() for item in filtered} | out
-    return frozenset(c for c in candidates if logical_key(c).casefold() not in named)
+    mapping, nobody = _mapped_identities(expose)
+
+    def names(principal: Any) -> FrozenSet[str]:
+        """Every key that ``principal`` is known by: its address and what it maps to."""
+        key = identity_key(principal)
+        return frozenset({key, *mapping.get(key, ())})
+
+    named: set[str] = set()
+    for item in filtered:
+        named |= names(item)
+    return frozenset(
+        c for c in candidates if identity_key(c) not in nobody and not names(c) & named
+    )
 
 
 __all__ = [
@@ -257,6 +294,7 @@ __all__ = [
     "READ_VERBS",
     "ReaderRuleError",
     "every_row_readers",
+    "identity_key",
     "logical_key",
     "parse_grant_scope",
 ]
