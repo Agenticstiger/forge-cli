@@ -263,6 +263,7 @@ class _Upload:
         self.client, self.bucket, self.prefix, self.uri = client, bucket, prefix, uri
         self.written = 0
         self.already = 0
+        self.index_there = False  # release.json was already published before this run
 
     def _done(self) -> str:
         """What this run left in S3, for a refusal's message."""
@@ -332,6 +333,7 @@ class _Upload:
     def check_index(self, index: _File) -> None:
         """Refuse, before any write, a target whose ``release.json`` is another release's."""
         head = self._head(self.prefix + index.rel)
+        self.index_there = head is not None
         if head is not None and not self._same(head, index):
             raise PublishError(
                 f"{self.uri}release.json already holds another release of this identity (other "
@@ -363,9 +365,15 @@ class _Upload:
                     if head is not None and self._same(head, item):
                         self.already += 1
                         return
-                    raise self._fail(
-                        f"{shown} already holds other bytes; a published release never changes"
-                    ) from None
+                    if self.index_there:
+                        why = "a published release never changes"
+                    else:  # an earlier run stopped before its release.json
+                        why = (
+                            f"{self.uri} holds no release.json, so no reader takes it as a "
+                            "release: an earlier run stopped partway. Delete the objects under "
+                            "it and run again, or publish the directory that run sealed"
+                        )
+                    raise self._fail(f"{shown} already holds other bytes; {why}") from None
                 if (code in s3.CONFLICT_CODES or status == 409) and attempt < _CONFLICT_TRIES:
                     continue  # the write raced a delete of the key: S3 says try again
                 if s3.is_denied_code(code):

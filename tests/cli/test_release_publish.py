@@ -132,8 +132,23 @@ def test_an_object_with_other_bytes_is_refused(tmp_path: Path) -> None:
         publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
     message = str(raised.value)
     assert "reports/ship-report.json already holds other bytes" in message
+    assert "holds no release.json, so no reader takes it as a release" in message
+    assert "Delete the objects under it and run again" in message
     assert "1 object(s) were written" in message and "release.json is written last" in message
     assert not any(k.endswith("release.json") for k in s3.writes)
+
+
+def test_other_bytes_beside_a_published_index_never_change(tmp_path: Path) -> None:
+    index = sealed(tmp_path / "rel")
+    s3 = FakeS3()
+    publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
+    s3.objects[("acme-releases", f"{_prefix(index)}bundle.tgz")] = b"swapped"
+    s3.checksums[("acme-releases", f"{_prefix(index)}bundle.tgz")] = None
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
+    assert "bundle.tgz already holds other bytes; a published release never changes" in str(
+        raised.value
+    )
 
 
 def test_an_object_uploaded_without_a_checksum_is_not_taken_as_ours(tmp_path: Path) -> None:
