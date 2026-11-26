@@ -84,7 +84,6 @@ _NOT_PUBLIC = "the table it references is not declared public"
 _FEW_KEYS = "the table it references holds fewer than two keys"
 _NOT_CATEGORICAL = "its key is not text: a history follows categorical columns"
 _TWO_TABLES = "it is the key of more than one relationship"
-_COMPOSITE = "a relationship whose key holds more than one column is not followed"
 
 
 class _Unspellable(ValueError):
