@@ -49,9 +49,9 @@ ignore_imports =
     # schema_registry/clients.py: GlueRegistry imports boto3 inside _glue()
     # (try/except ImportError), only when a contract names a Glue registry.
     fluid_build.schema_registry.clients -> boto3
-    # Spark job runs: boto3 is imported inside default_clients / resolve_region, only
-    # when a run is read or started (try/except ImportError).
-    fluid_build.build_runners.spark._adapters -> boto3
+    # S3 helpers (util/s3.py): boto3 is imported inside default_clients (try/except
+    # ImportError), only when a Spark run, a release publish or a release verify reads S3.
+    fluid_build.util.s3 -> boto3
     fluid_build.build_runners.spark._desired -> boto3
     # openlineage: imported inside the emit helpers, so it loads only when a
     # build runner actually emits a lineage event.
