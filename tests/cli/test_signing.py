@@ -184,7 +184,11 @@ class TestVerifyBundle:
                 "fluid_build.cli._signing.subprocess.run", return_value=fake_completed
             ) as mock_run,
         ):
-            result = _signing.verify_bundle(str(fake_bundle))
+            result = _signing.verify_bundle(
+                str(fake_bundle),
+                certificate_identity="ci@example.com",
+                certificate_oidc_issuer="https://issuer.example.com",
+            )
 
         argv = mock_run.call_args.args[0]
         assert argv == [
@@ -192,8 +196,8 @@ class TestVerifyBundle:
             "verify-blob",
             "--bundle",
             str(signed.resolve()),
-            "--certificate-identity-regexp=.*",
-            "--certificate-oidc-issuer-regexp=.*",
+            "--certificate-identity=ci@example.com",
+            "--certificate-oidc-issuer=https://issuer.example.com",
             str(fake_bundle.resolve()),
         ]
         assert mock_run.call_args.kwargs["shell"] is False
@@ -217,7 +221,7 @@ class TestVerifyBundle:
                 "fluid_build.cli._signing.subprocess.run", return_value=fake_completed
             ) as mock_run,
         ):
-            _signing.verify_bundle(str(fake_bundle), sigstore_bundle=str(other))
+            _signing.verify_bundle(str(fake_bundle), sigstore_bundle=str(other), key_ref=str(other))
         assert mock_run.call_args.args[0][2:4] == ["--bundle", str(other.resolve())]
 
     def test_identity_regexp_flows_into_argv(self, fake_bundle):
@@ -301,12 +305,39 @@ class TestVerifySignatureCLI:
             rc = verify_signature.run(self._args(str(fake_bundle)))
         assert rc == 1
 
+    @pytest.mark.parametrize(
+        "pins",
+        [
+            {},  # no signer named: anyone can get a certificate for their own identity
+            {"certificate_identity": "", "certificate_oidc_issuer": "https://i.example.com"},
+            {"certificate_identity": "ci@example.com", "certificate_oidc_issuer": "  "},
+            {"identity_regexp": "", "oidc_issuer_regexp": ".*"},
+        ],
+    )
+    def test_keyless_without_a_named_signer_is_refused(self, fake_bundle, pins):
+        (fake_bundle.parent / (fake_bundle.name + ".sigstore.json")).write_bytes(b"{}")
+        args = self._args(str(fake_bundle), identity_regexp=None, oidc_issuer_regexp=None)
+        for key, value in pins.items():
+            setattr(args, key, value)
+        with (
+            patch("fluid_build.cli._signing.shutil.which", return_value="/bin/cosign"),
+            patch("fluid_build.cli._signing.subprocess.run") as mock_run,
+            pytest.raises(CLIError, match="signing_identity_not_pinned"),
+        ):
+            verify_signature.run(args)
+        mock_run.assert_not_called()
+
     def test_half_an_exact_signer_is_refused(self, fake_bundle):
         (fake_bundle.parent / (fake_bundle.name + ".sigstore.json")).write_bytes(b"{}")
         with patch("fluid_build.cli._signing.shutil.which", return_value="/bin/cosign"):
             with pytest.raises(CLIError, match="signing_identity_not_pinned"):
                 verify_signature.run(
-                    self._args(str(fake_bundle), certificate_identity="ci@example.com")
+                    self._args(
+                        str(fake_bundle),
+                        certificate_identity="ci@example.com",
+                        identity_regexp=None,
+                        oidc_issuer_regexp=None,
+                    )
                 )
 
     def test_the_bundle_flag_is_on_the_parser(self):
@@ -320,9 +351,13 @@ class TestVerifySignatureCLI:
             "b.json",
             "x",
         )
-        for gone in ("--signature", "--certificate"):
-            with pytest.raises(SystemExit):
-                parser.parse_args(["verify-signature", "b.tgz", gone, "x"])
+        for gone in ("signature", "certificate"):
+            args = parser.parse_args(["verify-signature", "b.tgz", f"--{gone}", "x.sig"])
+            with (
+                patch("fluid_build.cli._signing.shutil.which", return_value="/bin/cosign"),
+                pytest.raises(CLIError, match="verify_signature_sig_pem_gone"),
+            ):
+                verify_signature.run(args)
 
     def test_cosign_missing_raises_cli_error(self, fake_bundle):
         with patch("fluid_build.cli._signing.shutil.which", return_value=None):
@@ -514,3 +549,30 @@ def test_a_failure_shows_cosign_s_error_not_its_warnings() -> None:
     result = {"stderr_tail": "WARNING: Skipping tlog verification\n\nError: invalid signature\n"}
     assert _signing.stderr_last_line(result) == "Error: invalid signature"
     assert _signing.stderr_last_line({}) == ""
+
+
+def test_schedule_sync_names_the_keyless_signer_exactly_or_refuses() -> None:
+    import argparse as ap
+
+    from fluid_build.cli import schedule_sync
+
+    parser = ap.ArgumentParser()
+    schedule_sync.register(parser.add_subparsers())
+    args = parser.parse_args(
+        [
+            "schedule-sync",
+            "--scheduler",
+            "airflow",
+            "--dags-dir",
+            "d",
+            "--verify-certificate-identity",
+            "ci@example.com",
+            "--verify-certificate-oidc-issuer",
+            "https://issuer.example.com",
+        ]
+    )
+    assert (args.verify_certificate_identity, args.verify_certificate_oidc_issuer) == (
+        "ci@example.com",
+        "https://issuer.example.com",
+    )
+    assert args.verify_identity_regexp is None and args.verify_oidc_issuer_regexp is None

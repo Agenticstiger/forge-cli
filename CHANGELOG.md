@@ -351,6 +351,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the regexps. cosign 2.x writes its own bundle format and 3.x the Sigstore one, so sign and verify
   with the same major version.
 
+- **Keyless signature verification names its signer.** `fluid verify-signature` and `fluid
+  schedule-sync --verify-signature` defaulted the identity and issuer regexps to `.*`, which any
+  Sigstore user's certificate for their own identity matches, and an empty
+  `--certificate-identity` fell back to it. Keyless now needs both an identity and an issuer,
+  exactly (`--certificate-identity`/`--certificate-oidc-issuer`; on schedule-sync
+  `--verify-certificate-identity`/`--verify-certificate-oidc-issuer`, new) or as regexps
+  (`--identity-regexp`/`--oidc-issuer-regexp`, `--verify-identity-regexp`/
+  `--verify-oidc-issuer-regexp`); a missing or empty one exits 2 with
+  `signing_identity_not_pinned` before cosign runs. `--signature`/`--certificate` exit 2 with
+  `verify_signature_sig_pem_gone`, naming `--bundle`.
+
 - **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through
   `runpy` and marks a run FAILED on any `SystemExit`, code 0 included, so a build that wrote its
   rows still ended `FAILED: SystemExit: 0` and `fluid apply --mode amend-and-build` reported it

@@ -313,17 +313,17 @@ def verify_bundle(
     key_ref: Optional[str] = None,
     certificate_identity: Optional[str] = None,
     certificate_oidc_issuer: Optional[str] = None,
-    identity_regexp: str = ".*",
-    oidc_issuer_regexp: str = ".*",
+    identity_regexp: Optional[str] = None,
+    oidc_issuer_regexp: Optional[str] = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> Dict:
     """Verify a signed tgz bundle from its Sigstore bundle via ``cosign verify-blob --bundle``.
 
     **Mode selection mirrors :func:`sign_bundle`:**
     - ``key_ref=None`` → keyless: the certificate in the Sigstore bundle must chain to
-      Fulcio and name the signer. ``certificate_identity`` with ``certificate_oidc_issuer``
-      pins it exactly; otherwise ``identity_regexp`` and ``oidc_issuer_regexp`` match it
-      (default ``.*``, permissive: tighten in production).
+      Fulcio and name the signer: ``certificate_identity`` and ``certificate_oidc_issuer``
+      exactly, or ``identity_regexp`` and ``oidc_issuer_regexp``. There is no default: a
+      check that names no signer, or an empty one, is refused (``signing_identity_not_pinned``).
     - ``key_ref="<path-or-kms-uri>"`` → keyed verify against a public key.
 
     ``sigstore_bundle`` defaults to ``<bundle>.sigstore.json``, what :func:`sign_bundle`
@@ -349,8 +349,8 @@ def verify_bundle(
         key_ref=key_ref,
         certificate_identity=certificate_identity,
         certificate_oidc_issuer=certificate_oidc_issuer,
-        identity_regexp=None if certificate_identity else identity_regexp,
-        oidc_issuer_regexp=None if certificate_oidc_issuer else oidc_issuer_regexp,
+        identity_regexp=identity_regexp,
+        oidc_issuer_regexp=oidc_issuer_regexp,
         timeout=timeout,
     )
     result["sigstore_bundle"] = str(signed)
@@ -388,34 +388,41 @@ def verify_blob(
         _validate_key_ref(key_ref)
         argv += ["--key", key_ref]
     else:
-        identity = (
-            f"--certificate-identity={certificate_identity}"
-            if certificate_identity
-            else (
-                f"--certificate-identity-regexp={identity_regexp}"
-                if identity_regexp is not None
-                else None
-            )
-        )
-        issuer = (
-            f"--certificate-oidc-issuer={certificate_oidc_issuer}"
-            if certificate_oidc_issuer
-            else (
-                f"--certificate-oidc-issuer-regexp={oidc_issuer_regexp}"
-                if oidc_issuer_regexp is not None
-                else None
-            )
-        )
-        if identity is None or issuer is None:
-            raise CLIError(
-                2,
-                "signing_identity_not_pinned",
-                {"hint": "keyless verification needs the signer's identity and issuer"},
-            )
         # one argv element each, so a value that starts with "-" is never read as a flag
-        argv += [identity, issuer]
+        argv += [
+            _signer_flag("certificate-identity", certificate_identity, identity_regexp),
+            _signer_flag("certificate-oidc-issuer", certificate_oidc_issuer, oidc_issuer_regexp),
+        ]
     argv.append(str(blob))
     return _run_cosign(argv, timeout=timeout)
+
+
+def _signer_flag(flag: str, exact: Optional[str], regexp: Optional[str]) -> str:
+    """``--<flag>=<exact>`` or ``--<flag>-regexp=<regexp>``: keyless verification names its
+    signer. Any Sigstore user can get a Fulcio certificate for their own identity, so a check
+    that names no identity and issuer proves nothing about who signed; an empty value (an
+    unset CI variable) names none either.
+
+    Raises:
+        CLIError: (exit 2) ``signing_identity_not_pinned``, neither given or one blank.
+    """
+    for value, form in ((exact, f"--{flag}="), (regexp, f"--{flag}-regexp=")):
+        if value is None:
+            continue
+        if not value.strip():
+            break
+        return form + value
+    raise CLIError(
+        2,
+        "signing_identity_not_pinned",
+        {
+            "flag": flag,
+            "hint": (
+                "keyless verification needs the signer: an exact certificate identity and OIDC "
+                "issuer (or regexps for them); an empty value pins nothing"
+            ),
+        },
+    )
 
 
 def stderr_last_line(result: Dict, limit: int = 300) -> str:

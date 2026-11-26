@@ -942,6 +942,23 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "supply-chain",
     ),
+    "signing_identity_not_pinned": (
+        [
+            "Keyless verification names its signer: pass the certificate identity and OIDC "
+            "issuer exactly (--certificate-identity / --certificate-oidc-issuer), or regexps "
+            "for them (--identity-regexp / --oidc-issuer-regexp)",
+            "An empty value (an unset CI variable) pins nothing and is refused",
+        ],
+        "supply-chain",
+    ),
+    "verify_signature_sig_pem_gone": (
+        [
+            "fluid bundle --sign writes one Sigstore bundle, <bundle>.sigstore.json; name "
+            "another one with --bundle PATH",
+            "A bundle with only .sig/.pem files: sign it again with fluid bundle --sign",
+        ],
+        "supply-chain",
+    ),
     "signing_key_ref_empty": (
         [
             "Provide a signing key reference (e.g. a cosign key or KMS key URI)",

@@ -14,8 +14,9 @@ Usage::
         --certificate-identity 'https://github.com/myorg/orders/.github/workflows/ci.yml@refs/heads/main' \\
         --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 
-Default regexps are permissive (``.*``) — pin the signer in production. A failed verification
-returns exit 1; a missing cosign binary or Sigstore bundle returns exit 2 (config error).
+Keyless verification names its signer, exactly or by regexp: there is no default, and an empty
+value is refused, since anyone can get a Sigstore certificate for their own identity. A failed
+verification returns exit 1; a missing cosign binary, Sigstore bundle or signer returns exit 2.
 """
 
 from __future__ import annotations
@@ -94,22 +95,23 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--identity-regexp",
-        default=".*",
+        default=None,
         help=(
-            "Regexp matching the acceptable OIDC subject (keyless mode). "
-            "Default '.*' accepts any — tighten in production to pin "
-            "signer identity. Ignored in keyed mode."
+            "Keyless: a regexp the signer's certificate identity must match, "
+            "instead of --certificate-identity. Ignored in keyed mode."
         ),
     )
     p.add_argument(
         "--oidc-issuer-regexp",
-        default=".*",
+        default=None,
         help=(
-            "Regexp matching the acceptable OIDC issuer. Default '.*' "
-            "accepts any — set to 'https://token.actions.githubusercontent.com' "
-            "to pin to GitHub Actions signers only."
+            "Keyless: a regexp the signer's OIDC issuer must match, instead "
+            "of --certificate-oidc-issuer."
         ),
     )
+    for gone in ("--signature", "--certificate"):
+        # gone with the .sig/.pem files: named so the refusal says where to go
+        p.add_argument(gone, dest=f"gone_{gone[2:]}", default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--timeout",
         type=int,
@@ -140,17 +142,25 @@ def run(args: argparse.Namespace, _logger: Optional[logging.Logger] = None) -> i
         f"[verify-signature] checking {args.bundle} (mode: {mode})",
         markup=False,
     )
+    for gone in ("signature", "certificate"):
+        if getattr(args, f"gone_{gone}", None) is not None:
+            raise CLIError(
+                2,
+                "verify_signature_sig_pem_gone",
+                {
+                    "flag": f"--{gone}",
+                    "hint": (
+                        "fluid bundle --sign writes one Sigstore bundle, <bundle>.sigstore.json, "
+                        "and .sig/.pem files are no longer read: name another one with --bundle "
+                        "PATH, and sign the bundle again if it has only .sig/.pem"
+                    ),
+                },
+            )
     exact = (
         getattr(args, "certificate_identity", None),
         getattr(args, "certificate_oidc_issuer", None),
     )
-    if any(exact) and not all(exact):
-        raise CLIError(
-            2,
-            "signing_identity_not_pinned",
-            {"hint": "pass both --certificate-identity and --certificate-oidc-issuer"},
-        )
-    if any(exact) and key_ref:
+    if any(v is not None for v in exact) and key_ref:
         raise CLIError(
             2,
             "signing_identity_not_pinned",

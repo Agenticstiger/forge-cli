@@ -318,24 +318,35 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p.add_argument(
-        "--verify-identity-regexp",
-        default=".*",
+        "--verify-certificate-identity",
+        default=None,
         help=(
-            "Regexp matching the acceptable OIDC signer identity "
-            "(keyless mode). Default '.*' accepts any \u2014 pin this in "
-            "production to 'https://github.com/<your-org>/.*' or "
-            "equivalent so a stolen/compromised signer can't push "
-            "malicious DAGs."
+            "Keyless --verify-signature: the signer's exact certificate identity "
+            "(with --verify-certificate-oidc-issuer). Keyless verification names its "
+            "signer, exactly or by regexp: there is no default."
+        ),
+    )
+    p.add_argument(
+        "--verify-certificate-oidc-issuer",
+        default=None,
+        help="Keyless --verify-signature: the signer's exact OIDC issuer.",
+    )
+    p.add_argument(
+        "--verify-identity-regexp",
+        default=None,
+        help=(
+            "Keyless --verify-signature: a regexp the signer's certificate identity "
+            "must match (e.g. 'https://github.com/<your-org>/.*'), instead of "
+            "--verify-certificate-identity."
         ),
     )
     p.add_argument(
         "--verify-oidc-issuer-regexp",
-        default=".*",
+        default=None,
         help=(
-            "Regexp matching the acceptable OIDC issuer (keyless "
-            "mode). Default '.*' accepts any. Pin to "
-            "'https://token.actions.githubusercontent.com' to force "
-            "GitHub-only signers, or your GitLab OIDC issuer URL."
+            "Keyless --verify-signature: a regexp the signer's OIDC issuer must match "
+            "(e.g. 'https://token.actions.githubusercontent.com'), instead of "
+            "--verify-certificate-oidc-issuer."
         ),
     )
     p.add_argument(
@@ -1690,8 +1701,10 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         verify_result = verify_bundle(
             bundle,
             key_ref=getattr(args, "verify_key", None),
-            identity_regexp=getattr(args, "verify_identity_regexp", ".*"),
-            oidc_issuer_regexp=getattr(args, "verify_oidc_issuer_regexp", ".*"),
+            certificate_identity=getattr(args, "verify_certificate_identity", None),
+            certificate_oidc_issuer=getattr(args, "verify_certificate_oidc_issuer", None),
+            identity_regexp=getattr(args, "verify_identity_regexp", None),
+            oidc_issuer_regexp=getattr(args, "verify_oidc_issuer_regexp", None),
             timeout=args.timeout,
         )
         if verify_result["exit_code"] != 0:

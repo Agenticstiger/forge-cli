@@ -592,7 +592,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # exit so CI stops — signing is opt-in; if the operator asked
         # for it, silent skip would be the wrong default.
         if getattr(args, "sign", False):
-            from ._signing import cosign_available, sign_bundle
+            from ._signing import cosign_available, sign_bundle, stderr_last_line
 
             if not cosign_available():
                 sys.stderr.write(
@@ -609,7 +609,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             if sig_result["exit_code"] != 0:
                 sys.stderr.write(
                     f"❌ cosign sign-blob exit {sig_result['exit_code']}: "
-                    f"{sig_result.get('stderr_tail', '')[:500]}\n"
+                    f"{stderr_last_line(sig_result)}\n"
                 )
                 return 1
             mode = "keyed mode" if sig_result.get("key_mode") == "keyed" else "keyless OIDC"
