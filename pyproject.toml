@@ -217,9 +217,10 @@ snowflake = [
 # provider; this extra is the explicit install target so `.[aws]` actually
 # pulls the SDK — the integration workflows install `.[dev,aws]`.
 aws = [
-  "boto3>=1.34",
+  # 1.35.2: PutObject takes IfNoneMatch (`fluid ship --release-to` writes once).
+  "boto3>=1.35.2",
   # Imported directly (ClientError, the bundled endpoint data); boto3 pulls it.
-  "botocore>=1.34",
+  "botocore>=1.35.2",
 ]
 
 # Visualizations (plan graph, HTML)
@@ -602,7 +603,7 @@ test-emulators-heavy = [
   "google-cloud-bigquery>=3.20",
   "google-cloud-storage>=2.16",
   "google-cloud-pubsub>=2.38",
-  "boto3>=1.34",
+  "boto3>=1.35.2",
 ]
 
 # One-shot install for contributors
@@ -1014,6 +1015,14 @@ module = [
     "fluid_build.profiler._stats",
     "fluid_build.profiler.bundle",
     "fluid_build.profiler.calendars",
+    "fluid_build.profiler.consumer_queries.__init__",
+    "fluid_build.profiler.consumer_queries._allow",
+    "fluid_build.profiler.consumer_queries._bounds",
+    "fluid_build.profiler.consumer_queries._child",
+    "fluid_build.profiler.consumer_queries._order",
+    "fluid_build.profiler.consumer_queries._types",
+    "fluid_build.profiler.consumer_queries.check",
+    "fluid_build.profiler.consumer_queries.runner",
     "fluid_build.profiler.dates",
     "fluid_build.profiler.defaults",
     "fluid_build.profiler.disclosure",
@@ -1022,6 +1031,7 @@ module = [
     "fluid_build.profiler.grouped",
     "fluid_build.profiler.history",
     "fluid_build.profiler.per_entity",
+    "fluid_build.profiler.query_rates",
     "fluid_build.profiler.ranks",
     "fluid_build.profiler.request",
     "fluid_build.profiler.runner",
@@ -1066,6 +1076,12 @@ module = [
     "fluid_build.maintenance.spec",
     "fluid_build.maintenance.statements",
     "fluid_build.build_runners.spark._maintenance",
+    # A sealed release published to S3 and verified back: whether an object is taken as
+    # ours, and whether a release reads as intact, so a silent Any is a silent overwrite.
+    "fluid_build.api.release",
+    "fluid_build.cli._release_publish",
+    "fluid_build.util.s3",
+    "fluid_build.util.release_record",
 ]
 strict = true
 

@@ -9,18 +9,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid profile` publishes a date column's min and max rounded to a calendar unit when too
+  few records hold the exact value.** Where fewer than `minimumCell` records hold a DATE or
+  timestamp column's smallest or largest value, the end is now the first (min) or last (max)
+  value of the finest UTC day (timestamps only), month or year holding at least `minimumCell`
+  records, status `F`, clipped to the range the contract declares, and only when the true end lies inside it (a
+  record outside the range leaves that end withheld); with no such bucket the end
+  stays withheld as before. A published end says only that its bucket holds that many records and
+  that none lies beyond it, as a date span's outer edge does. A profile or a request answer names
+  each rounded end and its unit per table under Rounded extremes; a column whose ends pass
+  exactly is unchanged.
+
+- **`fluid profile` answers a profile request's consumer queries with their rates.** A query that
+  keeps some of its unit's records and changes none (a `SELECT` of columns from its unit, a table
+  or a view that itself only keeps some rows of one table, with at most one `WHERE`) gets a `queries` entry: one level histogram over
+  `false` and `true`, where `k` is the records of the unit and the `true` count the rows the query
+  returns, per level of its `groupBy` column when it has one (format 1-3-0). The text is checked
+  and then run only as a tree built again and checked again, in the locked process; the count of
+  its own rows must match the one derived from the unit's records. What is answered is decided
+  before any record is read, so `--strict` refuses the rest, and each query not answered is named
+  under Not measured with its reason. The queries of one unit are checked as a set, together with
+  the facts of the same table, so two queries that differ by a few records give none back; a
+  private release publishes no query rate. A view unit counts its table's records and its
+  condition is one more factor of that table's set check; a view that joins or reshapes rows is
+  named before any read. A unit may aggregate when it counts entities: one table's rows grouped
+  by one column of a declared `many_to_one` relationship (`SELECT K, count(*) AS n FROM t GROUP
+  BY K`, with `count`, `sum`, `avg`, `min` or `max` of the table's columns, a `WHERE` and a
+  `HAVING`). Its records are the entities: the parents of a counted relationship, and each group
+  whose key is null or names no parent, or the distinct values of the column, and a query over it is checked as a set with whether the entity is in the
+  unit and, where the relationship's children-per-parent histogram withholds a bin, that bin;
+  any other aggregate, and a table's natural entity, is named before any read, and so are the
+  units and queries over one table's entities past the number one set check can count. A run
+  counts one table's records one way: as its rows (a fact of the table, a table unit or a view
+  unit), as its entities by one column, or as the parents of one relationship's children (a unit
+  over a child table, grouped by its key into the table). A fact decides first, then the first
+  answered query in request order, and a query whose unit counts a table another way is named
+  before any read. A sum or average over a decimal of more than 18 digits is refused before any read (its total could overflow depending on the records), and decimals of up to 38 digits now load exactly. A condition that could raise an error depending on a
+  row's value is refused before any read with the gateway's own condition fence, and any failure
+  that still depends on the records withholds every query of the run with one fixed message, so
+  a run says at most that some statement failed, never which. A query is checked as a set with the
+  table's facts and the other queries over it, and with the published cells of each column the
+  parts read (an ungrouped level histogram, an ungrouped histogram of a number or timestamp
+  column, or the rows with a value where `count` or `nullCount` is published), for small cells
+  before any rounding, the published cells never withheld. Grouped statistics, quantiles,
+  supports, calendars, date spans and pairs and a relationship's counts are not held in a
+  table's set; a column's cells are not held beside a part that does not read the column, and no
+  zero cell is looked for beside them; a table's facts asked with no query over that table keep
+  the facts' own check; and an entity unit is not checked with the statistics its table and its
+  parent table publish, which count the same records where every entity holds one row. A reader
+  can difference such counts, and the rounding hides the difference only when neither count lies
+  at a rounding edge.
+  The report adds `Queries: N of M published whole`.
+
+
+- **`fluid profile` can check a consumer query and run it in a locked process.** A query a profile
+  request lists is untrusted text. It is parsed with sqlglot and refused, naming the construct,
+  unless it is one `SELECT` (or a non-recursive `WITH` before one) built only from listed
+  expression classes and functions over the tables the request lists, with a total order wherever
+  `LIMIT`, `OFFSET` or a window depends on one. The canonical text is read back and checked a
+  second time. It then runs in a DuckDB process of its own: a bare environment, no inherited
+  descriptors, file-size, CPU and memory limits set before DuckDB loads, an in-memory database
+  with external access, extension loading and configuration changes locked, one `SELECT` per
+  statement, and only whole numbers, group keys and bits back. A statement that times out or runs
+  out of memory takes that status and the others still run; a process that dies is replaced.
 - **`fluid ship --release-dir DIR --artifacts LOCK.yaml` seals external files into the release.**
   A lock lists the files a product runs that Forge does not build (a Spark package, an Airflow
   DAG, any other file), each with its sha256 and the repository, commit and optional ref it was
   built from. Before any stage runs, ship refuses a lock it cannot seal: an unknown field or kind,
-  a path that is absolute, hidden or leads out of the lock's directory (by `..` or a linked
-  directory), a link, or bytes that are not the sha256 named (the message never shows the digest
-  the file has). The release copies each file to `external/<name>/<file>`, hashes the copy again
+  a path that names no file, is absolute, is hidden or leads out of the lock's directory by `..`,
+  a path through any linked directory, a link, or bytes that are not the sha256 named (the message
+  never shows the digest the file has). The release copies each file to `external/<name>/<file>`, hashes the copy again
   and records the entries in its `identity`, sorted by name and with no path on the machine that
   ran it, so two clean runs give one identity and changed bytes give a new one.
   `$RELEASE_ARTIFACTS` names the lock when the flag is absent, read only by a run that seals a
   release; the flag without `--release-dir` is refused. `fluid runs status --release-dir` names
   each external file and its source.
+- **`fluid ship --release-dir DIR --release-to s3://bucket/prefix/` publishes the sealed release
+  to S3, write-once.** After the local seal, every file goes under
+  `<prefix>/<product>/<code hex>/<env>/`, so each environment's release of one commit and one
+  lock sits under one code digest. Each file is one single-part PutObject with `ChecksumSHA256`
+  and `If-None-Match: *`, read back with `HeadObject` (`ChecksumMode=ENABLED`), and
+  `release.json` goes last. An object already at a key counts as published only when its
+  SHA-256 is ours, so a re-run of the same release finishes or repeats the upload. When another
+  run already published this identity and that release verifies intact, it stands and nothing is
+  written (`already-published`). Other bytes, a release there that does not verify, a denied
+  write or a bad read-back refuse the run (exit 1, or 3 after an apply) and the sealed directory
+  stays as it is. Files
+  over 5 GiB are refused before any write. `--release-to-require versioning` refuses a bucket
+  without versioning; `--release-to-require object-lock` refuses one without Object Lock and a
+  default retention (a mode and a period: an enabled lock with no rule locks nothing), and then
+  checks that every object reads back with a lock mode and a retain-until date still to come.
+  GOVERNANCE retention yields to `s3:BypassGovernanceRetention`; COMPLIANCE yields to no one. The run report's `release.remote` says where the release went, or why
+  not. `--release-to` without `--release-dir`, a target that is not `s3://bucket/prefix/`, or no
+  boto3 is refused before stage 1 (exit 2), and so is a run whose CI names no commit: without one
+  the release has no code digest.
+- **`fluid runs verify-release SRC` checks a sealed release, read-only.** SRC is a release
+  directory or the `s3://` prefix `--release-to` wrote. It checks that `release.json` is a
+  `fluid-release/1` record whose `identity_digest` is the digest of its `identity`, that an S3 key
+  ending in an identity's hex is this one's, that every file listed has the sha256 named, and that
+  the files `identity` pins (the bundle, each external file, the artifacts MANIFEST and what it
+  lists, the plan) are listed with those digests, so a swapped file with its entry rewritten is
+  not intact.
+  It recomputes `code_digest` and checks that an S3 key's code hex and environment are this
+  release's. Exit 0 intact, 1 not intact, 2 cannot decide (unreadable, access denied, or boto3
+  missing for `s3://`); `--json` prints the result with each object's path, sha256 and S3
+  VersionId, so a consumer can record the exact versions it checked. The check is public as `fluid_build.api.verify_release`
+  (API 1.3), and `fluid runs status --release-dir` shares its identity check.
+
+- **A release names the commit it was built from, and the digest of its code.** `identity`
+  gains `source` (`{uri: git+<repo>, digest: {gitCommit}}`), from the CI's own variables, when
+  the CI names a full commit (40 or 64 hex characters; a short one would give one commit two code
+  digests); until now the commit sat only in `provenance`, outside
+  `identity_digest`. `release.json` gains `code_digest`, the sha256 of the canonical JSON of
+  `product_id`, `source`, `external`, `forge_version` and `fluid_version`: the same for every
+  environment sealed from one commit and one lock, and absent without a source commit.
+
+### Changed
+
+- **The `aws` extra needs boto3 and botocore 1.35.2 or later**, the first release whose PutObject
+  takes `IfNoneMatch`.
+- **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
+  and behaviour.
 
 ### Changed
 

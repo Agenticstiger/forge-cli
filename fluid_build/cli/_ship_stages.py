@@ -142,6 +142,10 @@ class ShipOptions:
     # --artifacts LOCK, else $RELEASE_ARTIFACTS when the run seals a release: the external
     # files it seals, as an absolute path; "" for none. Set by ship (_release_lock).
     artifacts: str = ""
+    # --release-to s3://bucket/prefix/: where the sealed release is then published, write-once
+    # (_release_publish); "" for nowhere. --release-to-require: checks of its bucket first.
+    release_to: str = ""
+    release_to_require: Tuple[str, ...] = ()
 
 
 @dataclass

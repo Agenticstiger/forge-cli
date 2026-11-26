@@ -116,9 +116,10 @@ it (pii, restricted, ...) that groups a noisy statistic draws a warning, since t
 counts such a column as P1. --follow cannot be used with --release-table, --unit-key or
 --max-rows-per-unit; each followed parent key must name one row, except that a followed
 relationship out of a table with a validity window by its natural entity repeats its key by
-design, and its data precondition is then that an entity's versions follow one parent row (a
-release whose records break it is refused as profile_release_entity_units); and every table the
-release reads needs a --source <exposeId>=<location>.
+design. Where the release publishes children per entity of such a table, or a statistic grouped
+through a link into it, an entity's versions must follow one parent row, and a release whose
+records break that is refused as profile_release_entity_units. Every table the release reads
+needs a --source <exposeId>=<location>.
 
 For which unit: one entity is one row of the unit's expose; with a release table related to
 it, or with a unit key, an entity owns every row that belongs to it, and the stated loss holds

@@ -37,6 +37,14 @@ Steinke (2020) as the author; the repository's LICENSE names no other holder.
 Only the exact sampling part is ported, with the randomness drawn from a seeded
 source and explicit checks in place of assertions.
 
+The consumer-query checker and its locked child process (fluid_build/profiler/consumer_queries/:
+_allow.py, _bounds.py, _order.py, check.py, _child.py, runner.py) are adapted from
+flux_engine/consumers/ (_allow.py, _bounds.py, _order.py, check.py, _child.py, _frames.py,
+runner.py) of FLUX at commit 19dfe48, under the Apache License 2.0. The closed lists of
+expression classes, functions and CAST types, the token, nesting and node limits, the total-order
+rule and the process locks are kept as they are; the bundle registries, placeholders, requirements
+and Arrow transport are dropped.
+
 The JSON Schemas of the Bitol Open Data Contract Standard (ODCS) vendored under
 fluid_build/providers/odcs/ (odcs-schema-v3.1.0.json, odcs-schema-v3.2.0.json) are
 published by the Bitol project under the Apache License 2.0.

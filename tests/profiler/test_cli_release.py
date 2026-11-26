@@ -269,7 +269,10 @@ def test_a_release_names_an_ask_fluid_profile_does_not_form(workspace, registry,
     _ask_a_query(workspace)
     assert main(_argv()) == 0
     out = " ".join(_out(capsys).split())
-    assert "Not released (fluid profile runs no consumer query): query big_orders." in out
+    assert (
+        "Not released (a private release publishes no query rate: PROFILE-SPEC refuses noise on a query statistic): query big_orders."
+        in out
+    )
     assert "SELECT" not in out
 
 

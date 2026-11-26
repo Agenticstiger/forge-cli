@@ -15,7 +15,7 @@ import inspect
 
 import fluid_build.api as api
 
-EXPECTED_API_VERSION = "1.2"
+EXPECTED_API_VERSION = "1.3"
 
 EXPECTED_ALL = {
     "__api_version__",
@@ -76,6 +76,9 @@ EXPECTED_ALL = {
     "load_contract",
     "load_contract_from_text",
     "load_contract_from_dict",
+    # release verification (added in 1.3)
+    "ReleaseVerification",
+    "verify_release",
 }
 
 

@@ -42,6 +42,23 @@ withheld because no record lies below the witness, though a published minimum
 already shows that, and one whose witness is the largest value is withheld because
 no record lies above it, though a published maximum already shows that.
 
+A DATE or timestamp column's two ends are top and bottom coded where the exact value
+fails that check, as SDC tools do (sdcMicro ``topBotCoding``; ARX's date hierarchies,
+day to month to year, as a global recoding): :func:`round_extreme` takes the UTC
+calendar buckets that hold the smallest (or largest) value, from the finest (the day,
+for a timestamp; for a DATE the exact value is the day), the month, the year, and
+publishes the first that holds at least ``minimumCell`` records, as the bucket's
+first value (``min``) or last value at the column's resolution (``max``: its last day
+for a DATE, its last millisecond for a timestamp), status ``F``. The value is clipped
+to the range the contract declares, which is public. No bucket up to the year holding
+that many records leaves the end ``A``. This says nothing a date span's outer edge
+does not (:func:`fluid_build.profiler.defaults.date_span` publishes an edge only where
+each end bin holds at least ``minimumCell`` records): a published end says only that
+its bucket holds at least ``minimumCell`` records and that no record lies beyond the
+bucket, so a bucket of that many records places no record in it. The unit is chosen
+from bucket counts that are each at least ``minimumCell`` or not used, so a unit that
+was passed over says only that its bucket was too small, as a withheld cell does.
+
 A verdict names the check that fired with an SDMX ``CL_CONF_STATUS`` 1.4 code:
 ``A`` for a small count (a zero cell, a cell below the threshold, or a value too
 few records hold), ``O`` and ``T`` for dominance by one or two records, ``M`` for
@@ -125,11 +142,13 @@ reason names the rule that fired, never a value.
 
 from __future__ import annotations
 
+import calendar
 import math
 import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
+from datetime import date as _date
 from fractions import Fraction
 from typing import (
     AbstractSet,
@@ -171,6 +190,7 @@ __all__ = [
     "check_sum",
     "check_support",
     "pinned_children_cells",
+    "round_extreme",
     "round_count",
     "sample_size",
     "suppress_differencing",
@@ -514,6 +534,76 @@ def check_order_statistic(holders: int, rule: DisclosureRule) -> Verdict:
     return Verdict(SMALL_COUNT, f"fewer than {rule.minimum_cell} records hold the value")
 
 
+_MS_PER_DAY = 86_400_000
+#: ``date.toordinal()`` of 1970-01-01: the proleptic Gregorian day number of the epoch.
+_EPOCH_ORDINAL = 719_163
+
+
+def round_extreme(
+    end: str,
+    holders: Mapping[int, int],
+    rule: DisclosureRule,
+    *,
+    date: bool,
+    floor: Optional[int] = None,
+    ceiling: Optional[int] = None,
+) -> Optional[Tuple[int, str]]:
+    """Round the ``"min"`` or ``"max"`` end of a date or timestamp column to a calendar bucket.
+
+    *holders* is the number of records holding each value, in whole milliseconds since the
+    epoch, of the column's non-null values; *date* says the column is a DATE (its values are
+    midnights, and its smallest unit is the day). The buckets are UTC calendar days (a
+    timestamp only), months and years holding the smallest value for ``"min"`` and the
+    largest for ``"max"``. The first, finest bucket holding at least ``minimumCell`` records
+    gives ``(value, unit)``: the bucket's first millisecond for a minimum, its last day (a
+    DATE) or last millisecond (a timestamp) for a maximum, clipped to *floor* and *ceiling*,
+    the range the contract declares, and only when the true extreme lies inside that range.
+    ``None`` when no bucket up to the year holds that many records, or when the bucket lies
+    outside the years 1 to 9999. Whole-number arithmetic on milliseconds throughout.
+    """
+    if not holders:
+        return None
+    pivot = min(holders) if end == "min" else max(holders)
+    if (floor is not None and pivot < floor) or (ceiling is not None and pivot > ceiling):
+        # a record lies outside the declared range: clipping would put the end on the wrong
+        # side of it, so the end stays withheld
+        return None
+    day = pivot // _MS_PER_DAY
+    try:
+        buckets = _calendar_buckets(day, date)
+    except (ValueError, OverflowError):
+        return None
+    for unit, first, after in buckets:
+        low, high = first * _MS_PER_DAY, after * _MS_PER_DAY
+        if sum(count for value, count in holders.items() if low <= value < high) >= (
+            rule.minimum_cell
+        ):
+            if end == "min":
+                shown = low if floor is None else max(low, floor)
+            else:
+                shown = high - (_MS_PER_DAY if date else 1)
+                shown = shown if ceiling is None else min(shown, ceiling)
+            return shown, unit
+    return None
+
+
+def _calendar_buckets(day: int, date: bool) -> List[Tuple[str, int, int]]:
+    """The ``(unit, first day, day after)`` buckets holding epoch day *day*, finest first.
+
+    A DATE column has no day bucket: its exact value is the day, and was checked already.
+    """
+    found: List[Tuple[str, int, int]] = []
+    if not date:
+        found.append(("day", day, day + 1))
+    moment = _date.fromordinal(day + _EPOCH_ORDINAL)
+    month_first = _date(moment.year, moment.month, 1).toordinal() - _EPOCH_ORDINAL
+    length = calendar.monthrange(moment.year, moment.month)[1]
+    found.append(("month", month_first, month_first + length))
+    year_first = _date(moment.year, 1, 1).toordinal() - _EPOCH_ORDINAL
+    found.append(("year", year_first, year_first + (366 if calendar.isleap(moment.year) else 365)))
+    return found
+
+
 def check_group_count(k: int, rule: DisclosureRule) -> Verdict:
     """Check the ``k`` of a group of a declared statistic: a count of records.
 
@@ -586,6 +676,7 @@ def suppress_differencing(
     rule: DisclosureRule,
     factors: Callable[[Sequence[int]], Factors],
     states: Sequence[int],
+    fixed: AbstractSet[int] = frozenset(),
 ) -> FrozenSet[int]:
     """The facts of one table to withhold so that together they give back no small cell.
 
@@ -630,10 +721,11 @@ def suppress_differencing(
 
     The check covers the facts of one table among themselves and against the table's row
     count, not a fact's overlap with a histogram's cells, a column's counts or a
-    relationship's counts. Two exposes are two tables to it, even when the data owner reads
-    both from the same records, so facts asked of each are not checked together. Noise is
-    what the ONS credits with protecting against
-    differencing, in its comparison of post-tabular methods (2024), and the release under
+    relationship's counts, unless those are given as *fixed* parts (the consumer queries hold
+    a column's published cells that way). Two exposes are two tables to it, even when the
+    data owner reads both from the same records, so facts asked of each are not checked
+    together. Noise is what the ONS credits with protecting against differencing, in its
+    comparison of post-tabular methods (2024), and the release under
     differential privacy (``fluid profile --privacy-unit``) is the profiler's way to
     publish counts with noise. The pattern is the coordinated secondary suppression of
     linked tables that the Handbook on Statistical Disclosure Control (2nd edition, section
@@ -641,12 +733,19 @@ def suppress_differencing(
     combination of the facts' states is held to the threshold, which errs toward
     withholding, where an audit such as sdcTable's ``attack()`` solves for the bounds a
     reader can put on each suppressed cell.
+
+    *fixed* holds the positions of counts published already, such as a column's published
+    cells, which the check holds in every combination and never withholds. A cell only they
+    touch withholds the parts it differs in from the nearest held combination with the same
+    fixed states; when no such combination is held, merging every other part leaves the cell
+    as it is, so it is the published counts' own and withholds nothing here.
     """
-    candidates = frozenset(passed)
+    pinned = frozenset(fixed)
+    candidates = frozenset(passed) - pinned
     shown = set(candidates)
     width = len(next(iter(cells), ()))
     while shown:
-        order = sorted(shown)
+        order = sorted(shown | pinned)
         formed: Mapping[Combination, int]
         if len(order) == width:
             # Every fact is published: the combinations are the ones given, not formed again.
@@ -657,7 +756,7 @@ def suppress_differencing(
                 if count > 0:
                     projected[tuple(combination[at] for at in order)] += count
             formed = projected
-        touched = _touched(formed, order, rule, factors, states)
+        touched = _touched(formed, order, rule, factors, states, pinned)
         if not touched:
             break
         shown -= touched
@@ -670,22 +769,32 @@ def _touched(
     rule: DisclosureRule,
     factors: Callable[[Sequence[int]], Factors],
     states: Sequence[int],
+    fixed: AbstractSet[int] = frozenset(),
 ) -> Set[int]:
-    """The facts (positions) that touch a small cell of *formed*, else those touching a zero cell."""
+    """The facts (positions) that touch a small cell of *formed*, else those touching a zero cell.
+
+    A position in *fixed* is never returned (:func:`suppress_differencing`).
+    """
     width = len(order)
+    kept = frozenset(at for at, position in enumerate(order) if position in fixed)
+    most = width - len(kept)
 
     def changed(cell: Combination, at: int) -> List[Combination]:
         return [cell[:at] + (state,) + cell[at + 1 :] for state in states if state != cell[at]]
 
     def touching(cell: Combination) -> Set[int]:
-        return {at for at in range(width) if any(other in formed for other in changed(cell, at))}
+        return {
+            at
+            for at in range(width)
+            if at not in kept and any(other in formed for other in changed(cell, at))
+        }
 
     touched: Set[int] = set()
     for cell, count in formed.items():
-        if len(touched) == width:
+        if len(touched) == most:
             break
         if count < rule.minimum_cell:
-            touched |= touching(cell) or _differing_from_nearest(cell, formed)
+            touched |= touching(cell) or _differing_from_nearest(cell, formed, kept)
     if touched or not rule.zeros_disclosive:
         return {order[at] for at in touched}
     local = {position: at for at, position in enumerate(order)}
@@ -705,8 +814,8 @@ def _touched(
                 if zero in looked_at:
                     continue
                 looked_at.add(zero)
-                touched |= touching(zero) or _differing_from_nearest(zero, formed)
-                if len(touched) == width:
+                touched |= touching(zero) or _differing_from_nearest(zero, formed, kept)
+                if len(touched) == most:
                     return {order[at] for at in touched}
     return {order[at] for at in touched}
 
@@ -720,12 +829,18 @@ def _put_together(
     return tuple(placed[at] if at in placed else next(others) for at in range(width))
 
 
-def _differing_from_nearest(cell: Combination, formed: Iterable[Combination]) -> Set[int]:
-    """Where *cell* differs from the held combinations nearest it; every fact if none is held."""
+def _differing_from_nearest(
+    cell: Combination, formed: Iterable[Combination], kept: AbstractSet[int] = frozenset()
+) -> Set[int]:
+    """Where *cell* differs from the held combinations nearest it; every fact if none is held.
+
+    With *kept* (the local positions of fixed counts), only the held combinations with the same
+    states there are looked at, and none held returns nothing.
+    """
     nearest: Optional[int] = None
     found: Set[int] = set()
     for other in formed:
-        if other == cell:
+        if other == cell or any(cell[at] != other[at] for at in kept):
             continue
         differ = {
             at for at, (mine, theirs) in enumerate(zip(cell, other, strict=True)) if mine != theirs
@@ -734,6 +849,8 @@ def _differing_from_nearest(cell: Combination, formed: Iterable[Combination]) ->
             nearest, found = len(differ), differ
         elif len(differ) == nearest:
             found |= differ
+    if kept:
+        return found
     return found or set(range(len(cell)))
 
 

@@ -181,6 +181,8 @@ def _path(value: Any, kind: str, where: str) -> str:
             "by a path relative to it"
         )
     parts = PurePosixPath(value).parts
+    if not parts:  # "." or "./": the lock's directory itself
+        raise LockError(f"{where}.path: {value!r} names no file")
     if ".." in parts:
         raise LockError(f"{where}.path: {value!r} leads out of its directory (a .. segment)")
     for part in parts:
@@ -228,8 +230,10 @@ def _source(value: Any, where: str) -> Tuple[str, str, Optional[str]]:
 
 
 def check_files(entries: Sequence[LockEntry], base: Path, where: str) -> List[ExternalArtifact]:
-    """Each entry with its file, which must be a regular file (never a link) whose bytes have
-    the sha256 the entry names. A relative path is read from ``base``, the lock's directory."""
+    """Each entry with its file, which must be a regular file (never a link, nor a path through
+    a linked directory) whose bytes have the sha256 the entry names. A relative path is read from
+    ``base``, the lock's directory. A hard link is a regular file and is accepted: its bytes are
+    what the sha256 checks, wherever else they are linked."""
     from fluid_build._contract_loader import CLIError
     from fluid_build.cli._attestation import _sha256_file
     from fluid_build.cli.security import validate_cli_path
@@ -241,8 +245,16 @@ def check_files(entries: Sequence[LockEntry], base: Path, where: str) -> List[Ex
         local = base / entry.path
         try:
             validate_cli_path(local, mode="read", file_type="artifact", any_extension=True)
-            if not local.resolve().is_relative_to(root):
+            resolved = local.resolve()
+            if not resolved.is_relative_to(root):
                 raise LockError(f"{named}: {entry.path} leads out of the lock's directory (a link)")
+            if resolved.relative_to(root).as_posix() != PurePosixPath(entry.path).as_posix():
+                # A link inside the directory can still lead to a hidden one (cfg -> .git), so
+                # the path must name the file itself, through no linked directory at all.
+                raise LockError(
+                    f"{named}: {entry.path} goes through a linked directory; a lock names the "
+                    "file by its own path"
+                )
             release._regular_file(local)
             actual = _sha256_file(local)
         except CLIError as exc:
