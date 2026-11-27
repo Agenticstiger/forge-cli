@@ -87,9 +87,10 @@ withholds its group: its bins then say nothing of where records lie.
   reader of a history tracks categorical columns only. That is decided by the plan
   (:func:`followed_columns`), before the table is measured, so no record changes it: a key that is
   then found to hold a value that is no key of its table is written as a category and named, and
-  its history is not written. A table that is not published, a key that is neither text nor a
-  whole number and a whole number key that a statistic the contract declares reads are named and
-  the column is not tracked, and keeps the domain and the metrics it has. A published cell of
+  its history is not written, and so is a key whose table's history does not form. A table that
+  is not published, a key that is neither text nor a whole number and a whole number key that a
+  statistic the contract declares reads are named and the column is not tracked, and keeps the
+  domain and the metrics it has. A published cell of
   ``initial``, a group's size and a published change into or out of a key are each a floor on the
   children of that key's parent, so the relationship that keys the column publishes no children
   per parent: its statistics are written withheld whole, a decision of the plan that reads no

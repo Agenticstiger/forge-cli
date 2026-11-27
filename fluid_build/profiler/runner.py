@@ -2591,7 +2591,8 @@ def follows_key(relationship: Relationship, followed: FrozenSet[Tuple[str, str]]
 
 #: Why a relationship whose key a history follows publishes no children per parent.
 _FOLLOWED_KEY = (
-    "a history follows its key, and the cells of that history would give a bin of it back"
+    "its key is one a history may follow by the keys of a table published whole, "
+    "so it is withheld whatever the records hold"
 )
 
 
@@ -2605,6 +2606,10 @@ def _children_withheld(
 
     Each statistic (the histogram, and each grouping asked of it) holds its groups, one for each
     group key, as ``D`` with the open band, the way a member of a history is withheld whole.
+
+    The groupings branch cannot be reached today: groupings exist only in a request, and a request
+    follows nothing. It is kept as defence in depth, so that a grouping added later cannot publish
+    what the plan has withheld.
     """
     shape = {"bins": [str(edge) for edge in CHILDREN_EDGES]}
     entries: List[Dict[str, Any]] = []
