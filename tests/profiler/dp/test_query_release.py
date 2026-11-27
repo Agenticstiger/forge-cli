@@ -17,14 +17,13 @@ import copy
 import json
 from fractions import Fraction
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional
 
 import pytest
 
 from fluid_build.profiler import query_rates
 from fluid_build.profiler.dp import follow_release as fr
 from fluid_build.profiler.dp import query_release, release, selection
-from fluid_build.profiler.dp.follows import parse_follow
 from tests.profiler._fake_backend import FakeBackend
 from tests.profiler.dp import _gym_data as gym
 from tests.profiler.dp import _gym_queries as gq

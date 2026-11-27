@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import pytest
 
 from fluid_build.cli import main
-from fluid_build.profiler import _stats, document, sources
+from fluid_build.profiler import document, sources
 from fluid_build.profiler.dp import follow_release as fr
 from fluid_build.profiler.dp import release, selection
 from fluid_build.profiler.dp.discrete_gaussian import sample_discrete_gaussian

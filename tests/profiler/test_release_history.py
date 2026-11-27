@@ -17,7 +17,7 @@ import logging
 import re
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 import pytest
 import yaml
