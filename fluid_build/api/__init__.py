@@ -20,6 +20,8 @@ A release ``fluid ship --release-dir`` sealed, on disk or where ``--release-to``
 in S3, is checked read-only by :func:`verify_release` from ``.release`` (added in 1.3).
 A ``fluid verify --out`` report is judged by :func:`report_verdict` from ``.verify_report``
 (added in 1.4), the check ``fluid runs receipt record`` makes.
+``ReleaseVerification.bundle_digest`` (added in 1.5) is the digest of the bundle the
+release sealed.
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ from .source import (
 from .state import Cursor, RunLock, StateStore, Watermark
 from .verify_report import report_verdict
 
-__api_version__ = "1.4"
+__api_version__ = "1.5"
 
 __all__ = [
     "__api_version__",

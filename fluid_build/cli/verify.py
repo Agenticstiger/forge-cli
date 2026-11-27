@@ -324,6 +324,75 @@ Use Cases:
     p.set_defaults(func=run)
 
 
+def _bundle_env_matches(contract_path: str, env: Optional[str]) -> None:
+    """For a stage-1 bundle, the loader's own check that ``env`` is the one it was built for
+    (``check_bundle_env``); nothing for a contract file.
+
+    Raises:
+        ValueError: the bundle was built for another environment.
+    """
+    from fluid_build._contract_loader import _is_bundle_path, check_bundle_env
+
+    if not _is_bundle_path(contract_path):
+        return
+    try:
+        check_bundle_env(contract_path, env, logging.getLogger("fluid.verify.bundle"))
+    except CLIError as exc:
+        built = exc.context.get("bundle_env")
+        raise ValueError(
+            f"--env {env}: the bundle was built for "
+            + (f"--env {built}" if built else "no --env (the base contract)")
+        ) from None
+
+
+def _contract_bundle_digest(contract_path: str, env: Optional[str]) -> str:
+    """The bundle digest of ``contract_path`` under ``env``: what ``fluid ship --env`` seals as
+    the release's ``identity["bundle"]["manifest_digest"]``. Rebuilt with the functions
+    ``fluid bundle --format tgz`` uses (the composed contract, its dbt projects, the bundle's
+    merkle root), into a scratch directory that is removed.
+
+    Raises:
+        ValueError: the contract cannot be bundled.
+    """
+    import tempfile
+
+    from fluid_build.cli import bundle
+    from fluid_build.forge.core.bundle import build_bundle_tgz
+
+    path = Path(contract_path)
+    log = logging.getLogger("fluid.verify.bundle")
+    from fluid_build._contract_loader import _is_bundle_path
+
+    if _is_bundle_path(contract_path):
+        # A stage-1 bundle is the sealed bytes themselves: its own MANIFEST digest, verified
+        # against its members, is the digest to compare, for the --env it was built for.
+        from fluid_build.forge.core.plan_digest import read_bundle_digest
+
+        _bundle_env_matches(contract_path, env)
+        try:
+            return read_bundle_digest(path)
+        except Exception as exc:  # noqa: BLE001 - an unreadable bundle is a refusal
+            raise ValueError(f"{type(exc).__name__}: {exc}") from None
+    try:
+        compiled, _overlay = bundle.materialize_contract(path, env, log)
+        packed = bundle._dbt_projects(compiled, path)
+        if packed is None:
+            raise ValueError("its dbt projects cannot be packed")
+        with tempfile.TemporaryDirectory(prefix="fluid-verify-") as scratch:
+            return str(
+                build_bundle_tgz(
+                    compiled,
+                    Path(scratch) / "bundle.tgz",
+                    contract_id=bundle.bundle_contract_id(compiled),
+                    dbt_projects=packed[0],
+                )
+            )
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any load failure is a refusal, not a crash
+        raise ValueError(f"{type(exc).__name__}: {exc}") from None
+
+
 def _release_block(args: argparse.Namespace, contract_id: Any) -> Optional[Dict[str, Any]]:
     """``--release SRC``: the release this run checks, verified before anything else, as the
     ``--out`` report names it. Refused without ``--out`` (nothing would name it) and on a
@@ -341,8 +410,19 @@ def _release_block(args: argparse.Namespace, contract_id: Any) -> Optional[Dict[
         )
     from fluid_build.cli import _release_receipt
 
+    env = getattr(args, "env", None)
     try:
-        block = _release_receipt.report_release_block(source, str(contract_id))
+        digest = _contract_bundle_digest(args.contract, env)
+    except ValueError as exc:
+        raise CLIError(
+            2,
+            "verify_release_refused",
+            {"message": f"the contract cannot be bundled to compare it with the release: {exc}"},
+        ) from None
+    try:
+        block = _release_receipt.report_release_block(
+            source, str(contract_id), environment=env or None, contract_digest=digest
+        )
     except _release_receipt.ReceiptError as exc:
         raise CLIError(exc.exit_code, "verify_release_refused", {"message": str(exc)}) from None
     # a report on one expose is no check of the release: receipt record fails it
@@ -1555,6 +1635,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         )
 
     cprint(f"Contract: {contract_path}")
+    if getattr(args, "release", None):
+        # before the loader, whose own env check of a bundle is exit 1: under --release a
+        # bundle built for another --env is a release this run does not check (exit 2)
+        try:
+            _bundle_env_matches(contract_path, getattr(args, "env", None))
+        except ValueError as exc:
+            raise CLIError(2, "verify_release_refused", {"message": str(exc)}) from None
     try:
         contract = load_contract_with_overlay(contract_path, getattr(args, "env", None), logger)
     except CLIError:

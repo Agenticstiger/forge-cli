@@ -409,6 +409,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `signing_identity_not_pinned` before cosign runs. `--signature`/`--certificate` exit 2 with
   `verify_signature_sig_pem_gone`, naming `--bundle`.
 
+- **A release's verify report, deploy, partial publish and signing flags say what they did.**
+  - **Breaking: `fluid verify --release SRC` checks the release it names.** The report was tied to
+    the release by product only, so a run with another `--env`, or on a contract edited after
+    the seal, recorded a PASSED receipt for the release's environment. verify now refuses before
+    any check (exit 2, `verify_release_refused`) when `--env` is not the release's environment (no
+    `--env` against a release that has one included) or when the contract's bundle digest, rebuilt
+    the way `fluid bundle --format tgz` builds it, is not the one the release sealed. A stage-1
+    bundle given as the contract is compared by its own MANIFEST digest, and one built for another
+    `--env` is refused the same way (exit 2, `verify_release_refused`). The report's
+    `release` block records the env and that digest, `fluid runs receipt record` refuses a report
+    that names another (or none), and a verify receipt's signed Statement carries it as
+    `policy.digest`, as SLSA's verification summary asks.
+  - **`fluid runs deploy` checks where its receipt goes before the first copy.** A release outside
+    `<prefix>/<product>/<code hex>/<env>/` (a mirror) had its targets copied, then exited 2 with no
+    receipt; it now exits 2 with nothing written. A receipt that cannot be written after targets
+    were copied exits 1, says no deploy receipt exists, and names the targets written. After any
+    write the result is 0 or 1, never 2.
+  - **A publish that stopped before its `release.json` names a recovery that works.** The message
+    named a command that does not exist. It now lists the objects to delete before running the
+    same ship again (a delete marker as the current version lets the conditional write through,
+    as S3 documents; the old versions stay until a lifecycle rule or an admin removes them), and
+    on a bucket with Object Lock says the versions stay until retention ends, that only
+    `s3:BypassGovernanceRetention` deletes them early, and to seal from a new commit. It gives
+    both when the lock cannot be read.
+  - **Breaking: `fluid schedule-sync` refuses a `--verify-*` flag without `--verify-signature`.**
+    `--verify-key`, `--verify-certificate-identity`, `--verify-certificate-oidc-issuer`,
+    `--verify-identity-regexp` and `--verify-oidc-issuer-regexp` were ignored without it, and the
+    DAGs were pushed unchecked. Any of them alone now exits 2 with
+    `schedule_sync_verify_flags_need_gate` before anything runs.
+  - **`signing_identity_not_pinned` names the flags of the command that raised it**
+    (`--verify-certificate-identity` and the other `--verify-*` flags on schedule-sync), and
+    `fluid verify-signature --help` shows one keyless regexp example that passes both regexps.
+  - `fluid_build.api.ReleaseVerification` gains `bundle_digest`, the sealed bundle's digest
+    (`None` when the release pins none); API version 1.5.
+
 - **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through
   `runpy` and marks a run FAILED on any `SystemExit`, code 0 included, so a build that wrote its
   rows still ended `FAILED: SystemExit: 0` and `fluid apply --mode amend-and-build` reported it

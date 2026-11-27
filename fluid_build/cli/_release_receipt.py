@@ -606,14 +606,28 @@ def _verified(source: str, clients: ClientFactory, region: Optional[str]) -> Any
 
 
 def report_release_block(
-    source: str, contract_id: str, *, clients: Optional[ClientFactory] = None
+    source: str,
+    contract_id: str,
+    *,
+    environment: Optional[str],
+    contract_digest: str,
+    clients: Optional[ClientFactory] = None,
 ) -> Dict[str, Any]:
     """The ``release`` block ``fluid verify --release SRC --out R`` writes into its report: the
     release it checked, verified first, so ``receipt record`` can tie the report to it.
 
+    ``environment`` and ``contract_digest`` are what verify used: its ``--env`` and the bundle
+    digest of the contract it loaded (what ``fluid ship --env`` seals as the release's
+    ``identity["bundle"]["manifest_digest"]``). They are recorded, and refused unless the release
+    was sealed from them.
+
+    Follows SLSA's verification summary (v1): the policy applied, here the contract, is named
+    with a digest of its exact version, and a verification is of one resource in one environment
+    (the Stage of Kargo's promotion model).
+
     Raises:
         ReceiptError: the release is not intact (1), cannot be checked (2), or is another
-            product's (1).
+            product's (1), or sealed from another environment or contract (2).
     """
     from fluid_build.api import release as api_release
 
@@ -632,12 +646,26 @@ def report_release_block(
             f"--release {checked.source} is a release of {clean(checked.product_id, 120)}, and the "
             f"contract is {clean(contract_id, 120)}"
         )
+    if environment != checked.environment:
+        shown_env = clean(environment, 40) if environment else "(none)"
+        raise ReceiptError(
+            f"--env {shown_env}: {checked.source} is the release of "
+            f"{clean(checked.environment, 40)}",
+            UNDECIDED,
+        )
+    if checked.bundle_digest is None or contract_digest != checked.bundle_digest:
+        raise ReceiptError(
+            f"the contract is {clean(contract_digest, 80)} for --env {clean(environment, 40)}; "
+            f"{checked.source} was sealed from {clean(checked.bundle_digest, 80) or 'no bundle'}",
+            UNDECIDED,
+        )
     return {
         "source": checked.source,
         "product": checked.product_id,
-        "environment": checked.environment,
+        "environment": environment,
         "identity_digest": checked.identity_digest,
         "code_digest": checked.code_digest,
+        "contract_digest": contract_digest,
     }
 
 
@@ -690,15 +718,21 @@ def _read_report(path: str) -> Tuple[bytes, Dict[str, Any]]:
 
 
 def _report_is_of(report: Mapping[str, Any], checked: Any) -> Optional[str]:
-    """Why ``report`` is not a report on the release ``checked``, or None."""
+    """Why ``report`` is not a report on the release ``checked``, or None. Besides the release's
+    own digests, the report must name the environment and the contract (the bundle digest) it
+    checked, and they must be the ones the release was sealed from (SLSA's verification summary:
+    the policy digest, and the resource in its environment)."""
     block = report.get("release")
     if not isinstance(block, Mapping):
         return "it names no release: run fluid verify --release SRC --out REPORT"
+    if checked.bundle_digest is None:
+        return "the release pins no bundle digest, so no contract can be tied to it"
     for key, want in (
         ("identity_digest", checked.identity_digest),
         ("code_digest", checked.code_digest),
         ("product", checked.product_id),
         ("environment", checked.environment),
+        ("contract_digest", checked.bundle_digest),
     ):
         if block.get(key) != want:
             return f"its release block names another release ({key} differs)"
@@ -770,6 +804,7 @@ def record_receipt(
         report_bytes=report_bytes,
         report_meta={
             "contract_id": clean(report.get("contract_id"), 120),
+            "contract_digest": report["release"]["contract_digest"],
             "summary": {k: v for k, v in summary.items() if type(v) is int},
         },
         targets=target_records,
@@ -892,6 +927,19 @@ def _no_userinfo(value: Any) -> Any:
     return value
 
 
+def _policy(receipt: Mapping[str, Any]) -> Dict[str, Any]:
+    """The VSA's ``policy``: its uri, and for a verification the digest of the contract it
+    checked. SLSA's verification summary (v1) asks for ``policy.digest`` to name the exact
+    version of the policy applied."""
+    deploy = receipt.get("check") == rr.DEPLOY
+    kind = "deploy-log" if deploy else "report-verdict"
+    policy: Dict[str, Any] = {"uri": f"{RECEIPT_EXTENSION}#{kind}"}
+    digest = (receipt.get("report") or {}).get("contract_digest")
+    if not deploy and isinstance(digest, str) and rr.is_digest(digest):
+        policy["digest"] = {"sha256": digest.removeprefix("sha256:")}
+    return policy
+
+
 def statement(receipt: Mapping[str, Any], receipt_bytes: bytes) -> Dict[str, Any]:
     """The in-toto Statement ``--sign`` signs: an SLSA verification summary of the release's
     ``release.json`` (the subject, by its sha256), with the receipt in an extension field."""
@@ -912,10 +960,7 @@ def statement(receipt: Mapping[str, Any], receipt_bytes: bytes) -> Dict[str, Any
             "timeVerified": receipt["time_verified"],
             "resourceUri": receipt["resource_uri"],
             # a deploy is a record, not a verification: a VSA consumer tells them by the policy
-            "policy": {
-                "uri": f"{RECEIPT_EXTENSION}#"
-                + ("deploy-log" if receipt.get("check") == rr.DEPLOY else "report-verdict")
-            },
+            "policy": _policy(receipt),
             "inputAttestations": [
                 {
                     "uri": receipt["report"]["name"],

@@ -50,7 +50,7 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.auth import _sanitize_argv
@@ -59,6 +59,17 @@ logger = logging.getLogger(__name__)
 
 _COSIGN_BIN_NAME = "cosign"
 _DEFAULT_TIMEOUT = 120
+
+# The command-line flags a caller names a keyless signer with, per cosign flag: (exact, regexp).
+# A caller whose own flags differ (``schedule-sync --verify-*``) passes its own map, so the
+# not-pinned error names the flags the user typed. Prior art: cosign's verify-blob docs, which
+# say "Either --certificate-identity or --certificate-identity-regexp must be set for keyless
+# flows", each command naming its own pair.
+PinFlags = Mapping[str, Tuple[str, str]]
+VERIFY_SIGNATURE_PIN_FLAGS: PinFlags = {
+    "certificate-identity": ("--certificate-identity", "--identity-regexp"),
+    "certificate-oidc-issuer": ("--certificate-oidc-issuer", "--oidc-issuer-regexp"),
+}
 
 
 def cosign_available() -> bool:
@@ -315,6 +326,7 @@ def verify_bundle(
     certificate_oidc_issuer: Optional[str] = None,
     identity_regexp: Optional[str] = None,
     oidc_issuer_regexp: Optional[str] = None,
+    pin_flags: Optional[PinFlags] = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> Dict:
     """Verify a signed tgz bundle from its Sigstore bundle via ``cosign verify-blob --bundle``.
@@ -351,6 +363,7 @@ def verify_bundle(
         certificate_oidc_issuer=certificate_oidc_issuer,
         identity_regexp=identity_regexp,
         oidc_issuer_regexp=oidc_issuer_regexp,
+        pin_flags=pin_flags,
         timeout=timeout,
     )
     result["sigstore_bundle"] = str(signed)
@@ -368,6 +381,7 @@ def verify_blob(
     certificate_oidc_issuer: Optional[str] = None,
     identity_regexp: Optional[str] = None,
     oidc_issuer_regexp: Optional[str] = None,
+    pin_flags: Optional[PinFlags] = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> Dict:
     """Verify a file :func:`sign_blob` signed, from its bundle, with ``cosign verify-blob``:
@@ -390,18 +404,26 @@ def verify_blob(
     else:
         # one argv element each, so a value that starts with "-" is never read as a flag
         argv += [
-            _signer_flag("certificate-identity", certificate_identity, identity_regexp),
-            _signer_flag("certificate-oidc-issuer", certificate_oidc_issuer, oidc_issuer_regexp),
+            _signer_flag("certificate-identity", certificate_identity, identity_regexp, pin_flags),
+            _signer_flag(
+                "certificate-oidc-issuer", certificate_oidc_issuer, oidc_issuer_regexp, pin_flags
+            ),
         ]
     argv.append(str(blob))
     return _run_cosign(argv, timeout=timeout)
 
 
-def _signer_flag(flag: str, exact: Optional[str], regexp: Optional[str]) -> str:
+def _signer_flag(
+    flag: str,
+    exact: Optional[str],
+    regexp: Optional[str],
+    pin_flags: Optional[PinFlags] = None,
+) -> str:
     """``--<flag>=<exact>`` or ``--<flag>-regexp=<regexp>``: keyless verification names its
     signer. Any Sigstore user can get a Fulcio certificate for their own identity, so a check
     that names no identity and issuer proves nothing about who signed; an empty value (an
-    unset CI variable) names none either.
+    unset CI variable) names none either. ``pin_flags`` maps the cosign flag to the caller's
+    own (exact, regexp) flag names for the error; the default is verify-signature's.
 
     Raises:
         CLIError: (exit 2) ``signing_identity_not_pinned``, neither given or one blank.
@@ -412,14 +434,17 @@ def _signer_flag(flag: str, exact: Optional[str], regexp: Optional[str]) -> str:
         if not value.strip():
             break
         return form + value
+    names = {**VERIFY_SIGNATURE_PIN_FLAGS, **(pin_flags or {})}
+    exact_flag = names[flag][0]
+    ident, issuer = names["certificate-identity"], names["certificate-oidc-issuer"]
     raise CLIError(
         2,
         "signing_identity_not_pinned",
         {
-            "flag": flag,
+            "flag": exact_flag,
             "hint": (
-                "keyless verification needs the signer: an exact certificate identity and OIDC "
-                "issuer (or regexps for them); an empty value pins nothing"
+                f"keyless verification needs the signer: the identity ({ident[0]} or {ident[1]}) "
+                f"and the issuer ({issuer[0]} or {issuer[1]}); an empty value pins nothing"
             ),
         },
     )
