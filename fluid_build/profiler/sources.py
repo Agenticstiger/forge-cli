@@ -57,6 +57,7 @@ __all__ = [
     "SourceColumns",
     "SourceError",
     "describe_source",
+    "check_not_missing",
     "local_file",
     "midnight_utc",
     "read_columns",
@@ -148,6 +149,27 @@ def local_file(source: str, *, cwd: Optional[Path] = None) -> Optional[Path]:
         return _local_path(source, here)
     except SourceError:
         return None
+
+
+def check_not_missing(source: str, *, cwd: Optional[Path] = None) -> None:
+    """Refuse a source that could not be read as a file, without opening it.
+
+    A database URI is not checked (nothing is connected to); a path, a ``file://`` URL or a
+    sqlite database must name a file that exists. Only the file system is asked: no record is read.
+    """
+    scheme = _scheme(source)
+    here = cwd or Path.cwd()
+    if scheme in DATABASE_SCHEMES and scheme != "sqlite":
+        return
+    path = local_file(source, cwd=here) if scheme == "sqlite" else _local_path(source, here)
+    if path is None:
+        return
+    try:
+        found = path.is_file()
+    except OSError as exc:
+        raise SourceError(f"{path} could not be checked: {exc.strerror}") from None
+    if not found:
+        raise SourceError(f"{path} is not a file")
 
 
 def read_columns(
