@@ -26,7 +26,8 @@ from fluid_build.cli import _release_receipt as receipts
 from fluid_build.cli import _ship_release as release
 from fluid_build.cli.ops import _cli as ops_cli
 from fluid_build.util import receipt_record as rr
-from tests.cli._fake_s3 import FakeS3, S3Error, b64, sealed
+from tests.cli._fake_s3 import FakeS3, S3Error, b64
+from tests.cli._release_fixtures import release_block, sealed
 from tests.cli.test_ship_release import (  # noqa: F401 - fixtures
     _UNTIL_4,
     _install,
@@ -720,7 +721,7 @@ def test_a_release_on_disk_is_put_with_its_checksum_and_the_same_conditions(
 
 
 def _verify_receipt(tmp_path: Path, s3: DeployS3, uri: str, now: datetime) -> None:
-    block = receipts.report_release_block(uri, "acme.orders", clients=s3)
+    block = release_block(uri, "acme.orders", clients=s3)
     report = tmp_path / f"verify-{now.timestamp()}.json"
     report.write_text(json.dumps({"summary": PASSING, "release": block}), encoding="utf-8")
     done = receipts.record_receipt(uri, report_path=str(report), clients=s3, now=now)
@@ -859,7 +860,7 @@ def test_runs_status_lists_the_newest_deploy_receipt_beside_the_verify_one(
 
     _sealed_release(tmp_path / "nonprod", "nonprod", _deploy_block())
     rel = tmp_path / "nonprod"
-    block = receipts.report_release_block(str(rel), "acme.orders")
+    block = release_block(str(rel), "acme.orders")
     report = tmp_path / "verify.json"
     report.write_text(json.dumps({"summary": PASSING, "release": block}), encoding="utf-8")
     receipts.record_receipt(str(rel), report_path=str(report), now=T0)
@@ -1062,7 +1063,7 @@ def test_a_target_uri_s3_does_not_take_is_not_intact(tmp_path: Path) -> None:
 def test_a_bad_deploy_entry_keeps_the_verify_result_in_status(tmp_path: Path) -> None:
     _sealed_release(tmp_path / "nonprod", "nonprod", _deploy_block())
     rel = tmp_path / "nonprod"
-    block = receipts.report_release_block(str(rel), "acme.orders")
+    block = release_block(str(rel), "acme.orders")
     report = tmp_path / "verify.json"
     report.write_text(json.dumps({"summary": PASSING, "release": block}), encoding="utf-8")
     receipts.record_receipt(str(rel), report_path=str(report), now=T0)

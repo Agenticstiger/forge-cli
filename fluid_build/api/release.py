@@ -82,6 +82,11 @@ class ReleaseVerification:
     #: included), and in S3 the ``etag`` it was read at, for a record of exactly which versions
     #: were checked.
     objects: Tuple[Dict[str, Optional[str]], ...] = field(default_factory=tuple)
+    #: The merkle digest of the bundle the release sealed (the identity's
+    #: ``bundle.manifest_digest``): the digest of the contract and environment it was sealed
+    #: from. ``None`` when the identity pins none. Added in 1.5, last, so a positional
+    #: construction keeps working.
+    bundle_digest: Optional[str] = None
 
     @property
     def intact(self) -> bool:
@@ -163,6 +168,9 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
     shown_env = _clean(environment, 40) if isinstance(environment, str) else None
     stated = index.get("code_digest")
     shown_code = _clean(stated, 80) if isinstance(stated, str) else None
+    pinned = identity.get("bundle")
+    pinned = pinned.get("manifest_digest") if isinstance(pinned, Mapping) else None
+    shown_bundle = _clean(pinned, 80) if isinstance(pinned, str) else None
 
     def result(status: str, checked: int, problems: List[str]) -> ReleaseVerification:
         return ReleaseVerification(
@@ -172,6 +180,7 @@ def _check(shown: str, reader: "_Reader", index: Mapping[str, Any]) -> ReleaseVe
             product_id=shown_product,
             environment=shown_env,
             code_digest=shown_code,
+            bundle_digest=shown_bundle,
             files_checked=checked,
             problems=tuple(problems),
             objects=tuple(

@@ -190,3 +190,107 @@ def test_a_report_with_no_contract_digest_is_refused(tmp_path: Path) -> None:
     block = _block(checked, digest)
     del block["contract_digest"]
     assert receipts._report_is_of({"release": block}, checked) is not None
+
+
+# ---------------------------------------------------------------------------
+# the rebuild is the digest ship seals
+# ---------------------------------------------------------------------------
+
+OVERLAY = "metadata:\n  description: the nonprod overlay\n"
+
+
+def _shipped_digest(project: Path, env: str) -> str:
+    """The manifest digest of the bundle ``fluid ship --env`` runs ``fluid bundle`` for (stage
+    1): ``fluid bundle <contract> --env <env> --format tgz --out runtime/bundle.tgz`` in a
+    fresh process, as ship's identity reads it (``_ship_release._bundle_manifest``)."""
+    import os
+    import subprocess
+    import sys
+
+    from fluid_build.cli import _ship_release
+
+    repo = Path(verify.__file__).resolve().parents[2]
+    (project / "runtime").mkdir()
+    env_vars = {**os.environ, "PYTHONPATH": str(repo), "COLUMNS": "200"}
+    done = subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", "bundle", "contract.fluid.yaml"]
+        + ["--env", env, "--format", "tgz", "--out", "runtime/bundle.tgz"],
+        cwd=str(project),
+        env=env_vars,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    return str(_ship_release._bundle_manifest(project)["digest"])
+
+
+@pytest.mark.parametrize("env", ["nonprod", "prod"])
+def test_the_rebuilt_digest_is_the_one_ship_seals_in_any_checkout(tmp_path: Path, env: str) -> None:
+    """Two checkouts of one commit, in different directories and at different times, give the
+    digest ``fluid bundle`` (ship's stage 1) gives, overlay included: nothing about the path or
+    the clock is in it."""
+    digests = set()
+    for name in ("one", "two"):
+        project = tmp_path / name / "work"
+        (project / "overlays").mkdir(parents=True)
+        (project / "contract.fluid.yaml").write_text(CONTRACT, encoding="utf-8")
+        (project / "overlays" / "nonprod.yaml").write_text(OVERLAY, encoding="utf-8")
+        shipped = _shipped_digest(project, env)
+        rebuilt = verify._contract_bundle_digest(str(project / "contract.fluid.yaml"), env)
+        assert rebuilt == shipped
+        digests.add(shipped)
+    assert len(digests) == 1
+
+
+def test_the_overlay_is_part_of_the_digest(tmp_path: Path) -> None:
+    (tmp_path / "overlays").mkdir()
+    path = tmp_path / "contract.fluid.yaml"
+    path.write_text(CONTRACT, encoding="utf-8")
+    (tmp_path / "overlays" / "nonprod.yaml").write_text(OVERLAY, encoding="utf-8")
+    nonprod = verify._contract_bundle_digest(str(path), "nonprod")
+    assert nonprod != verify._contract_bundle_digest(str(path), "prod")
+
+
+# ---------------------------------------------------------------------------
+# record, and the Statement
+# ---------------------------------------------------------------------------
+
+
+def test_a_hand_made_report_is_refused_by_record_and_nothing_is_written(tmp_path: Path) -> None:
+    digest = "sha256:" + "a" * 64
+    release = _release(tmp_path, "nonprod", digest)
+    checked = api_release.verify_release(str(release))
+    for name, change in (
+        ("env", {"environment": "dev"}),
+        ("digest", {"contract_digest": "sha256:" + "c" * 64}),
+    ):
+        report = tmp_path / f"{name}.json"
+        body = {
+            "summary": {"total": 1, "match": 1, "mismatch": 0, "error": 0},
+            "release": {**_block(checked, digest), **change},
+        }
+        report.write_text(json.dumps(body), encoding="utf-8")
+        with pytest.raises(receipts.ReceiptError, match="differs"):
+            receipts.record_receipt(str(release), report_path=str(report))
+    assert not list(tmp_path.rglob("receipts"))
+
+
+def test_record_takes_a_report_on_the_sealed_contract_and_the_statement_names_it(
+    tmp_path: Path,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    release = _release(tmp_path, "nonprod", digest)
+    block = receipts.report_release_block(
+        str(release), "acme.orders", environment="nonprod", contract_digest=digest
+    )
+    report = tmp_path / "report.json"
+    summary = {"total": 1, "match": 1, "mismatch": 0, "error": 0}
+    report.write_text(json.dumps({"summary": summary, "release": block}), encoding="utf-8")
+    done = receipts.record_receipt(str(release), report_path=str(report))
+    assert done.result == "PASSED"
+    assert done.receipt["report"]["contract_digest"] == digest
+    policy = receipts.statement(done.receipt, b"{}")["predicate"]["policy"]
+    assert policy["digest"] == {"sha256": "a" * 64}
+    deploy = receipts.statement({**done.receipt, "check": "deploy"}, b"{}")
+    assert "digest" not in deploy["predicate"]["policy"]

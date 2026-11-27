@@ -15,7 +15,7 @@ import inspect
 
 import fluid_build.api as api
 
-EXPECTED_API_VERSION = "1.4"
+EXPECTED_API_VERSION = "1.5"
 
 EXPECTED_ALL = {
     "__api_version__",
