@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
-from fluid_build.profiler import disclosure, history
+from fluid_build.profiler import disclosure, history, references
 from fluid_build.profiler._stats import (
     DeclaredBlock,
     DeclaredStatistic,
@@ -264,6 +264,8 @@ def _not_followed(tmp_path: Path, why: str) -> Any:
         contract = library.contract(key_type="integer", classification="Internal")
     elif why == "one key":
         branch_keys, members = keys[:1], _spread(keys[:1], 40)
+    elif why == "two keys":
+        branch_keys, members = keys[:2], _spread(keys[:2], 40)
     elif why == "over the cap":
         branch_keys = library.keys(65, kind="integer")
         members = library.spread(branch_keys, [1] * 65)
@@ -280,7 +282,7 @@ def _not_followed(tmp_path: Path, why: str) -> Any:
 
 
 @pytest.mark.parametrize(
-    "why", ["orphan", "not public", "one key", "over the cap", "two relationships"]
+    "why", ["orphan", "not public", "one key", "two keys", "over the cap", "two relationships"]
 )
 def test_a_whole_number_key_that_is_not_tracked_keeps_its_number_domain_and_metrics(tmp_path, why):
     result = _not_followed(tmp_path, why)
@@ -478,15 +480,48 @@ def test_a_table_over_the_cap_is_not_followed_and_the_note_holds_no_count(tmp_pa
     assert "65" not in _said(result) and "64" not in _said(result)
 
 
-def test_a_table_with_one_key_is_not_followed(tmp_path):
+@pytest.mark.parametrize("size", [1, 2])
+def test_a_table_with_fewer_than_three_keys_is_not_followed(tmp_path, size, monkeypatch):
+    def formed(folder: Path) -> Any:
+        folder.mkdir()
+        return library.profile(
+            folder,
+            library.contract(),
+            library.branches(BRANCHES[:size]),
+            library.cards(_spread(BRANCHES[:size], 40)),
+        )
+
+    result = formed(tmp_path / "formed")
+    assert "branch_id" not in _tracked(result)
+    assert "fewer than three keys" in _said(result)
+    # the relationship is formed as it is where no key is followed at all
+    monkeypatch.setattr(references.References, "follow", lambda self, child, column: None)
+    assert formed(tmp_path / "unfollowed").canonical == result.canonical
+
+
+def test_a_table_with_three_keys_is_followed(tmp_path):
     result = library.profile(
         tmp_path,
         library.contract(),
-        library.branches(BRANCHES[:1]),
-        library.cards(_spread(BRANCHES[:1], 40)),
+        library.branches(BRANCHES[:3]),
+        library.cards(_spread(BRANCHES[:3], 40)),
     )
+    assert "branch_id" in _tracked(result)
+
+
+def test_a_history_follows_at_most_the_most_columns_counted_over_its_candidates(tmp_path):
+    """A candidate keeps its place: the key behind the most columns is not followed, whatever."""
+    keys = library.keys(12)
+    built = library.contract()
+    schema = built["exposes"][1]["contract"]["schema"]
+    extra = [f"kind{n:02d}" for n in range(history.MOST_COLUMNS)]
+    at = next(place for place, each in enumerate(schema) if each["name"] == "branch_id")
+    schema[at:at] = [{"name": name, "type": "enum('x', 'y')"} for name in extra]
+    rows = [{**row, **dict.fromkeys(extra, "x")} for row in library.cards(_spread(keys))]
+    result = library.profile(tmp_path, built, library.branches(keys), rows)
     assert "branch_id" not in _tracked(result)
-    assert "fewer than two keys" in _said(result)
+    assert f"at most {history.MOST_COLUMNS} columns" in _said(result)
+    assert set(extra) <= set(_tracked(result))
 
 
 # -- the guard and a brute-force reader --------------------------------------------------------

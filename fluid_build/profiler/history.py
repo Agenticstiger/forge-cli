@@ -144,7 +144,7 @@ from fluid_build.profiler._stats import (
 )
 
 if TYPE_CHECKING:  # the runner imports this module; its names are read inside functions
-    from fluid_build.profiler.runner import ExposePlan, StageTimings
+    from fluid_build.profiler.runner import ColumnPlan, ExposePlan, StageTimings
 
 __all__ = [
     "HistoryStage",
@@ -1133,21 +1133,37 @@ def asked_plan(
     return replace(plan, columns=tuple(each for each in plan.columns if each.name in named))
 
 
-def _tracked(
+@dataclass(frozen=True)
+class _Candidate:
+    """A column a history may follow, from the plan alone: the column, its key and its levels."""
+
+    column: "ColumnPlan"
+    #: The foreign key the column is, as the profile releases the table it references; ``None``
+    #: for a column that declares its own levels.
+    key: Optional[references.Followed]
+    levels: Tuple[str, ...]
+
+
+def _candidates(
     context: _Context,
     window: Any,
     declared: Optional[DeclaredBlock],
-) -> Tuple[List[_Tracked], List[Tuple[str, str]]]:
-    """The categorical columns a history follows, and each one left out with why.
+) -> List[Tuple[str, Union[str, _Candidate]]]:
+    """Each column of the plan a history may follow, or the reason it does not, in column order.
 
-    A column that a counted relationship keys on its own is a foreign key: it is followed by the
-    keys of the table it references, where the profile releases that table whole
-    (:mod:`fluid_build.profiler.references`), and whatever levels the contract declares for it.
+    Nothing here reads a value: the answer is the contract's, the public keys of the tables the
+    profile releases whole, and the plan's columns. A column that a counted relationship keys on
+    its own is a foreign key: it is followed by the keys of the table it references, where the
+    profile releases that table whole (:mod:`fluid_build.profiler.references`), and whatever levels
+    the contract declares for it. A history follows at most :data:`MOST_COLUMNS` columns, the
+    first of these in the plan's order. A candidate whose values then prove not to be levels
+    (:func:`_tracked`) keeps its place and is not replaced by a later column, so which columns a
+    history may follow never depends on a record.
     """
-    stage, read = context.stage, context.read
+    stage = context.stage
     taken = {window.key, window.start_column, window.end_column}
-    found: List[_Tracked] = []
-    notes: List[Tuple[str, str]] = []
+    found: List[Tuple[str, Union[str, _Candidate]]] = []
+    wanted = 0
     for column in context.plan.columns:
         key = (
             stage.released.follow(context.expose_id, column.name)
@@ -1159,43 +1175,99 @@ def _tracked(
         what = f"history of {context.expose_id}.{column.name}"
         levels = key.levels if key is not None else _declared_levels(declared, column.name)
         if key is not None and key.why is not None:
-            notes.append((what, key.why))
+            found.append((what, key.why))
         # Defence in depth: a declared statistic may read a key in a future block shape.
         elif key is not None and column.domain != "category" and _reads(declared, column.name):
-            notes.append((what, _READ_BY_STATISTIC))
+            found.append((what, _READ_BY_STATISTIC))
         elif levels is None:
-            notes.append((what, _NO_LEVELS))
+            found.append((what, _NO_LEVELS))
         elif len(levels) < 2:
-            notes.append((what, "it declares fewer than two levels"))
+            found.append((what, "it declares fewer than two levels"))
         elif len(levels) > MOST_LEVELS:
-            notes.append((what, f"it declares more than {MOST_LEVELS} levels"))
-        elif len(found) >= MOST_COLUMNS:
-            notes.append((what, f"a history follows at most {MOST_COLUMNS} columns"))
+            found.append((what, f"it declares more than {MOST_LEVELS} levels"))
+        elif wanted >= MOST_COLUMNS:
+            found.append((what, f"a history follows at most {MOST_COLUMNS} columns"))
         else:
-            index = {level: place for place, level in enumerate(levels)}
-            try:
-                values: List[Optional[int]] = []
-                for position, raw in enumerate(read.values[column.name]):
-                    value = stage.backend.read_value(
-                        column.domain, raw, column=column.name, row_index=position
-                    )
-                    if value is not None and key is not None:
-                        value = references.spell(value, domain=column.domain)
-                    values.append(None if value is None else _place(index, value))
-            except (ReadRefused, KeyError, ValueError):
-                notes.append(
-                    (
-                        what,
-                        (
-                            "a value of it is not a key of the table it references"
-                            if key is not None
-                            else "a value of it is outside its declared levels"
-                        ),
-                    )
+            wanted += 1
+            found.append((what, _Candidate(column, key, levels)))
+    return found
+
+
+def _tracked(
+    context: _Context,
+    window: Any,
+    declared: Optional[DeclaredBlock],
+) -> Tuple[List[_Tracked], List[Tuple[str, str]]]:
+    """The categorical columns a history follows, and each one left out with why.
+
+    Each candidate (:func:`_candidates`) is read: a column with a value outside its levels, or
+    that is no key of the table it references, is named and left out.
+    """
+    stage, read = context.stage, context.read
+    found: List[_Tracked] = []
+    notes: List[Tuple[str, str]] = []
+    for what, held in _candidates(context, window, declared):
+        if isinstance(held, str):
+            notes.append((what, held))
+            continue
+        column, key, levels = held.column, held.key, held.levels
+        index = {level: place for place, level in enumerate(levels)}
+        try:
+            values: List[Optional[int]] = []
+            for position, raw in enumerate(read.values[column.name]):
+                value = stage.backend.read_value(
+                    column.domain, raw, column=column.name, row_index=position
                 )
-                continue
-            found.append(_Tracked(column.name, levels, values, followed=key is not None))
+                if value is not None and key is not None:
+                    value = references.spell(value, domain=column.domain)
+                values.append(None if value is None else _place(index, value))
+        except (ReadRefused, KeyError, ValueError):
+            notes.append(
+                (
+                    what,
+                    (
+                        "a value of it is not a key of the table it references"
+                        if key is not None
+                        else "a value of it is outside its declared levels"
+                    ),
+                )
+            )
+            continue
+        found.append(_Tracked(column.name, levels, values, followed=key is not None))
     return found, notes
+
+
+def followed_columns(stage: HistoryStage) -> FrozenSet[Tuple[str, str]]:
+    """The ``(table, column)`` of each foreign key a history of the profile follows.
+
+    Decided by the plan alone: the contract, the tables the profile releases whole and their
+    public keys. No value and no count is read, so the answer is the same for any records of the
+    same shape. It holds every key a history may track (:func:`_tracked` drops only those whose
+    values prove not to be keys), and it is what the profile reads to withhold the relationship the
+    key follows (:mod:`fluid_build.profiler.runner`): a published cell of the key's history is a
+    floor on its parent's children, so the children per parent of that relationship are not
+    published beside it, whatever the counts.
+    """
+    found: Set[Tuple[str, str]] = set()
+    for plan, read, block, expose_id in _windowed(stage):
+        context = _Context(stage, plan, read, expose_id)
+        try:
+            window = _window(context, stage.exposes[expose_id])
+        except _Unformed:
+            continue
+        if _counts_the_entity(context, window):
+            continue
+        for _, held in _candidates(context, window, block):
+            if isinstance(held, _Candidate) and held.key is not None:
+                found.add((expose_id, held.column.name))
+    return frozenset(found)
+
+
+def _counts_the_entity(context: _Context, window: Any) -> bool:
+    """Whether a counted relationship keys the table's entity: its history is then not formed."""
+    from fluid_build.profiler import runner
+
+    return runner.counts_the_entity(context.stage.counted_keys, context.expose_id, (window.key,))
 
 
 def _initial_counts(
