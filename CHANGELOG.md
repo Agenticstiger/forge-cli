@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.42.0] — 2026-11-27
-
 ### Added
 
 - **`fluid profile` reads profile request format 1-3-0 and writes profile format 1-5-0 where it needs
@@ -43,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason. A statement that fails on the records withholds every query of the release. The
   disclosure checks of the exact path do not apply to a noisy release; an exact profile writes no
   `unit` and is unchanged. The release record re-derives the same bytes.
+
+## [0.42.0] — 2026-11-27
+
+### Added
 
 - **`fluid ship --release-dir DIR --release-archive PATH` also writes the sealed release as one
   `.tgz`**, for a platform that takes a file. It holds every file of the sealed directory at its
