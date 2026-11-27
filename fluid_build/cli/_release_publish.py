@@ -608,7 +608,10 @@ class _Upload:
         remove, by whether the bucket has Object Lock (both ways when that cannot be read)."""
         keys = self._keys_there()
         if keys:
-            shown = ", ".join(f"s3://{self.bucket}/{k}" for k in keys[:10])
+            from fluid_build.util.release_record import clean
+
+            # the keys are the bucket's, not ours: they must not rewrite the terminal
+            shown = ", ".join(clean(f"s3://{self.bucket}/{k}", 200) for k in keys[:10])
             more = f" and {len(keys) - 10} more" if len(keys) > 10 else ""
             what = f"the objects under {self.uri} ({shown}{more})"
         else:

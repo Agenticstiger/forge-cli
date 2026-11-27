@@ -773,3 +773,17 @@ def test_a_refused_release_run_in_ci_runs_no_git(
     assert fake.calls == [] and asked == []
     assert _ship([*_UNTIL_4, "--release-dir", "../rel2"]) == 0
     assert len(asked) == 1
+
+
+def test_a_key_the_bucket_holds_is_shown_cleaned_in_the_recovery(tmp_path: Path) -> None:
+    """The recovery lists the keys under the prefix, which anyone with a write there chose: a
+    control character in one never reaches the terminal."""
+    index = sealed(tmp_path / "rel")
+    s3 = FakeS3()
+    s3.put("acme-releases", f"{_prefix(index)}reports/ship-report.json", b"[]")
+    s3.put("acme-releases", f"{_prefix(index)}x\x1b[2J\nDelete nothing", b"x")
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "rel", TARGET, clients=s3)
+    message = str(raised.value)
+    assert "\x1b" not in message and "\n" not in message
+    assert "x?[2J?Delete nothing" in message
