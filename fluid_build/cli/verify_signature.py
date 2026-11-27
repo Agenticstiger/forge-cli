@@ -53,8 +53,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "      --certificate-identity 'https://github.com/myorg/orders/.github/workflows/ci.yml@refs/heads/main' \\\n"
             "      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'\n"
             "  fluid verify-signature /tmp/bundle.tgz \\\n"
-            "      --identity-regexp 'https://github.com/myorg/.*'\n"
-            "  fluid verify-signature /tmp/bundle.tgz \\\n"
+            "      --identity-regexp 'https://github.com/myorg/.*' \\\n"
             "      --oidc-issuer-regexp 'https://token.actions.githubusercontent.com'\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

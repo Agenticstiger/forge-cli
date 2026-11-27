@@ -944,12 +944,24 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "supply-chain",
     ),
+    "schedule_sync_verify_flags_need_gate": (
+        [
+            (
+                "Add --verify-signature --bundle <path> to check the bundle before it is pushed, "
+                "or drop the --verify-* flags"
+            ),
+            "Without --verify-signature the --verify-* flags would be ignored and nothing checked",
+        ],
+        "supply-chain",
+    ),
     "signing_identity_not_pinned": (
         [
             (
                 "Keyless verification names its signer: pass the certificate identity and OIDC "
-                "issuer exactly (--certificate-identity / --certificate-oidc-issuer), or regexps "
-                "for them (--identity-regexp / --oidc-issuer-regexp)"
+                "issuer exactly, or regexps for them, with the flags the error names (for "
+                "verify-signature: --certificate-identity / --certificate-oidc-issuer or "
+                "--identity-regexp / --oidc-issuer-regexp; for schedule-sync the same with a "
+                "--verify- prefix)"
             ),
             "An empty value (an unset CI variable) pins nothing and is refused",
         ],

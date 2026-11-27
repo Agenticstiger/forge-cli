@@ -194,3 +194,20 @@ class TestNotPinnedNamesTheCallersFlags:
         ):
             assert flag in text
         assert "--certificate-identity" not in text.replace("--verify-certificate-identity", "")
+
+
+class TestScheduleSyncEpilog:
+    def test_every_example_parses_and_passes_the_gate_check(self):
+        """Documented examples are run as tests (the idea behind trycmd)."""
+        text = (_subparser(schedule_sync, "schedule-sync").epilog or "").replace("\\\n", " ")
+        examples = [
+            shlex.split(line.strip())
+            for line in text.splitlines()
+            if line.strip().startswith("fluid schedule-sync")
+        ]
+        assert examples
+        from fluid_build.cli import build_parser
+
+        for words in examples:
+            args = build_parser().parse_args(words[1:])
+            schedule_sync._require_gate_for_verify_flags(args)
