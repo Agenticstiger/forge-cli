@@ -51,7 +51,18 @@ import datetime
 import re
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from fluid_build.profiler import document
 from fluid_build.profiler._stats import ReadRefused, StatisticsBackend
@@ -230,7 +241,7 @@ _EPOCH = datetime.date(1970, 1, 1)
 
 _NOT_PUBLIC = "the table it references is not declared public"
 _FEW_KEYS = "the table it references holds fewer than two keys"
-_NOT_CATEGORICAL = "its key is not text: a history follows categorical columns"
+_NOT_FOLLOWABLE = "its key is not text or a whole number"
 _TWO_TABLES = "it is the key of more than one relationship"
 
 
@@ -277,8 +288,8 @@ class Followed:
     """A foreign key of a history's table, as a tracked column follows it.
 
     *levels* are the keys of the table it references, as that table publishes them, in order; a
-    key is text, since the reader of a history follows categorical columns only. A foreign key that cannot be followed holds the reason instead
-    (*why*), which names no value.
+    key is text or a whole number, spelled as the table spells it. A foreign key that cannot be
+    followed holds the reason instead (*why*), which names no value.
     """
 
     levels: Tuple[str, ...] = ()
@@ -310,6 +321,8 @@ class References:
     #: For each key column of a published table, its keys in order, and the domain it is read in.
     keys: Mapping[Tuple[str, str], Tuple[str, ...]] = field(default_factory=dict)
     domains: Mapping[Tuple[str, str], str] = field(default_factory=dict)
+    #: The key columns of a published table that the contract types as whole numbers.
+    wholes: FrozenSet[Tuple[str, str]] = frozenset()
     #: Why a table a counted relationship reaches is not published, by ``exposeId``.
     left_out: Mapping[str, str] = field(default_factory=dict)
     #: ``(child, child column)`` to the ``(parent, parent column)`` of the one relationship it keys.
@@ -334,8 +347,8 @@ class References:
             return Followed(why=self.left_out.get(parent, _NOT_PUBLIC))
         levels = self.keys[(parent, key)]
         domain = self.domains[(parent, key)]
-        if domain != "category":
-            return Followed(domain=domain, why=_NOT_CATEGORICAL)
+        if domain != "category" and (domain != "number" or (parent, key) not in self.wholes):
+            return Followed(domain=domain, why=_NOT_FOLLOWABLE)
         if len(levels) < 2:
             return Followed(domain=domain, why=_FEW_KEYS)
         return Followed(levels=levels, domain=domain)
@@ -566,6 +579,7 @@ def form_references(stage: Stage) -> References:
     tables: Dict[str, Mapping[str, Any]] = {}
     keys: Dict[Tuple[str, str], Tuple[str, ...]] = {}
     domains: Dict[Tuple[str, str], str] = {}
+    wholes: Set[Tuple[str, str]] = set()
     left_out: Dict[str, str] = {}
     notes: List[Tuple[str, str]] = []
     for plan, read in zip(stage.plans, stage.reads, strict=True):
@@ -591,6 +605,8 @@ def form_references(stage: Stage) -> References:
             at = names.index(key)
             keys[(expose_id, key)] = tuple(sorted(str(row[at]) for row in rows))
             domains[(expose_id, key)] = by_name[key].domain
+            if by_name[key].whole:
+                wholes.add((expose_id, key))
     links: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
     for each in stage.relationships:
         if each.counted and len(each.child_columns) == 1 and not each.entity:
@@ -601,6 +617,7 @@ def form_references(stage: Stage) -> References:
         tables=tables,
         keys=keys,
         domains=domains,
+        wholes=frozenset(wholes),
         left_out=left_out,
         links={name: tuple(held) for name, held in links.items()},
         notes=tuple(notes),

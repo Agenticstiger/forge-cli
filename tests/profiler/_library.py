@@ -124,7 +124,9 @@ def contract(
 
 
 def keys(count: int, *, kind: str = "string") -> List[Any]:
-    """*count* branch keys: text, whole numbers or uuids."""
+    """*count* branch keys: text, whole numbers, uuids or dates."""
+    if kind == "date":
+        return [(date(2020, 1, 1) + timedelta(days=n)).isoformat() for n in range(count)]
     if kind == "integer":
         return list(range(1, count + 1))
     if kind == "uuid":

@@ -80,8 +80,15 @@ withholds its group: its bins then say nothing of where records lie.
   A column that a counted relationship keys on its own (a foreign key) is tracked too, where
   the profile releases the table it references whole
   (:mod:`fluid_build.profiler.references`): its levels are that table's keys, in the order it
-  publishes them. A value that is no key, a table that is not published and a key that is not
-  text are named and the column is not tracked. A published cell of ``initial``, a group's size
+  publishes them. The keys are text or whole numbers (an integer type, or a decimal of scale 0),
+  spelled as that table spells them. A followed key the contract types as a number is written in
+  the category domain, as a text key is, from its values' decimal text, and its number metrics are
+  not formed (:func:`read_as_text`): the reader of a history tracks categorical columns only. That
+  is decided before the table is measured (:func:`prepare_histories`), by the gate that tracks the
+  column, so a key that is not tracked keeps the domain and the metrics it has. A value that is no
+  key, a table that is not published, a key that is neither text nor a whole number and a whole
+  number key that a statistic the contract declares reads are named and the column is not
+  tracked. A published cell of ``initial``, a group's size
   and a published change into or out of a key are each a floor on the children of that key's
   parent, so beside the relationship's children per parent they can give back a bin that
   relationship withholds (:func:`disclosure.parents_at_or_above`). Where they would, the foreign
@@ -122,6 +129,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Union,
 )
 
 from fluid_build.profiler import dates, defaults, disclosure, references, sources
@@ -142,11 +150,14 @@ __all__ = [
     "HistoryStage",
     "MOST_COLUMNS",
     "MOST_LEVELS",
+    "Prepared",
     "asked_plan",
     "chain_level",
     "form_histories",
     "length_ladder",
     "order_versions",
+    "prepare_histories",
+    "read_as_text",
 ]
 
 #: The most tracked columns a history holds, and the most levels one of them has (public caps).
@@ -175,6 +186,10 @@ _COUNTED_KEY = (
 _NO_ROWS = "no row holds both an entity and a start"
 _NOT_DAYS = "a value of its start or end is not a whole day"
 _NO_LEVELS = "the contract declares no levels for it"
+#: Why a foreign key typed as numbers is not followed: a level histogram over it, or any other
+#: statistic that reads it, would count the children of each parent, which the guard of the
+#: history does not hold beside it.
+_READ_BY_STATISTIC = "a statistic the contract declares reads it, and a history follows it as text"
 
 # A row of a history: its start, whether its end is open, its end (0 when open) and its position.
 _Key = Tuple[int, int, int, int]
@@ -231,6 +246,21 @@ class _Tracked:
 
 class _Unformed(Exception):
     """A history that is not formed; the message is the reason, free of any count."""
+
+
+@dataclass(frozen=True)
+class Prepared:
+    """What a history reads of the records before any member is formed: its window, its versions
+    in order and the columns it tracks, with each column left out and why."""
+
+    window: Any
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]]
+    used: Sequence[int]
+    tracked: Sequence[_Tracked]
+    unfollowed: Sequence[Tuple[str, str]]
+    #: The tracked foreign keys the contract types as numbers: the profile writes each one as the
+    #: category it is followed as (:func:`read_as_text`).
+    as_text: FrozenSet[str] = frozenset()
 
 
 @dataclass
@@ -1067,6 +1097,13 @@ def _declared_levels(declared: Optional[DeclaredBlock], name: str) -> Optional[T
     return None
 
 
+def _reads(declared: Optional[DeclaredBlock], name: str) -> bool:
+    """Whether any statistic of the block, written or not, reads the column *name*."""
+    if declared is None:
+        return False
+    return any(name in each.columns for each in (*declared.statistics, *declared.structure))
+
+
 def _place(index: Mapping[str, int], level: str) -> int:
     """The position of *level* among a column's levels; ``KeyError`` for a value outside them."""
     return index[level]
@@ -1123,6 +1160,9 @@ def _tracked(
         levels = key.levels if key is not None else _declared_levels(declared, column.name)
         if key is not None and key.why is not None:
             notes.append((what, key.why))
+        # Defence in depth: a declared statistic may read a key in a future block shape.
+        elif key is not None and column.domain != "category" and _reads(declared, column.name):
+            notes.append((what, _READ_BY_STATISTIC))
         elif levels is None:
             notes.append((what, _NO_LEVELS))
         elif len(levels) < 2:
@@ -1535,18 +1575,41 @@ def _unfollowed_candidates(context: _Context, window: Any) -> List[Tuple[str, st
     return found
 
 
-def _history(
-    context: _Context,
-    expose: Mapping[str, Any],
-    declared: Optional[DeclaredBlock],
-    notes: List[Tuple[str, str]],
-) -> Dict[str, Any]:
+def _prepared(
+    context: _Context, expose: Mapping[str, Any], declared: Optional[DeclaredBlock]
+) -> Prepared:
+    """The window, the versions and the tracked columns of a table's history, or why it has none."""
     window = _window(context, expose)
     from fluid_build.profiler import runner
 
     if runner.counts_the_entity(context.stage.counted_keys, context.expose_id, (window.key,)):
         raise _Unformed(_COUNTED_KEY)
     stations, used = _ordered(context, window)
+    tracked, unfollowed = _tracked(context, window, declared)
+    domains = {column.name: column.domain for column in context.plan.columns}
+    return Prepared(
+        window,
+        stations,
+        used,
+        tracked,
+        unfollowed,
+        frozenset(
+            each.name for each in tracked if each.followed and domains[each.name] == "number"
+        ),
+    )
+
+
+def _history(
+    context: _Context,
+    prepared: Prepared,
+    notes: List[Tuple[str, str]],
+) -> Dict[str, Any]:
+    window, stations, used, tracked = (
+        prepared.window,
+        prepared.stations,
+        prepared.used,
+        prepared.tracked,
+    )
     versions = sum(len(held) for held in stations.values())
     lengths: Counter[int] = Counter(
         (following.start - current.start) // _MS_PER_DAY
@@ -1563,8 +1626,7 @@ def _history(
     found["versionLength"] = _version_length(context, window, lengths)
     found["chain"] = _chain(context, window, stations)
     found["lastVersion"] = _last_version(context, window, stations)
-    tracked, unfollowed = _tracked(context, window, declared)
-    notes.extend(unfollowed)
+    notes.extend(prepared.unfollowed)
     notes.extend(_unfollowed_candidates(context, window))
     if tracked:
         columns = {column.name: _entries(context, window, column, stations) for column in tracked}
@@ -1589,20 +1651,75 @@ def _state_columns(table: Dict[str, Any], plan: "ExposePlan", formed: Mapping[st
         columns.setdefault(name, {"domain": domains[name]})
 
 
-def form_histories(inputs: HistoryStage) -> List[Tuple[str, str]]:
+def _windowed(inputs: HistoryStage) -> List[Tuple["ExposePlan", sources.SourceColumns, Any, str]]:
+    """The tables whose history is formed: each with its reads, its block and its exposeId."""
+    from fluid_build.data_rules._model import declares_validity_window
+
+    found = []
+    for plan, read, block in zip(inputs.plans, inputs.reads, inputs.declared, strict=True):
+        expose = inputs.exposes.get(plan.expose_id)
+        if inputs.asked is not None and plan.expose_id not in inputs.asked:
+            continue
+        if plan.expose_id in inputs.blocks or expose is None:
+            continue
+        if declares_validity_window(expose):
+            found.append((plan, read, block, plan.expose_id))
+    return found
+
+
+def prepare_histories(inputs: HistoryStage) -> Dict[str, Union[Prepared, str]]:
+    """Read what each table's history needs of its records: its tracked columns, or why none forms.
+
+    Nothing is written to the document. The profile asks this before it measures a table, so that
+    a foreign key a history follows is written as the category it is followed as
+    (:func:`read_as_text`), and :func:`form_histories` is given the same answer, which it does not
+    read twice.
+    """
+    from fluid_build.profiler import runner
+
+    prepared: Dict[str, Union[Prepared, str]] = {}
+    for plan, read, block, expose_id in _windowed(inputs):
+        context = _Context(inputs, plan, read, expose_id)
+        with runner._timed(inputs.timings, "measure", expose_id):
+            try:
+                prepared[expose_id] = _prepared(context, inputs.exposes[expose_id], block)
+            except _Unformed as why:
+                prepared[expose_id] = str(why)
+    return prepared
+
+
+def read_as_text(prepared: Mapping[str, Union[Prepared, str]]) -> Dict[str, FrozenSet[str]]:
+    """The columns of each table the contract types as numbers that its history follows as text.
+
+    Each is a foreign key into a table the profile releases whole, whose keys are its levels.
+    The profile writes such a column in the category domain, as a text key is, since the reader of
+    a history tracks categorical columns only: and no other column is written otherwise.
+    """
+    return {
+        expose_id: held.as_text
+        for expose_id, held in prepared.items()
+        if isinstance(held, Prepared) and held.as_text
+    }
+
+
+def form_histories(
+    inputs: HistoryStage, prepared: Optional[Mapping[str, Union[Prepared, str]]] = None
+) -> List[Tuple[str, str]]:
     """Write the ``history`` of each table that declares a validity window; the asks left out.
 
     A table a bundle's fidelity block answers is left alone, and so is a table whose contract
     declares no window, unless a request asks for its history: that ask is named with why it is
     not answered. A table whose window the profile cannot form is named with why. The time is
     counted as the table's own measure and check time. With a request (``asked``) only the tables
-    it names are formed.
+    it names are formed. *prepared* is what :func:`prepare_histories` read of the same stage.
     """
     from fluid_build.data_rules._model import declares_validity_window
     from fluid_build.profiler import runner
 
+    if prepared is None:
+        prepared = prepare_histories(inputs)
     notes: List[Tuple[str, str]] = []
-    for plan, read, found in zip(inputs.plans, inputs.reads, inputs.declared, strict=True):
+    for plan, read in zip(inputs.plans, inputs.reads, strict=True):
         expose_id = plan.expose_id
         expose = inputs.exposes.get(expose_id)
         if inputs.asked is not None and expose_id not in inputs.asked:
@@ -1614,11 +1731,12 @@ def form_histories(inputs: HistoryStage) -> List[Tuple[str, str]]:
                 notes.append((f"history of {expose_id}", _NO_WINDOW))
             continue
         context = _Context(inputs, plan, read, expose_id)
+        held = prepared[expose_id]
+        if isinstance(held, str):
+            notes.append((f"history of {expose_id}", held))
+            continue
         with runner._timed(inputs.timings, "measure", expose_id):
-            try:
-                formed = _history(context, expose, found, notes)
-                inputs.tables_doc[expose_id]["history"] = formed
-                _state_columns(inputs.tables_doc[expose_id], context.plan, formed)
-            except _Unformed as why:
-                notes.append((f"history of {expose_id}", str(why)))
+            formed = _history(context, held, notes)
+            inputs.tables_doc[expose_id]["history"] = formed
+            _state_columns(inputs.tables_doc[expose_id], context.plan, formed)
     return notes

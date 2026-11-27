@@ -130,6 +130,11 @@ _NUMBER_TYPES = frozenset(
     "int integer int2 int4 int8 int16 int32 int64 tinyint smallint mediumint bigint long "
     "longint serial bigserial year decimal dec numeric number bignumeric money".split()
 )
+_INTEGER_TYPES = frozenset(
+    "int integer int2 int4 int8 int16 int32 int64 tinyint smallint mediumint bigint long "
+    "longint serial bigserial".split()
+)
+_SCALED_TYPES = frozenset("decimal dec numeric number".split())
 _TIMESTAMP_TYPES = frozenset(
     "date timestamp timestamptz timestamp_tz timestamp_ntz timestamp_ltz timestampntz "
     "datetime datetime2 smalldatetime".split()
@@ -267,6 +272,8 @@ class ColumnPlan:
     #: contract's range rules: ``None`` for a bound it does not declare. ``None`` as a whole
     #: when the contract states a range this does not read, and the ends are then not rounded.
     extreme_bounds: Optional[Tuple[Optional[int], Optional[int]]] = None
+    #: The contract types the column as a whole number: an integer type, or a decimal of scale 0.
+    whole: bool = False
 
 
 @dataclass(frozen=True)
@@ -420,6 +427,23 @@ def column_domain(type_name: Any) -> Tuple[Optional[str], Optional[str]]:
     return None, "the type is not one fluid profile reads"
 
 
+def is_whole_number(type_name: Any) -> bool:
+    """Whether a FLUID column type holds whole numbers only: an integer type, or a decimal, numeric
+    or number type that states a scale of 0 (``decimal(10)`` and ``decimal(10, 0)``).
+
+    A decimal with no stated scale, ``money`` and a scale above 0 are not: their values may carry
+    a fraction.
+    """
+    text = re.sub(r"\s+", "", str(type_name or "").lower())
+    base = _base_type(type_name)
+    if base in _INTEGER_TYPES:
+        return True
+    if base not in _SCALED_TYPES:
+        return False
+    stated = re.fullmatch(r"[a-z]+\((\d+)(?:,(\d+))?\)", text)
+    return stated is not None and int(stated.group(2) or 0) == 0
+
+
 def expose_ids(contract: Mapping[str, Any]) -> List[str]:
     """The contract's exposeIds, in the order it declares them."""
     return [str(item["exposeId"]) for item in iter_exposes(dict(contract)) if item.get("exposeId")]
@@ -485,6 +509,7 @@ def plan_expose(contract: Mapping[str, Any], expose_id: str) -> ExposePlan:
                     name=name,
                     domain=domain,
                     date=is_date,
+                    whole=is_whole_number(entry.get("type")),
                     extreme_bounds=_extreme_bounds(entry, is_date) if domain == TIMESTAMP else None,
                 )
             )
@@ -1128,6 +1153,29 @@ def profile_exposes(
     tallies: Tuple["Counter[str]", "Counter[str]"] = (Counter(), Counter())
     tables_doc: Dict[str, Dict[str, Any]] = {}
     results: List[TableResult] = []
+    raw_exposes = {
+        str(item.get("exposeId")): item
+        for item in iter_exposes(dict(contract))
+        if item.get("exposeId")
+    }
+    counted_keys = frozenset((each.child, tuple(each.child_columns)) for each in relationships)
+    released = references.NONE
+    stage: Optional[history.HistoryStage] = None
+    prepared: Dict[str, Any] = {}
+    followed_as_text: Dict[str, FrozenSet[str]] = {}
+    if request is None:  # a bundle's table has its own history, and a request asks for one
+        # Read before a table is measured: a foreign key a history follows by the keys of a table
+        # released whole is written as the category it is followed as (history.read_as_text).
+        released = references.form_references(
+            references.Stage(raw_exposes, plans, reads, relationships, backend, blocks)
+        )
+        stage = history.HistoryStage(
+            raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
+            tallies, fractional_bits, timings, counted_keys, released,
+        )  # fmt: skip
+        if released.wholes:  # no whole-number key: nothing to read early, and nothing held
+            prepared = history.prepare_histories(stage)
+            followed_as_text = history.read_as_text(prepared)
     for plan, read, found, missing in zip(plans, reads, declared, uncovered, strict=True):
         with _timed(timings, "measure", plan.expose_id):
             table_doc, result = _profile_table(
@@ -1142,6 +1190,7 @@ def profile_exposes(
                 asked.get(plan.expose_id),
                 answered.grouped_by.get(plan.expose_id, frozenset()),
                 timings,
+                followed_as_text.get(plan.expose_id, frozenset()),
             )
         tables_doc[plan.expose_id] = table_doc
         # A request lists what it asks, so what the defaults leave out is told per listed item.
@@ -1151,11 +1200,6 @@ def profile_exposes(
             if request is not None
             else replace(result, uncovered=missing, no_span=spanless)
         )
-    raw_exposes = {
-        str(item.get("exposeId")): item
-        for item in iter_exposes(dict(contract))
-        if item.get("exposeId")
-    }
     dated = dates.DateStage(
         raw_exposes, by_expose, tables_doc, backend, rule, tallies, fractional_bits, held, timings
     )
@@ -1182,7 +1226,6 @@ def profile_exposes(
         for position, each in enumerate(relationships)
         if each.counted
     }
-    released = references.NONE
     if request is not None and planned.history_asks:
         # a request forms the history of the tables that ask for one, and no other
         date_notes.extend(
@@ -1193,7 +1236,7 @@ def profile_exposes(
                     reads,
                     [planned.history_blocks.get(plan.expose_id) for plan in plans],
                     blocks, tables_doc, backend, rule, tallies, fractional_bits, timings,
-                    frozenset((each.child, tuple(each.child_columns)) for each in relationships),
+                    counted_keys,
                     references.NONE,
                     {
                         (relationships[at].child, tuple(relationships[at].child_columns)): done.shown
@@ -1203,22 +1246,20 @@ def profile_exposes(
                 )  # fmt: skip
             )
         )
-    if request is None:  # a bundle's table has its own history, and a request asks for one
-        released = references.form_references(
-            references.Stage(raw_exposes, plans, reads, relationships, backend, blocks)
-        )
+    if stage is not None:
         date_notes.extend(
             history.form_histories(
-                history.HistoryStage(
-                    raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
-                    tallies, fractional_bits, timings,
-                    frozenset((each.child, tuple(each.child_columns)) for each in relationships),
-                    released,
-                    {
-                        (relationships[at].child, tuple(relationships[at].child_columns)): done.shown
+                replace(
+                    stage,
+                    children_shown={
+                        (
+                            relationships[at].child,
+                            tuple(relationships[at].child_columns),
+                        ): done.shown
                         for at, (_, done) in counted_entries.items()
                     },
-                )  # fmt: skip
+                ),
+                prepared or None,
             )
         )
         date_notes.extend(released.notes)
@@ -2921,12 +2962,17 @@ def _profile_table(
     asked: Optional[RequestTable] = None,
     grouped_by: FrozenSet[str] = frozenset(),
     timings: Optional[StageTimings] = None,
+    as_text: FrozenSet[str] = frozenset(),
 ) -> Tuple[Dict[str, Any], TableResult]:
     """One table of the document, from one read of its records, and its summary.
 
     *keys* are the table's foreign-key columns whose children per parent are counted, and
     *grouped_by* its columns a relationship's statistics are grouped by: the sizes of their
     groups are published, so each is withheld what a level or a binned number is.
+
+    The *as_text* columns are numbers a history follows by the keys of a table released whole:
+    each is written in the category domain, from its values' decimal text, as a text key is, and
+    its number metrics are not formed (:func:`fluid_build.profiler.history.read_as_text`).
     """
     tally, cell_tally = tallies
     domains = {column.name: column.domain for column in plan.columns}
@@ -2946,8 +2992,12 @@ def _profile_table(
     rounded: List[Tuple[str, str, str]] = []
     columns_doc = {
         column.name: _column(
-            column,
-            read.values[column.name],
+            replace(column, domain=CATEGORY) if column.name in as_text else column,
+            (
+                _decimal_texts(column, read.values[column.name], backend)
+                if column.name in as_text
+                else read.values[column.name]
+            ),
             read.row_count,
             backend,
             rule,
@@ -2990,6 +3040,17 @@ def _profile_table(
         left_out=tuple(left_out),
         rounded_extremes=tuple(rounded),
     )
+
+
+def _decimal_texts(
+    column: ColumnPlan, raw: Sequence[Any], backend: StatisticsBackend
+) -> List[Optional[str]]:
+    """A number column's values as the decimal text a reference table spells its keys in."""
+    found: List[Optional[str]] = []
+    for index, value in enumerate(raw):
+        read = backend.read_value(column.domain, value, column=column.name, row_index=index)
+        found.append(None if read is None else references.spell(read, domain=column.domain))
+    return found
 
 
 def _declared_block(
