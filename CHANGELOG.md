@@ -421,6 +421,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose package reports another version, and the image's pip, setuptools and wheel come from the
   hash-locked `requirements/release-image.txt`. A local image build runs `python -m build --wheel`
   first.
+- **A private release no longer refuses a `--source` for an expose it chooses not to read.**
+  `fluid profile --privacy-unit` refused with `profile_release_source_unused` as soon as a
+  `--source <exposeId>=<location>` named an expose of the contract that the release holds no
+  statistic of, so a caller that hands every expose its records could not release at all. The
+  release now goes on without reading that file, and its report names each such source with its
+  reason (the expose only, never its location or a value). An expose of the contract is the
+  only name that qualifies: a `--source` naming none is still refused, as is one given twice,
+  one with no location or one naming a file that does not exist, and no output is written over
+  such a file. Its `--table` is set aside with it. `--strict` keeps the refusal, before any
+  record is read. A profile that names its tables with `--expose` or a request is unchanged: it reads
+  exactly what it was told to, so a source beyond that stays a mistake.
 
 ### Security
 

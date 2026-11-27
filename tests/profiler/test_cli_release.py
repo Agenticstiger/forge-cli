@@ -555,10 +555,9 @@ def test_an_unreadable_request_or_one_that_lists_nothing_releasable_is_refused(
     assert main(_swap(_argv(), "--request", "missing.yml")) != 0
 
 
-def test_a_source_for_another_table_is_refused_since_only_the_release_table_is_read(
-    workspace, registry, selected, capsys
-):
-    argv = [
+def _release_of_orders_with_a_source_for_customers(workspace, *more):
+    (workspace / "customers.csv").write_text("id,name\n1,Ada\n", encoding="utf-8")
+    return [
         "profile",
         "shop.fluid.yaml",
         "--request",
@@ -571,11 +570,32 @@ def test_a_source_for_another_table_is_refused_since_only_the_release_table_is_r
         "customers",
         "--release-table",
         "orders",
+        "--max-rows-per-unit",
+        "2",
         "--rho",
-        "1",
+        "0.5",
         "--release-record",
         "rec.json",
+        *more,
     ]
+
+
+def test_a_source_for_another_table_is_noted_since_only_the_release_table_is_read(
+    workspace, registry, selected, capsys
+):
+    assert main(_release_of_orders_with_a_source_for_customers(workspace)) == 0
+    out = " ".join(_out(capsys).split())
+    assert "--source customers names exposes[customers], which this release does not read" in out
+    assert "reads the release table exposes[orders] only" in out
+    assert "no record of it was read" in out
+    assert "customers.csv" not in out and "Ada" not in out
+    assert (workspace / "rec.json").is_file()
+
+
+def test_strict_refuses_a_source_for_another_table_since_only_the_release_table_is_read(
+    workspace, registry, selected, capsys
+):
+    argv = _release_of_orders_with_a_source_for_customers(workspace, "--strict")
     assert main(argv) == 1
     assert "profile_release_source_unused" in _out(capsys)
     assert not (workspace / "rec.json").exists()
