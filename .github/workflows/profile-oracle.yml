@@ -1,0 +1,58 @@
+# Profile oracle — the exhaustive audit of a history that follows a foreign key
+# (tests/profiler/test_reference_follow_oracle.py).
+#
+# The default test run holds one small universe of the audit and the table of two keys. The full
+# set (O1 to O5) takes about an hour, so it runs here instead: on a pull request that touches
+# the modules the audit judges, and on request. Not on a schedule, and not a required check.
+
+name: Profile oracle
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - fluid_build/profiler/history.py
+      - fluid_build/profiler/references.py
+      - fluid_build/profiler/runner.py
+      - fluid_build/profiler/disclosure.py
+      - tests/profiler/test_reference_follow_oracle.py
+      - .github/workflows/profile-oracle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  oracle:
+    name: Full oracle universes (O1 to O5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        env:
+          PIP_TIMEOUT: "30"
+        run: |
+          pip install --upgrade pip
+          for attempt in 1 2 3; do
+            pip install -e ".[dev,local]" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -e .[dev,local] failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
+      - name: Run every universe of the oracle
+        env:
+          FLUID_PROFILE_ORACLE: full
+        run: python -m pytest tests/profiler/test_reference_follow_oracle.py -n 3 -q -p no:randomly

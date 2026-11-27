@@ -239,8 +239,11 @@ _NAME_SEPARATORS = re.compile(r"[\s.\-_]+")
 _MS_PER_DAY = 86_400_000
 _EPOCH = datetime.date(1970, 1, 1)
 
+#: The fewest keys a history follows: with two keys the totals a history publishes pin its cells.
+_LEAST_KEYS = 3
+
 _NOT_PUBLIC = "the table it references is not declared public"
-_FEW_KEYS = "the table it references holds fewer than two keys"
+_FEW_KEYS = "the table it references holds fewer than three keys"
 _NOT_FOLLOWABLE = "its key is not text or a whole number"
 _TWO_TABLES = "it is the key of more than one relationship"
 
@@ -349,7 +352,7 @@ class References:
         domain = self.domains[(parent, key)]
         if domain != "category" and (domain != "number" or (parent, key) not in self.wholes):
             return Followed(domain=domain, why=_NOT_FOLLOWABLE)
-        if len(levels) < 2:
+        if len(levels) < _LEAST_KEYS:
             return Followed(domain=domain, why=_FEW_KEYS)
         return Followed(levels=levels, domain=domain)
 

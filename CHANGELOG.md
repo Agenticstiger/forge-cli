@@ -51,14 +51,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nullCount` and the withheld `distinctCount`; its `sum`, `min`, `max` and `quantiles` are not
   formed). Before, such a key was named as not followed, and the history carried it as an
   untracked column, so a generated history held each entity's key constant across its versions.
-  A key that is not tracked keeps its number domain and every metric it had, whatever the reason:
-  a value that is no key of the table, a table that is not published whole, fewer than two keys,
-  two relationships on the column, or a key over the cap. A key the contract's statistics read is
-  not followed. A key that is neither text nor a whole number (a float, a decimal with a scale, a
-  date) is still named as not followed, now with the reason "its key is not text or a whole
-  number". Cells of the key's `initial` and `transitions` are checked, and its shares withheld
-  against the children per parent, exactly as for a text key. A private release and a profile
-  request write no `references` and follow nothing, as before.
+  A key that is not followed keeps its number domain and every metric it had, whatever the reason:
+  a table that is not published whole, fewer than three keys, two relationships on the column, or
+  a key over the cap. A key the contract's statistics read is not followed. A key that is neither
+  text nor a whole number (a float, a decimal with a scale, a date) is still named as not
+  followed, now with the reason "its key is not text or a whole number". Cells of the key's
+  `initial` and `transitions` are checked exactly as for a text key. A private release and a
+  profile request write no `references` and follow nothing, as before.
+- **A history follows a foreign key into a table of at least three keys.** A table of fewer than
+  three keys is not followed, since with two the published totals pin the cells; its profile is
+  byte for byte that of a profile that follows no key. The keys a history follows are the plan's
+  alone (the contract, and the public keys of the tables released whole): a key a record then
+  proves is no key of its table is still one of them, so it is written as the category it would be
+  followed as, and only its history is left out. The most columns a history follows count the
+  candidates, so a column whose values fail the read keeps its place under the 32-column cap; this
+  is the one change for a profile that follows no key. A relationship written withheld because its
+  key is followed carries a note that holds no count, and no structural class.
+
+### Security
+
+- **`fluid profile` no longer decides from the counts whether a followed foreign key's history is
+  published.** In 0.42.0 a history that follows a foreign key into a table published whole
+  withheld the key's `initial` and `transitions` where their counts, beside the relationship's
+  children per parent, would bound a withheld bin. That decision read the counts, so on a very
+  small child table the choice itself could narrow a withheld count. Now the relationship's
+  children per parent are withheld whenever the contract makes a history follow the key, and the
+  key's history goes through the ordinary output check. A 0.42.0 profile that writes `references`
+  and a history tracking a foreign key over a small table should be regenerated before it is
+  shared further. Present since 0.42.0.
 
 ## [0.42.0] — 2026-11-27
 

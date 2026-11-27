@@ -81,19 +81,21 @@ withholds its group: its bins then say nothing of where records lie.
   the profile releases the table it references whole
   (:mod:`fluid_build.profiler.references`): its levels are that table's keys, in the order it
   publishes them. The keys are text or whole numbers (an integer type, or a decimal of scale 0),
-  spelled as that table spells them. A followed key the contract types as a number is written in
-  the category domain, as a text key is, from its values' decimal text, and its number metrics are
-  not formed (:func:`read_as_text`): the reader of a history tracks categorical columns only. That
-  is decided before the table is measured (:func:`prepare_histories`), by the gate that tracks the
-  column, so a key that is not tracked keeps the domain and the metrics it has. A value that is no
-  key, a table that is not published, a key that is neither text nor a whole number and a whole
-  number key that a statistic the contract declares reads are named and the column is not
-  tracked. A published cell of ``initial``, a group's size
-  and a published change into or out of a key are each a floor on the children of that key's
-  parent, so beside the relationship's children per parent they can give back a bin that
-  relationship withholds (:func:`disclosure.parents_at_or_above`). Where they would, the foreign
-  key's ``initial`` and its ``transitions`` are each withheld whole, at the level of the group,
-  so neither a size nor a cell is written for them (:func:`_guarded`).
+  spelled as that table spells them, and a table of fewer than three keys is not followed. A
+  followed key the contract types as a number is written in the category domain, as a text key is,
+  from its values' decimal text, and its number metrics are not formed (:func:`read_as_text`): the
+  reader of a history tracks categorical columns only. That is decided by the plan
+  (:func:`followed_columns`), before the table is measured, so no record changes it: a key that is
+  then found to hold a value that is no key of its table is written as a category and named, and
+  its history is not written, and so is a key whose table's history does not form. A table that
+  is not published, a key that is neither text nor a whole number and a whole number key that a
+  statistic the contract declares reads are named and the column is not tracked, and keeps the
+  domain and the metrics it has. A published cell of
+  ``initial``, a group's size and a published change into or out of a key are each a floor on the
+  children of that key's parent, so the relationship that keys the column publishes no children
+  per parent: its statistics are written withheld whole, a decision of the plan that reads no
+  count (:func:`followed_columns`). The key's ``initial`` and ``transitions`` then go through the
+  ordinary output check like any categorical column's.
 * ``reasons`` (with at least two tracked columns): the changes by the one tracked column that moves,
   or ``several``. Its cells and the transitions' group totals are linked: with two tracked columns
   ``several = M_a + M_b - k``, with ``M_a`` the changes of ``a`` (the sum of its transitions' group
@@ -116,7 +118,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import (
     TYPE_CHECKING,
@@ -144,7 +146,7 @@ from fluid_build.profiler._stats import (
 )
 
 if TYPE_CHECKING:  # the runner imports this module; its names are read inside functions
-    from fluid_build.profiler.runner import ExposePlan, StageTimings
+    from fluid_build.profiler.runner import ColumnPlan, ExposePlan, StageTimings
 
 __all__ = [
     "HistoryStage",
@@ -215,11 +217,6 @@ class HistoryStage:
     counted_keys: FrozenSet[Tuple[str, Tuple[str, ...]]] = frozenset()
     #: The tables the profile releases whole, whose keys a foreign key of a history follows.
     released: Optional[references.References] = None
-    #: Which bins of each counted relationship's children per parent publish their cell, by
-    #: ``(child table, child columns)``.
-    children_shown: Mapping[Tuple[str, Tuple[str, ...]], Tuple[bool, ...]] = field(
-        default_factory=dict
-    )
     #: The tables whose history a request asks for, each with the candidate columns it names (or
     #: ``None`` for the contract's categorical columns). ``None`` as a whole: every table that
     #: declares a window is formed, as a default profile does.
@@ -258,9 +255,6 @@ class Prepared:
     used: Sequence[int]
     tracked: Sequence[_Tracked]
     unfollowed: Sequence[Tuple[str, str]]
-    #: The tracked foreign keys the contract types as numbers: the profile writes each one as the
-    #: category it is followed as (:func:`read_as_text`).
-    as_text: FrozenSet[str] = frozenset()
 
 
 @dataclass
@@ -314,7 +308,6 @@ class _Context:
         definition: str,
         shape: Mapping[str, Any],
         keys: Sequence[str],
-        group_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         """A statistic withheld whole by a rule of the history: ``D``, with the open band."""
         entry: Dict[str, Any] = {
@@ -324,8 +317,6 @@ class _Context:
             **shape,
             "groups": [{"group": key, "status": disclosure.WITHHELD} for key in keys],
         }
-        if group_by is not None:
-            entry["groupBy"] = group_by
         self.stage.tallies[0][disclosure.SECONDARY] += len(keys)
         return entry
 
@@ -1133,21 +1124,37 @@ def asked_plan(
     return replace(plan, columns=tuple(each for each in plan.columns if each.name in named))
 
 
-def _tracked(
+@dataclass(frozen=True)
+class _Candidate:
+    """A column a history may follow, from the plan alone: the column, its key and its levels."""
+
+    column: "ColumnPlan"
+    #: The foreign key the column is, as the profile releases the table it references; ``None``
+    #: for a column that declares its own levels.
+    key: Optional[references.Followed]
+    levels: Tuple[str, ...]
+
+
+def _candidates(
     context: _Context,
     window: Any,
     declared: Optional[DeclaredBlock],
-) -> Tuple[List[_Tracked], List[Tuple[str, str]]]:
-    """The categorical columns a history follows, and each one left out with why.
+) -> List[Tuple[str, Union[str, _Candidate]]]:
+    """Each column of the plan a history may follow, or the reason it does not, in column order.
 
-    A column that a counted relationship keys on its own is a foreign key: it is followed by the
-    keys of the table it references, where the profile releases that table whole
-    (:mod:`fluid_build.profiler.references`), and whatever levels the contract declares for it.
+    Nothing here reads a value: the answer is the contract's, the public keys of the tables the
+    profile releases whole, and the plan's columns. A column that a counted relationship keys on
+    its own is a foreign key: it is followed by the keys of the table it references, where the
+    profile releases that table whole (:mod:`fluid_build.profiler.references`), and whatever levels
+    the contract declares for it. A history follows at most :data:`MOST_COLUMNS` columns, the
+    first of these in the plan's order. A candidate whose values then prove not to be levels
+    (:func:`_tracked`) keeps its place and is not replaced by a later column, so which columns a
+    history may follow never depends on a record.
     """
-    stage, read = context.stage, context.read
+    stage = context.stage
     taken = {window.key, window.start_column, window.end_column}
-    found: List[_Tracked] = []
-    notes: List[Tuple[str, str]] = []
+    found: List[Tuple[str, Union[str, _Candidate]]] = []
+    wanted = 0
     for column in context.plan.columns:
         key = (
             stage.released.follow(context.expose_id, column.name)
@@ -1159,43 +1166,100 @@ def _tracked(
         what = f"history of {context.expose_id}.{column.name}"
         levels = key.levels if key is not None else _declared_levels(declared, column.name)
         if key is not None and key.why is not None:
-            notes.append((what, key.why))
+            found.append((what, key.why))
         # Defence in depth: a declared statistic may read a key in a future block shape.
         elif key is not None and column.domain != "category" and _reads(declared, column.name):
-            notes.append((what, _READ_BY_STATISTIC))
+            found.append((what, _READ_BY_STATISTIC))
         elif levels is None:
-            notes.append((what, _NO_LEVELS))
+            found.append((what, _NO_LEVELS))
         elif len(levels) < 2:
-            notes.append((what, "it declares fewer than two levels"))
+            found.append((what, "it declares fewer than two levels"))
         elif len(levels) > MOST_LEVELS:
-            notes.append((what, f"it declares more than {MOST_LEVELS} levels"))
-        elif len(found) >= MOST_COLUMNS:
-            notes.append((what, f"a history follows at most {MOST_COLUMNS} columns"))
+            found.append((what, f"it declares more than {MOST_LEVELS} levels"))
+        elif wanted >= MOST_COLUMNS:
+            found.append((what, f"a history follows at most {MOST_COLUMNS} columns"))
         else:
-            index = {level: place for place, level in enumerate(levels)}
-            try:
-                values: List[Optional[int]] = []
-                for position, raw in enumerate(read.values[column.name]):
-                    value = stage.backend.read_value(
-                        column.domain, raw, column=column.name, row_index=position
-                    )
-                    if value is not None and key is not None:
-                        value = references.spell(value, domain=column.domain)
-                    values.append(None if value is None else _place(index, value))
-            except (ReadRefused, KeyError, ValueError):
-                notes.append(
-                    (
-                        what,
-                        (
-                            "a value of it is not a key of the table it references"
-                            if key is not None
-                            else "a value of it is outside its declared levels"
-                        ),
-                    )
+            wanted += 1
+            found.append((what, _Candidate(column, key, levels)))
+    return found
+
+
+def _tracked(
+    context: _Context,
+    window: Any,
+    declared: Optional[DeclaredBlock],
+) -> Tuple[List[_Tracked], List[Tuple[str, str]]]:
+    """The categorical columns a history follows, and each one left out with why.
+
+    Each candidate (:func:`_candidates`) is read: a column with a value outside its levels, or
+    that is no key of the table it references, is named and left out.
+    """
+    stage, read = context.stage, context.read
+    found: List[_Tracked] = []
+    notes: List[Tuple[str, str]] = []
+    for what, held in _candidates(context, window, declared):
+        if isinstance(held, str):
+            notes.append((what, held))
+            continue
+        column, key, levels = held.column, held.key, held.levels
+        index = {level: place for place, level in enumerate(levels)}
+        try:
+            values: List[Optional[int]] = []
+            for position, raw in enumerate(read.values[column.name]):
+                value = stage.backend.read_value(
+                    column.domain, raw, column=column.name, row_index=position
                 )
-                continue
-            found.append(_Tracked(column.name, levels, values, followed=key is not None))
+                if value is not None and key is not None:
+                    value = references.spell(value, domain=column.domain)
+                values.append(None if value is None else _place(index, value))
+        except (ReadRefused, KeyError, ValueError):
+            notes.append(
+                (
+                    what,
+                    (
+                        "a value of it is not a key of the table it references"
+                        if key is not None
+                        else "a value of it is outside its declared levels"
+                    ),
+                )
+            )
+            continue
+        found.append(_Tracked(column.name, levels, values, followed=key is not None))
     return found, notes
+
+
+def followed_columns(stage: HistoryStage) -> FrozenSet[Tuple[str, str]]:
+    """The ``(table, column)`` of each foreign key a history of the profile follows.
+
+    Decided by the plan alone: the contract, the tables the profile releases whole and their
+    public keys. No value and no count is read, so the answer is the same for any records of the
+    same shape (the tables it reads are those the profile releases whole, whose rows are public).
+    It holds every key a history may track (:func:`_tracked` drops only those whose
+    values prove not to be keys), and it is what the profile reads to withhold the relationship the
+    key follows (:mod:`fluid_build.profiler.runner`): a published cell of the key's history is a
+    floor on its parent's children, so the children per parent of that relationship are not
+    published beside it, whatever the counts.
+    """
+    found: Set[Tuple[str, str]] = set()
+    for plan, read, block, expose_id in _windowed(stage):
+        context = _Context(stage, plan, read, expose_id)
+        try:
+            window = _window(context, stage.exposes[expose_id])
+        except _Unformed:
+            continue
+        if _counts_the_entity(context, window):
+            continue
+        for _, held in _candidates(context, window, block):
+            if isinstance(held, _Candidate) and held.key is not None:
+                found.add((expose_id, held.column.name))
+    return frozenset(found)
+
+
+def _counts_the_entity(context: _Context, window: Any) -> bool:
+    """Whether a counted relationship keys the table's entity: its history is then not formed."""
+    from fluid_build.profiler import runner
+
+    return runner.counts_the_entity(context.stage.counted_keys, context.expose_id, (window.key,))
 
 
 def _initial_counts(
@@ -1213,12 +1277,8 @@ def _initial(
     context: _Context,
     column: _Tracked,
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
-    *,
-    whole: bool = False,
 ) -> Dict[str, Any]:
-    """The first level of each entity; with *whole*, withheld whole: no size and no cell."""
-    if whole:
-        return context.withheld("levelHistogram/1", {"levels": list(column.levels)}, [""])
+    """The first level of each entity."""
     return _levels_entry(
         context,
         f"{context.expose_id}.{column.name} initial",
@@ -1281,16 +1341,10 @@ def _transitions(
     window: Any,
     column: _Tracked,
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
-    *,
-    whole: bool = False,
 ) -> Dict[str, Any]:
-    """The changes of *column*, grouped by the column; with *whole*, every group withheld."""
+    """The changes of *column*, grouped by the column."""
     backend = context.stage.backend
     levels, size = column.levels, len(column.levels)
-    if whole:
-        return context.withheld(
-            "levelHistogram/1", {"levels": list(levels)}, list(levels), column.name
-        )
     moves, from_null = _move_counts(column, stations)
     total = from_null + sum(sum(each) for each in moves)
     name = f"{context.expose_id}.{column.name} transitions"
@@ -1364,180 +1418,6 @@ def _reasons(
     return context.withheld("levelHistogram/1", shape, [""])
 
 
-# ---------------------------------------------------------------------------
-# A tracked foreign key beside the relationship's children per parent
-# ---------------------------------------------------------------------------
-
-
-def _floor(count: int, rule: disclosure.DisclosureRule) -> int:
-    """The records a reader knows a published number holds at least: its band's lower end."""
-    return disclosure.sample_size(count, rule)["min"]
-
-
-def _ceiling(count: int, rule: disclosure.DisclosureRule) -> int:
-    """The records a published number holds at most: its band's upper end."""
-    return disclosure.sample_size(count, rule)["max"]
-
-
-def _hidden_mass(
-    group: Mapping[str, Any], skip: Optional[int], rule: disclosure.DisclosureRule
-) -> Tuple[List[int], int]:
-    """The cells a published group withholds, and the records they hold together at least.
-
-    The group's size less the most each cell it publishes can hold: the size (and the cells) are
-    rounded, so the lower end of the size's band and the upper end of each cell's are used. The
-    cell at *skip* is the group's own, zero by the contract and no cell of the check. Whatever the
-    size says, the check's complementary suppression holds that the cells it withholds are not a
-    small count together: they hold at least the rule's minimum cell.
-    """
-    cells = group["levelCounts"]
-    hidden = [at for at, count in enumerate(cells) if count is None and at != skip]
-    shown = sum(
-        _ceiling(count, rule) for at, count in enumerate(cells) if count is not None and at != skip
-    )
-    size = group.get("k")
-    sized = (_floor(size, rule) if isinstance(size, int) else 0) - shown
-    return hidden, max(sized, rule.minimum_cell) if hidden else 0
-
-
-def _changes_out(group: Mapping[str, Any], summed: int, rule: disclosure.DisclosureRule) -> int:
-    """The changes out of a key a published group shows: its size, or its cells if more."""
-    size = group.get("k")
-    return max(summed, _floor(size, rule) if isinstance(size, int) else 0)
-
-
-def _published_floors(
-    initial: Mapping[str, Any], transitions: Mapping[str, Any], rule: disclosure.DisclosureRule
-) -> List[int]:
-    """The child rows each key is known to hold, read from the entries as they are written.
-
-    A key's parent holds a row for each entity that starts at the key and for each change into it
-    (the next version of a change is a row of its own), and a row for each change out of it (the
-    version before the change is a row of its own). The first two are rows of the key's own
-    ``initial`` cell and of the cells of the other groups; the last is the group's size (or its
-    cells, where they sum to more). Where a group withholds cells but publishes its size, the
-    withheld cells hold at least that size less what the published ones can: that much is placed
-    on the withheld key already floored highest. A reader cannot tell which withheld key holds
-    it, and a bin it derives from every placement it derives from this one.
-    """
-    levels = initial["levels"]
-    held = [0] * len(levels)
-    left = [0] * len(levels)
-    masses: List[Tuple[List[int], int]] = []
-    (group,) = initial["groups"]
-    if group["status"] == _FREE:
-        for at, count in enumerate(group["levelCounts"]):
-            if count is not None:
-                held[at] += _floor(count, rule)
-        masses.append(_hidden_mass(group, None, rule))
-    for group in transitions["groups"]:
-        if group["status"] != _FREE:
-            continue
-        source = levels.index(group["group"])
-        summed = 0
-        for at, count in enumerate(group["levelCounts"]):
-            if count is not None and at != source:
-                held[at] += _floor(count, rule)
-                summed += _floor(count, rule)
-        left[source] = _changes_out(group, summed, rule)
-        masses.append(_hidden_mass(group, source, rule))
-    for hidden, mass in masses:
-        if hidden and mass:
-            held[max(hidden, key=lambda at: (max(held[at], left[at]), -at))] += mass
-    return [max(rows, changes) for rows, changes in zip(held, left, strict=True)]
-
-
-def _published_ceilings(
-    initial: Mapping[str, Any], entities: int, rest: int, rule: disclosure.DisclosureRule
-) -> List[Optional[int]]:
-    """The child rows each key's parent holds at most, read from the ``initial`` as written.
-
-    A parent's children are its entities' first versions (its cell of ``initial``) and the rows
-    that follow a first version, *rest* of them in all, wherever they fall: at most the cell
-    plus *rest*. A published cell is read at the top of its band. A withheld cell is at most the
-    group's *entities* less what the other cells hold at least. The group's size and the rows
-    that are no first version are the exact counts, which a reader holds no tighter than. A
-    reader can lower a ceiling further by the published changes into the other keys; that
-    cannot pin a cell here, since a published change into another key leaves at least
-    ``minimumCell`` withheld changes that may land on this one. An entry withheld whole gives no
-    ceiling.
-    """
-    levels = initial["levels"]
-    (group,) = initial["groups"]
-    if group["status"] != _FREE:
-        return [None] * len(levels)
-    cells = group["levelCounts"]
-    least = sum(_floor(count, rule) for count in cells if count is not None)
-    return [
-        (_ceiling(count, rule) if count is not None else max(entities - least, 0)) + rest
-        for count in cells
-    ]
-
-
-def _guarded(
-    context: _Context,
-    window: Any,
-    column: _Tracked,
-    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
-) -> bool:
-    """Whether a foreign key's ``initial`` and ``transitions`` are both withheld whole.
-
-    A published number of either says that a key's parent holds at least that many child rows
-    (:func:`_published_floors`: a cell of ``initial``, a change into a key, a group's size, which
-    is the changes out of it). Every key is a parent of the relationship that keys the column, so
-    beside the relationship's published children per parent a reader forms, for each bin, the
-    parents that lie in it or above it (:func:`disclosure.parents_at_or_above`). The bins the
-    relationship withheld, which no other count gave back, may be pinned by that. A floor also
-    uses up part of the children's total (a parent holds at least the larger of its bin's lower
-    edge and its floor), so a floor above its bin's edge bounds the other parents from above; the
-    reader is given the floors themselves (:func:`disclosure.pinned_children_cells`), and the
-    total is the relationship's own children, which is never above what a rounded row count lets
-    a reader assume. Where they are, both entries are withheld whole, at the level of the group,
-    so neither a size, a ``sampleSize`` nor a cell of them is written: a number written beside a
-    withheld cell gives that cell back (by the group's size) as much as the cell does. The check
-    is run again on what is written, so it holds as it stands. Nothing here reads a value: it
-    reads counts the profiler formed.
-    """
-    from fluid_build.profiler import runner
-
-    stage = context.stage
-    shown = stage.children_shown.get((context.expose_id, (column.name,)))
-    if shown is None:
-        return False
-    edges = runner.CHILDREN_EDGES
-    lower = list(edges[:-1])
-    per_key = [0] * len(column.levels)
-    for value in column.values:
-        if value is not None:
-            per_key[value] += 1
-    cells = [0] * len(lower)
-    for held in per_key:
-        cells[min(bisect_right(edges, held) - 1, len(lower) - 1)] += 1
-    children, rule = sum(per_key), stage.rule
-    base = disclosure.pinned_children_cells(lower, cells, shown, children, rule)
-    # The trial runs write into counters of their own: what is written is formed once, after.
-    trial = _Context(
-        replace(stage, tallies=(Counter(), Counter())),
-        context.plan,
-        context.read,
-        context.expose_id,
-    )
-    entities = sum(_initial_counts(column, stations))
-    for whole in (False, True):
-        initial = _initial(trial, column, stations, whole=whole)
-        floors = _published_floors(
-            initial, _transitions(trial, window, column, stations, whole=whole), rule
-        )
-        ceilings = _published_ceilings(initial, entities, children - entities, rule)
-        known = disclosure.parents_at_or_above(lower, floors)
-        pinned = disclosure.pinned_children_cells(
-            lower, cells, shown, children, rule, 0, None, known, floors, ceilings
-        )
-        if not pinned - base:
-            return whole
-    return True  # pragma: no cover - a withheld entry holds no floor
-
-
 def _entries(
     context: _Context,
     window: Any,
@@ -1545,10 +1425,9 @@ def _entries(
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
 ) -> Dict[str, Any]:
     """The ``initial`` and the ``transitions`` of one tracked column."""
-    whole = _guarded(context, window, column, stations) if column.followed else False
     return {
-        "initial": _initial(context, column, stations, whole=whole),
-        "transitions": _transitions(context, window, column, stations, whole=whole),
+        "initial": _initial(context, column, stations),
+        "transitions": _transitions(context, window, column, stations),
     }
 
 
@@ -1580,23 +1459,11 @@ def _prepared(
 ) -> Prepared:
     """The window, the versions and the tracked columns of a table's history, or why it has none."""
     window = _window(context, expose)
-    from fluid_build.profiler import runner
-
-    if runner.counts_the_entity(context.stage.counted_keys, context.expose_id, (window.key,)):
+    if _counts_the_entity(context, window):
         raise _Unformed(_COUNTED_KEY)
     stations, used = _ordered(context, window)
     tracked, unfollowed = _tracked(context, window, declared)
-    domains = {column.name: column.domain for column in context.plan.columns}
-    return Prepared(
-        window,
-        stations,
-        used,
-        tracked,
-        unfollowed,
-        frozenset(
-            each.name for each in tracked if each.followed and domains[each.name] == "number"
-        ),
-    )
+    return Prepared(window, stations, used, tracked, unfollowed)
 
 
 def _history(
@@ -1670,10 +1537,9 @@ def _windowed(inputs: HistoryStage) -> List[Tuple["ExposePlan", sources.SourceCo
 def prepare_histories(inputs: HistoryStage) -> Dict[str, Union[Prepared, str]]:
     """Read what each table's history needs of its records: its tracked columns, or why none forms.
 
-    Nothing is written to the document. The profile asks this before it measures a table, so that
-    a foreign key a history follows is written as the category it is followed as
-    (:func:`read_as_text`), and :func:`form_histories` is given the same answer, which it does not
-    read twice.
+    Nothing is written to the document. :func:`form_histories` asks it when it is not given the
+    answer. Which keys a history follows is not read from it: that is the plan's
+    (:func:`followed_columns`).
     """
     from fluid_build.profiler import runner
 
@@ -1688,18 +1554,24 @@ def prepare_histories(inputs: HistoryStage) -> Dict[str, Union[Prepared, str]]:
     return prepared
 
 
-def read_as_text(prepared: Mapping[str, Union[Prepared, str]]) -> Dict[str, FrozenSet[str]]:
+def read_as_text(
+    plans: Sequence["ExposePlan"], followed: FrozenSet[Tuple[str, str]]
+) -> Dict[str, FrozenSet[str]]:
     """The columns of each table the contract types as numbers that its history follows as text.
 
-    Each is a foreign key into a table the profile releases whole, whose keys are its levels.
-    The profile writes such a column in the category domain, as a text key is, since the reader of
-    a history tracks categorical columns only: and no other column is written otherwise.
+    Each is a foreign key into a table the profile releases whole, whose keys are its levels
+    (:func:`followed_columns`). The profile writes such a column in the category domain, as a text
+    key is, since the reader of a history tracks categorical columns only: and no other column is
+    written otherwise. The plan decides it, as it decides the relationship the key follows: a
+    key a record then proves is no key of its table is written as a category all the same, and
+    only its history is left out.
     """
-    return {
-        expose_id: held.as_text
-        for expose_id, held in prepared.items()
-        if isinstance(held, Prepared) and held.as_text
-    }
+    held: Dict[str, Set[str]] = {}
+    for plan in plans:
+        for column in plan.columns:
+            if column.domain == "number" and (plan.expose_id, column.name) in followed:
+                held.setdefault(plan.expose_id, set()).add(column.name)
+    return {expose_id: frozenset(names) for expose_id, names in held.items()}
 
 
 def form_histories(
