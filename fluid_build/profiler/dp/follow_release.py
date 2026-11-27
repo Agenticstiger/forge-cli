@@ -1,7 +1,9 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""A release under differential privacy whose unit follows its child rows (profile format 1-4-0).
+"""A release under differential privacy whose unit follows its child rows (profile format 1-4-0, or
+1-5-0 when it holds a column's ``nullCount/2``, a table's noisy history or a consumer query's noisy
+rate).
 
 With ``--follow`` the privacy unit is one row of the unit's expose together with the rows of
 child tables that follow it (:mod:`~fluid_build.profiler.dp.follows`; PROFILE-SPEC section 3a), and
@@ -11,6 +13,13 @@ before anything is measured, from the seed and from each parent's own children, 
 * a count table of a table ``T`` (levels, bins, cliques) moves by at most ``m_T`` rows, so its
   squared L2 sensitivity is ``m_T**2`` and its noise is
   :func:`~fluid_build.profiler.dp.release.scale_units` of that, in exact integers;
+* a column's ``nullCount/2`` of ``T`` (two cells: the rows kept where it holds a value and where
+  it holds none) is a count table of ``T`` like the others: squared L2 sensitivity ``m_T**2``;
+* a member of a table's noisy history (:mod:`~fluid_build.profiler.dp.history_release`) is a count
+  table of ``T`` as well, charged ``m_T`` for one row and so ``m_T**2``, the pair members too;
+* a consumer query's noisy rate (:mod:`~fluid_build.profiler.dp.query_release`) is a count table
+  of its unit's records: ``m_T`` for the rows of ``T`` and ``m_T**2`` squared, or ``m_P`` for the
+  groups of ``T``'s rows by the child column of a followed relationship out of ``P``;
 * a rank correlation of ``T`` has the sensitivity of the registry's, times ``m_T``;
 * a relationship's children-per-parent histogram, ungrouped or grouped by a parent column, has
   the sensitivity of PROFILE-SPEC "What a noisy statistic is charged": ``m_P`` when the unit
@@ -64,7 +73,14 @@ from typing import (
 from fluid_build.policy._common import iter_exposes
 from fluid_build.profiler import defaults, document, runner, sources
 from fluid_build.profiler._stats import Request, StatisticsBackend
-from fluid_build.profiler.dp import bounding, consistency, rank_noise, selection
+from fluid_build.profiler.dp import (
+    bounding,
+    consistency,
+    history_release,
+    query_release,
+    rank_noise,
+    selection,
+)
 from fluid_build.profiler.dp.bounding import ROWS, UnitPlan
 from fluid_build.profiler.dp.discrete_gaussian import sample_discrete_gaussian
 from fluid_build.profiler.dp.follows import (
@@ -80,11 +96,14 @@ from fluid_build.profiler.dp.release import (
     BINS,
     CLIQUE,
     DEFAULT_ROW_FLOOR,
+    HISTORY,
     LEVELS,
     LINK,
     NO_CELL,
+    NULLCOUNT,
     PAIR_DAYS,
     PAIRS,
+    QUERY,
     RANK,
     RELATION,
     RULE_NAME,
@@ -114,6 +133,8 @@ from fluid_build.profiler.dp.release import (
     fit_prefix,
     left_out_reason,
     noise_label,
+    null_cells,
+    null_count_label,
     other_table_pairs,
     pair_cells,
     pair_label,
@@ -301,6 +322,11 @@ class FollowReleasePlan:
     entity_units: Tuple[
         Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]], ...
     ] = ()
+    #: The consumer queries the release answers (and names), ``None`` when the request has none.
+    queries: Optional[query_release.QueryRelease] = None
+    #: The tables whose entities the release states (its history, or a query over its entities),
+    #: with the columns of an entity's key. The truncation keeps such a table's entities whole.
+    entity_tables: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
 
     @property
     def selects(self) -> bool:
@@ -313,6 +339,12 @@ class FollowReleasePlan:
     @property
     def read_tables(self) -> Tuple[str, ...]:
         return tuple(table for table, _ in self.reads)
+
+    def read_names(self, table: str) -> Tuple[str, ...]:
+        """The columns of *table* to read: those the release reads, then the ones only a query reads."""
+        held = [column.name for column in dict(self.reads).get(table, ())]
+        extra = () if self.queries is None else self.queries.read.get(table, ())
+        return tuple(dict.fromkeys([*held, *extra]))
 
     def table(self, name: str) -> TablePlan:
         return next(each for each in self.tables if each.table == name)
@@ -681,6 +713,7 @@ def plan_follow_release(
     parent_sets: List[Tuple[str, Tuple[str, ...]]] = []
     entity_units: List[Tuple[str, Tuple[str, ...], str, Tuple[str, ...], Tuple[str, ...]]] = []
     extra_read: Dict[str, List[str]] = {}
+    entity_of: Dict[str, Tuple[str, ...]] = {}
     entities = _entity_relationships(declared)
 
     def note_entities(each: runner.Relationship) -> None:
@@ -873,6 +906,80 @@ def plan_follow_release(
         not_released.append((f"fact {fact.name}", _NOT_NOISY))
     not_released.extend(asked_for.unformed(request, workload=WORKLOAD_UNUSED, private=True))
 
+    # -- the histories the request asks of the tables the unit follows into
+    histories: Dict[str, history_release.HistoryPlan] = {}
+    for table in tree.order[1:]:
+        found = columns[table]
+        asked_history = getattr(found.asked, "history", None)
+        if asked_history is None:
+            continue
+        planned, history_notes = history_release.plan_history(
+            table,
+            found.expose,
+            found.expose_plan,
+            asked_history,
+            _structure_of(contract, backend, table, bits, keyed.get(table, frozenset())),
+            backend,
+        )
+        not_released.extend(history_notes)
+        into = tree.edge_into(table)
+        if planned is None or into is None:
+            continue
+        histories[table] = planned
+        extra_read.setdefault(table, []).extend(planned.read)
+        # the history states the table's entities, so the truncation keeps each whole
+        entity_of[table] = (planned.entity,)
+        note_keys(table, (planned.entity,))
+        if (planned.entity,) != into.spec.child_columns:
+            # an entity lies in one unit by construction when its key is the followed one; else the
+            # records are checked (profile_release_entity_units)
+            item = (
+                table,
+                (planned.entity,),
+                into.parent,
+                into.spec.parent_columns,
+                into.spec.child_columns,
+            )
+            if item not in entity_units:
+                entity_units.append(item)
+                note_keys(into.parent, into.spec.parent_columns)
+                note_keys(into.child, into.spec.child_columns)
+                note_keys(table, (planned.entity,))
+
+    # -- the consumer queries the release answers, decided before any record is read
+    queries = query_release.plan_noisy_queries(
+        contract,
+        request,
+        backend,
+        unit=unit,
+        reach=reach,
+        edges=tree.edges,
+        histories={table: planned_history.entity for table, planned_history in histories.items()},
+    )
+    if queries is not None:
+        not_released.extend(queries.named)
+        for asked_query in queries.queries:
+            # the groups of a followed relationship out of a versioned table are its entities: the
+            # records must put an entity's versions in one unit
+            entering = tree.edge_into(asked_query.table)
+            if asked_query.form != query_release.FORM_FOLLOWED or entering is None:
+                continue
+            # a group of a followed relationship is the rows of one parent row: it leaves with its
+            # parent whole, so the rows kept under a parent need no grouping by entity here
+            for each in declared:
+                if each.entity and (
+                    each.parent,
+                    each.parent_columns,
+                    each.child,
+                    each.child_columns,
+                ) == (
+                    entering.parent,
+                    entering.spec.parent_columns,
+                    entering.child,
+                    entering.spec.child_columns,
+                ):
+                    note_entities(each)
+
     # -- each reached table's plan, now that its keys and structure columns are known
     tables: List[TablePlan] = []
     for table in tree.order:
@@ -888,6 +995,7 @@ def plan_follow_release(
             set(each.name for each in released)
             | set(extra_read.get(table, ()))
             | set(paired_columns(found.date_pairs))
+            | set(found.null_counts)
         )
         read = tuple(column for column in found.expose_plan.columns if column.name in needed)
         asked = found.asked
@@ -921,12 +1029,20 @@ def plan_follow_release(
             reach=m,
             date_pairs=found.date_pairs,
             date_required=found.date_required,
+            null_counts=found.null_counts,
+            history=histories.get(table),
         )
         tables.append(TablePlan(table, m, table_plan, asked is not None))
         if asked is not None:
             not_released.extend(
                 _table_not_released(
-                    asked, table, frozenset(c.name for c in released), found.why_not, found.skipped
+                    asked,
+                    table,
+                    frozenset(c.name for c in released),
+                    found.why_not,
+                    found.skipped,
+                    frozenset(found.null_counts),
+                    history=history_release.EXPOSE_REASON if table == unit else None,
                 )
             )
             not_released.extend(found.rank_left_out)
@@ -979,6 +1095,8 @@ def plan_follow_release(
         key_sets=tuple((table, names) for table, sets in used_keys.items() for names in sets),
         parent_sets=tuple(dict.fromkeys(parent_sets)),
         entity_units=tuple(entity_units),
+        queries=queries,
+        entity_tables=tuple(entity_of.items()),
     )
     parts = follow_parts(plan, {})
     if not parts:
@@ -992,6 +1110,21 @@ def plan_follow_release(
         )
     split_budget(rho, plan.selects, len(parts))
     return plan
+
+
+def _structure_of(
+    contract: Mapping[str, Any],
+    backend: StatisticsBackend,
+    table: str,
+    bits: int,
+    keys: FrozenSet[str],
+) -> Callable[[str], Tuple[Optional[ReleasedColumn], str]]:
+    """The public cells of a column of *table*, as a history's tracked columns are placed."""
+
+    def structure(name: str) -> Tuple[Optional[ReleasedColumn], str]:
+        return _group_structure(contract, backend, table, name, bits, keys=keys)
+
+    return structure
 
 
 def request_tables(request: Request) -> List[str]:
@@ -1062,8 +1195,10 @@ def follow_parts(
     """Every noisy statistic of the release, once, in document order. The one source of the parts.
 
     The parts of each table the unit reaches (:func:`~fluid_build.profiler.dp.release.release_parts`
-    with the table's cliques), table by table, then each relationship's histogram, then each
-    statistic grouped through a link. Every label names its table, so no two parts share a stream.
+    with the table's cliques, then the members of its history), table by table, then each
+    relationship's histogram, then each statistic grouped through a link, then the rate of each
+    consumer query (a label of the form ``query/<name>``). Every other label names its table, so no
+    two parts share a stream.
     """
     parts: List[FollowPart] = []
     for each in plan.tables:
@@ -1076,6 +1211,16 @@ def follow_parts(
                     each.reach,
                 )
             )
+        if each.plan.history is not None:
+            for part in history_release.history_parts(each.plan.history):
+                parts.append(
+                    FollowPart(
+                        each.table,
+                        replace(part, label=f"{each.table}/{part.label}"),
+                        each.reach**2,
+                        each.reach,
+                    )
+                )
     for relation in plan.relations:
         parts.append(
             FollowPart(
@@ -1104,6 +1249,11 @@ def follow_parts(
                 link.reach,
             )
         )
+    if plan.queries is not None:
+        for asked, part in zip(
+            plan.queries.queries, query_release.query_parts(plan.queries), strict=True
+        ):
+            parts.append(FollowPart(asked.table, part, asked.sensitivity, asked.charge))
     return tuple(parts)
 
 
@@ -1116,7 +1266,9 @@ def admit(
     are admitted in this order while the release's cells stay within
     ``selection.MOST_RELEASE_CELLS``: every date pair (the tables in the plan's order, the pairs
     in the request's), then every column that may hold a null (tables, then columns, in the plan's
-    order), then every link statistic whose counted child column may hold a null. The first that
+    order), then every null count (tables, then columns, in the plan's order), then every history
+    (the tables in the plan's order; for each, its core members, then each tracked column, then
+    ``reasons``), then every consumer query (in the request's order), then every link statistic whose counted child column may hold a null. The first that
     does not fit is left out and so is every one after it. A left-out part is named by its label
     and the reason, never a count. The decision reads the cliques only, which are released under the
     selection's share. The plan comes back as it was when every added part fits.
@@ -1125,15 +1277,26 @@ def admit(
     by_label = {each.part.label: each.part for each in parts}
     pairs: List[Tuple[Part, ...]] = []
     columns: List[Tuple[Part, ...]] = []
+    nulls: List[Tuple[Part, ...]] = []
     for each in plan.tables:
         mine = release_parts(each.plan, cliques.get(each.table, ()))
-        own_pairs, own_columns = added_units(each.plan, mine)
-        for found, into in ((own_pairs, pairs), (own_columns, columns)):
+        own_pairs, own_columns, own_nulls = added_units(each.plan, mine)
+        for found, into in ((own_pairs, pairs), (own_columns, columns), (own_nulls, nulls)):
             into.extend(
                 tuple(by_label[f"{each.table}/{part.label}"] for part in unit) for unit in found
             )
+    histories: List[Tuple[Part, ...]] = []
+    for each in plan.tables:
+        if each.plan.history is not None:
+            histories.extend(
+                tuple(by_label[f"{each.table}/{label}"] for label in unit)
+                for unit in history_release.history_units(each.plan.history)
+            )
+    asked = [
+        tuple(by_label[label] for label in unit) for unit in query_release.query_units(plan.queries)
+    ]
     links = [(by_label[link.label],) for link in plan.links if link.column.nullable]
-    units = [*pairs, *columns, *links]
+    units = [*pairs, *columns, *nulls, *histories, *asked, *links]
     if not units:
         return plan, ()
     added = {part.label for unit in units for part in unit}
@@ -1159,6 +1322,16 @@ def admit(
                 for pair in inner.date_pairs
                 if f"{each.table}/{pair_label(PAIR_DAYS, *pair)}" not in gone
             ),
+            null_counts=tuple(
+                name
+                for name in inner.null_counts
+                if f"{each.table}/{null_count_label(name)}" not in gone
+            ),
+            history=(
+                None
+                if inner.history is None
+                else history_release.admitted(inner.history, gone, f"{each.table}/")
+            ),
         )
         tables.append(replace(each, plan=kept))
     return (
@@ -1166,6 +1339,7 @@ def admit(
             plan,
             tables=tuple(tables),
             links=tuple(link for link in plan.links if link.label not in gone),
+            queries=query_release.admitted(plan.queries, gone),
         ),
         left,
     )
@@ -1246,6 +1420,11 @@ class FollowRows:
     keys: Mapping[Tuple[str, Tuple[str, ...]], Sequence[Optional[bytes]]]
     #: The cell of each row of a group or link column; ``None``: a null, in no group.
     placed: Mapping[Tuple[str, str], Sequence[Optional[int]]]
+    #: What the history of each table that holds one reads of its rows.
+    histories: Mapping[str, history_release.HistoryRows] = field(default_factory=dict)
+    #: The records as read, for the consumer queries only (never released); empty when the release
+    #: answers none.
+    raw: Mapping[str, sources.SourceColumns] = field(default_factory=dict, repr=False)
 
 
 def encode_follow_rows(
@@ -1333,6 +1512,7 @@ def encode_follow_rows(
         placed[(table, name)] = full
     encoded: Dict[str, EncodedRows] = {}
     contents: Dict[str, List[bytes]] = {}
+    histories: Dict[str, history_release.HistoryRows] = {}
     for each in plan.tables:
         table = each.table
         released = {column.name: column for column in each.plan.columns}
@@ -1354,6 +1534,9 @@ def encode_follow_rows(
             bounding.encode_values([exact[table][name][index] for name in read_names])
             for index in range(counts[table])
         ]
+        tied = query_release.query_content(plan.queries, table, read[table], counts[table])
+        if tied is not None:
+            rows_bytes = [mine + more for mine, more in zip(rows_bytes, tied, strict=True)]
         contents[table] = rows_bytes
         encoded[table] = EncodedRows(
             cells=cells_of,
@@ -1362,8 +1545,21 @@ def encode_follow_rows(
             levels=levels,
             grid=grid,
             pairs=pair_cells(each.plan, exact[table], table=table),
+            nulls=null_cells(each.plan.null_counts, exact[table]),
         )
-    return FollowRows(counts=counts, tables=encoded, contents=contents, keys=keys, placed=placed)
+        if each.plan.history is not None:
+            histories[table] = history_release.encode_history(
+                each.plan.history, exact[table], backend, plan.fractional_bits, table=table
+            )
+    return FollowRows(
+        counts=counts,
+        tables=encoded,
+        contents=contents,
+        keys=keys,
+        placed=placed,
+        histories=histories,
+        raw=dict(read) if plan.queries is not None and plan.queries.queries else {},
+    )
 
 
 def _one_unit_each(
@@ -1436,6 +1632,14 @@ class FollowRelease:
     plan: Optional[FollowReleasePlan] = None
     #: Each added part left out, ``(label, reason)``, in the order they were to be fitted in.
     left_out: Tuple[Tuple[str, str], ...] = ()
+    #: Each consumer query the records withheld, ``(query <name>, reason)``: its part and share
+    #: stay in ``tables``, and nothing is written for it.
+    unanswered: Tuple[Tuple[str, str], ...] = ()
+
+    @property
+    def withheld_labels(self) -> FrozenSet[str]:
+        """The labels of the query parts the records withheld."""
+        return frozenset("query/" + what[len("query ") :] for what, _ in self.unanswered)
 
     @property
     def measurement_rho(self) -> Fraction:
@@ -1593,6 +1797,7 @@ def truncated(plan: FollowReleasePlan, rows: FollowRows, seed: bytes) -> Dict[st
         {edge.child: rows.keys[(edge.parent, edge.spec.parent_columns)] for edge in follows.edges},
         {edge.child: rows.keys[(edge.child, edge.spec.child_columns)] for edge in follows.edges},
         seed,
+        entity_keys={table: rows.keys[(table, names)] for table, names in plan.entity_tables},
     )
 
 
@@ -1648,9 +1853,17 @@ def draw_follow(
     plan, left_out = admit(plan, released)
     share, tables = describe(plan, released)
     measured = measure_counts(plan, rows, kept, tables, backend)
+    # The consumer queries run over the rows kept; a failure that depends on the records withholds
+    # every one of them and leaves the other parts as they were.
+    answered: Optional[Dict[str, List[int]]] = {}
+    if any(item.kind == QUERY for item in tables):
+        answered = query_release.exact_counts(plan.queries, rows.raw, kept, backend)
+    measured.update(answered or {})
     values_of: Dict[str, Tuple[str, ...]] = {}
     for each in plan.tables:
-        mine = [item for item in tables if item.table == each.table and item.kind in _TABLE_KINDS]
+        mine = [
+            item for item in tables if item.table == each.table and item.kind in _MEASURED_KINDS
+        ]
         counted = [item for item in mine if item.kind != RANK]
         if counted:
             values_of.update(_count_values(counted, measured, seed, each.plan))
@@ -1665,7 +1878,7 @@ def draw_follow(
                 )
                 values_of[item.label] = (decimal_text(noised),)
     for item in tables:
-        if item.kind in (RELATION, LINK):
+        if item.kind in (RELATION, LINK) or (item.kind == QUERY and answered is not None):
             values_of[item.label] = tuple(
                 _integer_text(value)
                 for value in _noisy(measured[item.label], item.scale_units, seed, item.label)
@@ -1686,10 +1899,13 @@ def draw_follow(
         share=share,
         plan=plan,
         left_out=left_out,
+        unanswered=query_release.withheld(plan.queries) if answered is None else (),
     )
 
 
-_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK, *PAIRS)
+_TABLE_KINDS = (CLIQUE, LEVELS, BINS, RANK, NULLCOUNT, *PAIRS)
+#: The kinds drawn table by table: those of the table's own block and the members of its history.
+_MEASURED_KINDS = (*_TABLE_KINDS, HISTORY)
 
 
 def measure_counts(
@@ -1707,8 +1923,17 @@ def measure_counts(
     found: Dict[str, List[int]] = {}
     relations = {relation.label: relation for relation in plan.relations}
     links = {link.label: link for link in plan.links}
+    history_counts: Dict[str, Dict[str, List[int]]] = {}
     for table in tables:
-        if table.kind in (CLIQUE, LEVELS, BINS, *PAIRS):
+        if table.kind == HISTORY:
+            held = plan.table(table.table).plan.history
+            assert held is not None  # a member of a history is a part of a plan that holds it
+            if table.table not in history_counts:
+                history_counts[table.table] = history_release.history_counts(
+                    held, rows.histories[table.table], kept[table.table]
+                )
+            found[table.label] = history_counts[table.table][table.label[len(table.table) + 1 :]]
+        elif table.kind in (CLIQUE, LEVELS, BINS, NULLCOUNT, *PAIRS):
             cells = table_cells(table, rows.tables[table.table], kept[table.table])
             counts = [0] * table.cells
             for value in cells:
@@ -1731,7 +1956,8 @@ def _count_values(
     """The noisy counts of one table's count tables as decimal text.
 
     The cliques and the histograms of required columns are made to agree; a histogram of a column
-    that may hold a null and the days and the order of a date pair are noised on their own
+    that may hold a null, the days and the order of a date pair and a column's null count are noised
+    on their own
     (:func:`~fluid_build.profiler.dp.release.agrees`).
     """
     count_tables: List[consistency.CountTable] = []
@@ -1835,6 +2061,22 @@ def _link_entry(link: LinkStat, item: ReleasedTable, cells: Sequence[str]) -> Di
     return entry
 
 
+def _format_of(
+    tables: Mapping[str, Mapping[str, Any]],
+    relationships: Sequence[Mapping[str, Any]],
+    queries: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    """Format 1-4-0, which a release that follows its child rows always wrote, or 1-5-0 when the
+    tables or the queries hold a form only that holds (a column's ``nullCount/2``, a noisy
+    query)."""
+    needed = document.schema_url_for(tables, relationships=relationships, queries=queries)
+    return (
+        document.SCHEMA_URL_1_5_0
+        if needed == document.SCHEMA_URL_1_5_0
+        else document.SCHEMA_URL_1_4_0
+    )
+
+
 def _document(
     plan: FollowReleasePlan,
     tables: Sequence[ReleasedTable],
@@ -1849,6 +2091,14 @@ def _document(
     for each in plan.tables:
         mine = [item for item in tables if item.table == each.table and item.kind in _TABLE_KINDS]
         block = _table_block(each.plan, mine, values_of, selection_version, states_selection=True)
+        if each.plan.history is not None:
+            prefix = f"{each.table}/"
+            members = {
+                item.label[len(prefix) :]: item
+                for item in tables
+                if item.table == each.table and item.kind == HISTORY
+            }
+            block["history"] = history_release.history_block(each.plan.history, members, values_of)
         for name, domain in domains.get(each.table, {}).items():
             block["columns"].setdefault(name, {"domain": domain})
         out_tables[each.table] = block
@@ -1876,13 +2126,16 @@ def _document(
                 "statistics": statistics,
             }
         )
+    asked = query_release.query_entries(
+        plan.queries, {item.label: item for item in tables if item.kind == QUERY}, values_of
+    )
     if producer is None:
         from fluid_build import __version__
 
         producer = document.producer_uri(__version__)
     return {
         "_producer": producer,
-        "_schemaURL": document.SCHEMA_URL_1_4_0,
+        "_schemaURL": _format_of(out_tables, relationships, asked),
         "encoding": {"fractionalBits": plan.fractional_bits, "rounding": "floor"},
         "disclosureRules": {RULE_NAME: {}},
         "privacy": {
@@ -1903,6 +2156,7 @@ def _document(
         },
         "tables": out_tables,
         "relationships": relationships,
+        **({"queries": asked} if asked else {}),
     }
 
 
@@ -2023,7 +2277,7 @@ def check_follow_record(
             or not isinstance(owner, str)
         ):
             raise _mismatch("a table's columns are not names")
-        if stated.get("kind") in (RANK, RELATION, LINK, *PAIRS):
+        if stated.get("kind") in (RANK, RELATION, LINK, NULLCOUNT, HISTORY, QUERY, *PAIRS):
             continue
         if len(columns) >= 2:
             by_table[owner] = (*by_table.get(owner, ()), tuple(columns))

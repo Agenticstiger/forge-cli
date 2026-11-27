@@ -305,8 +305,9 @@ def test_every_ask_fluid_profile_does_not_form_is_named_with_its_reason():
         (f"dates customers.joined_at to orders.placed_at of {link}", asked_for.NO_DATES),
         (f"exposure customers.joined_at to left_at of {link}", asked_for.NO_EXPOSURE),
         (f"exposure customers.joined_at of {link}", asked_for.NO_EXPOSURE),
-        ("query paid_orders", asked_for.NO_QUERIES_PRIVATE),
     ]
+    # which queries a private release answers needs the contract: it plans and names them itself
+    assert not hasattr(asked_for, "NO_QUERIES_PRIVATE")
     assert asked_for.unformed(replace(asked, tables=(), relationships=(), queries=())) == []
     assert (
         asked_for.unformed(replace(asked, tables=(), relationships=(), queries=()), private=True)

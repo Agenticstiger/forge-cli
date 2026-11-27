@@ -25,6 +25,7 @@ from fluid_build.profiler._stats import (
     Request,
     RequestColumn,
     RequestDatePair,
+    RequestHistory,
     RequestTable,
     load_backend,
 )
@@ -696,6 +697,152 @@ def test_a_request_profile_writes_no_history(tmp_path):
     result = _profile(tmp_path, _contract(), _stations(), request=asked)
     assert "history" not in result.document["tables"][TABLE]
     assert not any("history" in what for what, _ in result.not_measured)
+
+
+# -- a request that asks for the history ----------------------------------------------------------
+
+
+def _asking(
+    *tables: Tuple[str, Optional[RequestHistory], Tuple[RequestColumn, ...]],
+) -> Request:
+    return Request(
+        contract_digest=None,
+        fractional_bits=16,
+        tables=tuple(
+            RequestTable(name, True, columns, history=ask) for name, ask, columns in tables
+        ),
+    )
+
+
+def _two_tables(tmp_path: Path, asked: Request, rows: Sequence[Dict[str, Any]]):
+    """The stations table and a copy of it under another name, each from its own file."""
+    contract = _contract()
+    (expose,) = contract["exposes"]
+    contract["exposes"] = [expose, {**expose, "exposeId": "gauge_version"}]
+    return profile_exposes(
+        contract,
+        [
+            ExposeSource(TABLE, _write(tmp_path / "stations.ndjson", rows)),
+            ExposeSource("gauge_version", _write(tmp_path / "gauges.ndjson", rows)),
+        ],
+        backend=load_backend(),
+        request=asked,
+    )
+
+
+_STATUS = (RequestColumn("status", "category"),)
+
+
+def test_a_request_that_asks_the_history_forms_it(tmp_path):
+    asked = _asking((TABLE, RequestHistory(), _STATUS))
+    result = _profile(tmp_path, _contract(), _stations(), request=asked)
+    published = _history_of(result)
+    assert published["entity"] == ["station_id"]
+    assert published["start"] == "valid_from" and published["end"] == "valid_to"
+    # with no columns asked the candidates are the contract's categorical columns
+    assert list(published["columns"]) == ["status", "sensor_model"]
+    assert "reasons" in published
+    assert not any("history" in what for what, _ in result.not_measured)
+    # the entity, start, end and the tracked columns are stated by name and domain, and nothing is
+    # measured of the ones the request does not list
+    columns = result.document["tables"][TABLE]["columns"]
+    assert set(columns) == {"station_id", "valid_from", "valid_to", "status", "sensor_model"}
+    assert columns["sensor_model"] == {"domain": "category"}
+    assert columns["valid_from"] == {"domain": "timestamp"}
+    assert "metrics" in columns["status"]
+
+
+def test_an_exact_history_of_a_request_names_format_1_3_0_and_the_engine_reads_it(tmp_path):
+    asked = _asking((TABLE, RequestHistory(), _STATUS))
+    result = _profile(tmp_path, _contract(), _stations(), request=asked)
+    assert result.document["_schemaURL"] == document.SCHEMA_URL_1_3_0
+    loaded, _ = load_profile_text(result.canonical.decode("utf-8"))
+    assert loaded.tables[TABLE].history is not None
+    for member in ("versionsPerEntity", "chain", "lastVersion"):
+        assert result.document["tables"][TABLE]["history"][member]["disclosure"] == RULE.name
+
+
+def test_the_columns_a_request_asks_are_the_ones_the_history_tracks(tmp_path):
+    asked = _asking((TABLE, RequestHistory(columns=("sensor_model",)), _STATUS))
+    result = _profile(tmp_path, _contract(), _stations(), request=asked)
+    published = _history_of(result)
+    assert list(published["columns"]) == ["sensor_model"]
+    assert "reasons" not in published  # one tracked column has no reasons
+    assert not any("history" in what for what, _ in result.not_measured)
+
+
+def test_a_request_forms_the_history_of_the_asked_table_only(tmp_path):
+    asked = _asking(
+        (TABLE, RequestHistory(), _STATUS),
+        ("gauge_version", None, _STATUS),
+    )
+    result = _two_tables(tmp_path, asked, _stations())
+    assert "history" in result.document["tables"][TABLE]
+    assert "history" not in result.document["tables"]["gauge_version"]
+    assert not any("gauge_version" in what and "history" in what for what, _ in result.not_measured)
+
+
+def test_a_request_that_does_not_ask_names_no_history_and_keeps_its_bytes(tmp_path):
+    asked = _asking((TABLE, None, _STATUS))
+    result = _profile(tmp_path, _contract(), _stations(), request=asked)
+    assert "history" not in result.document["tables"][TABLE]
+    assert result.document["_schemaURL"] != document.SCHEMA_URL_1_5_0
+    assert not any("history" in what for what, _ in result.not_measured)
+
+
+def test_an_ask_on_a_table_with_no_window_is_named_with_why(tmp_path):
+    asked = _asking((TABLE, RequestHistory(), _STATUS))
+    result = _profile(tmp_path, _contract(window=False), _stations(), request=asked)
+    assert "history" not in result.document["tables"][TABLE]
+    said = dict(result.not_measured)
+    assert "validity window" in said[f"history of {TABLE}"]
+
+
+def test_an_ask_the_records_cannot_answer_is_named_without_a_count(tmp_path):
+    rows = _stations()
+    rows[3]["valid_from"] = "2022-01-04T10:30:00Z"
+    asked = _asking((TABLE, RequestHistory(), _STATUS))
+    result = _profile(tmp_path, _contract(), rows, request=asked)
+    assert "history" not in result.document["tables"][TABLE]
+    assert "not a whole day" in dict(result.not_measured)[f"history of {TABLE}"]
+    for what, reason in result.not_measured:
+        assert not any(ch.isdigit() for ch in what + reason), (what, reason)
+
+
+def test_a_candidate_column_that_is_the_start_is_named_and_not_tracked(tmp_path):
+    asked = _asking((TABLE, RequestHistory(columns=("status", "valid_from")), _STATUS))
+    result = _profile(tmp_path, _contract(), _stations(), request=asked)
+    assert list(_history_of(result)["columns"]) == ["status"]
+    assert f"history of {TABLE}.valid_from" in dict(result.not_measured)
+
+
+def test_the_reader_gives_a_table_its_history_ask_and_a_column_its_null_count(tmp_path):
+    text = (
+        '"_schemaURL": "https://agenticstiger.github.io/flux/engine/spec/profile-request/'
+        '1-3-0/FluxProfileRequest.json"\n'
+        '"encoding":\n  "fractionalBits": 16\n  "rounding": "floor"\n'
+        '"tables":\n  "station_version":\n    "columns":\n      "status":\n'
+        '        "domain": "category"\n        "statistics":\n          - "nullCount/2"\n'
+        '    "history":\n      "columns":\n        - "status"\n'
+    )
+    asked = load_backend().read_request(text, name="request")
+    (table,) = asked.tables
+    assert table.history == RequestHistory(columns=("status",))
+    assert table.column("status").statistics == ("nullCount/2",)
+
+
+def test_a_null_count_ask_of_an_exact_profile_is_named_with_why(tmp_path):
+    asked = _asking(
+        (TABLE, None, (RequestColumn("status", "category", statistics=("nullCount/2",)),))
+    )
+    result = _profile(tmp_path, _contract(), _stations(), request=asked)
+    assert "statistics" not in result.document["tables"][TABLE]["columns"]["status"] or all(
+        each["definition"] != "nullCount/2"
+        for each in result.document["tables"][TABLE]["columns"]["status"]["statistics"]
+    )
+    reason = dict(result.not_measured)[f"nullCount/2 of {TABLE}.status"]
+    assert "exact profile" in reason and "noise" in reason
+    assert not any(ch.isdigit() for ch in reason.replace("nullCount/2", ""))
 
 
 def test_a_default_profile_leaves_the_window_pair_to_the_history(stations):

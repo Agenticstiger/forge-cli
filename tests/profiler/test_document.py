@@ -19,6 +19,7 @@ from fluid_build.profiler.document import (
     SCHEMA_URL_1_2_0,
     SCHEMA_URL_1_3_0,
     SCHEMA_URL_1_4_0,
+    SCHEMA_URL_1_5_0,
     DocumentError,
     build_document,
     canonical_bytes,
@@ -163,6 +164,12 @@ _BINS = {"column": "c", "bins": ["0", "1"]}
         ),
         ({"orders": _table()}, [{"statistics": [{"groupBy": "c"}]}], SCHEMA_URL_1_4_0),
         ({"orders": _table()}, [{"statistics": [{"groupByBins": _BINS}]}], SCHEMA_URL_1_4_0),
+        ({"orders": _with_statistic("nullCount/2")}, [], SCHEMA_URL_1_5_0),
+        (
+            {"orders": _with_grouping(groupByLink=_LINK, definition="nullCount/2")},
+            [],
+            SCHEMA_URL_1_5_0,
+        ),
         # Each format holds the ones before it, so the least is the latest any form needs.
         ({"orders": _with_statistic("quantile/2")}, [], SCHEMA_URL_1_1_0),
         (
@@ -179,6 +186,41 @@ def test_a_document_names_the_least_format_that_holds_it(tables, relationships, 
     )
 
 
+def _with_history(**members):
+    table = _table()
+    table["history"] = {"entity": ["k"], "start": "s", "end": "e", **members}
+    return table
+
+
+_EXACT_MEMBER = {"definition": "levelHistogram/1", "disclosure": "acro-default", "groups": []}
+_NOISY_MEMBER = {**_EXACT_MEMBER, "disclosure": "noisy", "noise": {"mechanism": "gaussian"}}
+
+
+def test_an_exact_history_names_format_1_3_0_and_a_noisy_member_names_1_5_0():
+    exact = _with_history(chain=_EXACT_MEMBER, columns={"c": {"initial": _EXACT_MEMBER}})
+    assert schema_url_for({"orders": exact}) == SCHEMA_URL_1_3_0
+    for noisy in (
+        _with_history(chain=_NOISY_MEMBER),
+        _with_history(chain=_EXACT_MEMBER, columns={"c": {"initial": _NOISY_MEMBER}}),
+        _with_history(columns={"c": {"initial": _EXACT_MEMBER, "transitions": _NOISY_MEMBER}}),
+        _with_history(reasons=_NOISY_MEMBER),
+    ):
+        assert schema_url_for({"orders": noisy}) == SCHEMA_URL_1_5_0
+
+
+def test_a_query_with_noise_or_a_unit_names_format_1_5_0():
+    plain = {"name": "q", "statistics": [{"definition": "levelHistogram/1", "groups": []}]}
+    grouped = {"name": "q", "statistics": [{"groupBy": "c", "groups": []}]}
+    noisy = {"name": "q", "statistics": [{"noise": {"mechanism": "gaussian"}, "groups": []}]}
+    unit = {"name": "q", "unit": {"table": "orders"}, "statistics": [{"groups": []}]}
+    tables = {"orders": _table()}
+    assert schema_url_for(tables, queries=[plain]) == SCHEMA_URL
+    assert schema_url_for(tables, queries=[grouped]) == SCHEMA_URL_1_3_0
+    assert schema_url_for(tables, queries=[noisy]) == SCHEMA_URL_1_5_0
+    assert schema_url_for(tables, queries=[unit]) == SCHEMA_URL_1_5_0
+    assert schema_url_for(tables, queries=[grouped, noisy]) == SCHEMA_URL_1_5_0
+
+
 def test_the_formats_are_the_ones_flux_stats_reads():
     profile = pytest.importorskip("flux_stats.profile")
     assert SCHEMA_URL == profile.SCHEMA_URL
@@ -187,9 +229,10 @@ def test_the_formats_are_the_ones_flux_stats_reads():
     assert SCHEMA_URL_1_3_0 == profile.SCHEMA_URL_1_3_0
 
 
-def test_the_newest_format_is_the_one_flux_stats_reads():
+def test_the_newest_formats_are_the_ones_flux_stats_reads():
     profile = pytest.importorskip("flux_stats.profile")
     assert SCHEMA_URL_1_4_0 == profile.SCHEMA_URL_1_4_0
+    assert SCHEMA_URL_1_5_0 == profile.SCHEMA_URL_1_5_0
 
 
 def test_the_producer_names_this_repository_at_the_release():
@@ -243,3 +286,50 @@ def test_the_grid_lies_from_0_to_128_bits(bits):
 def test_a_document_needs_a_table():
     with pytest.raises(DocumentError):
         _document(tables={})
+
+
+_NOISY_HISTORY = {"history": {"versionsPerEntity": {"noise": {}}}}
+_NULL_COUNT_TABLE = _with_statistic("nullCount/2")
+_NOISY_QUERY = {"statistics": [{"noise": {}}]}
+
+
+def _with_forms(base, **forms):
+    return {**base, **forms}
+
+
+@pytest.mark.parametrize(
+    ("tables", "queries"),
+    [
+        ({"t": _with_forms(_table(), **_NOISY_HISTORY, cliqueSelection={})}, ()),
+        (
+            {
+                "t": _with_forms(
+                    _table(), **_NOISY_HISTORY, cliques=[{"definition": "cliqueMarginal/2"}]
+                )
+            },
+            (),
+        ),
+        (
+            {
+                "t": _with_forms(
+                    _table(),
+                    **_NOISY_HISTORY,
+                    columnPairs=_with_pair("kendallTau/1")["columnPairs"],
+                )
+            },
+            (),
+        ),
+        (
+            {
+                "t": _with_forms(
+                    _NULL_COUNT_TABLE, columnPairs=_with_pair("kendallTau/1")["columnPairs"]
+                )
+            },
+            (),
+        ),
+        ({"t": _with_forms(_NULL_COUNT_TABLE, cliqueSelection={})}, ()),
+        ({"t": _with_forms(_table(), cliqueSelection={})}, [_NOISY_QUERY]),
+    ],
+)
+def test_a_form_of_format_1_4_0_never_lowers_a_form_of_format_1_5_0(tables, queries):
+    assert schema_url_for(tables, queries=queries) == SCHEMA_URL_1_5_0

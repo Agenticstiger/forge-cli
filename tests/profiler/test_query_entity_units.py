@@ -462,11 +462,12 @@ def test_an_entity_that_also_keys_per_entity_statistics_is_refused_before_any_re
     assert plan.reason == query_rates.PER_ENTITY_KEY
 
 
-def test_a_private_release_names_the_query_as_not_released():
+def test_a_private_release_plans_the_entity_query_itself_and_the_request_names_none():
     request = _request(_on_unit("many", MANY))
-    assert asked_for.unformed(request, private=True) == [
-        ("query many", asked_for.NO_QUERIES_PRIVATE)
-    ]
+    assert asked_for.unformed(request, private=True) == []
+    noisy = query_rates.plan_queries(CONTRACT, request, FakeBackend().enum_levels, noisy=True)
+    (plan,) = noisy.plans
+    assert plan.reason is None and plan.entity is not None
 
 
 # ---- the run-wide failure rule covers these statements ----------------------------------------
@@ -614,6 +615,21 @@ def test_a_population_past_the_bound_is_cut_at_plan_time_in_request_order():
     assert not asked_for.decided_by_records(query_rates.ENTITIES_PAST_BOUND)
     # the states of the bin factor times two to the units and queries stay inside the child's cap
     assert 8 * 2 ** (1 + len(answered)) <= MAX_GROUPS < 8 * 2 ** (2 + len(answered))
+
+
+def test_a_noisy_plan_sizes_a_population_as_one_whose_parent_is_never_joined():
+    from fluid_build.profiler.consumer_queries import MAX_GROUPS
+
+    queries = _many_queries(40)
+    exact = query_rates.plan_queries(CONTRACT, _request(*queries), FakeBackend().enum_levels)
+    noisy = query_rates.plan_queries(
+        CONTRACT, _request(*queries), FakeBackend().enum_levels, noisy=True
+    )
+    held = len(noisy.answerable())
+    assert held > len(exact.answerable())
+    # no bin factor: two to the units and queries stay inside the child's cap
+    assert 2 ** (1 + held) <= MAX_GROUPS < 2 ** (2 + held)
+    assert {each.reason for each in noisy.plans if each.reason} <= {query_rates.ENTITIES_PAST_BOUND}
 
 
 def test_a_request_past_the_bound_is_refused_by_strict_before_any_read(tmp_path):

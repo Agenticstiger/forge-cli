@@ -14,12 +14,13 @@ never the seed. Only the standard library is imported at module scope.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import AbstractSet, Any, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "columns_text",
     "left_out_words",
     "part_words",
+    "query_notes",
     "report",
     "say_not_released",
     "unknown_values_notes",
@@ -34,13 +35,17 @@ _KIND = {
     "link": "histogram grouped through a link,",
     "pairDays": "days of the date pair",
     "pairOrder": "order of the date pair",
+    "nullCount": "null count of",
+    "history": "history member",
+    "query": "noisy query",
 }
 
 
 def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
     """What the histograms of columns that may hold a null and of date pairs count, in words.
 
-    Names columns and pairs only: the format holds no noisy null count, so none is released, and a
+    Names columns and pairs only. A column whose ``nullCount/2`` the request lists has it released,
+    two noisy cells of a table of their own; without that ask no null count is released, and a
     share of nulls is never stated.
     """
     place = "" if table is None else f" of exposes[{table}]"
@@ -50,7 +55,23 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
         notes.append(
             f"The histogram of {', '.join(nullable)}{place}, which the contract does not declare "
             "required, counts the column's known values: a record with no value lands in no cell. "
-            "It joins no clique, and no null count or share of nulls is released."
+            "It joins no clique"
+            + ("." if plan.null_counts else ", and no null count or share of nulls is released.")
+        )
+    if plan.null_counts:
+        notes.append(
+            f"The null count of {', '.join(plan.null_counts)}{place} is two cells, the records "
+            "where the column holds a value and where it holds none, noised on its own: it joins "
+            "no clique, and a share of nulls formed from its two cells is as noisy as they are."
+        )
+    if getattr(plan, "history", None) is not None:
+        notes.append(
+            f"The history of {plan.history.table} counts entities and pairs of consecutive "
+            "versions of an entity, member by member, on public ladders that are never trimmed to "
+            "the records: each member is noised on its own and joins no clique. An entity's "
+            "versions follow one row of the parent table; the engine cannot check that, and its "
+            "evidence says so. An entity is kept whole or dropped whole under one parent row, and "
+            "one with more versions than the cap under it is not described."
         )
     if plan.date_pairs:
         notes.append(
@@ -60,6 +81,29 @@ def unknown_values_notes(plan: Any, table: Optional[str] = None) -> List[str]:
             + "."
         )
     return notes
+
+
+def query_notes(plan: Any, drawn: Any = None) -> List[str]:
+    """What the noisy queries of a release count, in words; names no query text and no count.
+
+    With the *drawn* release, nothing is said when every query was withheld: none was written.
+    """
+    queries = getattr(plan, "queries", None)
+    if queries is None or not queries.queries:
+        return []
+    held: AbstractSet[str] = getattr(drawn, "withheld_labels", frozenset())
+    if all(each.label in held for each in queries.queries):
+        return []
+    return [
+        "Each noisy query counts the records of its unit in two cells for each group, those the "
+        "query does not return and those it does, and the profile states the unit; it is noised "
+        "on its own, joins no clique and is made to agree with no other table, and no group is "
+        "suppressed. The engine cannot check that a query reads only a record's own unit and "
+        "the tables the unit does not reach, nor that an entity's rows lie in one unit; its "
+        "evidence says so. For a query by a table's natural entity, an entity is kept whole or "
+        "dropped whole under one parent row, and one with more rows than the cap under it is "
+        "not described."
+    ]
 
 
 def columns_text(table: Any) -> str:
@@ -72,20 +116,31 @@ def part_words(label: str, table: Optional[str] = None) -> str:
     """A release part's label in the words the other items it leaves out are named with.
 
     ``[<table>/]pair/<days|order>/<start>/<end>`` is a date pair, ``[<table>/]noise/<column>`` a
-    column's histogram, and ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped
-    through a link; any other label is said as it is.
+    column's histogram, ``[<table>/]nullCount/<column>`` a column's null count,
+    ``[<table>/]history/<member>[/<column>]`` a member of a table's history, ``query/<name>`` a
+    consumer query's rate, and
+    ``link/<child>.<column>/by/<parent>.<column>/via/...`` a column grouped through a link; any other
+    label is said as it is.
     """
     steps = label.split("/")
     if steps[0] == "link" and len(steps) >= 4 and "." in steps[1]:
         child, column = steps[1].split(".", 1)
         return f"{column} of {child} grouped by {steps[3]}"
-    if steps[0] not in ("noise", "pair") and len(steps) > 1:
+    if steps[0] == "query":
+        return label
+    if steps[0] not in ("noise", "pair", "nullCount", "history") and len(steps) > 1:
         table, steps = steps[0], steps[1:]
     where = f" of {table}" if table else ""
     if steps[0] == "pair" and len(steps) == 4:
         return f"date pair {steps[2]} to {steps[3]}{where}"
     if steps[0] == "noise" and len(steps) == 2:
         return f"{steps[1]}{where}"
+    if steps[0] == "nullCount" and len(steps) == 2:
+        return f"null count of {steps[1]}{where}"
+    if steps[0] == "history" and len(steps) == 2:
+        return f"history {steps[1]}{where}"
+    if steps[0] == "history" and len(steps) == 3:
+        return f"history {steps[1]} of {steps[2]}{where}"
     return label
 
 
@@ -113,7 +168,7 @@ def say_not_released(say: Any, plan: Any, drawn: Any) -> None:
     """Say what the release does not hold, one line for each reason: the plan's and the cap's."""
     by_reason: Dict[str, List[str]] = {}
     left = left_out_words(drawn.left_out, getattr(plan, "table", None))
-    for what, reason in (*plan.not_released, *left):
+    for what, reason in (*plan.not_released, *left, *getattr(drawn, "unanswered", ())):
         by_reason.setdefault(reason, []).append(what)
     for reason, items in by_reason.items():
         say(f"Not released ({reason}): {'; '.join(items)}.", soft_wrap=True)
@@ -165,8 +220,10 @@ def report(
 ) -> None:
     """Tell the owner what was released, under which loss, and what was left out."""
     from fluid_build.cli.console import warning
+    from fluid_build.profiler import document
     from fluid_build.profiler.dp import release
 
+    format_text = document.format_name(str(drawn.document["_schemaURL"]))
     say(
         f"Released exposes[{plan.unit}] and the tables its unit follows into under differential "
         f"privacy: noisy counts, discrete Gaussian noise, answering the request {request[0]}"
@@ -177,8 +234,8 @@ def report(
         say(line, soft_wrap=True)
     say(
         f"The profile names exposes[{plan.unit}] and its follows as its privacy unit (format "
-        "1-4-0, PROFILE-SPEC section 3a); the engine cannot check that the profiler truncated "
-        "the tables as stated, nor that noise was drawn, and its evidence says so.",
+        f"{format_text}, PROFILE-SPEC section 3a); the engine cannot check that the profiler "
+        "truncated the tables as stated, nor that noise was drawn, and its evidence says so.",
         soft_wrap=True,
     )
     say_unread_sources(say, unread)
@@ -221,6 +278,8 @@ def report(
     )
     say(rests, soft_wrap=True)
     for table in drawn.tables:
+        if table.label in drawn.withheld_labels:
+            continue  # nothing was written for it: the reason is under Not released
         place = f" ({table.table})" if table.table else ""
         if table.kind == "rank":
             first, second = table.columns
@@ -231,7 +290,11 @@ def report(
                 soft_wrap=True,
             )
             continue
-        what = table.label if table.kind in ("relationship", "link") else columns_text(table)
+        what = (
+            table.label
+            if table.kind in ("relationship", "link", "history", "query")
+            else columns_text(table)
+        )
         say(
             f"  {_KIND[table.kind]} {what}{place}: noise scale {table.scale}, share rho "
             f"{table.share}, squared L2 sensitivity {table.sensitivity} for one unit",
@@ -240,6 +303,8 @@ def report(
     for each in (drawn.plan or plan).tables:
         for line in unknown_values_notes(each.plan, each.table):
             say(line, soft_wrap=True)
+    for line in query_notes(drawn.plan or plan, drawn):
+        say(line, soft_wrap=True)
     if plan.selects:
         chosen: Dict[str, Any] = dict(drawn.cliques)
         listed = "; ".join(

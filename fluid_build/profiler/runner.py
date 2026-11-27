@@ -802,6 +802,57 @@ class _Planned:
     unfiltered: Dict[str, Optional[DeclaredBlock]]
     keys: Dict[str, FrozenSet[str]]
     fractional_bits: int
+    #: The tables whose history a request asks for, by expose: the candidate columns it names, or
+    #: ``None`` for the contract's categorical columns.
+    history_asks: Dict[str, Optional[Tuple[str, ...]]] = field(default_factory=dict)
+    #: Each such table's plan with the columns its history reads (read, and profiled only where
+    #: the request lists them), and the default block that gives those columns' levels.
+    history_plans: Dict[str, ExposePlan] = field(default_factory=dict)
+    history_blocks: Dict[str, Optional[DeclaredBlock]] = field(default_factory=dict)
+
+
+def _plan_history_asks(
+    contract: Mapping[str, Any],
+    request: Request,
+    full: Mapping[str, ExposePlan],
+    held: Mapping[str, FrozenSet[str]],
+    *,
+    backend: StatisticsBackend,
+    fractional_bits: int,
+) -> Tuple[
+    Dict[str, Optional[Tuple[str, ...]]],
+    Dict[str, ExposePlan],
+    Dict[str, Optional[DeclaredBlock]],
+]:
+    """What a request's history asks read: the tables, their plans and the levels they declare.
+
+    Settled from the contract before a record is read. A table that declares no window reads
+    nothing for it; the history names why it forms none.
+    """
+    exposes = {
+        str(item.get("exposeId")): item
+        for item in iter_exposes(dict(contract))
+        if item.get("exposeId")
+    }
+    asks: Dict[str, Optional[Tuple[str, ...]]] = {}
+    plans: Dict[str, ExposePlan] = {}
+    blocks: Dict[str, Optional[DeclaredBlock]] = {}
+    for table in request.tables:
+        if table.history is None:
+            continue
+        asks[table.expose_id] = table.history.columns
+        plan = history.asked_plan(
+            exposes[table.expose_id], full[table.expose_id], table.history.columns
+        )
+        plans[table.expose_id] = plan
+        blocks[table.expose_id] = (
+            _default_block(
+                contract, plan, backend, fractional_bits, held.get(table.expose_id, frozenset())
+            )[0]
+            if plan.columns
+            else None
+        )
+    return asks, plans, blocks
 
 
 def _plan_profile(
@@ -865,6 +916,7 @@ def _plan_profile(
         )
     _refuse_repeated(exposes)
     plans = [_plan_with_columns(contract, each.expose_id) for each in exposes]
+    full = {plan.expose_id: plan for plan in plans}
     asked: Dict[str, RequestTable] = {}
     if request is not None:
         for each in request.tables:
@@ -929,6 +981,13 @@ def _plan_profile(
             backend,
             fractional_bits,
         )
+    history_asks: Dict[str, Optional[Tuple[str, ...]]] = {}
+    history_plans: Dict[str, ExposePlan] = {}
+    history_blocks: Dict[str, Optional[DeclaredBlock]] = {}
+    if request is not None:
+        history_asks, history_plans, history_blocks = _plan_history_asks(
+            contract, request, full, held, backend=backend, fractional_bits=fractional_bits
+        )
     return _Planned(
         fact_plans=fact_plans,
         query_plans=query_plans,
@@ -944,6 +1003,9 @@ def _plan_profile(
         unfiltered=unfiltered,
         keys=keys,
         fractional_bits=fractional_bits,
+        history_asks=history_asks,
+        history_plans=history_plans,
+        history_blocks=history_blocks,
     )
 
 
@@ -1011,15 +1073,16 @@ def profile_exposes(
     reads: List[sources.SourceColumns] = []
     for exposed, plan in zip(exposes, plans, strict=True):
         with _timed(timings, "read", plan.expose_id):
+            history_plan = planned.history_plans.get(plan.expose_id)
+            names = _read_names(plan, fact_plans, query_plans, history_plan)
             reads.append(
                 _dates_read(
-                    plan,
-                    sources.read_columns(
-                        exposed.source,
-                        _read_names(plan, fact_plans, query_plans),
-                        table=exposed.table,
-                        cwd=cwd,
+                    (
+                        plan
+                        if history_plan is None
+                        else replace(plan, columns=_joined(plan, history_plan))
                     ),
+                    sources.read_columns(exposed.source, names, table=exposed.table, cwd=cwd),
                 )
             )
     spans, no_span = _date_spans(
@@ -1120,7 +1183,27 @@ def profile_exposes(
         if each.counted
     }
     released = references.NONE
-    if request is None:  # a request has no ask for a history, and a bundle's table has its own
+    if request is not None and planned.history_asks:
+        # a request forms the history of the tables that ask for one, and no other
+        date_notes.extend(
+            history.form_histories(
+                history.HistoryStage(
+                    raw_exposes,
+                    [planned.history_plans.get(plan.expose_id, plan) for plan in plans],
+                    reads,
+                    [planned.history_blocks.get(plan.expose_id) for plan in plans],
+                    blocks, tables_doc, backend, rule, tallies, fractional_bits, timings,
+                    frozenset((each.child, tuple(each.child_columns)) for each in relationships),
+                    references.NONE,
+                    {
+                        (relationships[at].child, tuple(relationships[at].child_columns)): done.shown
+                        for at, (_, done) in counted_entries.items()
+                    },
+                    planned.history_asks,
+                )  # fmt: skip
+            )
+        )
+    if request is None:  # a bundle's table has its own history, and a request asks for one
         released = references.form_references(
             references.Stage(raw_exposes, plans, reads, relationships, backend, blocks)
         )
@@ -1873,17 +1956,25 @@ def _fact_refusal(exc: "facts.FactRefused") -> ProfileError:
     )
 
 
+def _joined(plan: ExposePlan, more: ExposePlan) -> Tuple[ColumnPlan, ...]:
+    """The columns of *plan*, then those of *more* it does not hold."""
+    held = {column.name for column in plan.columns}
+    return (*plan.columns, *(column for column in more.columns if column.name not in held))
+
+
 def _read_names(
     plan: ExposePlan,
     fact_plans: Sequence["facts.FactPlan"],
     query_plans: "query_rates.QueryPlans",
+    history_plan: Optional[ExposePlan] = None,
 ) -> List[str]:
-    """The columns of a table to read: those profiled, then those only a fact or a query reads.
+    """The columns of a table to read: those profiled, then those only a fact, a query or a
+    history reads.
 
-    A column read for a fact or a query alone is read and never profiled: reading is not
-    publishing.
+    A column read for a fact, a query or a history alone is read and never profiled: reading is
+    not publishing.
     """
-    names = [column.name for column in plan.columns]
+    names = [column.name for column in _joined(plan, history_plan or plan)]
     for each in fact_plans:
         if each.table == plan.expose_id:
             names.extend(name for name in each.columns if name not in names)

@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""The profile document: PROFILE-SPEC formats 1-0-0 to 1-4-0, its canonical bytes and digest.
+"""The profile document: PROFILE-SPEC formats 1-0-0 to 1-5-0, its canonical bytes and digest.
 
 flux-engine ``docs/spec/PROFILE-SPEC.md`` §1 fixes the shape: the OpenLineage
 facet envelope (``_producer``, ``_schemaURL``), the grid (``encoding``), the
@@ -19,7 +19,9 @@ A profile names the least format that holds it (:func:`schema_url_for`): 1-0-0, 
 holds a ``quantile/2`` statistic (1-1-0), an ``invariants`` section (1-2-0), a statistic
 grouped by a link (1-3-0), a table released whole under ``references`` (1-3-0), or a rank
 correlation, a statistic grouped by the bins of a column
-or a relationship's statistic grouped by a parent column (1-4-0). A table's ``datePairs``, ``calendar`` and ``history`` and
+or a relationship's statistic grouped by a parent column (1-4-0), or a column's ``nullCount/2``, a
+member of a table's ``history`` that carries noise, or a query's statistic that carries noise or a
+``unit`` (1-5-0). A table's ``datePairs``, ``calendar`` and ``history`` and
 a relationship's ``dates``, ``structural`` and ``exposure`` are forms of 1-3-0. A profile without one of
 them keeps the bytes it had.
 
@@ -47,6 +49,7 @@ __all__ = [
     "SCHEMA_URL_1_2_0",
     "SCHEMA_URL_1_3_0",
     "SCHEMA_URL_1_4_0",
+    "SCHEMA_URL_1_5_0",
     "build_document",
     "canonical_bytes",
     "check_fractional_bits",
@@ -73,6 +76,10 @@ SCHEMA_URL_1_3_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-3
 #: ``cliqueMarginal/2`` and a ``groupBy`` on a relationship's statistic
 #: (``flux_stats.profile.SCHEMA_URL_1_4_0``; a test keeps the two equal).
 SCHEMA_URL_1_4_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-4-0/FluxProfile.json"
+#: Format 1-5-0, which adds a column's ``nullCount/2``, a ``noise`` block on a member of a table's
+#: ``history`` and a query's ``unit`` and noisy statistic (``flux_stats.profile.SCHEMA_URL_1_5_0``;
+#: a test keeps the two equal).
+SCHEMA_URL_1_5_0 = "https://agenticstiger.github.io/flux/engine/spec/profile/1-5-0/FluxProfile.json"
 
 #: The statistics only format 1-1-0 holds.
 _ADDED_IN_1_1_0 = frozenset({"quantile/2"})
@@ -115,8 +122,14 @@ def producer_uri(version: str) -> str:
 _RANK_DEFINITIONS = frozenset({"kendallTau/1", "spearmanRho/1"})
 
 
+#: The definition of a column's noisy count of its known and NULL rows, a form of format 1-5-0.
+_NULL_COUNT = "nullCount/2"
+
+
 def _statistic_format(statistic: Mapping[str, Any]) -> int:
-    """The format, as a number from 0 (1-0-0) to 4 (1-4-0), that one column statistic needs."""
+    """The format, as a number from 0 (1-0-0) to 5 (1-5-0), that one column statistic needs."""
+    if statistic.get("definition") == _NULL_COUNT:
+        return 5
     if "groupByBins" in statistic or "rowFloor" in statistic:
         return 4
     if "groupByLink" in statistic or "per" in statistic:
@@ -124,17 +137,31 @@ def _statistic_format(statistic: Mapping[str, Any]) -> int:
     return 1 if statistic.get("definition") in _ADDED_IN_1_1_0 else 0
 
 
+def _members_of(history: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The statistics a table's ``history`` holds: its members, the tracked columns', ``reasons``."""
+    found: List[Mapping[str, Any]] = []
+    for key, member in history.items():
+        if key == "columns" and isinstance(member, Mapping):
+            for tracked in member.values():
+                found.extend(each for each in tracked.values() if isinstance(each, Mapping))
+        elif isinstance(member, Mapping):
+            found.append(member)
+    return found
+
+
 def _table_format(table: Mapping[str, Any]) -> int:
     needed = 3 if "datePairs" in table or "calendar" in table or "history" in table else 0
+    if any("noise" in each for each in _members_of(table.get("history", {}))):
+        needed = 5
     if "cliqueSelection" in table or any(
         each.get("definition") == "cliqueMarginal/2" for each in table.get("cliques", ())
     ):
-        needed = 4
+        needed = max(needed, 4)
     for column in table.get("columns", {}).values():
         needed = max([needed, *(_statistic_format(each) for each in column.get("statistics", ()))])
     for pair in table.get("columnPairs", ()):
         if any(each.get("definition") in _RANK_DEFINITIONS for each in pair.get("statistics", ())):
-            needed = 4
+            needed = max(needed, 4)
     return needed
 
 
@@ -149,7 +176,22 @@ def _relationship_format(relationship: Mapping[str, Any]) -> int:
     return 0
 
 
-_FORMATS = (SCHEMA_URL, SCHEMA_URL_1_1_0, SCHEMA_URL_1_2_0, SCHEMA_URL_1_3_0, SCHEMA_URL_1_4_0)
+_FORMATS = (
+    SCHEMA_URL,
+    SCHEMA_URL_1_1_0,
+    SCHEMA_URL_1_2_0,
+    SCHEMA_URL_1_3_0,
+    SCHEMA_URL_1_4_0,
+    SCHEMA_URL_1_5_0,
+)
+
+
+def _query_format(query: Mapping[str, Any]) -> int:
+    """A query's statistic with noise or a ``unit`` is a form of 1-5-0; one grouped, of 1-3-0."""
+    statistics = query.get("statistics", ())
+    if "unit" in query or any("noise" in each or "unit" in each for each in statistics):
+        return 5
+    return 3 if any("groupBy" in each for each in statistics) else 0
 
 
 def schema_url_for(
@@ -162,22 +204,29 @@ def schema_url_for(
 ) -> str:
     """The least format that holds *tables*, *relationships*, any ``invariants`` and ``queries``.
 
-    1-3-0 with ``references``; 1-3-0 with a ``groupBy`` on a query's statistic (a query's rate per group); 1-4-0 with a rank correlation, a ``groupByBins``, a ``rowFloor`` or a relationship's
-    statistic grouped by a parent column (and with cliques of ``cliqueMarginal/2`` or a
-    ``cliqueSelection``); 1-3-0 with a ``groupByLink``; 1-2-0 with ``invariants``; 1-1-0
-    when any statistic is ``quantile/2``; else 1-0-0. Each format holds everything the
-    ones before it do.
+    1-5-0 with a ``nullCount/2``, a noisy member of a ``history``, and a query's ``unit`` or noisy
+    statistic; 1-4-0 with a rank correlation, a ``groupByBins``, a ``rowFloor`` or a
+    relationship's statistic grouped by a parent column (and with cliques of ``cliqueMarginal/2``
+    or a ``cliqueSelection``); 1-3-0 with ``references``, a ``groupByLink`` or a ``groupBy`` on a
+    query's statistic (a query's rate per group); 1-2-0 with ``invariants``; 1-1-0 when any
+    statistic is ``quantile/2``; else 1-0-0. Each format holds everything the ones before it do.
     """
     needed = 2 if invariants else 0
     if references:
         needed = max(needed, 3)
-    if any("groupBy" in statistic for each in queries for statistic in each.get("statistics", ())):
-        needed = max(needed, 3)
+    for query in queries:
+        needed = max(needed, _query_format(query))
     for table in tables.values():
         needed = max(needed, _table_format(table))
     for relationship in relationships:
         needed = max(needed, _relationship_format(relationship))
     return _FORMATS[needed]
+
+
+def format_name(schema_url: str) -> str:
+    """The format a ``_schemaURL`` names, as ``1-5-0``: its second last path step."""
+    steps = schema_url.rstrip("/").split("/")
+    return steps[-2] if len(steps) >= 2 else schema_url
 
 
 def build_document(

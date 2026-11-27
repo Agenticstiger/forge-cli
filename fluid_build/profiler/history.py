@@ -8,9 +8,12 @@ entity, two time dimensions that bound a version (``validityParams.isStart`` and
 on the end dimension, ``openEnd`` and ``chain`` (RFC-versioned-relationships section 1). A default
 profile (one without a request) writes the table's ``history`` when the profile reads the entity
 column, the start and the end, and the start and the end are DATE columns, or timestamp columns, of
-one type. ``fluxsim init`` reads it to write the bundle's history. A request has no ask for a
-history, and a private release publishes nothing outside its noise, which PROFILE-SPEC refuses on a
-history, so neither writes one.
+one type. ``fluxsim init`` reads it to write the bundle's history. A request of format 1-3-0
+writes the history of the tables that ask for one (``history: {}``, or ``history: {columns: [...]}``
+to name the candidate tracked columns), and no other: the entity, start, end and candidate columns
+are read for it and profiled only if the request lists them too, and an ask the history does not
+form is named with why. A private release publishes nothing outside its noise, which PROFILE-SPEC
+refuses on a history outside the account, so it writes none.
 
 **Versions.** The rows used are those whose entity column and start are known. The versions of an
 entity are ordered by start, then end (an open end last), then row position. An end is open when
@@ -139,7 +142,11 @@ __all__ = [
     "HistoryStage",
     "MOST_COLUMNS",
     "MOST_LEVELS",
+    "asked_plan",
+    "chain_level",
     "form_histories",
+    "length_ladder",
+    "order_versions",
 ]
 
 #: The most tracked columns a history holds, and the most levels one of them has (public caps).
@@ -198,6 +205,10 @@ class HistoryStage:
     children_shown: Mapping[Tuple[str, Tuple[str, ...]], Tuple[bool, ...]] = field(
         default_factory=dict
     )
+    #: The tables whose history a request asks for, each with the candidate columns it names (or
+    #: ``None`` for the contract's categorical columns). ``None`` as a whole: every table that
+    #: declares a window is formed, as a default profile does.
+    asked: Optional[Mapping[str, Optional[Tuple[str, ...]]]] = None
 
 
 @dataclass(frozen=True)
@@ -569,6 +580,34 @@ def _window(context: _Context, expose: Mapping[str, Any]) -> Any:
     return window
 
 
+def order_versions(
+    keys: Sequence[Optional[Any]],
+    starts: Sequence[Optional[int]],
+    ends: Sequence[Optional[int]],
+    literal: Optional[int],
+) -> Tuple[Dict[Any, List[_Version]], List[int]]:
+    """Each entity's versions in order, and the position of each row used.
+
+    A row is used when its entity (*keys*, ``None`` where it holds none) and its start are known.
+    The versions of an entity are ordered by start, then end (an open end last), then row position.
+    An end is open when it is ``None`` or equals the ``openEnd`` *literal* of the contract.
+    """
+    held: Dict[Any, List[Tuple[_Key, _Version]]] = {}
+    used: List[int] = []
+    for position, (key, start, end) in enumerate(zip(keys, starts, ends, strict=True)):
+        if key is None or start is None:
+            continue
+        used.append(position)
+        closed = end is not None and end != literal
+        version = _Version(start, end if closed else None, position)
+        order = (start, 0 if closed else 1, end if closed and end is not None else 0, position)
+        held.setdefault(key, []).append((order, version))
+    return {
+        key: [version for _, version in sorted(versions, key=lambda each: each[0])]
+        for key, versions in held.items()
+    }, used
+
+
 def _ordered(
     context: _Context, window: Any
 ) -> Tuple[Dict[Tuple[Any, ...], List[_Version]], List[int]]:
@@ -582,22 +621,12 @@ def _ordered(
     starts = _instants(context, window.start_column, date_column)
     ends = _instants(context, window.end_column, date_column)
     literal = _open_literal(context, window.end_column, date_column, window.open_end)
-    held: Dict[Tuple[Any, ...], List[Tuple[_Key, _Version]]] = {}
-    used: List[int] = []
-    for position, (key, start, end) in enumerate(zip(keys, starts, ends, strict=True)):
-        if None in key or start is None:
-            continue
-        used.append(position)
-        closed = end is not None and end != literal
-        version = _Version(start, end if closed else None, position)
-        order = (start, 0 if closed else 1, end if closed and end is not None else 0, position)
-        held.setdefault(key, []).append((order, version))
+    held, used = order_versions(
+        [None if None in key else key for key in keys], starts, ends, literal
+    )
     if not held:
         raise _Unformed(_NO_ROWS)
-    return {
-        key: [version for _, version in sorted(versions, key=lambda each: each[0])]
-        for key, versions in held.items()
-    }, used
+    return held, used
 
 
 # ---------------------------------------------------------------------------
@@ -942,8 +971,13 @@ def _start_extremes(context: _Context, window: Any) -> Tuple[Optional[int], Opti
     return low, high
 
 
+def length_ladder() -> Tuple[int, ...]:
+    """The public ladder of the whole days from a version's start to the next version's start."""
+    return dates.DAY_LADDER[dates.DAY_LADDER.index(0) :]
+
+
 def _version_length(context: _Context, window: Any, lengths: "Counter[int]") -> Dict[str, Any]:
-    ladder = dates.DAY_LADDER[dates.DAY_LADDER.index(0) :]
+    ladder = length_ladder()
     name = f"{context.expose_id} version length"
     days = list(lengths.elements())
     low, high = _start_extremes(context, window)
@@ -953,20 +987,28 @@ def _version_length(context: _Context, window: Any, lengths: "Counter[int]") -> 
     return _written(context, coded, ladder)
 
 
+def chain_level(current: _Version, following: _Version) -> str:
+    """How *current* ends where *following*, the next version of its entity, begins.
+
+    The end is the next start (``nextStart``), the day before it (``dayBefore``), earlier than that
+    (``gap``), or later, or open (``overlap``).
+    """
+    if current.end is None or current.end > following.start:
+        return "overlap"
+    if current.end == following.start:
+        return "nextStart"
+    if following.start - current.end == _MS_PER_DAY:
+        return "dayBefore"
+    return "gap"
+
+
 def _chain(
     context: _Context, window: Any, stations: Mapping[Tuple[Any, ...], Sequence[_Version]]
 ) -> Dict[str, Any]:
     levels: Counter[str] = Counter()
     for held in stations.values():
         for current, following in zip(held, held[1:], strict=False):
-            if current.end is None or current.end > following.start:
-                levels["overlap"] += 1
-            elif current.end == following.start:
-                levels["nextStart"] += 1
-            elif following.start - current.end == _MS_PER_DAY:
-                levels["dayBefore"] += 1
-            else:
-                levels["gap"] += 1
+            levels[chain_level(current, following)] += 1
     counts = [levels[each] for each in _CHAIN_LEVELS]
     emptied = _EMPTIED.get(window.chain, frozenset())
     empty = frozenset(
@@ -1028,6 +1070,30 @@ def _declared_levels(declared: Optional[DeclaredBlock], name: str) -> Optional[T
 def _place(index: Mapping[str, int], level: str) -> int:
     """The position of *level* among a column's levels; ``KeyError`` for a value outside them."""
     return index[level]
+
+
+def asked_plan(
+    expose: Mapping[str, Any], plan: "ExposePlan", columns: Optional[Sequence[str]]
+) -> "ExposePlan":
+    """*plan* of a table a request asks the history of, with only the columns that history reads.
+
+    Those are the entity, start and end of the contract's window and the candidate columns
+    (*columns*, or every categorical column of the table when the request names none). A table
+    that declares no well formed window reads none, and the history names why it forms none.
+    """
+    from fluid_build.forge_datamodel.semantics_builder import version_window
+
+    semantics = expose.get("semantics")
+    window = version_window(semantics if isinstance(semantics, Mapping) else {})
+    if window is None:
+        return replace(plan, columns=())
+    named = {window.key, window.start_column, window.end_column}
+    named |= (
+        set(columns)
+        if columns is not None
+        else {column.name for column in plan.columns if column.domain == "category"}
+    )
+    return replace(plan, columns=tuple(each for each in plan.columns if each.name in named))
 
 
 def _tracked(
@@ -1451,6 +1517,24 @@ def _entries(
 # ---------------------------------------------------------------------------
 
 
+def _unfollowed_candidates(context: _Context, window: Any) -> List[Tuple[str, str]]:
+    """Each candidate column a request names that a history cannot follow, with why."""
+    asked = context.stage.asked
+    named = None if asked is None else asked.get(context.expose_id)
+    if not named:
+        return []
+    columns = {column.name for column in context.plan.columns}
+    taken = {window.key, window.start_column, window.end_column}
+    found: List[Tuple[str, str]] = []
+    for name in named:
+        what = f"history of {context.expose_id}.{name}"
+        if name in taken:
+            found.append((what, "it is the entity, the start or the end of the window"))
+        elif name not in columns:
+            found.append((what, f"it {_NOT_READ}"))
+    return found
+
+
 def _history(
     context: _Context,
     expose: Mapping[str, Any],
@@ -1481,6 +1565,7 @@ def _history(
     found["lastVersion"] = _last_version(context, window, stations)
     tracked, unfollowed = _tracked(context, window, declared)
     notes.extend(unfollowed)
+    notes.extend(_unfollowed_candidates(context, window))
     if tracked:
         columns = {column.name: _entries(context, window, column, stations) for column in tracked}
         found["columns"] = columns
@@ -1489,12 +1574,29 @@ def _history(
     return found
 
 
+def _state_columns(table: Dict[str, Any], plan: "ExposePlan", formed: Mapping[str, Any]) -> None:
+    """Name each column *formed* history refers to in the table's ``columns``, as its domain alone.
+
+    The profile reader takes a history only when its entity, start, end and tracked columns are
+    columns of the table. A profile that lists every column has them all; one that answers a
+    request lists only the asked, so the others are stated by name and domain, which the contract
+    declares, and nothing is measured of them.
+    """
+    named = [*formed["entity"], formed["start"], formed["end"], *formed.get("columns", {})]
+    domains = {column.name: column.domain for column in plan.columns}
+    columns = table.setdefault("columns", {})
+    for name in named:
+        columns.setdefault(name, {"domain": domains[name]})
+
+
 def form_histories(inputs: HistoryStage) -> List[Tuple[str, str]]:
     """Write the ``history`` of each table that declares a validity window; the asks left out.
 
     A table a bundle's fidelity block answers is left alone, and so is a table whose contract
-    declares no window. A table whose window the profile cannot form is named with why. The time
-    is counted as the table's own measure and check time.
+    declares no window, unless a request asks for its history: that ask is named with why it is
+    not answered. A table whose window the profile cannot form is named with why. The time is
+    counted as the table's own measure and check time. With a request (``asked``) only the tables
+    it names are formed.
     """
     from fluid_build.data_rules._model import declares_validity_window
     from fluid_build.profiler import runner
@@ -1503,12 +1605,20 @@ def form_histories(inputs: HistoryStage) -> List[Tuple[str, str]]:
     for plan, read, found in zip(inputs.plans, inputs.reads, inputs.declared, strict=True):
         expose_id = plan.expose_id
         expose = inputs.exposes.get(expose_id)
-        if expose_id in inputs.blocks or expose is None or not declares_validity_window(expose):
+        if inputs.asked is not None and expose_id not in inputs.asked:
+            continue
+        if expose_id in inputs.blocks or expose is None:
+            continue
+        if not declares_validity_window(expose):
+            if inputs.asked is not None:
+                notes.append((f"history of {expose_id}", _NO_WINDOW))
             continue
         context = _Context(inputs, plan, read, expose_id)
         with runner._timed(inputs.timings, "measure", expose_id):
             try:
-                inputs.tables_doc[expose_id]["history"] = _history(context, expose, found, notes)
+                formed = _history(context, expose, found, notes)
+                inputs.tables_doc[expose_id]["history"] = formed
+                _state_columns(inputs.tables_doc[expose_id], context.plan, formed)
             except _Unformed as why:
                 notes.append((f"history of {expose_id}", str(why)))
     return notes

@@ -439,9 +439,12 @@ lineage = [
 # at format 1-2-0 (flux_stats.request), rank correlations
 # (flux_stats.rank_correlation), the follows reach of a release under differential
 # privacy (flux_stats.noise) and profile format 1-4-0.
+# 0.13.0 is the first release that holds profile format 1-5-0 and the profile request
+# format 1-3-0: a noisy member of a history, nullCount/2 and a noisy query rate with
+# its unit.
 profile = [
   "duckdb>=1.5.0",
-  "flux-stats[yaml]>=0.11,<1",
+  "flux-stats[yaml]>=0.13,<1",
 ]
 
 # ``fluid profile`` releasing a table under differential privacy: the choice of
@@ -1043,6 +1046,8 @@ module = [
     "fluid_build.profiler.dp.discrete_gaussian",
     "fluid_build.profiler.dp.follow_release",
     "fluid_build.profiler.dp.follows",
+    "fluid_build.profiler.dp.history_release",
+    "fluid_build.profiler.dp.query_release",
     "fluid_build.profiler.dp.randomness",
     "fluid_build.profiler.dp.rank_noise",
     "fluid_build.profiler.dp.record",

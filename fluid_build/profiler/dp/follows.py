@@ -17,8 +17,12 @@ tables before anything is measured. For each followed relationship it keeps at m
 of each parent row, the ``c`` with the smallest keyed priority
 (:func:`~fluid_build.profiler.dp.bounding.bound_rows`), and it reads only that parent's own
 children, so the rows kept for a unit depend on the seed and on that unit alone, never on another
-unit or on the order of the records. A child dropped takes its descendants with it, and a row of a
-followed table that follows no kept row is dropped.
+unit or on the order of the records. For a table whose entities the release states (its history, or
+a query over its entities) the cap is spent on whole entities instead
+(:func:`~fluid_build.profiler.dp.bounding.bound_entities`): an entity is kept with every version it
+has under that parent row or dropped with all of them, and one with more versions than ``c`` is
+dropped. A child dropped takes its descendants with it, and a row of a followed table that follows
+no kept row is dropped.
 
 Nothing here prints or records anything that depends on the records.
 """
@@ -251,6 +255,8 @@ def keep_rows(
     parent_keys: Mapping[str, Sequence[Optional[bytes]]],
     child_keys: Mapping[str, Sequence[Optional[bytes]]],
     seed: bytes,
+    *,
+    entity_keys: Optional[Mapping[str, Sequence[Optional[bytes]]]] = None,
 ) -> Dict[str, List[int]]:
     """The rows kept of each table the unit reaches, ascending, after truncation.
 
@@ -261,6 +267,13 @@ def keep_rows(
     candidate only when its key is that of a kept parent row, and of the candidates of one parent
     key at most ``c`` are kept, by keyed priority. The priority of a row depends on the seed, the
     edge, the parent key and the row's own bytes: no other row.
+
+    *entity_keys* holds, for a table whose entities the release states, the encoded key of the
+    entity each row is a version of (``None``: it is no entity's version). The cap of such a table
+    is spent on entities, not on rows: under one parent key an entity is kept with all of its rows
+    or with none, by a keyed priority of the seed, the edge, the parent key and the entity's key
+    (:func:`~fluid_build.profiler.dp.bounding.bound_entities`). A table not named there is
+    truncated by row.
     """
     kept: Dict[str, List[int]] = {plan.unit: list(range(counts[plan.unit]))}
     for edge in plan.edges:
@@ -271,12 +284,18 @@ def keep_rows(
         candidates = [
             at for at, key in enumerate(child_keys[into]) if key is not None and key in held
         ]
-        chosen = bounding.bound_rows(
-            [child_keys[into][at] for at in candidates],
-            [contents[into][at] for at in candidates],
-            seed,
-            edge.max_children,
-            label=edge.label,
-        )
+        units = [child_keys[into][at] for at in candidates]
+        rows = [contents[into][at] for at in candidates]
+        if entity_keys is not None and into in entity_keys:
+            chosen = bounding.bound_entities(
+                units,
+                [entity_keys[into][at] for at in candidates],
+                rows,
+                seed,
+                edge.max_children,
+                label=edge.label,
+            )
+        else:
+            chosen = bounding.bound_rows(units, rows, seed, edge.max_children, label=edge.label)
         kept[into] = sorted(candidates[each] for each in chosen)
     return kept

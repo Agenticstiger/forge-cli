@@ -45,9 +45,11 @@ _FLAGS = (
 HELP = """\
 With --request FILE, --privacy-unit EXPOSE, --rho R and --release-record PATH the profile
 is a release under differential privacy: the noisy counts of one table, and the noisy rank
-correlations and date pairs the request asks for, in profile format 1-2-0 (1-3-0 when it holds
-a date pair, 1-4-0 when it holds a rank correlation, a clique with a binned column, a clique
-selection or a unit that follows its child rows), which flux-engine grades
+correlations, date pairs, null counts and consumer queries the request asks for, in profile
+format 1-2-0 (1-3-0 when it holds a date pair, 1-4-0 when it holds a rank correlation, a clique
+with a binned column, a clique selection or a unit that follows its child rows, 1-5-0 when it
+holds a null count, a noisy history or a noisy query),
+which flux-engine grades
 P3. Nothing else of the request is released.
 
 What it releases, from the release table (the privacy unit's expose, or with
@@ -58,7 +60,21 @@ of the unit's expose that name one entity by COL[,COL]):
     lists, on the bins the contract's declared range gives (else the type's ladder);
   - for a column the contract does not declare required, the same histogram over the column's
     known values: a record with no value lands in no cell, the column has a share of its own and
-    joins no clique, and no null count or share of nulls is released;
+    joins no clique;
+  - for each column whose nullCount/2 the request lists (a request of format 1-3-0; any column
+    that is not a key), a noisy count of its known and its NULL records, two cells of a table of
+    its own with a share of its own, which joins no clique;
+  - for each consumer query of the request that passes the checks (a query that keeps some of
+    its unit's records and changes none, the unit a table or a view of one table, or the groups
+    of one table's rows by an entity: the child column of a relationship the unit follows, or
+    the natural entity of a table whose history the release holds), a noisy rate: two cells for
+    each group, the records of its unit the query does not return and those it does, with a
+    share of its own, the unit stated in the profile, and the sensitivity of the records one
+    unit changes of it (m of the table, or of the parent for the groups of a followed
+    relationship). A query of a table the unit does not reach, a groupBy over entities and
+    any query that does not pass is named with its reason and never a count; a failure that
+    depends on the records withholds every query of the release, named the same way, and the
+    other statistics are as they would have been;
   - for each date pair of two DATE columns the request lists (a table the release holds), a
     noisy histogram of the days from start to end on the whole public ladder of days, never
     trimmed, and a noisy order (after, before, same), both over the records where both dates
@@ -106,7 +122,14 @@ relationship asked by the request in a fixed public ladder when its child is rea
 parent is not (or the reverse), grouped by the parent columns the request names (a category by
 its levels, a number or timestamp by public bins); and the child columns the request asks to be
 grouped through a relationship (groupByLink) by the parent column's levels, when the unit
-follows the relationship or does not reach the parent. Before anything is measured, at most MAX
+follows the relationship or does not reach the parent; and, for a table the unit follows into
+(not the unit's own expose) whose history the request asks (a request of format 1-3-0, the
+contract declaring a validity window), a noisy history in format 1-5-0: its versionsPerEntity,
+firstStart, versionLength, chain and lastVersion, each tracked column's initial and transitions
+and the table's reasons, every one a count table of its own with a share of its own and the
+sensitivity of the rows one unit contributes (m_T), counted on public ladders that are never
+trimmed to the records. An entity's versions must follow one parent row (above), or the release
+is refused. Before anything is measured, at most MAX
 children of each parent row are kept by a keyed priority that reads only that parent's own
 children, so what a unit keeps never depends on another unit or on the order of the records;
 children beyond the cap and rows that follow no kept row are dropped. A table the unit does not
@@ -688,7 +711,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             read_tables = [plan.table]
             named = plan.table
         if getattr(args, "strict", False):
-            _refuse_unformed_pairs(plan)
+            _refuse_unformed_asks(plan)
             _refuse_left_out_before_reading(plan, follows)
         aside = _set_aside_unread_sources(
             args.source,
@@ -720,11 +743,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         version = None if recorded is None else recorded.versions.get("opendp")
         drawn: Any
         if follows:
-            wanted_columns = dict(plan.reads)
             reads = {
                 each.expose_id: sources.read_columns(
                     each.source,
-                    [column.name for column in wanted_columns[each.expose_id]],
+                    list(plan.read_names(each.expose_id)),
                     table=each.table,
                     cwd=Path.cwd(),
                 )
@@ -741,7 +763,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         else:
             read = sources.read_columns(
                 exposes[0].source,
-                [column.name for column in plan.read],
+                list(plan.read_names),
                 table=exposes[0].table,
                 cwd=Path.cwd(),
             )
@@ -812,11 +834,16 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 0
 
 
-def _refuse_unformed_pairs(plan: Any) -> None:
-    """Under ``--strict``, refuse before any record is read a date pair the contract shows cannot be formed."""
+def _refuse_unformed_asks(plan: Any) -> None:
+    """Under ``--strict``, refuse before any record is read what the contract and the request rule out.
+
+    A date pair the contract shows cannot be formed, and a consumer query the plan names: the
+    reasons it names are decided from the contract and the request alone, and the one the records
+    decide (a statement that fails on them) is given only once they are read.
+    """
     from fluid_build.profiler import request as asked_for
 
-    unformed = [item for item in plan.not_released if item[0].startswith("date pair ")]
+    unformed = [item for item in plan.not_released if item[0].startswith(("date pair ", "query "))]
     if unformed:
         raise asked_for.refuse_asks(unformed)
 
@@ -971,6 +998,8 @@ _KIND = {
     "rank": "rank correlation",
     "pairDays": "days of the date pair",
     "pairOrder": "order of the date pair",
+    "nullCount": "null count of",
+    "query": "noisy query",
 }
 
 
@@ -1040,6 +1069,8 @@ def _report(
     )
     say(rests, soft_wrap=True)
     for table in drawn.tables:
+        if table.label in drawn.withheld_labels:
+            continue  # nothing was written for it: the reason is under Not released
         if table.kind == "rank":
             first, second = table.columns
             say(
@@ -1049,13 +1080,15 @@ def _report(
                 soft_wrap=True,
             )
             continue
-        shown = _profile_follow.columns_text(table)
+        shown = table.label if table.kind == "query" else _profile_follow.columns_text(table)
         say(
             f"  {_KIND[table.kind]} {shown}: noise scale {table.scale}, "
             f"share rho {table.share}, squared L2 sensitivity {plan.sensitivity} for one entity",
             soft_wrap=True,
         )
     for line in _profile_follow.unknown_values_notes(drawn.plan or plan):
+        say(line, soft_wrap=True)
+    for line in _profile_follow.query_notes(drawn.plan or plan, drawn):
         say(line, soft_wrap=True)
     if ranked:
         say(
