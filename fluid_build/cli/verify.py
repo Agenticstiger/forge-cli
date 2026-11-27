@@ -340,6 +340,18 @@ def _contract_bundle_digest(contract_path: str, env: Optional[str]) -> str:
 
     path = Path(contract_path)
     log = logging.getLogger("fluid.verify.bundle")
+    from fluid_build._contract_loader import _is_bundle_path
+
+    if _is_bundle_path(contract_path):
+        # A stage-1 bundle is the sealed bytes themselves: its own MANIFEST digest, verified
+        # against its members, is the digest to compare (the loader already refused an --env
+        # the bundle was not built for).
+        from fluid_build.forge.core.plan_digest import read_bundle_digest
+
+        try:
+            return read_bundle_digest(path)
+        except Exception as exc:  # noqa: BLE001 - an unreadable bundle is a refusal
+            raise ValueError(f"{type(exc).__name__}: {exc}") from None
     try:
         compiled, _overlay = bundle.materialize_contract(path, env, log)
         packed = bundle._dbt_projects(compiled, path)

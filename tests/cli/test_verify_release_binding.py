@@ -294,3 +294,33 @@ def test_record_takes_a_report_on_the_sealed_contract_and_the_statement_names_it
     assert policy["digest"] == {"sha256": "a" * 64}
     deploy = receipts.statement({**done.receipt, "check": "deploy"}, b"{}")
     assert "digest" not in deploy["predicate"]["policy"]
+
+
+def test_a_stage_one_bundle_is_compared_by_its_own_manifest_digest(
+    tmp_path: Path, contract: Path
+) -> None:
+    """``fluid verify runtime/bundle.tgz --release``: the bundle is the sealed bytes, so its own
+    MANIFEST digest is compared, not a rebuild from the gzip bytes."""
+    digest = _seal_digest(contract, "nonprod")
+    release = _release(tmp_path, "nonprod", digest)
+    bundle = contract.parent / "nonprod.tgz"
+    block = verify._release_block(
+        _args(bundle, "nonprod", release, tmp_path / "r.json"), "acme.orders"
+    )
+    assert block is not None
+    assert block["contract_digest"] == digest
+
+
+def test_a_bundle_of_another_contract_is_refused(
+    tmp_path: Path, contract: Path, no_checks: None
+) -> None:
+    release = _release(tmp_path, "nonprod", _seal_digest(contract, "nonprod"))
+    contract.write_text(CONTRACT.replace("Orders", "Orders edited"), encoding="utf-8")
+    other = _seal_digest(contract, "nonprod")
+    with pytest.raises(CLIError) as raised:
+        verify._release_block(
+            _args(contract.parent / "nonprod.tgz", "nonprod", release, tmp_path / "r.json"),
+            "acme.orders",
+        )
+    assert raised.value.exit_code == 2
+    assert other in str(raised.value.context["message"])
