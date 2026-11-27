@@ -53,10 +53,16 @@ def _args(**overrides) -> argparse.Namespace:
         "bundle": None,
         "verify_signature": False,
         "verify_key": None,
-        "verify_identity_regexp": ".*",
-        "verify_oidc_issuer_regexp": ".*",
+        "verify_certificate_identity": None,
+        "verify_certificate_oidc_issuer": None,
+        "verify_identity_regexp": None,
+        "verify_oidc_issuer_regexp": None,
         "git_commit_author": None,
     }
+    if overrides.get("verify_signature"):
+        # a signed run names its signer; the verify flags are refused without the gate
+        defaults["verify_identity_regexp"] = ".*"
+        defaults["verify_oidc_issuer_regexp"] = ".*"
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
 
