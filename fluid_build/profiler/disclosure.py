@@ -146,12 +146,10 @@ import calendar
 import math
 import re
 import unicodedata
-from bisect import bisect_right
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date as _date
 from fractions import Fraction
-from heapq import heappop, heappush
 from typing import (
     AbstractSet,
     Any,
@@ -864,9 +862,6 @@ def pinned_children_cells(
     rule: DisclosureRule,
     childless: int = 0,
     upper: Optional[int] = None,
-    at_least: Sequence[int] = (),
-    floors: Sequence[int] = (),
-    ceilings: Sequence[Optional[int]] = (),
 ) -> FrozenSet[int]:
     """The withheld cells of a children-per-parent table a reader may work out exactly.
 
@@ -882,16 +877,7 @@ def pinned_children_cells(
     together are not a small count, nor a zero where zeros are disclosive. Any table it
     can hold true has nonnegative cells with the parents' sum, ``lower * c <= children
     <= upper * c`` (a parent holds between its bin's edges), at least *childless* parents
-    in the first cell, and each published cell in its band. With *at_least* (see
-    :func:`parents_at_or_above`) the reader also knows, of each bin, that at least that many
-    parents lie in it or in a bin above: a table with fewer of them is not one it can hold true.
-    With *floors* (the children each parent is known to hold at least) and *ceilings* (at most,
-    ``None`` for no bound), one entry for each parent in the same order, it also knows each
-    parent's range. A table is one it can hold true only if the parents can be given to its bins
-    so that each parent's range meets its bin, the bins hold the table's counts, and the children
-    the parents hold can add up to *children* (:func:`_ranges_hold`). A floor above its bin's
-    lower edge uses up more of the total, and a ceiling below its bin's top gives some back, so
-    each bounds the other parents.
+    in the first cell, and each published cell in its band.
     A withheld cell is safe when two such tables differ in it. The true table (*cells*)
     is one; the other is searched for among the tables one or two parents' moves away.
     A cell with no such pair is returned, so the search errs toward withholding: a
@@ -905,7 +891,6 @@ def pinned_children_cells(
         for value, shown in zip(cells, published, strict=True)
     ]
     any_published = any(published)
-    ranges = _parent_ranges(floors, ceilings, children)
 
     def holds(table: Sequence[int]) -> bool:
         if min(table) < 0 or table[0] < childless:
@@ -913,15 +898,10 @@ def pinned_children_cells(
         for value, band in zip(table, bands, strict=True):
             if band is not None and not band["min"] <= value <= band["max"]:
                 return False
-        for at, need in enumerate(at_least):
-            if sum(table[at:]) < need:
-                return False
         if any_published:
             rest = sum(value for value, shown in zip(table, published, strict=True) if not shown)
             if not check_count(rest, rule).published:
                 return False
-        if ranges:
-            return _ranges_hold(lower_edges, tops, table, ranges, children)
         if sum(edge * value for edge, value in zip(lower_edges, table, strict=True)) > children:
             return False
         if tops[-1] is None and table[-1] > 0:
@@ -957,152 +937,6 @@ def pinned_children_cells(
         if not _two_tables(cells, index, moves, holds, repairs):
             pinned.add(index)
     return frozenset(pinned)
-
-
-_Range = Tuple[int, int]
-
-
-def _parent_ranges(
-    floors: Sequence[int], ceilings: Sequence[Optional[int]], children: int
-) -> List[_Range]:
-    """Each parent's range of children, a ceiling no higher than the children's total."""
-    if not floors and not ceilings:
-        return []
-    count = max(len(floors), len(ceilings))
-    low = list(floors) + [0] * (count - len(floors))
-    high = list(ceilings) + [None] * (count - len(ceilings))
-    return [
-        (at, children if top is None else min(top, children))
-        for at, top in zip(low, high, strict=True)
-    ]
-
-
-def _ranges_hold(
-    lower_edges: Sequence[int],
-    tops: Sequence[Optional[int]],
-    table: Sequence[int],
-    ranges: Sequence[_Range],
-    children: int,
-) -> bool:
-    """Whether the parents, each with its range of children, can fill *table* and hold *children*.
-
-    Each parent's bins are a run (the bins its range meets), so the parents can be given to the
-    bins exactly when a greedy pass does it: bin by bin, the parents that may lie there and
-    that stop soonest. Which parents are given to which bins then changes the least and the most
-    the parents can hold together (a parent holds at least the larger of its floor and its bin's
-    lower edge, and at most the smaller of its ceiling and its bin's top). Both are least and
-    most over every way of giving them (:func:`_extreme`); a total between them is one a way of
-    giving them reaches, since two ways one swap of two parents apart reach totals that meet.
-    """
-    parents = sum(table)
-    if len(ranges) > parents:
-        return False
-    full: List[_Range] = list(ranges) + [(0, children)] * (parents - len(ranges))
-    bins = len(lower_edges)
-    top_of = [children if top is None else top for top in tops]
-    runs: List[Tuple[int, int, int, int]] = []
-    for floor, ceiling in full:
-        if ceiling < floor:
-            return False
-        first = bisect_right(lower_edges, floor) - 1
-        last = bisect_right(lower_edges, ceiling) - 1
-        if floor > top_of[first]:
-            return False
-        runs.append((first, last, floor, ceiling))
-    waiting: List[int] = []
-    ordered = sorted(runs)
-    taken = 0
-    for at in range(bins):
-        while taken < parents and ordered[taken][0] <= at:
-            heappush(waiting, ordered[taken][1])
-            taken += 1
-        for _ in range(table[at]):
-            if not waiting or heappop(waiting) < at:
-                return False
-    groups = Counter(runs)
-
-    def least(run: Tuple[int, int, int, int], at: int) -> int:
-        return max(run[2], lower_edges[at])
-
-    def most(run: Tuple[int, int, int, int], at: int) -> int:
-        return -min(run[3], top_of[at])
-
-    smallest = _extreme(groups, table, least)
-    largest = _extreme(groups, table, most)
-    return smallest is not None and largest is not None and smallest <= children <= -largest
-
-
-def _extreme(
-    groups: Mapping[Tuple[int, int, int, int], int],
-    table: Sequence[int],
-    cost: Callable[[Tuple[int, int, int, int], int], int],
-) -> Optional[int]:
-    """The least total *cost* of giving the parents (*groups* of alike) to the bins of *table*.
-
-    A transportation problem, solved by the shortest augmenting path (Bellman-Ford over a graph
-    of groups and bins); ``None`` where the parents do not fit the bins.
-    """
-    kinds = list(groups)
-    size = len(table)
-    source, sink = 0, 1 + len(kinds) + size
-    arcs: List[List[int]] = []  # to, capacity, cost, and the index of the reverse arc
-    out: List[List[int]] = [[] for _ in range(sink + 1)]
-
-    def add(start: int, end: int, capacity: int, price: int) -> None:
-        out[start].append(len(arcs))
-        arcs.append([end, capacity, price, len(arcs) + 1])
-        out[end].append(len(arcs))
-        arcs.append([start, 0, -price, len(arcs) - 1])
-
-    big = sum(groups.values())
-    for number, kind in enumerate(kinds):
-        add(source, 1 + number, groups[kind], 0)
-        for at in range(kind[0], kind[1] + 1):
-            add(1 + number, 1 + len(kinds) + at, big, cost(kind, at))
-    for at, wanted in enumerate(table):
-        add(1 + len(kinds) + at, sink, wanted, 0)
-    total = moved = 0
-    while moved < big:
-        distance: List[Optional[int]] = [None] * (sink + 1)
-        before = [-1] * (sink + 1)
-        distance[source] = 0
-        queue = deque([source])
-        while queue:
-            here = queue.popleft()
-            for index in out[here]:
-                end, room, price, _ = arcs[index]
-                reached, known = distance[here], distance[end]
-                if room > 0 and reached is not None and (known is None or reached + price < known):
-                    distance[end] = reached + price
-                    before[end] = index
-                    if end not in queue:
-                        queue.append(end)
-        if distance[sink] is None:
-            return None
-        flow, here = big, sink
-        while here != source:
-            flow = min(flow, arcs[before[here]][1])
-            here = arcs[arcs[before[here]][3]][0]
-        here = sink
-        while here != source:
-            arcs[before[here]][1] -= flow
-            arcs[arcs[before[here]][3]][1] += flow
-            here = arcs[arcs[before[here]][3]][0]
-        moved += flow
-        total += flow * (distance[sink] or 0)
-    return total
-
-
-def parents_at_or_above(lower_edges: Sequence[int], floors: Iterable[int]) -> List[int]:
-    """For each bin of a children-per-parent table, the parents known to lie in it or above it.
-
-    *floors* are the children each parent is known to hold at least: what a public key's published
-    cells, changes and group sizes each show of its distinct child rows. A parent whose floor
-    reaches a bin's lower edge holds at least that many children, so it lies in that bin or in
-    one above.
-    """
-    held = list(floors)
-    return [sum(1 for floor in held if floor >= edge) for edge in lower_edges]
 
 
 def _two_tables(

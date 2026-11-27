@@ -51,14 +51,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nullCount` and the withheld `distinctCount`; its `sum`, `min`, `max` and `quantiles` are not
   formed). Before, such a key was named as not followed, and the history carried it as an
   untracked column, so a generated history held each entity's key constant across its versions.
-  A key that is not tracked keeps its number domain and every metric it had, whatever the reason:
-  a value that is no key of the table, a table that is not published whole, fewer than two keys,
-  two relationships on the column, or a key over the cap. A key the contract's statistics read is
-  not followed. A key that is neither text nor a whole number (a float, a decimal with a scale, a
-  date) is still named as not followed, now with the reason "its key is not text or a whole
-  number". Cells of the key's `initial` and `transitions` are checked, and its shares withheld
-  against the children per parent, exactly as for a text key. A private release and a profile
-  request write no `references` and follow nothing, as before.
+  A key that is not followed keeps its number domain and every metric it had, whatever the reason:
+  a table that is not published whole, fewer than three keys, two relationships on the column, or
+  a key over the cap. A key the contract's statistics read is not followed. A key that is neither
+  text nor a whole number (a float, a decimal with a scale, a date) is still named as not
+  followed, now with the reason "its key is not text or a whole number". Cells of the key's
+  `initial` and `transitions` are checked exactly as for a text key. A private release and a
+  profile request write no `references` and follow nothing, as before.
+- **A foreign key a history follows withholds the children per parent of its relationship,
+  decided by the contract and not by any count.** Each published cell of the key's `initial` and
+  `transitions` is a floor on the children of one parent, so beside the relationship's children
+  per parent it could give a withheld bin back. Before, a guard withheld the key's whole history
+  where its counts would pin a bin, and the guard's own decision depended on the counts: it
+  published next to nothing on realistic tables, and whether it withheld said where the hidden
+  mass was.
+  Now a key a history follows (a column that a counted relationship keys, into a table the profile
+  publishes whole) writes every statistic of that relationship withheld whole, with a note
+  that holds no count, and the key's `initial` and `transitions` go through the ordinary output
+  check with nothing extra withheld. The keys a history follows are the plan's alone (the
+  contract, and the public keys of the tables released whole): a column a record then proves is no
+  key of its table is still one of them, so its relationship stays withheld, its column is
+  written as the category it would be followed as, and only its history is left out; the most
+  columns a history follows count the candidates, not the ones that read. A table of fewer than
+  three keys is not followed, since with two the published totals pin the cells. An exhaustive
+  audit over small universes, with every world profiled and grouped by the document it publishes,
+  finds no named count pinned that the same profile with no followed key does not pin. Nothing
+  changes for a profile that follows no key.
 
 ## [0.42.0] — 2026-11-27
 

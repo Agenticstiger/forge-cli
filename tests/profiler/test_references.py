@@ -17,7 +17,7 @@ from typing import Any, Dict, Tuple
 
 import pytest
 
-from fluid_build.profiler import references
+from fluid_build.profiler import references, runner
 from fluid_build.profiler._stats import Request, RequestColumn, RequestTable, load_backend
 from fluid_build.profiler.runner import ExposeSource, profile_exposes
 from tests.profiler import _library as library
@@ -375,7 +375,10 @@ def test_a_table_marked_public_and_left_out_is_named_with_why_and_a_published_on
     published = _run(_folder(tmp_path, "a"), library.contract())
     assert "branch" in published.document["references"]
     assert not any("reference table" in what for what, _ in published.not_measured)
-    assert not any("published whole" in why for _, why in published.not_measured)
+    assert not any(
+        "published whole" in why and runner._FOLLOWED_KEY not in why
+        for _, why in published.not_measured
+    )
     unreached = _run(_folder(tmp_path, "b"), library.contract(related=False))
     assert "no relationship" in _notes(unreached)["reference table branch"]
     labelled = library.contract(

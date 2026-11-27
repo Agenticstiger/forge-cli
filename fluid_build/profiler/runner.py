@@ -1161,11 +1161,12 @@ def profile_exposes(
     counted_keys = frozenset((each.child, tuple(each.child_columns)) for each in relationships)
     released = references.NONE
     stage: Optional[history.HistoryStage] = None
-    prepared: Dict[str, Any] = {}
+    followed: FrozenSet[Tuple[str, str]] = frozenset()
     followed_as_text: Dict[str, FrozenSet[str]] = {}
     if request is None:  # a bundle's table has its own history, and a request asks for one
-        # Read before a table is measured: a foreign key a history follows by the keys of a table
-        # released whole is written as the category it is followed as (history.read_as_text).
+        # Decided before a table is measured, by the plan alone: a foreign key a history follows by
+        # the keys of a table released whole is written as the category it is followed as, and the
+        # relationship that keys it publishes no children per parent (history.followed_columns).
         released = references.form_references(
             references.Stage(raw_exposes, plans, reads, relationships, backend, blocks)
         )
@@ -1173,9 +1174,8 @@ def profile_exposes(
             raw_exposes, plans, reads, declared, blocks, tables_doc, backend, rule,
             tallies, fractional_bits, timings, counted_keys, released,
         )  # fmt: skip
-        if released.wholes:  # no whole-number key: nothing to read early, and nothing held
-            prepared = history.prepare_histories(stage)
-            followed_as_text = history.read_as_text(prepared)
+        followed = history.followed_columns(stage)
+        followed_as_text = history.read_as_text(plans, followed)
     for plan, read, found, missing in zip(plans, reads, declared, uncovered, strict=True):
         with _timed(timings, "measure", plan.expose_id):
             table_doc, result = _profile_table(
@@ -1222,6 +1222,7 @@ def profile_exposes(
             fractional_bits,
             answered.relationship_groupings.get(position, ()),
             timings,
+            followed,
         )
         for position, each in enumerate(relationships)
         if each.counted
@@ -1238,35 +1239,23 @@ def profile_exposes(
                     blocks, tables_doc, backend, rule, tallies, fractional_bits, timings,
                     counted_keys,
                     references.NONE,
-                    {
-                        (relationships[at].child, tuple(relationships[at].child_columns)): done.shown
-                        for at, (_, done) in counted_entries.items()
-                    },
                     planned.history_asks,
                 )  # fmt: skip
             )
         )
     if stage is not None:
-        date_notes.extend(
-            history.form_histories(
-                replace(
-                    stage,
-                    children_shown={
-                        (
-                            relationships[at].child,
-                            tuple(relationships[at].child_columns),
-                        ): done.shown
-                        for at, (_, done) in counted_entries.items()
-                    },
-                ),
-                prepared or None,
-            )
-        )
+        date_notes.extend(history.form_histories(stage))
         date_notes.extend(released.notes)
+        date_notes.extend(
+            (f"children per parent of {each.child}({', '.join(each.child_columns)}) to {each.parent}",
+             _FOLLOWED_KEY)
+            for each in relationships
+            if each.counted and follows_key(each, followed)
+        )  # fmt: skip
     counted = list(counted_entries.values())
     calendars.withhold_beside_relationships(tables_doc, [entry for entry, _ in counted], tallies)
     relationship_docs, relationship_notes = _relationship_dates(
-        dated, relationships, counted_entries, request
+        dated, relationships, counted_entries, request, followed
     )
     date_notes.extend(relationship_notes)
     unanswered: Tuple[Tuple[str, str], ...] = ()
@@ -1629,6 +1618,7 @@ def _relationship_dates(
     relationships: Sequence[Relationship],
     counted_entries: Mapping[int, Tuple[Dict[str, Any], "RelationshipResult"]],
     request: Optional[Request],
+    followed: FrozenSet[Tuple[str, str]] = frozenset(),
 ) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
     """The ``relationships[]`` entries, each with its dates, structural classes and exposure.
 
@@ -1656,7 +1646,13 @@ def _relationship_dates(
             extras, extra_notes = dates.relationship_extras(
                 stage,
                 rel,
-                dates.RelationshipAsks(asked_dates, asked_exposure, counted=entry is not None),
+                dates.RelationshipAsks(
+                    asked_dates,
+                    asked_exposure,
+                    # a relationship withheld whole for the key a history follows says no more of
+                    # its parents' children (a structural class does) than its histogram does
+                    counted=entry is not None and not follows_key(rel, followed),
+                ),
             )
         notes.extend(extra_notes)
         if entry is None and extras:
@@ -2448,12 +2444,14 @@ def _children_per_parent(
     fractional_bits: int,
     groupings: Sequence[Tuple[str, Grouping]] = (),
     timings: Optional[StageTimings] = None,
+    followed: FrozenSet[Tuple[str, str]] = frozenset(),
 ) -> Tuple[Dict[str, Any], RelationshipResult]:
     """The ``relationships[]`` entry of one relationship, its time counted for its child."""
     with _timed(timings, "measure", relationship.child):
         return _children_counted(
-            relationship, tables, backend, rule, tallies, fractional_bits, groupings, timings
-        )
+            relationship, tables, backend, rule, tallies, fractional_bits, groupings, timings,
+            followed,
+        )  # fmt: skip
 
 
 def _children_counted(
@@ -2465,6 +2463,7 @@ def _children_counted(
     fractional_bits: int,
     groupings: Sequence[Tuple[str, Grouping]],
     timings: Optional[StageTimings],
+    followed: FrozenSet[Tuple[str, str]] = frozenset(),
 ) -> Tuple[Dict[str, Any], RelationshipResult]:
     """The ``relationships[]`` entry of one relationship: a histogram with the parent as unit.
 
@@ -2480,7 +2479,15 @@ def _children_counted(
     value, and a parent whose value is null in none. Every statistic of the relationship goes
     through the one call, so the output check sees the partition the groups share, and the
     audit of withheld cells runs group by group, on the parents and children of each.
+
+    A relationship whose key a history follows (*followed*, which the plan decides: see
+    :func:`fluid_build.profiler.history.followed_columns`) is written withheld whole before any
+    count is read: the cells of that history are floors on the children of each parent, which the
+    cells of this histogram would give back, so none of its statistics is published, whatever the
+    counts.
     """
+    if follows_key(relationship, followed):
+        return _children_withheld(relationship, groupings, rule, tallies)
     parents, counts = _parent_counts(relationship, tables, backend)
     if relationship.entity:
         # A grouping by a parent column is placed by the entity's versions: a group when they
@@ -2572,6 +2579,58 @@ def _children_counted(
     }
     return document_entry, RelationshipResult(
         relationship, published=published, cells=len(CHILDREN_EDGES) - 1, shown=shown
+    )
+
+
+def follows_key(relationship: Relationship, followed: FrozenSet[Tuple[str, str]]) -> bool:
+    """Whether the one column that keys *relationship* is a foreign key a history follows."""
+    return len(relationship.child_columns) == 1 and (
+        (relationship.child, relationship.child_columns[0]) in followed
+    )
+
+
+#: Why a relationship whose key a history follows publishes no children per parent.
+_FOLLOWED_KEY = (
+    "a history follows its key, and the cells of that history would give a bin of it back"
+)
+
+
+def _children_withheld(
+    relationship: Relationship,
+    groupings: Sequence[Tuple[str, Grouping]],
+    rule: disclosure.DisclosureRule,
+    tallies: Tuple["Counter[str]", "Counter[str]"],
+) -> Tuple[Dict[str, Any], RelationshipResult]:
+    """The ``relationships[]`` entry of a relationship written withheld whole: no count is read.
+
+    Each statistic (the histogram, and each grouping asked of it) holds its groups, one for each
+    group key, as ``D`` with the open band, the way a member of a history is withheld whole.
+    """
+    shape = {"bins": [str(edge) for edge in CHILDREN_EDGES]}
+    entries: List[Dict[str, Any]] = []
+    for document, keys in (
+        ({}, ("",)),
+        *((grouping.document, grouping.keys) for _, grouping in groupings),
+    ):
+        entries.append(
+            {
+                "definition": "marginalHistogram/1",
+                "sampleSize": {"min": 0},
+                "disclosure": rule.name,
+                **shape,
+                **document,
+                "groups": [{"group": key, "status": disclosure.WITHHELD} for key in keys],
+            }
+        )
+        tallies[0][disclosure.SECONDARY] += len(keys)
+    document_entry = {
+        "parent": {"table": relationship.parent, "columns": list(relationship.parent_columns)},
+        "child": {"table": relationship.child, "columns": list(relationship.child_columns)},
+        "statistics": entries,
+    }
+    cells = len(CHILDREN_EDGES) - 1
+    return document_entry, RelationshipResult(
+        relationship, published=0, cells=cells, shown=(False,) * cells
     )
 
 
