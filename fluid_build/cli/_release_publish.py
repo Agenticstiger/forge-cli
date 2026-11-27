@@ -24,7 +24,8 @@ its key (HTTP 409) is tried again, as S3 allows.
 The rule is rclone's ``--immutable`` (a changed file is refused, an identical one is not),
 compared by SHA-256; the checksum and the conditional write are the S3 API's own
 (docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html). ``If-None-Match`` on
-PutObject needs botocore 1.35.2, the ``[aws]`` extra's floor.
+PutObject came with botocore 1.35.2; the ``[aws]`` extra's floor (``pyproject.toml``) is
+higher, since ``fluid runs deploy`` copies on condition with ``CopyObject``.
 
 boto3 is imported only when a release is published; module scope is standard library
 (``fluid ship`` imports this on ``--help``).
@@ -563,9 +564,64 @@ class _Upload:
         if self.index_there or self._head(f"{self.prefix}release.json", denied_is_missing=True):
             # published before this run, or by another run while this one wrote
             return "a published release never changes"
-        # An earlier run stopped before its release.json.
+        # An earlier run stopped before its release.json. Blobs first and the manifest last is the
+        # OCI distribution-spec's order too, and there a retried push is idempotent because blobs
+        # are content-addressed. Here reports/ holds run-specific bytes under fixed keys, so a
+        # re-seal cannot repeat the upload: the objects must go first (or the commit change).
         return (
             f"{self.uri} holds no release.json, so no reader takes it as a release: an earlier "
-            "run stopped partway. Delete the objects under it and run again, or publish the "
-            "directory that run sealed"
+            f"run stopped partway. {self._recovery()}"
         )
+
+    def _locked_bucket(self) -> Optional[bool]:
+        """Whether the bucket has Object Lock; None when it cannot be read (denied or failed)."""
+        from fluid_build.util import s3
+
+        if self.lock:  # read already, with ``--release-to-require object-lock``
+            return True
+        try:
+            config = self.client.get_object_lock_configuration(Bucket=self.bucket)
+        except Exception as exc:  # noqa: BLE001 - botocore's errors, sorted by their code
+            if s3.error_code(exc) == "ObjectLockConfigurationNotFoundError":
+                return False
+            return None
+        inner = config.get("ObjectLockConfiguration") or {}
+        return bool(inner.get("ObjectLockEnabled") == "Enabled")
+
+    def _keys_there(self) -> Optional[List[str]]:
+        """The keys under the release prefix, or None when they cannot be listed."""
+        keys: List[str] = []
+        token = ""
+        try:
+            while True:
+                extra = {"ContinuationToken": token} if token else {}
+                page = self.client.list_objects_v2(Bucket=self.bucket, Prefix=self.prefix, **extra)
+                keys += [str(item["Key"]) for item in page.get("Contents") or []]
+                token = str(page.get("NextContinuationToken") or "")
+                if not (page.get("IsTruncated") and token):
+                    return keys
+        except Exception:  # noqa: BLE001 - no s3:ListBucket, or a failed read: name the prefix
+            return None
+
+    def _recovery(self) -> str:
+        """The way out of a partial publish whose reports differ from this run's: the objects to
+        remove, by whether the bucket has Object Lock (both ways when that cannot be read)."""
+        keys = self._keys_there()
+        if keys:
+            shown = ", ".join(f"s3://{self.bucket}/{k}" for k in keys[:10])
+            more = f" and {len(keys) - 10} more" if len(keys) > 10 else ""
+            what = f"the objects under {self.uri} ({shown}{more})"
+        else:
+            what = f"every object under {self.uri}"
+        plain = f"Delete {what}, then run the same ship again."
+        locked = (
+            "With Object Lock the versions stay until their retention ends, and in GOVERNANCE "
+            "mode only s3:BypassGovernanceRetention deletes them early; seal from a new commit, "
+            "which gives a new code digest and so a new prefix."
+        )
+        state = self._locked_bucket()
+        if state is True:
+            return locked
+        if state is False:
+            return plain
+        return f"Without Object Lock: {plain[0].lower()}{plain[1:]} {locked}"
