@@ -434,12 +434,9 @@ def _signer_flag(
         if not value.strip():
             break
         return form + value
-    names = pin_flags or VERIFY_SIGNATURE_PIN_FLAGS
-    exact_flag = names.get(flag, (f"--{flag}", f"--{flag}-regexp"))[0]
-    ident = names.get("certificate-identity", ("--certificate-identity", "--identity-regexp"))
-    issuer = names.get(
-        "certificate-oidc-issuer", ("--certificate-oidc-issuer", "--oidc-issuer-regexp")
-    )
+    names = {**VERIFY_SIGNATURE_PIN_FLAGS, **(pin_flags or {})}
+    exact_flag = names[flag][0]
+    ident, issuer = names["certificate-identity"], names["certificate-oidc-issuer"]
     raise CLIError(
         2,
         "signing_identity_not_pinned",
