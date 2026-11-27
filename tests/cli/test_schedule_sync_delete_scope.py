@@ -38,8 +38,8 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "bundle": None,
         "verify_signature": False,
         "verify_key": None,
-        "verify_identity_regexp": ".*",
-        "verify_oidc_issuer_regexp": ".*",
+        "verify_identity_regexp": None,
+        "verify_oidc_issuer_regexp": None,
         "git_commit_author": None,
         "delete_scope": "product",
     }

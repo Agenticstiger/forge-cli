@@ -314,7 +314,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "``--verify-signature``. Matches bundles signed with "
             "``bundle --sign --sign-key``. Selects keyed verification "
             "over the default keyless Fulcio-cert verification. "
-            "Ignored when --verify-signature is not set."
+            "Needs --verify-signature: given without it, schedule-sync exits 2."
         ),
     )
     p.add_argument(
@@ -1637,6 +1637,53 @@ _DISPATCHERS = {
 # -----------------------------------------------------------------------------
 
 
+_VERIFY_FLAG_DESTS = (
+    "verify_key",
+    "verify_certificate_identity",
+    "verify_certificate_oidc_issuer",
+    "verify_identity_regexp",
+    "verify_oidc_issuer_regexp",
+)
+
+# The flags a keyless signer is named with here, for the not-pinned error.
+_VERIFY_PIN_FLAGS = {
+    "certificate-identity": ("--verify-certificate-identity", "--verify-identity-regexp"),
+    "certificate-oidc-issuer": (
+        "--verify-certificate-oidc-issuer",
+        "--verify-oidc-issuer-regexp",
+    ),
+}
+
+
+def _require_gate_for_verify_flags(args: argparse.Namespace) -> None:
+    """Exit 2 when a ``--verify-*`` flag is given without ``--verify-signature``.
+
+    Without the gate those flags would be ignored and unsigned DAGs pushed as if checked.
+    A flag is given when its value is not None: an empty string counts. Prior art: the
+    ``--require-signed`` rule in ``cli/ops/_cli.py::_signer`` (a dependent flag without its
+    enabler is a usage error), the shape of cloup's ``If(IsSet(...), then=require_all)``.
+    """
+    if getattr(args, "verify_signature", False):
+        return
+    given = [
+        "--" + dest.replace("_", "-")
+        for dest in _VERIFY_FLAG_DESTS
+        if getattr(args, dest, None) is not None
+    ]
+    if given:
+        raise CLIError(
+            2,
+            "schedule_sync_verify_flags_need_gate",
+            {
+                "flags": given,
+                "hint": (
+                    f"{', '.join(given)} only apply with --verify-signature; without it the "
+                    "bundle is not checked. Add --verify-signature, or drop the flags"
+                ),
+            },
+        )
+
+
 @traced_stage("schedule-sync")
 def run(args, _logger: Optional[logging.Logger] = None) -> int:
     """Entry point wired to ``func=run`` in :func:`register`.
@@ -1660,6 +1707,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
     # Flags of the Airflow check first: a bad combination is exit 2 before anything runs.
     airflow_check = _airflow_check(args, dags_dir)
     check_only = bool(getattr(args, "check_only", False))
+    _require_gate_for_verify_flags(args)
 
     # ── Supply-chain gate: verify bundle signature BEFORE dispatching ──
     # Opt-in via --verify-signature. When set, the bundle signature is
@@ -1705,6 +1753,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
             certificate_oidc_issuer=getattr(args, "verify_certificate_oidc_issuer", None),
             identity_regexp=getattr(args, "verify_identity_regexp", None),
             oidc_issuer_regexp=getattr(args, "verify_oidc_issuer_regexp", None),
+            pin_flags=_VERIFY_PIN_FLAGS,
             timeout=args.timeout,
         )
         if verify_result["exit_code"] != 0:
