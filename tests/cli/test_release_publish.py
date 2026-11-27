@@ -155,9 +155,87 @@ def test_an_object_with_other_bytes_is_refused(tmp_path: Path) -> None:
     message = str(raised.value)
     assert "reports/ship-report.json already holds other bytes" in message
     assert "holds no release.json, so no reader takes it as a release" in message
-    assert "Delete the objects under it and run again" in message
+    assert "run stopped partway. Delete the objects under s3://acme-releases/" in message
+    assert "then run the same ship again" in message
+    assert "Object Lock" not in message  # the bucket has none: the one remedy that works
     assert "2 object(s) were written" in message and "release.json is written last" in message
     assert not any(k.endswith("release.json") for k in s3.writes)
+
+
+def _stopped_halfway(tmp_path: Path, s3: FakeS3) -> Any:
+    """A publish that stopped before release.json, then a re-seal with other reports."""
+    index = sealed(tmp_path / "first")
+    s3.deny_put.add(f"{_prefix(index)}release.json")
+    with pytest.raises(publish.PublishError):
+        publish.publish_release(tmp_path / "first", TARGET, clients=s3)
+    s3.deny_put.clear()
+    assert not any(k.endswith("release.json") for _, k in s3.objects)
+    sealed(tmp_path / "second", {"reports/ship-report.json": b'{"run": 2}'}, run_id="run-2")
+    return index
+
+
+def test_a_partial_publish_is_recovered_by_deleting_the_prefix_and_shipping_again(
+    tmp_path: Path,
+) -> None:
+    s3 = FakeS3()
+    index = _stopped_halfway(tmp_path, s3)
+    prefix = _prefix(index)
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "second", TARGET, clients=s3)
+    message = str(raised.value)
+    for key in ("artifacts/MANIFEST.json", "bundle.tgz", "reports/ship-report.json"):
+        assert f"s3://acme-releases/{prefix}{key}" in message  # each object to remove, named
+    for bucket, key in [k for k in s3.objects if k[1].startswith(prefix)]:
+        s3.delete_object(Bucket=bucket, Key=key)
+    done = publish.publish_release(tmp_path / "second", TARGET, clients=s3)
+    assert (done.written, done.already) == (4, 0)
+    assert api_release.verify_release(done.uri, clients=s3).intact
+
+
+def test_a_partial_publish_on_a_versioned_bucket_is_recovered_past_delete_markers(
+    tmp_path: Path,
+) -> None:
+    # S3 (conditional-writes docs): "For buckets with versioning enabled, if there's no current
+    # object version with the same name, or if the current object version is a delete marker,
+    # the write operation succeeds." So after the delete, If-None-Match: * lets the keys through.
+    s3 = FakeS3()
+    s3.versions = True
+    s3.versioning = "Enabled"
+    index = _stopped_halfway(tmp_path, s3)
+    for bucket, key in [k for k in s3.objects if k[1].startswith(_prefix(index))]:
+        s3.delete_object(Bucket=bucket, Key=key)
+    assert s3.deleted  # each key's current version is now a delete marker
+    done = publish.publish_release(tmp_path / "second", TARGET, clients=s3)
+    assert (done.written, done.already) == (4, 0)
+    assert not s3.deleted
+
+
+def test_the_remedy_with_object_lock_is_a_new_commit_not_a_delete(tmp_path: Path) -> None:
+    s3 = FakeS3()
+    s3.object_lock = True
+    _stopped_halfway(tmp_path, s3)
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "second", TARGET, clients=s3)
+    message = str(raised.value)
+    assert "s3:BypassGovernanceRetention" in message and "seal from a new commit" in message
+    assert "new code digest and so a new prefix" in message
+    assert "Delete the objects" not in message
+
+
+def test_the_remedy_gives_both_ways_when_object_lock_cannot_be_read(tmp_path: Path) -> None:
+    s3 = FakeS3()
+    _stopped_halfway(tmp_path, s3)
+
+    def denied(**_: Any) -> Any:
+        raise S3Error("AccessDenied", 403)
+
+    s3.get_object_lock_configuration = denied  # type: ignore[method-assign]
+    s3.list_objects_v2 = denied  # type: ignore[method-assign]
+    with pytest.raises(publish.PublishError) as raised:
+        publish.publish_release(tmp_path / "second", TARGET, clients=s3)
+    message = str(raised.value)
+    assert "Without Object Lock: delete every object under s3://acme-releases/" in message
+    assert "then run the same ship again. With Object Lock the versions stay" in message
 
 
 def test_other_bytes_beside_a_published_index_never_change(tmp_path: Path) -> None:
