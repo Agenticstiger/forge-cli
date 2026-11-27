@@ -934,6 +934,49 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "supply-chain",
     ),
+    "signing_sigstore_bundle_missing": (
+        [
+            (
+                "Sign the bundle first ('fluid bundle <contract> --format tgz --sign'): it writes "
+                "<bundle>.sigstore.json beside it"
+            ),
+            "Or name the Sigstore bundle with --bundle PATH",
+        ],
+        "supply-chain",
+    ),
+    "schedule_sync_verify_flags_need_gate": (
+        [
+            (
+                "Add --verify-signature --bundle <path> to check the bundle before it is pushed, "
+                "or drop the --verify-* flags"
+            ),
+            "Without --verify-signature the --verify-* flags would be ignored and nothing checked",
+        ],
+        "supply-chain",
+    ),
+    "signing_identity_not_pinned": (
+        [
+            (
+                "Keyless verification names its signer: pass the certificate identity and OIDC "
+                "issuer exactly, or regexps for them, with the flags the error names (for "
+                "verify-signature: --certificate-identity / --certificate-oidc-issuer or "
+                "--identity-regexp / --oidc-issuer-regexp; for schedule-sync the same with a "
+                "--verify- prefix)"
+            ),
+            "An empty value (an unset CI variable) pins nothing and is refused",
+        ],
+        "supply-chain",
+    ),
+    "verify_signature_sig_pem_gone": (
+        [
+            (
+                "fluid bundle --sign writes one Sigstore bundle, <bundle>.sigstore.json; name "
+                "another one with --bundle PATH"
+            ),
+            "A bundle with only .sig/.pem files: sign it again with fluid bundle --sign",
+        ],
+        "supply-chain",
+    ),
     "signing_key_ref_empty": (
         [
             "Provide a signing key reference (e.g. a cosign key or KMS key URI)",

@@ -571,7 +571,7 @@ _SOURCE_CONTRACT_SUFFIXES = (".yaml", ".yml", ".json")
 #: (a bundle from an older fluid) has them ignored.
 PROVENANCE_KEYS: Tuple[str, ...] = ("contract", "overlay")
 
-#: Appended to the bundle's file name, like ``.intoto.jsonl`` and ``.sig``. The
+#: Appended to the bundle's file name, like ``.intoto.jsonl`` and ``.sigstore.json``. The
 #: pattern is Helm's ``<chart>.tgz.prov``: a file beside the archive that names
 #: the archive's sha256.
 PROVENANCE_SUFFIX = ".provenance.json"

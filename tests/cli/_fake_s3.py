@@ -84,10 +84,23 @@ class FakeS3:
             raise S3Error("ConditionalRequestConflict", 409)
         if b64(data) != ChecksumSHA256:
             raise S3Error("BadDigest", 400)
+        # A delete marker as the current version counts as no object (S3's conditional-writes
+        # page): the write goes through, and the marker is no longer current.
         if (Bucket, Key) in self.objects:
             raise S3Error("PreconditionFailed", 412)
+        self.deleted.discard(Key)
         self.put(Bucket, Key, data)
         self.writes.append(Key)
+        return {}
+
+    def delete_object(self, *, Bucket: str, Key: str) -> Dict[str, Any]:
+        """Delete the key. On a versioned bucket (``versions``) a delete marker becomes the
+        current version (listed by ``list_object_versions``); otherwise the key is gone."""
+        self.calls.append("delete_object")
+        self.objects.pop((Bucket, Key), None)
+        self.checksums.pop((Bucket, Key), None)
+        if self.versions:
+            self.deleted.add(Key)
         return {}
 
     def put(self, bucket: str, key: str, data: bytes, checksum: Optional[str] = "") -> None:

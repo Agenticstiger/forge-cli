@@ -3,21 +3,20 @@
 
 """``fluid verify-signature`` — cosign keyless verification of a tgz bundle.
 
-Sibling to ``fluid bundle --sign``. Checks that the bundle's .sig + .pem
-files match the tgz content and were signed by an OIDC identity + issuer
-matching optional regexps.
+Sibling to ``fluid bundle --sign``. Checks that the bundle's Sigstore bundle,
+``<bundle>.sigstore.json``, matches the tgz content and was signed by a key, or keyless by an
+OIDC identity and issuer: pinned exactly, or matching regexps.
 
 Usage::
 
-    fluid verify-signature bundle.tgz
+    fluid verify-signature bundle.tgz --key cosign.pub
     fluid verify-signature bundle.tgz \\
-        --identity-regexp 'https://github.com/myorg/.*' \\
-        --oidc-issuer-regexp 'https://token.actions.githubusercontent.com'
+        --certificate-identity 'https://github.com/myorg/orders/.github/workflows/ci.yml@refs/heads/main' \\
+        --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 
-Default regexps are permissive (``.*``) — tighten in production to
-enforce "only bundles signed by our GitHub org are acceptable." A
-failed verification returns exit 1; a missing cosign binary / missing
-.sig / .pem returns exit 2 (config error).
+Keyless verification names its signer, exactly or by regexp: there is no default, and an empty
+value is refused, since anyone can get a Sigstore certificate for their own identity. A failed
+verification returns exit 1; a missing cosign binary, Sigstore bundle or signer returns exit 2.
 """
 
 from __future__ import annotations
@@ -40,18 +39,21 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Verify a Sigstore-cosign-signed tgz bundle",
         description=(
             "Companion to ``fluid bundle --sign``. Verifies the "
-            "``<bundle>.sig`` + ``<bundle>.pem`` match the bundle bytes "
-            "and the signing OIDC identity / issuer matches the supplied "
-            "regexps. Exit 0 = valid; exit 1 = invalid signature or "
+            "Sigstore bundle ``<bundle>.sigstore.json`` matches the bundle "
+            "bytes and was signed by --key, or keyless by the OIDC identity "
+            "and issuer given (exactly, or by regexp). Sign and verify with "
+            "the same cosign major version. Exit 0 = valid; exit 1 = invalid signature or "
             "identity mismatch; exit 2 = config error (bundle not found, "
             "cosign not on PATH, etc.)."
         ),
         epilog=(
             "Examples:\n"
-            "  fluid verify-signature /tmp/bundle.tgz\n"
+            "  fluid verify-signature /tmp/bundle.tgz --key cosign.pub\n"
             "  fluid verify-signature /tmp/bundle.tgz \\\n"
-            "      --identity-regexp 'https://github.com/myorg/.*'\n"
+            "      --certificate-identity 'https://github.com/myorg/orders/.github/workflows/ci.yml@refs/heads/main' \\\n"
+            "      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'\n"
             "  fluid verify-signature /tmp/bundle.tgz \\\n"
+            "      --identity-regexp 'https://github.com/myorg/.*' \\\n"
             "      --oidc-issuer-regexp 'https://token.actions.githubusercontent.com'\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -61,14 +63,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Path to the tgz bundle to verify.",
     )
     p.add_argument(
-        "--signature",
+        "--bundle",
+        dest="sigstore_bundle",
         default=None,
-        help="Path to the .sig file. Default: <bundle>.sig.",
-    )
-    p.add_argument(
-        "--certificate",
-        default=None,
-        help="Path to the .pem file (keyless mode). Default: <bundle>.pem.",
+        metavar="PATH",
+        help="The Sigstore bundle fluid bundle --sign wrote. Default: <bundle>.sigstore.json.",
     )
     p.add_argument(
         "--key",
@@ -82,23 +81,36 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p.add_argument(
+        "--certificate-identity",
+        default=None,
+        metavar="ID",
+        help="Keyless: the signer's exact certificate identity (with --certificate-oidc-issuer).",
+    )
+    p.add_argument(
+        "--certificate-oidc-issuer",
+        default=None,
+        metavar="URL",
+        help="Keyless: the signer's exact OIDC issuer (with --certificate-identity).",
+    )
+    p.add_argument(
         "--identity-regexp",
-        default=".*",
+        default=None,
         help=(
-            "Regexp matching the acceptable OIDC subject (keyless mode). "
-            "Default '.*' accepts any — tighten in production to pin "
-            "signer identity. Ignored in keyed mode."
+            "Keyless: a regexp the signer's certificate identity must match, "
+            "instead of --certificate-identity. Ignored in keyed mode."
         ),
     )
     p.add_argument(
         "--oidc-issuer-regexp",
-        default=".*",
+        default=None,
         help=(
-            "Regexp matching the acceptable OIDC issuer. Default '.*' "
-            "accepts any — set to 'https://token.actions.githubusercontent.com' "
-            "to pin to GitHub Actions signers only."
+            "Keyless: a regexp the signer's OIDC issuer must match, instead "
+            "of --certificate-oidc-issuer."
         ),
     )
+    for gone in ("--signature", "--certificate"):
+        # gone with the .sig/.pem files: named so the refusal says where to go
+        p.add_argument(gone, dest=f"gone_{gone[2:]}", default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--timeout",
         type=int,
@@ -129,11 +141,36 @@ def run(args: argparse.Namespace, _logger: Optional[logging.Logger] = None) -> i
         f"[verify-signature] checking {args.bundle} (mode: {mode})",
         markup=False,
     )
+    for gone in ("signature", "certificate"):
+        if getattr(args, f"gone_{gone}", None) is not None:
+            raise CLIError(
+                2,
+                "verify_signature_sig_pem_gone",
+                {
+                    "flag": f"--{gone}",
+                    "hint": (
+                        "fluid bundle --sign writes one Sigstore bundle, <bundle>.sigstore.json, "
+                        "and .sig/.pem files are no longer read: name another one with --bundle "
+                        "PATH, and sign the bundle again if it has only .sig/.pem"
+                    ),
+                },
+            )
+    exact = (
+        getattr(args, "certificate_identity", None),
+        getattr(args, "certificate_oidc_issuer", None),
+    )
+    if any(v is not None for v in exact) and key_ref:
+        raise CLIError(
+            2,
+            "signing_identity_not_pinned",
+            {"hint": "--key verifies keyed signatures; the certificate flags are keyless"},
+        )
     result = verify_bundle(
         args.bundle,
-        sig_path=args.signature,
-        pem_path=args.certificate,
+        sigstore_bundle=getattr(args, "sigstore_bundle", None),
         key_ref=key_ref,
+        certificate_identity=exact[0],
+        certificate_oidc_issuer=exact[1],
         identity_regexp=args.identity_regexp,
         oidc_issuer_regexp=args.oidc_issuer_regexp,
         timeout=args.timeout,
@@ -146,10 +183,11 @@ def run(args: argparse.Namespace, _logger: Optional[logging.Logger] = None) -> i
         )
         return 0
 
-    stderr_tail = result.get("stderr_tail", "")
+    from fluid_build.cli._signing import stderr_last_line
+
     cprint(
         f"[verify-signature] \u2718 verification failed "
-        f"(exit {result['exit_code']}): {stderr_tail[:500]}",
+        f"(exit {result['exit_code']}): {stderr_last_line(result)}",
         markup=False,
     )
     # cosign exit 1 = verification failure; anything else we also

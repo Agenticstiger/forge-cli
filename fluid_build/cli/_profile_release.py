@@ -24,7 +24,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 __all__ = ["HELP", "add_flags", "run", "wanted"]
 
@@ -142,7 +142,8 @@ relationship out of a table with a validity window by its natural entity repeats
 design. Where the release publishes children per entity of such a table, or a statistic grouped
 through a link into it, an entity's versions must follow one parent row, and a release whose
 records break that is refused as profile_release_entity_units. Every table the release reads
-needs a --source <exposeId>=<location>.
+needs a --source <exposeId>=<location>. A --source for another expose of the contract is not
+read: the report names it and says why, and --strict refuses it instead.
 
 For which unit: one entity is one row of the unit's expose; with a release table related to
 it, or with a unit key, an entity owns every row that belongs to it, and the stated loss holds
@@ -712,12 +713,18 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         if getattr(args, "strict", False):
             _refuse_unformed_asks(plan)
             _refuse_left_out_before_reading(plan, follows)
-        _only_the_read_tables(args.source, contract, read_tables)
-        exposes = profile_cmd._expose_sources(contract, read_tables, args.source, args.table)
-        out = profile_cmd._out_path(args.out, named, [each.source for each in exposes])
-        record_path = _check_record_path(
-            args.release_record, out, [each.source for each in exposes], new=not rederive
+        aside = _set_aside_unread_sources(
+            args.source,
+            args.table,
+            contract,
+            read_tables,
+            strict=bool(getattr(args, "strict", False)),
+            follows=bool(follows),
         )
+        exposes = profile_cmd._expose_sources(contract, read_tables, aside.sources, aside.tables)
+        kept_away = [each.source for each in exposes] + aside.locations
+        out = profile_cmd._out_path(args.out, named, kept_away)
+        record_path = _check_record_path(args.release_record, out, kept_away, new=not rederive)
         notice = release.rho_warning(rho)
         if notice is not None:
             console_warning(notice)
@@ -822,6 +829,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         None if rederive else record_path,
         request=(Path(str(args.request)).name, digest_matched),
         rederived=rederive,
+        unread=aside.notes,
     )
     return 0
 
@@ -864,19 +872,54 @@ def _refuse_left_out_before_reading(plan: Any, follows: Any) -> None:
         )
 
 
-def _only_the_read_tables(given: Sequence[str], contract: Any, tables: Sequence[str]) -> None:
-    """Refuse a ``--source`` for a table the release does not read.
+class _SetAside(NamedTuple):
+    """``--source`` and ``--table`` split into what the release reads and what it leaves alone."""
+
+    sources: List[str]
+    tables: List[str]
+    #: Each source the release leaves alone: ``(exposeId, reason)``, once.
+    notes: List[Tuple[str, str]]
+    #: Where those sources are, so that no output is written over one.
+    locations: List[str]
+
+
+def _set_aside_unread_sources(
+    given: Sequence[str],
+    given_tables: Optional[Sequence[str]],
+    contract: Any,
+    tables: Sequence[str],
+    *,
+    strict: bool,
+    follows: bool,
+) -> _SetAside:
+    """Split ``--source`` into what the release reads and the sources it chooses not to read.
 
     A release of one table reads that table only; one whose unit follows its child rows reads the
-    tables it reaches and the others its statistics group by.
+    tables it reaches and the others its statistics group by. A ``--source`` paired with an
+    expose of the contract that the release does not read is set aside, with the ``--table``
+    that goes with it, and named in the report with its reason; no record of it is read.
+    ``--strict`` refuses it instead, before any record is read. A set-aside ``--source`` is
+    refused when it is given twice, has no location, or names a file that does not exist; one
+    that names no expose is left to the pairing that follows, which refuses it.
     """
-    from fluid_build.profiler import runner
+    from fluid_build.profiler import runner, sources
     from fluid_build.profiler.sources import describe_source
 
     ids = runner.expose_ids(contract)
+    why = (
+        "no statistic of this release is formed from its rows"
+        if follows
+        else f"a private release of one table reads the release table exposes[{tables[0]}] only"
+    )
+    kept: List[str] = []
+    unread: Dict[str, str] = {}
+    locations: List[str] = []
     for value in given:
-        head, sep, _ = value.partition("=")
-        if sep and head in ids and head not in tables:
+        head, sep, location = value.partition("=")
+        if not (sep and head in ids and head not in tables):
+            kept.append(value)
+            continue
+        if strict:
             raise runner.ProfileError(
                 "profile_release_source_unused",
                 (
@@ -891,6 +934,30 @@ def _only_the_read_tables(given: Sequence[str], contract: Any, tables: Sequence[
                     "next": f"leave out --source {describe_source(value).partition('=')[0]}=...",
                 },
             )
+        if head in unread:
+            raise runner.ProfileError(
+                "profile_source_repeated",
+                f"exposes[{head}] is given more than one --source",
+                {"read": "nothing: no record was read", "next": "give each expose one source"},
+            )
+        if not location:
+            raise runner.ProfileError(
+                "profile_source_empty",
+                f"--source {head}= names no location",
+                {
+                    "read": "nothing: no record was read",
+                    "next": f"write --source {head}=<location>, or leave it out",
+                },
+            )
+        sources.check_not_missing(location)  # the file system is asked; nothing is opened
+        unread[head] = why
+        locations.append(location)
+    kept_tables = [
+        value
+        for value in given_tables or ()
+        if value.partition("=")[0] not in unread or "=" not in value
+    ]
+    return _SetAside(kept, kept_tables, list(unread.items()), locations)
 
 
 def _words(plan: Any) -> List[str]:
@@ -945,6 +1012,7 @@ def _report(
     *,
     request: Tuple[str, Optional[bool]],
     rederived: bool,
+    unread: Sequence[Tuple[str, str]] = (),
 ) -> None:
     """Tell the owner what was released, under which loss, and what was left out.
 
@@ -967,6 +1035,7 @@ def _report(
         "loss holds for a row of it and, as above, for an entity.",
         soft_wrap=True,
     )
+    _profile_follow.say_unread_sources(say, unread)
     total = release.decimal_text(plan.rho)
     ranked = len(drawn.rank_tables)
     measured = f"{len(drawn.count_tables)} tables"

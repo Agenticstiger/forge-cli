@@ -217,10 +217,11 @@ snowflake = [
 # provider; this extra is the explicit install target so `.[aws]` actually
 # pulls the SDK — the integration workflows install `.[dev,aws]`.
 aws = [
-  # 1.35.2: PutObject takes IfNoneMatch (`fluid ship --release-to` writes once).
-  "boto3>=1.35.2",
+  # 1.40.61: CopyObject takes IfMatch and IfNoneMatch on the destination (`fluid runs
+  # deploy` copies on condition); PutObject has taken IfNoneMatch since 1.35.2.
+  "boto3>=1.40.61",
   # Imported directly (ClientError, the bundled endpoint data); boto3 pulls it.
-  "botocore>=1.35.2",
+  "botocore>=1.40.61",
 ]
 
 # Visualizations (plan graph, HTML)
@@ -606,7 +607,7 @@ test-emulators-heavy = [
   "google-cloud-bigquery>=3.20",
   "google-cloud-storage>=2.16",
   "google-cloud-pubsub>=2.38",
-  "boto3>=1.35.2",
+  "boto3>=1.40.61",
 ]
 
 # One-shot install for contributors
@@ -1092,6 +1093,8 @@ module = [
     "fluid_build.util.receipt_record",
     "fluid_build.cli._release_receipt",
     "fluid_build.api.verify_report",
+    "fluid_build.cli._deploy_targets",
+    "fluid_build.cli._release_deploy",
 ]
 strict = true
 

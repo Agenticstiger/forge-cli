@@ -20,7 +20,8 @@ from fluid_build.cli import _release_publish as publish
 from fluid_build.cli import _release_receipt as receipts
 from fluid_build.cli.ops import _cli as ops_cli
 from fluid_build.util import receipt_record as rr
-from tests.cli._fake_s3 import FakeS3, hex_of, sealed
+from tests.cli._fake_s3 import FakeS3, hex_of
+from tests.cli._release_fixtures import BUNDLE_DIGEST, release_block, sealed
 
 pytestmark = pytest.mark.unit
 
@@ -40,7 +41,7 @@ def _report(
     path: Path, release: Any, summary: Dict[str, int] = PASSING, *, clients: Any = None
 ) -> Path:
     """A ``fluid verify --release <release> --out <path>`` report."""
-    block = receipts.report_release_block(str(release), "acme.orders", clients=clients)
+    block = release_block(str(release), "acme.orders", clients=clients)
     path.write_text(json.dumps({"summary": summary, "release": block}), encoding="utf-8")
     return path
 
@@ -559,12 +560,14 @@ def test_runs_status_lists_the_newest_receipt_of_each_environment(
 # ---------------------------------------------------------------------------
 
 
-def test_verify_release_names_the_release_in_the_report(tmp_path: Path, s3: FakeS3) -> None:
+def test_verify_release_names_the_release_in_the_report(
+    tmp_path: Path, s3: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from fluid_build.cli import verify
     from fluid_build.cli._common import CLIError
 
     uris = _published(tmp_path, s3, "nonprod")
-    block = receipts.report_release_block(uris["nonprod"], "acme.orders", clients=s3)
+    block = release_block(uris["nonprod"], "acme.orders", clients=s3)
     index = json.loads((tmp_path / "nonprod" / "release.json").read_text(encoding="utf-8"))
     assert block == {
         "source": uris["nonprod"],
@@ -572,16 +575,25 @@ def test_verify_release_names_the_release_in_the_report(tmp_path: Path, s3: Fake
         "environment": "nonprod",
         "identity_digest": index["identity_digest"],
         "code_digest": index["code_digest"],
+        "contract_digest": BUNDLE_DIGEST,
     }
     with pytest.raises(
         receipts.ReceiptError, match="is a release of acme.orders, and the contract is other"
     ):
-        receipts.report_release_block(uris["nonprod"], "other", clients=s3)
-    args = argparse.Namespace(release=str(tmp_path / "nonprod"), out=None)
+        release_block(uris["nonprod"], "other", clients=s3)
+    monkeypatch.setattr(verify, "_contract_bundle_digest", lambda path, env: BUNDLE_DIGEST)
+    args = argparse.Namespace(
+        release=str(tmp_path / "nonprod"), out=None, contract="c.yaml", env="nonprod"
+    )
     with pytest.raises(CLIError) as raised:
         verify._release_block(args, "acme.orders")
     assert raised.value.exit_code == 2
-    args = argparse.Namespace(release=str(tmp_path / "nonprod"), out=str(tmp_path / "r.json"))
+    args = argparse.Namespace(
+        release=str(tmp_path / "nonprod"),
+        out=str(tmp_path / "r.json"),
+        contract="c.yaml",
+        env="nonprod",
+    )
     assert verify._release_block(args, "acme.orders")["identity_digest"] == index["identity_digest"]
 
 
@@ -872,7 +884,7 @@ def test_the_ci_metadata_carries_no_userinfo(
 
 def test_a_report_on_one_expose_records_a_failed_receipt(tmp_path: Path) -> None:
     sealed(tmp_path / "nonprod", environment="nonprod")
-    block = receipts.report_release_block(str(tmp_path / "nonprod"), "acme.orders")
+    block = release_block(str(tmp_path / "nonprod"), "acme.orders")
     block["expose"] = "orders"
     (tmp_path / "one.json").write_text(
         json.dumps({"summary": PASSING, "release": block}), encoding="utf-8"
@@ -977,6 +989,34 @@ def cosign(monkeypatch: pytest.MonkeyPatch, s3: FakeS3) -> Dict[str, Any]:
 SIGNER = receipts.SignerPolicy(
     certificate_identity="ci@example.com", certificate_oidc_issuer="https://issuer.example.com"
 )
+
+
+@pytest.mark.parametrize("field", ["check", "policy"])
+def test_require_signed_refuses_a_statement_of_a_deploy(
+    tmp_path: Path,
+    s3: FakeS3,
+    cosign: Dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """A signed Statement that says it records a deploy (its check, or its policy) never stands
+    for a verification, whatever else it says."""
+    uris = _published(tmp_path, s3, "nonprod", "prod")
+    report = _report(tmp_path / "verify.json", uris["nonprod"], clients=s3)
+    real = receipts.statement
+
+    def of_a_deploy(receipt: Any, data: bytes) -> Dict[str, Any]:
+        out = real(receipt, data)
+        if field == "check":
+            out["predicate"][receipts.RECEIPT_EXTENSION]["check"] = "deploy"
+        else:
+            out["predicate"]["policy"]["uri"] = f"{receipts.RECEIPT_EXTENSION}#deploy-log"
+        return out
+
+    monkeypatch.setattr(receipts, "statement", of_a_deploy)
+    receipts.record_receipt(uris["nonprod"], report_path=str(report), sign=True, clients=s3)
+    found = receipts.check_receipt(uris["prod"], environment="nonprod", signer=SIGNER, clients=s3)
+    assert found.exit_code == 1 and f"Statement's {field} is not the receipt's" in found.reason
 
 
 def test_require_signed_passes_a_receipt_signed_by_the_pinned_signer(

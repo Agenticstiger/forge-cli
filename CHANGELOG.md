@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] — 2026-11-27
+
 ### Added
 
 - **`fluid profile` reads profile request format 1-3-0 and writes profile format 1-5-0 where it needs
@@ -225,6 +227,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes, 1 does not, 2 cannot decide (a release with no code digest included).
   `fluid runs status --release-dir` lists the newest receipt of each environment under each
   release, picked as the check picks it.
+- **`fluid ship --release-dir DIR --artifacts LOCK --deploy-targets FILE` seals where each
+  external file goes.** The file names the AWS account and one `s3://bucket/key` per lock entry
+  (`$RELEASE_DEPLOY_TARGETS` when the flag is absent, read only beside `--release-dir`). The
+  release records them in `identity["deploy"]` with each file's kind, release path and sha256,
+  every Airflow DAG last, so they change the identity digest and not the code digest. Refused
+  before stage 1: a field the format does not allow, an account that is not 12 digits, a name
+  the lock does not list, a `to` that is not one object, two targets with one `to`, or a file
+  over 5 GiB. `fluid runs verify-release` checks each target is a sealed external file.
+
+- **`fluid runs deploy SRC --env E` copies a sealed release's external files to its targets.**
+  It verifies the release and its environment, optionally passes `--require-receipt ENV` (as
+  `fluid runs receipt check`, with `--require-locked` and `--require-signed`), and checks that
+  the credentials are the release's account (STS). A release in S3 must sit in a bucket with
+  versioning Enabled, every object read at a real version (exit 2 otherwise: Suspended or off
+  writes the "null" version, replaced in place, which pins nothing), and its `release.json` must
+  have one version and no delete marker (exit 1 otherwise: targets rewritten after the seal keep
+  the code digest), so the release prefix's writers must hold neither `s3:DeleteObjectVersion`
+  nor `s3:PutBucketVersioning`; the deploy role reads the bucket's versioning
+  (`s3:GetBucketVersioning`) and the versions of `release.json` (`s3:ListBucketVersions`), and
+  needs `s3:ListBucket` on each target bucket (S3 answers a key not written yet as denied
+  without it, and the deploy names that permission) and `s3:GetObjectVersion` for the read-back;
+  `--sign` is checked before any copy. Then each target, every DAG
+  last: one that already has the file's full-object SHA-256 is left alone; otherwise CopyObject
+  copies the release object at the version and ETag the check read (`CopySourceIfMatch`), with `If-Match`
+  the target's ETag, or `If-None-Match: *` for a new key, `ExpectedBucketOwner` on every call to
+  it and a SHA-256 checksum, and reads it back. A target changed meanwhile (412) stops the
+  deploy before the DAGs; a race (409) is tried three times; a bucket policy that enforces
+  conditional writes (501) is named and refused. A 412 whose target now holds the release's
+  bytes (a copy whose answer was lost) counts as copied. A release directory is put with the same
+  conditions. It writes a deploy receipt (`"check": "deploy"`) with each target's VersionId,
+  and the deploy log as its report, to `<code hex>/deploys/<env>/` (`deploys/<env>/` beside a
+  release directory), never under `receipts/<env>/`, so a deployer needs no write where the gate
+  reads; a failure once a target was reached writes a FAILED one and exits 1. `--dry-run` writes
+  nothing. Exit 0 deployed, 1 refused or failed, 2 cannot decide before any target. `verify-release`
+  ties each target's kind to its sealed file's, and an environment cannot be named `receipts`
+  or `deploys`.
+
+- **Only a verify receipt gates.** A receipt now states `check`, `verify` or `deploy` (absent:
+  verify). `fluid runs receipt check` reads `receipts/<env>/` only, and a newest entry there that
+  records anything but a verify fails the check, as any other foreign file does. `deploys/<env>/`
+  keeps the same write-once and listing rules and never gates. `fluid runs status --release-dir`
+  lists the newest deploy receipt as `deployed`. `--require-locked` says that a reader without
+  `s3:GetObjectRetention` sees no lock.
+
 - **A release is sealed only from the commit the CI names.** When the contract sits in a git
   checkout at another commit than the CI's variable names (the contract in a second repository
   or a submodule, or a pull-request pipeline that builds a local merge commit, as Bitbucket and
@@ -277,8 +323,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The `aws` extra needs boto3 and botocore 1.35.2 or later**, the first release whose PutObject
-  takes `IfNoneMatch`.
+- **The `aws` extra needs boto3 and botocore 1.40.61 or later**, the first release whose
+  CopyObject takes `IfMatch` and `IfNoneMatch` on the destination (PutObject took `IfNoneMatch`
+  from 1.35.2). `fluid runs deploy` refuses an older botocore with exit 2.
+- **`fluid ship --help` words `--require-artifacts` and the stage switches more briefly.** Same
+  meaning and behaviour.
 - **`fluid ship --help` words exit 3 and `--acknowledge-inspected` more briefly.** Same meaning
   and behaviour.
 - **The release builds with a locked build backend.** `setuptools`, `setuptools-scm` and `wheel`
@@ -373,6 +422,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid bundle --sign` works with cosign 3.x.** It wrote `<bundle>.sig` (and `<bundle>.pem`
+  keyless) with `--output-signature`/`--output-certificate`, which cosign 3.x refuses for a blob
+  ("must specify --bundle with --new-bundle-format"). It now writes one Sigstore bundle,
+  `<bundle>.sigstore.json` (the signature, the certificate keyless, the log proof), keyless or
+  keyed, and `fluid verify-signature` and `fluid schedule-sync --verify-signature` verify from it
+  with `cosign verify-blob --bundle`. `verify-signature --bundle PATH` names another Sigstore
+  bundle (`--signature` and `--certificate` are gone, and `.sig`/`.pem` files are no longer read);
+  `--certificate-identity` with `--certificate-oidc-issuer` pins a keyless signer exactly, beside
+  the regexps. cosign 2.x writes its own bundle format and 3.x the Sigstore one, so sign and verify
+  with the same major version.
+
+- **Keyless signature verification names its signer.** `fluid verify-signature` and `fluid
+  schedule-sync --verify-signature` defaulted the identity and issuer regexps to `.*`, which any
+  Sigstore user's certificate for their own identity matches, and an empty
+  `--certificate-identity` fell back to it. Keyless now needs both an identity and an issuer,
+  exactly (`--certificate-identity`/`--certificate-oidc-issuer`; on schedule-sync
+  `--verify-certificate-identity`/`--verify-certificate-oidc-issuer`, new) or as regexps
+  (`--identity-regexp`/`--oidc-issuer-regexp`, `--verify-identity-regexp`/
+  `--verify-oidc-issuer-regexp`); a missing or empty one exits 2 with
+  `signing_identity_not_pinned` before cosign runs. `--signature`/`--certificate` exit 2 with
+  `verify_signature_sig_pem_gone`, naming `--bundle`.
+
+- **A release's verify report, deploy, partial publish and signing flags say what they did.**
+  - **Breaking: `fluid verify --release SRC` checks the release it names.** The report was tied to
+    the release by product only, so a run with another `--env`, or on a contract edited after
+    the seal, recorded a PASSED receipt for the release's environment. verify now refuses before
+    any check (exit 2, `verify_release_refused`) when `--env` is not the release's environment (no
+    `--env` against a release that has one included) or when the contract's bundle digest, rebuilt
+    the way `fluid bundle --format tgz` builds it, is not the one the release sealed. A stage-1
+    bundle given as the contract is compared by its own MANIFEST digest, and one built for another
+    `--env` is refused the same way (exit 2, `verify_release_refused`). The report's
+    `release` block records the env and that digest, `fluid runs receipt record` refuses a report
+    that names another (or none), and a verify receipt's signed Statement carries it as
+    `policy.digest`, as SLSA's verification summary asks.
+  - **`fluid runs deploy` checks where its receipt goes before the first copy.** A release outside
+    `<prefix>/<product>/<code hex>/<env>/` (a mirror) had its targets copied, then exited 2 with no
+    receipt; it now exits 2 with nothing written. A receipt that cannot be written after targets
+    were copied exits 1, says no deploy receipt exists, and names the targets written. After any
+    write the result is 0 or 1, never 2.
+  - **A publish that stopped before its `release.json` names a recovery that works.** The message
+    named a command that does not exist. It now lists the objects to delete before running the
+    same ship again (a delete marker as the current version lets the conditional write through,
+    as S3 documents; the old versions stay until a lifecycle rule or an admin removes them), and
+    on a bucket with Object Lock says the versions stay until retention ends, that only
+    `s3:BypassGovernanceRetention` deletes them early, and to seal from a new commit. It gives
+    both when the lock cannot be read.
+  - **Breaking: `fluid schedule-sync` refuses a `--verify-*` flag without `--verify-signature`.**
+    `--verify-key`, `--verify-certificate-identity`, `--verify-certificate-oidc-issuer`,
+    `--verify-identity-regexp` and `--verify-oidc-issuer-regexp` were ignored without it, and the
+    DAGs were pushed unchecked. Any of them alone now exits 2 with
+    `schedule_sync_verify_flags_need_gate` before anything runs.
+  - **`signing_identity_not_pinned` names the flags of the command that raised it**
+    (`--verify-certificate-identity` and the other `--verify-*` flags on schedule-sync), and
+    `fluid verify-signature --help` shows one keyless regexp example that passes both regexps.
+  - `fluid_build.api.ReleaseVerification` gains `bundle_digest`, the sealed bundle's digest
+    (`None` when the release pins none); API version 1.5.
+
 - **A Spark build that succeeds on Glue ends SUCCEEDED.** Glue runs forge's Spark runner through
   `runpy` and marks a run FAILED on any `SystemExit`, code 0 included, so a build that wrote its
   rows still ended `FAILED: SystemExit: 0` and `fluid apply --mode amend-and-build` reported it
@@ -385,6 +491,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose package reports another version, and the image's pip, setuptools and wheel come from the
   hash-locked `requirements/release-image.txt`. A local image build runs `python -m build --wheel`
   first.
+- **A private release no longer refuses a `--source` for an expose it chooses not to read.**
+  `fluid profile --privacy-unit` refused with `profile_release_source_unused` as soon as a
+  `--source <exposeId>=<location>` named an expose of the contract that the release holds no
+  statistic of, so a caller that hands every expose its records could not release at all. The
+  release now goes on without reading that file, and its report names each such source with its
+  reason (the expose only, never its location or a value). An expose of the contract is the
+  only name that qualifies: a `--source` naming none is still refused, as is one given twice,
+  one with no location or one naming a file that does not exist, and no output is written over
+  such a file. Its `--table` is set aside with it. `--strict` keeps the refusal, before any
+  record is read. A profile that names its tables with `--expose` or a request is unchanged: it reads
+  exactly what it was told to, so a source beyond that stays a mistake.
 
 ### Security
 
