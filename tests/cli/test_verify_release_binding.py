@@ -257,7 +257,9 @@ def test_the_overlay_is_part_of_the_digest(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_hand_made_report_is_refused_by_record_and_nothing_is_written(tmp_path: Path) -> None:
+def test_a_report_naming_another_env_or_digest_is_refused_by_record_and_nothing_is_written(
+    tmp_path: Path,
+) -> None:
     digest = "sha256:" + "a" * 64
     release = _release(tmp_path, "nonprod", digest)
     checked = api_release.verify_release(str(release))
@@ -324,3 +326,22 @@ def test_a_bundle_of_another_contract_is_refused(
         )
     assert raised.value.exit_code == 2
     assert other in str(raised.value.context["message"])
+
+
+def test_a_bundle_built_for_another_environment_is_refused_before_any_check(
+    tmp_path: Path, no_checks: None
+) -> None:
+    """``fluid verify runtime/bundle.tgz --env nonprod --release <nonprod>`` on a bundle built for
+    prod: exit 2 (the release is not the one this run checks), ahead of the loader's own exit 1
+    for a bundle of another env, and nothing is checked or written."""
+    project = tmp_path / "work"
+    (project / "overlays").mkdir(parents=True)
+    (project / "contract.fluid.yaml").write_text(CONTRACT, encoding="utf-8")
+    (project / "overlays" / "nonprod.yaml").write_text(OVERLAY, encoding="utf-8")
+    nonprod = verify._contract_bundle_digest(str(project / "contract.fluid.yaml"), "nonprod")
+    _shipped_digest(project, "prod")
+    release = _release(tmp_path, "nonprod", nonprod)
+    out = tmp_path / "r.json"
+    message = _refused(_args(project / "runtime" / "bundle.tgz", "nonprod", release, out))
+    assert "--env nonprod" in message and "--env prod" in message
+    assert not out.exists()

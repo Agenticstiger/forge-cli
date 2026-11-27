@@ -415,7 +415,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the seal, recorded a PASSED receipt for the release's environment. verify now refuses before
     any check (exit 2, `verify_release_refused`) when `--env` is not the release's environment (no
     `--env` against a release that has one included) or when the contract's bundle digest, rebuilt
-    the way `fluid bundle --format tgz` builds it, is not the one the release sealed. The report's
+    the way `fluid bundle --format tgz` builds it, is not the one the release sealed. A stage-1
+    bundle given as the contract is compared by its own MANIFEST digest, and one built for another
+    `--env` is refused the same way (exit 2, `verify_release_refused`). The report's
     `release` block records the env and that digest, `fluid runs receipt record` refuses a report
     that names another (or none), and a verify receipt's signed Statement carries it as
     `policy.digest`, as SLSA's verification summary asks.
