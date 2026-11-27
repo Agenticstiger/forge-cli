@@ -21,8 +21,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 
 from fluid_build.profiler import disclosure, history
-from fluid_build.profiler.runner import CHILDREN_EDGES
+from fluid_build.profiler._stats import (
+    DeclaredBlock,
+    DeclaredStatistic,
+    Request,
+    RequestColumn,
+    RequestHistory,
+    RequestTable,
+    load_backend,
+)
+from fluid_build.profiler.runner import CHILDREN_EDGES, ExposeSource, profile_exposes
 from tests.profiler import _library as library
+from tests.profiler.dp import _gym_data as gym
 
 pytestmark = pytest.mark.unit
 
@@ -147,17 +157,300 @@ def test_a_composite_foreign_key_is_not_followed_and_its_table_is_not_published(
     assert "reference table branch" in dict(result.not_measured)
 
 
-def test_a_numeric_key_is_published_and_its_foreign_key_is_named_not_followed(tmp_path):
+def _column_of(result: Any, name: str = "branch_id") -> Dict[str, Any]:
+    entry: Dict[str, Any] = result.document["tables"]["card"]["columns"][name]
+    return entry
+
+
+#: The metrics only a number is read in: a followed key is not read in them.
+NUMBER_METRICS = {"sum", "min", "max", "quantiles"}
+
+
+@pytest.mark.parametrize("kind", ["integer", "bigint", "decimal(10,0)", "decimal(10)"])
+def test_a_whole_number_key_is_followed_by_the_keys_its_table_publishes(tmp_path, kind):
     keys = library.keys(12, kind="integer")
     result = library.profile(
         tmp_path,
-        library.contract(key_type="integer"),
+        library.contract(key_type=kind),
+        library.branches(list(reversed(keys))),
+        library.cards(_spread(keys)),
+    )
+    published = [row[0] for row in result.document["references"]["branch"]["rows"]]
+    follow = _tracked(result)["branch_id"]
+    assert published == sorted(str(key) for key in keys)
+    assert follow["initial"]["levels"] == published
+    assert follow["transitions"]["levels"] == published
+    assert follow["transitions"]["groupBy"] == "branch_id"
+    assert _said(result) == ""
+    load_profile_text(result.canonical.decode("utf-8"))  # the registry reads the history back
+
+
+@pytest.mark.parametrize(
+    ("kind", "key_kind"),
+    [
+        ("decimal(10,2)", "integer"),
+        ("decimal", "integer"),
+        ("numeric(8,1)", "integer"),
+        ("money", "integer"),
+        ("date", "date"),
+    ],
+)
+def test_a_key_that_is_not_a_whole_number_is_named_and_not_followed(tmp_path, kind, key_kind):
+    keys = library.keys(12, kind=key_kind)
+    result = library.profile(
+        tmp_path,
+        library.contract(key_type=kind),
         library.branches(keys),
         library.cards(_spread(keys)),
     )
-    assert "branch" in result.document["references"]
     assert "branch_id" not in _tracked(result)
-    assert "categorical" in _said(result)
+    assert _said(result) == "its key is not text or a whole number"
+    assert _column_of(result)["domain"] == ("timestamp" if key_kind == "date" else "number")
+    load_profile_text(result.canonical.decode("utf-8"))
+
+
+def _scaled_child(tmp_path: Path, fractional: bool) -> Any:
+    """Cards whose key is ``decimal(10,2)`` into a whole-number branch key, whole in value or not."""
+    keys = library.keys(12, kind="integer")
+    contract = library.contract(key_type="integer")
+    for column in contract["exposes"][1]["contract"]["schema"]:
+        if column["name"] == "branch_id":
+            column["type"] = "decimal(10,2)"
+    members = [[f"{key}.00" for key in each] for each in _spread(keys)]
+    if fractional:
+        members.append(["2.50"])
+    return library.profile(tmp_path, contract, library.branches(keys), library.cards(members))
+
+
+def test_a_scaled_column_whose_values_are_all_whole_follows_a_whole_number_key(tmp_path):
+    result = _scaled_child(tmp_path, fractional=False)
+    published = [row[0] for row in result.document["references"]["branch"]["rows"]]
+    assert _tracked(result)["branch_id"]["initial"]["levels"] == published
+    assert _column_of(result)["domain"] == "category"
+
+
+def test_a_scaled_column_with_one_fractional_value_is_an_orphan_and_keeps_its_domain(tmp_path):
+    result = _scaled_child(tmp_path, fractional=True)
+    assert "branch_id" not in _tracked(result)
+    assert _said(result) != ""
+    assert _column_of(result)["domain"] == "number"
+
+
+def test_the_column_of_a_followed_whole_number_key_is_written_as_a_text_key_is(tmp_path):
+    keys = library.keys(12, kind="integer")
+    whole = library.profile(
+        tmp_path, library.contract(key_type="integer"), library.branches(keys),
+        library.cards(_spread(keys)),
+    )  # fmt: skip
+    (tmp_path / "text").mkdir()
+    text_keys = library.keys(12)
+    text = library.profile(
+        tmp_path / "text", library.contract(), library.branches(text_keys),
+        library.cards(_spread(text_keys)),
+    )  # fmt: skip
+    assert _column_of(whole) == _column_of(text)
+    assert _column_of(whole)["domain"] == "category"
+    assert not NUMBER_METRICS & set(_column_of(whole)["metrics"])
+    assert "statistics" not in _column_of(whole)
+
+
+def _not_followed(tmp_path: Path, why: str) -> Any:
+    """A profile in which the card's whole-number key is left untracked for the reason *why*."""
+    keys = library.keys(12, kind="integer")
+    members, contract, branch_keys = _spread(keys), library.contract(key_type="integer"), keys
+    if why == "orphan":
+        members = [*members, [9999]]
+    elif why == "not public":
+        contract = library.contract(key_type="integer", classification="Internal")
+    elif why == "one key":
+        branch_keys, members = keys[:1], _spread(keys[:1], 40)
+    elif why == "over the cap":
+        branch_keys = library.keys(65, kind="integer")
+        members = library.spread(branch_keys, [1] * 65)
+    elif why == "two relationships":
+        card = contract["exposes"][1]
+        card["semantics"]["relationships"].append(
+            {**card["semantics"]["relationships"][0], "name": "also_branch"}
+        )
+    else:
+        raise AssertionError(why)
+    return library.profile(
+        tmp_path, contract, library.branches(branch_keys), library.cards(members)
+    )
+
+
+@pytest.mark.parametrize(
+    "why", ["orphan", "not public", "one key", "over the cap", "two relationships"]
+)
+def test_a_whole_number_key_that_is_not_tracked_keeps_its_number_domain_and_metrics(tmp_path, why):
+    result = _not_followed(tmp_path, why)
+    assert "branch_id" not in _tracked(result)
+    assert _said(result) != ""
+    entry = _column_of(result)
+    assert entry["domain"] == "number"
+    assert NUMBER_METRICS <= set(entry["metrics"])
+    load_profile_text(result.canonical.decode("utf-8"))
+
+
+def test_a_whole_number_key_into_a_table_that_is_not_public_is_not_followed(tmp_path):
+    result = _not_followed(tmp_path, "not public")
+    assert "references" not in result.document
+    assert _said(result) == "the table it references is not declared public"
+
+
+def test_a_whole_number_key_with_a_value_that_is_no_key_is_named_and_not_followed(tmp_path):
+    result = _not_followed(tmp_path, "orphan")
+    assert "not a key of the table it references" in _said(result)
+    assert "9999" not in " ".join(why for _, why in result.not_measured)
+
+
+def test_the_disclosure_of_a_key_is_not_widened_by_following_it(tmp_path):
+    # the metrics a followed key still publishes are the text key's, each as the text key's is
+    keys = library.keys(12, kind="integer")
+    result = library.profile(
+        tmp_path, library.contract(key_type="integer"), library.branches(keys),
+        library.cards(_spread(keys)),
+    )  # fmt: skip
+    metrics = _column_of(result)["metrics"]
+    assert set(metrics) == {"count", "nullCount", "distinctCount"}
+    # a foreign key's distinct values are the parents that have a child: withheld, as for text
+    assert metrics["distinctCount"]["status"] == "D"
+    assert "value" not in metrics["distinctCount"]
+
+
+def test_a_followed_whole_number_key_that_a_declared_statistic_reads_is_not_followed(
+    tmp_path, monkeypatch
+):
+    keys = library.keys(12, kind="integer")
+    monkeypatch.setattr(history, "_reads", lambda block, name: name == "branch_id")
+    result = library.profile(
+        tmp_path, library.contract(key_type="integer"), library.branches(keys),
+        library.cards(_spread(keys)),
+    )  # fmt: skip
+    assert "branch_id" not in _tracked(result)
+    assert "a statistic the contract declares reads it" in _said(result)
+    assert _column_of(result)["domain"] == "number"
+    assert NUMBER_METRICS <= set(_column_of(result)["metrics"])
+    # a text key is read as a category, whatever else reads it: it is followed as before
+    (tmp_path / "text").mkdir()
+    text = library.profile(
+        tmp_path / "text", library.contract(), library.branches(BRANCHES),
+        library.cards(_spread()),
+    )  # fmt: skip
+    assert "branch_id" in _tracked(text)
+
+
+def test_a_statistic_reads_a_column_by_its_column_its_group_or_its_structure():
+    def statistic(column: str, group_by: Optional[str] = None) -> DeclaredStatistic:
+        return DeclaredStatistic(
+            "levelHistogram/1",
+            "levelHistogram",
+            column,
+            group_by,
+            {},
+            (column, group_by) if group_by else (column,),
+            {},
+        )
+
+    held = DeclaredBlock(16, (statistic("kind"), statistic("tier", "branch_id")))
+    assert history._reads(held, "kind") and history._reads(held, "branch_id")
+    assert not history._reads(held, "city") and not history._reads(None, "kind")
+    structured = DeclaredBlock(16, (), structure=(statistic("branch_id"),))
+    assert history._reads(structured, "branch_id")
+
+
+def test_a_profile_without_a_whole_number_key_prepares_no_history_early(tmp_path, monkeypatch):
+    """The records' versions are held only while the tables are measured, where a key needs them."""
+    from fluid_build.profiler import runner
+
+    calls: List[str] = []
+    early: List[int] = []
+    real_prepare, real_measure = history.prepare_histories, runner._profile_table
+
+    def prepare(stage: Any) -> Any:
+        calls.append("prepare")
+        return real_prepare(stage)
+
+    def measure(*args: Any, **kwargs: Any) -> Any:
+        early.append(len(calls))
+        return real_measure(*args, **kwargs)
+
+    monkeypatch.setattr(history, "prepare_histories", prepare)
+    monkeypatch.setattr(runner, "_profile_table", measure)
+    keys = library.keys(12)
+    result = library.profile(
+        tmp_path, library.contract(), library.branches(keys), library.cards(_spread(keys))
+    )
+    assert "branch_id" in _tracked(result)  # still followed, as text
+    assert early == [0, 0] and calls == ["prepare"]
+    calls.clear()
+    early.clear()
+    (tmp_path / "whole").mkdir()
+    whole = library.keys(12, kind="integer")
+    library.profile(
+        tmp_path / "whole", library.contract(key_type="integer"), library.branches(whole),
+        library.cards(_spread(whole)),
+    )  # fmt: skip
+    assert early == [1, 1] and calls == ["prepare"]  # read before the tables, and handed on
+
+
+@pytest.mark.parametrize("path", ["request", "private release"])
+def test_a_request_and_a_private_release_follow_nothing(tmp_path, path):
+    if path == "request":
+        keys = library.keys(12, kind="integer")
+        asked = Request(
+            contract_digest=None,
+            fractional_bits=16,
+            tables=(
+                RequestTable("branch", True, (RequestColumn("branch_id", "number"),)),
+                RequestTable(
+                    "card", True, (RequestColumn("branch_id", "number"),), history=RequestHistory()
+                ),
+            ),
+        )
+        result = profile_exposes(
+            library.contract(key_type="integer"),
+            [
+                ExposeSource(library.BRANCH, library.write(tmp_path / "b.ndjson", library.branches(keys))),
+                ExposeSource(library.CARD, library.write(tmp_path / "c.ndjson", library.cards(_spread(keys)))),
+            ],
+            backend=load_backend(),
+            request=asked,
+        )  # fmt: skip
+        document = result.document
+        assert document["tables"]["card"]["columns"]["branch_id"]["domain"] == "number"
+        assert "branch_id" not in document["tables"]["card"]["history"].get("columns", {})
+    else:
+        drawn, _ = gym.draw(gym.follow_plan(gym.request(history={})))
+        document = drawn.document
+    assert "references" not in document
+    for table in document["tables"].values():
+        for name in table.get("history", {}).get("columns", {}):
+            assert table["columns"][name]["domain"] == "category"
+
+
+def test_a_small_cell_of_a_whole_number_key_is_withheld_as_a_text_keys_is(tmp_path):
+    size = [45, 30, 3, 30]
+
+    def follow(kind: str) -> Dict[str, Any]:
+        (tmp_path / kind).mkdir()
+        keys = library.keys(4, kind="integer" if kind == "whole" else "string")
+        result = library.profile(
+            tmp_path / kind,
+            library.contract(key_type="integer" if kind == "whole" else "string"),
+            library.branches(keys),
+            library.cards(_twice(library.spread(keys, size))),
+        )
+        found: Dict[str, Any] = _tracked(result)["branch_id"]
+        return found
+
+    whole, text = follow("whole"), follow("text")
+    for part in ("initial", "transitions"):
+        assert [(each["status"], each.get("levelCounts")) for each in whole[part]["groups"]] == [
+            (each["status"], each.get("levelCounts")) for each in text[part]["groups"]
+        ]
+    (initial,) = whole["initial"]["groups"]
+    assert initial["levelCounts"][2] is None  # the cell of three entities is not written
 
 
 def test_a_table_that_is_not_public_is_not_followed(tmp_path):
@@ -610,6 +903,41 @@ def test_where_the_floors_pin_a_bin_the_foreign_key_writes_no_number_for_its_sha
     # the column is still followed, with its levels, and the table it follows is published whole
     assert follow["initial"]["levels"] == follow["transitions"]["levels"]
     assert "branch" in result.document["references"]
+
+
+def _whole_keys(text: Sequence[Any]) -> List[Optional[int]]:
+    """``b01`` to ``b12`` as 10 to 21: whole numbers that sort, as text, in the same order."""
+    return [None if each is None else int(each[1:]) + 9 for each in text]
+
+
+def _whole_profile_of(tmp_path: Path, case: str) -> Tuple[Any, List[Dict[str, Any]], List[int]]:
+    keys, members = _pinned_members()[case]
+    chains = [_whole_keys(chain) for chain in members]
+    rows = library.cards(chains)
+    whole = _whole_keys(keys)
+    result = library.profile(
+        tmp_path, library.contract(key_type="integer"), library.branches(whole), rows
+    )
+    return result, rows, whole
+
+
+@pytest.mark.parametrize("case", PINNED)
+def test_the_guard_holds_a_whole_number_key_as_it_holds_a_text_key(tmp_path, case):
+    # history._guarded reads the key's per-parent counts, whatever its keys are spelled as
+    (tmp_path / "text").mkdir()
+    (tmp_path / "whole").mkdir()
+    text, _, _ = _profile_of(tmp_path / "text", case)
+    whole, rows, keys = _whole_profile_of(tmp_path / "whole", case)
+    for part in ("initial", "transitions"):
+        written = _tracked(whole)["branch_id"][part]
+        expected = _tracked(text)["branch_id"][part]
+        assert [(g["status"], g.get("k"), g.get("levelCounts")) for g in written["groups"]] == [
+            (g["status"], g.get("k"), g.get("levelCounts")) for g in expected["groups"]
+        ]
+        assert written["sampleSize"] == expected["sampleSize"]
+    assert _published_numbers(whole) == _published_numbers(text)
+    assert _derivable(whole, rows, keys, banded=False) == []
+    assert _derivable(whole, rows, keys, banded=True) == []
 
 
 @pytest.mark.parametrize("seed", range(8))

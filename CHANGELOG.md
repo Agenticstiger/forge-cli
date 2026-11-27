@@ -42,6 +42,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disclosure checks of the exact path do not apply to a noisy release; an exact profile writes no
   `unit` and is unchanged. The release record re-derives the same bytes.
 
+### Changed
+
+- **A history follows a whole-number foreign key to a table the profile publishes whole.** A key
+  typed as an integer, or as a decimal of scale 0, is tracked as a text key is: its levels are the
+  published table's keys, spelled as that table spells them, and the column is written in the
+  category domain, from its values' decimal text, with the metrics that domain forms (`count`,
+  `nullCount` and the withheld `distinctCount`; its `sum`, `min`, `max` and `quantiles` are not
+  formed). Before, such a key was named as not followed, and the history carried it as an
+  untracked column, so a generated history held each entity's key constant across its versions.
+  A key that is not tracked keeps its number domain and every metric it had, whatever the reason:
+  a value that is no key of the table, a table that is not published whole, fewer than two keys,
+  two relationships on the column, or a key over the cap. A key the contract's statistics read is
+  not followed. A key that is neither text nor a whole number (a float, a decimal with a scale, a
+  date) is still named as not followed, now with the reason "its key is not text or a whole
+  number". Cells of the key's `initial` and `transitions` are checked, and its shares withheld
+  against the children per parent, exactly as for a text key. A private release and a profile
+  request write no `references` and follow nothing, as before.
+
 ## [0.42.0] — 2026-11-27
 
 ### Added
