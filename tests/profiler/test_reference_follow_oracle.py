@@ -66,6 +66,11 @@ FULL = os.environ.get("FLUID_PROFILE_ORACLE") == "full"
 needs_full = pytest.mark.skipif(not FULL, reason="set FLUID_PROFILE_ORACLE=full to run it")
 
 
+# A universe of the full set runs for minutes (one worker on a laptop took about 2, 5, 6, 9 and 4
+# minutes for o1 to o5), and a shared runner is slower, so each carries a bound of its own in place
+# of the repository's 10-minute default: that default ends the worker, and the run reports a crash.
+
+
 @dataclass(frozen=True)
 class Universe:
     name: str
@@ -308,26 +313,31 @@ def test_o0_a_followed_key_pins_no_named_count_or_bin_over_members_of_one_branch
 
 
 @needs_full
+@pytest.mark.timeout(1200)
 def test_o1_a_followed_key_pins_no_named_count_or_bin(monkeypatch):
     _audit_universe(UNIVERSES[1], monkeypatch)
 
 
 @needs_full
+@pytest.mark.timeout(2400)
 def test_o2_a_followed_key_pins_no_named_count_or_bin(monkeypatch):
     _audit_universe(UNIVERSES[2], monkeypatch)
 
 
 @needs_full
+@pytest.mark.timeout(2400)
 def test_o3_a_followed_key_pins_no_named_count_over_chains_of_three(monkeypatch):
     _audit_universe(UNIVERSES[3], monkeypatch)
 
 
 @needs_full
+@pytest.mark.timeout(3600)
 def test_o4_a_followed_key_pins_no_named_count_on_the_production_bins(monkeypatch):
     _audit_universe(UNIVERSES[4], monkeypatch)
 
 
 @needs_full
+@pytest.mark.timeout(2400)
 def test_o5_a_followed_key_pins_no_named_count_under_a_larger_rule(monkeypatch):
     _audit_universe(UNIVERSES[5], monkeypatch)
 

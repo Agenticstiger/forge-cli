@@ -8,6 +8,11 @@ keys and the key is one a history can track. Every profile below leaves that pat
 table is not public, the key is composite or not text or whole, the table holds no validity
 window, a request or a private release forms the history, or the table is over the cap. Each
 canonical document is pinned by its sha256.
+
+The document names the release that wrote it in ``_producer``, so the version is fixed to one
+value while each document is formed and the pins hold on any install. They were recorded by
+running these scenarios, with that version, on the commit before the change and again on the
+change: both give the values below.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from typing import Any, Callable, Dict, List
 
 import pytest
 
+import fluid_build
 from fluid_build.profiler._stats import (
     Request,
     RequestColumn,
@@ -31,6 +37,15 @@ from tests.profiler import _library as library
 from tests.profiler.dp import _gym_data as gym
 
 pytestmark = pytest.mark.unit
+
+
+#: The release the pinned documents name as their producer.
+FIXED_VERSION = "0.0.0"
+
+
+@pytest.fixture(autouse=True)
+def _fixed_release(monkeypatch):
+    monkeypatch.setattr(fluid_build, "__version__", FIXED_VERSION)
 
 
 def _spread(keys: List[Any], per: int = 20) -> List[List[Any]]:
@@ -162,18 +177,18 @@ SCENARIOS: Dict[str, Callable[[Path], str]] = {
     "private_release": _private_release,
 }
 
-#: sha256 of each canonical document, recorded before the change that follows a key without a guard.
+#: sha256 of each canonical document, recorded with the release fixed to ``FIXED_VERSION``, on the commit before the change.
 PINNED: Dict[str, str] = {
-    "composite": "d62fd2cfb8808e6a00b1db8200587f448d8e5fde7c64726ca7d583072175cb86",  # pragma: allowlist secret
-    "date_key": "8f0c9574a781b1b312ae05b9218679945ab9b0a318768ebcc68b286b2fe5fcdb",  # pragma: allowlist secret
-    "no_window": "5b5aafc8114c5c472c4d79cda9ce15bcdfb28ce7db24c62f514a3b24b01cca17",  # pragma: allowlist secret
-    "not_public": "ba97c786988b1396d89a7f1b885847ffbec4a4adb63250ae95b0e861f245b73a",  # pragma: allowlist secret
-    "not_public_whole": "90c42d37bfa19cb293542f2438b0e21389ac4e0c98f56c05c938c5ca71788e10",  # pragma: allowlist secret
-    "over_the_cap": "886ef59ae6f30c30e03d368a19c947463eb6ce6e1e6734fbbc1740965fe17a8b",  # pragma: allowlist secret
+    "composite": "06c04aceec71ef1859f79baee5e5c6416692cea59a70508669d0feeae6363821",  # pragma: allowlist secret
+    "date_key": "906870a163e3962fbb78bb64217147b28f44060ff6f19cb7e89459c31dea843f",  # pragma: allowlist secret
+    "no_window": "8e573511e0eba4c392032cf3292ccc080e2dabd71e174b805169bc42842a100a",  # pragma: allowlist secret
+    "not_public": "6ac7d7852839e6cd924a8eac2b07866563b548485c2e1f5e9f615edfb515ca13",  # pragma: allowlist secret
+    "not_public_whole": "b597883a65d9ce3c6f2d1667c8bef28106dad4d1b0c7c4373a220995695e99ee",  # pragma: allowlist secret
+    "over_the_cap": "50d943712d518f6d9dc6833d5f971fa11916568019611d08536124bf2cb8315a",  # pragma: allowlist secret
     "private_release": "9d604a172418a13840224c5ab51bea8cb550916503037d75f55720bf9261bf6d",  # pragma: allowlist secret
-    "request": "e3511f26143e8a4a04a50bdd3dfb492d1a651a66553aed683c62790fb14d9d80",  # pragma: allowlist secret
-    "scaled_number": "7986477d5154614283f3d7d7910c7202682e6167a46bc4bb4a439d5c2c6b6108",  # pragma: allowlist secret
-    "two_relationships": "46b1d74940a27b8ded9b732211f49960a3e850a3198e5f2b0e9e5493fba90d96",  # pragma: allowlist secret
+    "request": "c15df72d472b367612ab826455c5911e3ca59b4ef7e12d9ee1bc3df4a1e88403",  # pragma: allowlist secret
+    "scaled_number": "815ef340d92d3c23d2db1db8048332bc165055954b10a883975b700e9f4c832b",  # pragma: allowlist secret
+    "two_relationships": "6238b2693f872756e9aad35a70a2f34c16b2c1de8a74bde6f8d5cd3c19502ef2",  # pragma: allowlist secret
 }
 
 
@@ -185,6 +200,7 @@ def test_a_profile_that_follows_no_key_is_written_as_before(tmp_path, name):
 if __name__ == "__main__":  # pragma: no cover - records the pins
     import tempfile
 
+    fluid_build.__version__ = FIXED_VERSION
     for each in sorted(SCENARIOS):
         with tempfile.TemporaryDirectory() as folder:
             print(f'    "{each}": "{SCENARIOS[each](Path(folder))}",')
