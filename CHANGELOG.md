@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.0] — 2026-11-27
+
 ### Added
 
 - **`fluid profile` reads profile request format 1-3-0 and writes profile format 1-5-0 where it needs
