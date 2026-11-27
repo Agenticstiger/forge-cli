@@ -324,8 +324,9 @@ def _register_deploy(sub: argparse._SubParsersAction) -> None:
             "with If-Match the target's ETag, or If-None-Match * for a new one, and read back. "
             "Records a deploy receipt in deploys/<env>/ beside the release, which never gates "
             "(only a verify receipt in receipts/<env>/ does). Exit 0 deployed or nothing to "
-            "change, 1 refused or failed (a FAILED deploy receipt), 2 cannot decide before any "
-            "target."
+            "change, 1 refused or failed (a FAILED deploy receipt, or a receipt that could not be "
+            "written after targets were copied), 2 cannot decide before any target is written "
+            "(a release outside <prefix>/<product>/<code hex>/<env>/ has nowhere for a receipt)."
         ),
     )
     dep.add_argument("source", metavar="SRC", help="A release directory, or its s3:// prefix")

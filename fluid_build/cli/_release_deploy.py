@@ -138,6 +138,19 @@ def deploy_release(
         dest = _client(factory, target_region)
         _guard_conditions(dest, "CopyObject" if source.startswith("s3://") else "PutObject")
         _check_account(deploy["account"], account_of, target_region)
+        # Every check runs before the first write, and after any write the result is 0 or 1,
+        # never 2 (the return-code contract of the AWS CLI's s3 commands: 1 for a failed
+        # transfer, 2 for what could not be parsed or decided). The receipt's place is one of
+        # those checks: a release outside <prefix>/<product>/<code hex>/<env>/ has nowhere
+        # for a receipt, and finding that out after the copies would leave live targets
+        # and no record of them.
+        receipts._place(
+            source,
+            str(checked.code_digest).split(":", 1)[1],
+            str(checked.environment),
+            factory,
+            region,
+        )
     except (DeployError, receipts.ReceiptError) as exc:
         out.exit_code, out.reason = exc.exit_code, str(exc)
         return out
@@ -186,8 +199,12 @@ def deploy_release(
             now=now,
         )
     except receipts.ReceiptError as exc:
-        out.exit_code = UNDECIDED
-        out.reason = f"{out.reason}; the deploy receipt was not written: {exc}"
+        written = [r["to"] for r in out.targets if r["action"] == "copied"]
+        out.exit_code = FAIL
+        out.reason = (
+            f"{out.reason}; no deploy receipt exists, it could not be written ({exc}); "
+            + ("targets written: " + ", ".join(written) if written else "no target was written")
+        )
         return out
     out.receipt = done.uri
     return out
