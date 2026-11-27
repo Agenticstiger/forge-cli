@@ -1167,3 +1167,37 @@ def test_a_read_back_refused_names_s3_get_object_version(
     monkeypatch.setattr(DeployS3, "head_object", no_versions)
     done = _deploy(uri, s3)
     assert done.exit_code == 1 and "lack s3:GetObjectVersion on it" in done.reason
+
+
+def test_a_mirrored_layout_is_undecided_before_any_target_is_written(
+    tmp_path: Path, s3: DeployS3
+) -> None:
+    uri = _published(tmp_path, s3)
+    src = uri.split("/", 3)[3]
+    for (bucket, key), data in list(s3.objects.items()):
+        if bucket == "acme-releases" and key.startswith(src):
+            s3.put(bucket, "mirror/" + key[len(src) :], data)
+    done = _deploy("s3://acme-releases/mirror/", s3)
+    assert done.exit_code == 2, done.reason
+    assert "is not <prefix>/<product>/<code hex>/<env>/" in done.reason
+    assert _target_writes(s3) == [] and s3.copies == []
+    assert done.receipt is None
+
+
+def test_a_receipt_that_cannot_be_written_after_the_copies_fails_and_names_the_targets(
+    tmp_path: Path,
+) -> None:
+    class NoReceiptWrites(DeployS3):
+        def put_object(self, **kw: Any) -> Dict[str, Any]:  # type: ignore[override]
+            if "/deploys/prod/" in kw.get("Key", ""):
+                raise S3Error("AccessDenied", 403)
+            return super().put_object(**kw)
+
+    s3 = NoReceiptWrites()
+    uri = _published(tmp_path, s3)
+    done = _deploy(uri, s3)
+    assert done.exit_code == 1, done.reason
+    assert done.receipt is None
+    assert "no deploy receipt exists" in done.reason
+    assert "s3://acme-jobs/jobs/orders_jobs.zip" in done.reason
+    assert "s3://acme-airflow/dags/orders_dag.py" in done.reason
