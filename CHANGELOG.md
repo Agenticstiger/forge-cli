@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.1] — 2026-11-28
+
+### Security
+
+- **`fluid profile` publishes a history's tracked column only when every count of its version
+  table passes the output check.** For each categorical column a history tracks, it writes the
+  column's value on each entity's first version (`initial`) and the changes between versions
+  (`transitions`). Each was checked on its own. A reader who combined them with the profile's other
+  counts could therefore work out counts that the check withholds, such as how many versions keep
+  their value. This also covers a foreign key that a history follows: withholding its
+  relationship's children per parent, as 0.43.0 does, did not close the exact total of changes.
+  Under the default rule a reader got bounds, not exact counts. Exact profiles from 0.41.0 to
+  0.43.0 whose history tracks a column should be regenerated before they are shared further.
+  Present since 0.41.0.
+  - **When the members are published.** Both are now published only when one output check passes
+    on every count of the column's version table, together with the column's own statistics.
+    Those counts are the first values, every change, every unchanged pair and the last values.
+    Otherwise both are written withheld whole. Under the default rule that happens whenever any
+    count of the table is zero or small. Two examples are a pair of levels that never follow each
+    other, and a column that changes on every version.
+  - **NULLs.** A column is published only when no value of it is NULL and either of these holds:
+    the contract declares it required, or its published count equals the published row count. At
+    a rounding base above 1, a published history therefore also shows that the column holds no
+    NULL.
+  - **Marker columns.** A column that a declared `endMarker` or `currentFlag` names is always
+    withheld, with a note that holds no count. This holds whatever value the marker declares.
+  - **`reasons`.** It is published only when every tracked column is, including a column that a
+    marker names. Its check also covers the version pairs where no tracked column changes.
+  - **Unchanged.** A profile without a tracked column is unchanged.
+  - **With `fluxsim init`.** A withheld column is carried, so it keeps its first value across an
+    entity's versions. The exception is the marker the engine writes on an ending entity's last
+    version.
+    - The end share of entities:
+      - Engine 0.13.0 takes it from the history's `lastVersion`, which stays published, so its end
+        is unchanged.
+      - From engine 0.13.1, when the marker column's history is withheld, `fluxsim init` estimates
+        it from the column's level histogram, and says so in its assumptions.
+    - With engine 0.13.0, `fluxsim init --strict` can now list that level histogram as a statistic
+      no rule reads, where the same run passed with 0.43.0. To fix that, use engine 0.13.1, or pass
+      `--allow` with the pointer the refusal names.
+    - No engine writes a `currentFlag`, so nothing changes for it.
+
 ## [0.43.0] — 2026-11-27
 
 ### Added
