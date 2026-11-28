@@ -1240,6 +1240,7 @@ def profile_exposes(
                     counted_keys,
                     references.NONE,
                     planned.history_asks,
+                    declared,
                 )  # fmt: skip
             )
         )
@@ -3279,22 +3280,9 @@ def _declare_statistics(
     formed: List[Tuple[DeclaredStatistic, MeasuredStatistic]] = []
     for statistic in declared.statistics:
         if statistic.columns not in rows:
-            names = statistic.columns
-            rows[names] = [
-                dict(zip(names, record, strict=True))
-                for record in zip(*(read.values[name] for name in names), strict=True)
-            ]
+            rows[statistic.columns] = _statistic_rows(read, statistic)
         try:
-            if statistic.grouping is not None:
-                measured = backend.measure_keyed(
-                    declared,
-                    statistic,
-                    rows[statistic.columns],
-                    statistic.grouping.assigned,
-                    statistic.grouping.keys,
-                )
-            else:
-                measured = backend.measure(declared, statistic, rows[statistic.columns])
+            measured = _measure_declared(declared, statistic, rows[statistic.columns], backend)
         except MeasureRefused as exc:
             if declared.every_declared_group:  # the block the contract's declarations give
                 raise ProfileError(
@@ -3331,6 +3319,55 @@ def _declare_statistics(
         )
         columns_doc[statistic.column].setdefault("statistics", []).append(entry)
     return left_out
+
+
+def _statistic_rows(
+    read: sources.SourceColumns, statistic: DeclaredStatistic
+) -> List[Dict[str, Any]]:
+    """The records a declared statistic reads: one mapping of its columns' values per row."""
+    names = statistic.columns
+    return [
+        dict(zip(names, record, strict=True))
+        for record in zip(*(read.values[name] for name in names), strict=True)
+    ]
+
+
+def _measure_declared(
+    declared: DeclaredBlock,
+    statistic: DeclaredStatistic,
+    rows: Sequence[Mapping[str, Any]],
+    backend: StatisticsBackend,
+) -> MeasuredStatistic:
+    """One declared statistic over its *rows*, grouped as the block groups it."""
+    if statistic.grouping is not None:
+        return backend.measure_keyed(
+            declared, statistic, rows, statistic.grouping.assigned, statistic.grouping.keys
+        )
+    return backend.measure(declared, statistic, rows)
+
+
+def column_edge_statistics(
+    declared: Optional[DeclaredBlock],
+    read: sources.SourceColumns,
+    backend: StatisticsBackend,
+    column: str,
+) -> List[Tuple[DeclaredStatistic, MeasuredStatistic]]:
+    """The histograms and quantiles of *column* the table's statistics are formed with, measured.
+
+    Each is measured as :func:`_declare_statistics` measures it, in the block's order, and one
+    that no record forms a group of is left out as it is there. Their decisions together are the
+    ones the table's statistics were written with (:func:`_edge_decisions`).
+    """
+    found: List[Tuple[DeclaredStatistic, MeasuredStatistic]] = []
+    if declared is None:
+        return found
+    for statistic in declared.statistics:
+        if statistic.column != column or statistic.kind not in _EDGE_KINDS:
+            continue
+        measured = _measure_declared(declared, statistic, _statistic_rows(read, statistic), backend)
+        if measured.groups:
+            found.append((statistic, measured))
+    return found
 
 
 #: What to do about a record outside what the contract declares for its column.

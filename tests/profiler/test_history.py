@@ -347,6 +347,7 @@ def test_rows_with_no_entity_are_left_out_of_the_history(stations, tmp_path):
     # Rows whose entity is null belong to no entity, so they never chain as one more entity.
     result, rows = stations
     first = date(2022, 1, 1)
+    # ten at each status: a small count of them would be withheld with the rest
     keyless = [
         {
             "station_id": None,
@@ -355,7 +356,7 @@ def test_rows_with_no_entity_are_left_out_of_the_history(stations, tmp_path):
             "status": STATUS[k % 3],
             "sensor_model": MODELS[k % 2],
         }
-        for k in range(25)
+        for k in range(30)
     ]
     with_keyless = _profile(tmp_path, _contract(), [*rows, *keyless])
     assert _history_of(with_keyless) == _history_of(result)
@@ -575,15 +576,43 @@ def test_reasons_are_withheld_whole_when_a_tracked_column_holds_a_null(tmp_path)
     assert _group(published["columns"]["status"]["initial"])
 
 
-def test_changes_from_a_null_are_a_group_that_is_never_written(tmp_path):
-    rows = _stations()
-    for station in range(260, 274):  # one version of each of fourteen stations with ten
+def _with_nulls_in_sensor_model(rows: List[Dict[str, Any]]) -> None:
+    for station in range(260, 300):  # one version of each of the forty stations with ten
         held = [row for row in rows if row["station_id"] == station]
         held[4]["sensor_model"] = None
+
+
+def test_a_column_the_contract_declares_required_but_the_records_leave_null_is_withheld_whole(
+    tmp_path,
+):
+    # The contract's word does not show the records: a NULL among them withholds both members
+    # whole, and no change from a NULL is written as a group.
+    rows = _stations()
+    _with_nulls_in_sensor_model(rows)
+    contract = _contract()
+    contract["exposes"][0]["contract"]["schema"][4]["required"] = True
+    result = _profile(tmp_path, contract, rows)
+    column = _history_of(result)["columns"]["sensor_model"]
+    assert [g["status"] for g in column["initial"]["groups"]] == ["C"]
+    assert sorted(g["group"] for g in column["transitions"]["groups"]) == ["m1", "m2"]
+    assert [g["status"] for g in column["transitions"]["groups"]] == ["C", "C"]
+    assert column["initial"]["sampleSize"] == {"min": 0}
+
+
+def test_a_column_that_holds_nulls_the_document_does_not_show_is_withheld_whole(tmp_path):
+    # Its published count is not the table's row count and the contract does not declare it
+    # required, so neither member is written: both are withheld whole, with no note.
+    rows = _stations()
+    _with_nulls_in_sensor_model(rows)
     result = _profile(tmp_path, _contract(), rows)
-    entry = _history_of(result)["columns"]["sensor_model"]["transitions"]
-    assert sorted(g["group"] for g in entry["groups"]) == ["m1", "m2"]
-    assert all(g["status"] == "F" for g in entry["groups"])
+    published = _history_of(result)
+    column = published["columns"]["sensor_model"]
+    assert [g["status"] for g in column["initial"]["groups"]] == ["C"]
+    assert sorted(g["group"] for g in column["transitions"]["groups"]) == ["m1", "m2"]
+    assert [g["status"] for g in column["transitions"]["groups"]] == ["C", "C"]
+    assert column["initial"]["sampleSize"] == {"min": 0}
+    assert published["columns"]["status"]["initial"]["groups"][0]["status"] == "F"
+    assert "sensor_model" not in " ".join(why for _, why in result.not_measured)
 
 
 def test_a_few_changes_from_a_null_withhold_every_group_beside_them(tmp_path):

@@ -1,8 +1,9 @@
-# Profile oracle — the exhaustive audit of a history that follows a foreign key
+# Profile oracle — the exhaustive audits of a history's tracked columns: a categorical column
+# (tests/profiler/test_history_column_oracle.py) and a foreign key it follows
 # (tests/profiler/test_reference_follow_oracle.py).
 #
-# The default test run holds one small universe of the audit and the table of two keys. The full
-# set (O1 to O5) takes about an hour, so it runs here instead: on a pull request that touches
+# The default test run holds the small universes of each audit. The full sets take about an hour,
+# so they run here instead: on a pull request that touches
 # the modules the audit judges, and on request. Not on a schedule, and not a required check.
 
 name: Profile oracle
@@ -15,6 +16,7 @@ on:
       - fluid_build/profiler/references.py
       - fluid_build/profiler/runner.py
       - fluid_build/profiler/disclosure.py
+      - tests/profiler/test_history_column_oracle.py
       - tests/profiler/test_reference_follow_oracle.py
       - .github/workflows/profile-oracle.yml
   workflow_dispatch:
@@ -27,7 +29,7 @@ env:
 
 jobs:
   oracle:
-    name: Full oracle universes (O1 to O5)
+    name: Full oracle universes
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -55,4 +57,4 @@ jobs:
       - name: Run every universe of the oracle
         env:
           FLUID_PROFILE_ORACLE: full
-        run: python -m pytest tests/profiler/test_reference_follow_oracle.py -n 3 -q -p no:randomly
+        run: python -m pytest tests/profiler/test_history_column_oracle.py tests/profiler/test_reference_follow_oracle.py -n 3 -q -p no:randomly

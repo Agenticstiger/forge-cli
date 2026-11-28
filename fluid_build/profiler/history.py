@@ -70,13 +70,31 @@ withholds its group: its bins then say nothing of where records lie.
 * ``columns``: each categorical column the contract declares levels for (at most 32 columns of at
   most 64 levels each): ``initial``, the value on each entity's first version, and
   ``transitions``, grouped by the column itself. Group ``a`` counts, over the levels ``b``, each
-  change from ``a`` to ``b`` between consecutive versions. A change from NULL is one more group,
-  checked and never written. The diagonal (``a`` to ``a``) is zero by definition: it is written 0,
-  status ``F``, and is not in the check. The check sees each group on the levels except its own
-  (one cell fewer, in a placeholder order), which is exactly the cells a reader can form, and
-  the group sizes and their total as it sees any grouped level histogram. The group of a value
-  that a declared ``endMarker`` or ``currentFlag`` puts on the last version alone has no change by
-  the contract: where the records leave it empty it is out of the check and written as zeros.
+  change from ``a`` to ``b`` between consecutive versions. The diagonal (``a`` to ``a``) is zero by
+  definition: it is written 0, status ``F``, and is not in the check. The check sees each group on
+  the levels except its own (one cell fewer, in a placeholder order), which is exactly the cells a
+  reader can form of the changes, and the group sizes and their total as it sees any grouped level
+  histogram. The two members are written together or not at all. A
+  reader holding both beside the column's own statistics and the table's counts forms every count
+  of the column's version table: the versions at a level by the level before them (the unchanged
+  ones, on the diagonal, included, or the entity's start) and by the level after them (or the
+  entity's end), and the sums of those. So both are published only where no value of the column is
+  NULL and the plan or the document shows it (the contract declares it ``required``, or its
+  published ``count`` is ``F`` and equals the table's published ``rowCount``), and where one call
+  of the output check over the column's own statistics, as the table forms them, and the two
+  groupBy histograms of the versions by the level before and after them (the versions after or
+  before a NULL, and the column's values outside the history, are the rows no group holds)
+  publishes every group and every cell of both, and leaves the column's own statistics as the
+  table wrote them. At a rounding base above 1 the published counts do not show a few NULLs, so a
+  published history also tells a reader that the column holds none: under a rule that holds zeros
+  disclosive that is a count the column's own ``nullCount`` withholds, and the only one.
+  Otherwise both members are written withheld whole,
+  and no note says why: the check decides, not the plan. A column that a declared ``endMarker`` or
+  ``currentFlag`` names has that value on a last version alone, so no change leaves it and its
+  version table holds a group of none: both members are written withheld whole, whatever the
+  records hold and whatever value the marker declares (the marker names the column; its value is
+  not read), a decision of the plan, and one note names the column and the reason, with no
+  count.
   A column that a counted relationship keys on its own (a foreign key) is tracked too, where
   the profile releases the table it references whole
   (:mod:`fluid_build.profiler.references`): its levels are that table's keys, in the order it
@@ -94,16 +112,16 @@ withholds its group: its bins then say nothing of where records lie.
   ``initial``, a group's size and a published change into or out of a key are each a floor on the
   children of that key's parent, so the relationship that keys the column publishes no children
   per parent: its statistics are written withheld whole, a decision of the plan that reads no
-  count (:func:`followed_columns`). The key's ``initial`` and ``transitions`` then go through the
-  ordinary output check like any categorical column's.
+  count (:func:`followed_columns`). The key's two members are then published by the same rule as
+  any categorical column's, over the key's non-null values.
 * ``reasons`` (with at least two tracked columns): the changes by the one tracked column that moves,
   or ``several``. Its cells and the transitions' group totals are linked: with two tracked columns
   ``several = M_a + M_b - k``, with ``M_a`` the changes of ``a`` (the sum of its transitions' group
-  totals) and ``k`` the changes that move a column. A withheld group's total, or the moves from a
-  NULL (a group never written), could be worked out from them. So ``reasons`` is published only
-  when every one of its cells passes, every group of every tracked column's ``transitions`` is
-  published, and no tracked column holds a NULL on a version used. Otherwise it is written
-  withheld whole.
+  totals) and ``k`` the changes that move a column. The version pairs where no tracked column moves
+  are the pairs less ``k``, one more cell of the same count. So ``reasons`` is published only
+  when every tracked column's two members are published in full, no tracked column holds a NULL on
+  a version used, and one call of the output check over its cells and that one (checked and never
+  written) publishes every one. Otherwise it is written withheld whole.
 
 A member withheld whole by these rules is ``D`` with the open band other ``D`` statistics carry.
 
@@ -171,6 +189,10 @@ _FREE = disclosure.FREE
 _CHAIN_LEVELS: Tuple[str, ...] = ("dayBefore", "gap", "nextStart", "overlap")
 _LAST_LEVELS: Tuple[str, ...] = ("closed", "open")
 _SEVERAL = "several"
+#: Internal names of what the check is given beside a tracked column's versions; never written.
+_NONE_MOVES = "\x00none"
+_BEFORE = "\x00before"
+_AFTER = "\x00after"
 _EMPTIED: Mapping[str, FrozenSet[str]] = {
     "nextStart": frozenset({"dayBefore", "gap", "overlap"}),
     "dayBefore": frozenset({"nextStart", "gap", "overlap"}),
@@ -179,6 +201,10 @@ _EMPTIED: Mapping[str, FrozenSet[str]] = {
 _PINNED = "the entities' and the versions' counts would give a withheld cell back"
 _NO_WINDOW = "its semantics declare no validity window that is well formed"
 _NOT_READ = "is not a column fluid profile reads"
+_NAMED_BY_LIFECYCLE = (
+    "a declared endMarker or currentFlag names it, so its history is withheld whatever the "
+    "records hold"
+)
 _NOT_DATES = "its start and end are not DATE columns, or timestamp columns, of one type"
 #: Why a table whose entity is a counted relationship's foreign key forms no history.
 _COUNTED_KEY = (
@@ -221,6 +247,9 @@ class HistoryStage:
     #: ``None`` for the contract's categorical columns). ``None`` as a whole: every table that
     #: declares a window is formed, as a default profile does.
     asked: Optional[Mapping[str, Optional[Tuple[str, ...]]]] = None
+    #: The blocks the tables' own statistics were formed from, where those are not ``declared``
+    #: (a request answers the statistics it lists, and no others). ``None``: ``declared``.
+    measured: Optional[Sequence[Optional[DeclaredBlock]]] = None
 
 
 @dataclass(frozen=True)
@@ -1298,23 +1327,16 @@ def _moved(
     return before, after
 
 
-def _final_levels(window: Any, column: _Tracked) -> FrozenSet[int]:
-    """The levels of *column* the contract puts on an entity's last version alone.
+def _named_by_lifecycle(window: Any, column: _Tracked) -> bool:
+    """Whether a declared ``endMarker`` or ``currentFlag`` names *column*, whatever its value.
 
-    A declared ``endMarker`` holds its value on the final version only, and a ``currentFlag`` on
-    the last version only, so no change leaves that value: its group of ``transitions`` is zero
-    by the contract.
+    The marker names the column and its value is not read: a value spelled another way than the
+    column's level (``2.0`` for ``'2'``, ``1`` for a boolean) names the column all the same.
     """
-    found: Set[int] = set()
-    for declared in (window.end_marker, window.current_flag):
-        if declared is None or declared[0] != column.name:
-            continue
-        value = declared[1]
-        spelled = {str(value)} | (
-            {"true" if value else "false"} if isinstance(value, bool) else set()
-        )
-        found.update(at for at, level in enumerate(column.levels) if level in spelled)
-    return frozenset(found)
+    return any(
+        declared is not None and declared[0] == column.name
+        for declared in (window.end_marker, window.current_flag)
+    )
 
 
 def _move_counts(
@@ -1350,20 +1372,13 @@ def _transitions(
     name = f"{context.expose_id}.{column.name} transitions"
     # The check sees each group on the levels but its own: one cell fewer, in a placeholder order.
     slots = [str(place) for place in range(size - 1)]
-    final = _final_levels(window, column)
     kept = {
-        level: (
-            []
-            if at in final and not any(moves[at])
-            else [place for place in range(size) if place != at]
-        )
-        for at, level in enumerate(levels)
+        level: [place for place in range(size) if place != at] for at, level in enumerate(levels)
     }
     seen = MeasuredStatistic(
         groups=tuple(
             backend.count_levels([moves[at][place] for place in kept[level]], slots, level)
             for at, level in enumerate(levels)
-            if kept[level]
         ),
         left_out=(
             backend.count_levels([from_null, *([0] * (size - 2))], slots) if from_null else None
@@ -1391,8 +1406,10 @@ def _reasons(
     names = sorted([*(column.name for column in tracked), _SEVERAL])
     shape = {"levels": names}
     counts: Counter[str] = Counter()
+    pairs = 0
     for held in stations.values():
         for current, following in zip(held, held[1:], strict=False):
+            pairs += 1
             moving = [
                 column.name for column in tracked if _moved(column, current, following) is not None
             ]
@@ -1400,9 +1417,9 @@ def _reasons(
                 counts[moving[0] if len(moving) == 1 else _SEVERAL] += 1
     holds_null = any(column.values[position] is None for column in tracked for position in used)
     unpublished = any(
-        group["status"] != _FREE
+        not _written_in_full(entry[member])
         for entry in columns.values()
-        for group in entry["transitions"]["groups"]
+        for member in ("initial", "transitions")
     )
     if not holds_null and not unpublished:
         values = [counts[each] for each in names]
@@ -1411,11 +1428,291 @@ def _reasons(
         measured = MeasuredStatistic(groups=(context.stage.backend.count_levels(values, names),))
         decision = context.check(statistic, measured, name=name, total=sum(values))
         group_status = decision.group_status[""]
-        if group_status == _FREE and all(
-            status == _FREE for status in decision.cell_status.get("", ("C",))
+        if (
+            group_status == _FREE
+            and all(status == _FREE for status in decision.cell_status.get("", ("C",)))
+            and _none_moves_passes(context, names, values, pairs - sum(values))
         ):
             return context.entry(statistic, measured, decision)
     return context.withheld("levelHistogram/1", shape, [""])
+
+
+def _none_moves_passes(
+    context: _Context, names: Sequence[str], values: Sequence[int], none: int
+) -> bool:
+    """Whether the changes by column, and the version pairs no tracked column moves, all pass.
+
+    The pairs of consecutive versions are public beside the versions and the entities, so the
+    pairs where no tracked column moves are the pairs less the changes the cells give: one more
+    cell of the same count, checked with them. It is checked and never written.
+    """
+    seen = [*names, _NONE_MOVES]
+    name = f"{context.expose_id} reasons"
+    statistic = _level_statistic(name, seen)
+    backend = context.stage.backend
+    measured = MeasuredStatistic(groups=(backend.count_levels([*values, none], seen),))
+    decision = context.check(statistic, measured, name=name, total=sum(values) + none)
+    return decision.group_status[""] == _FREE and all(
+        status == _FREE for status in decision.cell_status.get("", ("C",))
+    )
+
+
+# ---------------------------------------------------------------------------
+# A tracked column's version table
+# ---------------------------------------------------------------------------
+
+
+def _written_in_full(entry: Mapping[str, Any]) -> bool:
+    """Whether every group of a written member is published, with every cell published."""
+    return all(
+        group["status"] == _FREE and all(status == _FREE for status in group.get("cellStatus", ()))
+        for group in entry["groups"]
+    )
+
+
+@dataclass(frozen=True)
+class _VersionTable:
+    """The versions of a tracked column counted by the level before and after them.
+
+    ``pairs[j][k]`` holds the pairs of consecutive versions at level ``j`` then ``k`` (the diagonal
+    included): the versions at ``k`` by the level before them, and read the other way, the versions
+    at ``j`` by the level after them. ``first`` and ``last`` hold the entities' first and last
+    versions by level. ``from_null`` holds the versions after a NULL, ``to_null`` those followed by
+    one, and ``outside`` the values of rows no entity's version holds (no entity, or no start).
+    """
+
+    first: List[int]
+    last: List[int]
+    pairs: List[List[int]]
+    from_null: List[int]
+    to_null: List[int]
+    outside: List[int]
+
+    @property
+    def records(self) -> int:
+        """The column's non-null values: each is a version in one of the groups, or outside."""
+        return sum(self.first) + sum(map(sum, self.pairs)) + sum(self.from_null) + sum(self.outside)
+
+
+def _version_table(
+    column: _Tracked, stations: Mapping[Tuple[Any, ...], Sequence[_Version]]
+) -> _VersionTable:
+    size = len(column.levels)
+    first, last = [0] * size, [0] * size
+    pairs = [[0] * size for _ in range(size)]
+    from_null, to_null, outside = [0] * size, [0] * size, [0] * size
+    values = column.values
+    held_rows: Set[int] = set()
+    for held in stations.values():
+        held_rows.update(version.position for version in held)
+        first_level, last_level = values[held[0].position], values[held[-1].position]
+        if first_level is not None:
+            first[first_level] += 1
+        if last_level is not None:
+            last[last_level] += 1
+        for current, following in zip(held, held[1:], strict=False):
+            before, after = values[current.position], values[following.position]
+            if before is not None and after is not None:
+                pairs[before][after] += 1
+            elif after is not None:
+                from_null[after] += 1
+            elif before is not None:
+                to_null[before] += 1
+    for position, value in enumerate(values):
+        if value is not None and position not in held_rows:
+            outside[value] += 1
+    return _VersionTable(first, last, pairs, from_null, to_null, outside)
+
+
+def _grouped_by(name: str, levels: Sequence[str], group_by: str) -> DeclaredStatistic:
+    return DeclaredStatistic(
+        identifier="levelHistogram/1",
+        kind="levelHistogram",
+        column=name,
+        group_by=group_by,
+        shape={"levels": list(levels)},
+        columns=(),
+        read_as={},
+    )
+
+
+def _level_tables(
+    context: _Context, column: _Tracked, table: _VersionTable
+) -> List[Tuple[DeclaredStatistic, MeasuredStatistic]]:
+    """The versions of *column* as two groupBy level histograms, each beside its own histogram.
+
+    One groups the versions by what came before them (the entity's start, or a level, the unchanged
+    versions included), the other by what follows them (a level, or the entity's end). The versions
+    after, or followed by, a NULL, and the values of rows outside the history, are the rows no
+    group holds. Every count of the version table is a cell of one of them. The group keys are
+    internal and never written.
+    """
+    backend = context.stage.backend
+    levels = list(column.levels)
+    size = len(levels)
+
+    def keyed(label: str, at: int) -> str:
+        return f"\x00{label}:{at}"
+
+    def left_out(counts: Sequence[int]) -> Optional[MeasuredGroup]:
+        return backend.count_levels(counts, levels) if any(counts) else None
+
+    before = [backend.count_levels(table.first, levels, keyed("start", 0))]
+    before += [
+        backend.count_levels(table.pairs[j], levels, keyed("before", j)) for j in range(size)
+    ]
+    after = [
+        backend.count_levels([table.pairs[k][j] for k in range(size)], levels, keyed("after", j))
+        for j in range(size)
+    ]
+    after.append(backend.count_levels(table.last, levels, keyed("end", 0)))
+    return [
+        (
+            _grouped_by(column.name, levels, _BEFORE),
+            MeasuredStatistic(
+                groups=tuple(before),
+                left_out=left_out([table.from_null[k] + table.outside[k] for k in range(size)]),
+            ),
+        ),
+        (
+            _grouped_by(column.name, levels, _AFTER),
+            MeasuredStatistic(
+                groups=tuple(after),
+                left_out=left_out([table.to_null[k] + table.outside[k] for k in range(size)]),
+            ),
+        ),
+    ]
+
+
+def _required(context: _Context, name: str) -> bool:
+    """Whether the contract declares the column ``required``."""
+    body = context.stage.exposes[context.expose_id].get("contract")
+    schema = body.get("schema") if isinstance(body, Mapping) else None
+    return any(
+        isinstance(entry, Mapping) and entry.get("name") == name and entry.get("required") is True
+        for entry in (schema if isinstance(schema, list) else ())
+    )
+
+
+def _holds_no_null(context: _Context, column: _Tracked) -> bool:
+    """Whether the column holds no NULL, as the records show and as the plan or document shows.
+
+    No value of the column is NULL, as the records show, and the plan or the document says so too:
+    the column is ``required``, or its published ``count`` equals the table's published
+    ``rowCount``. The contract's word alone is not taken over the records; at a rounding base above
+    1 whether a NULL is there is the one bit this adds.
+    """
+    if None in column.values:
+        return False
+    if _required(context, column.name):
+        return True
+    table = context.stage.tables_doc[context.expose_id]
+    count = table.get("columns", {}).get(column.name, {}).get("metrics", {}).get("count", {})
+    return (
+        count.get("status") == _FREE
+        and count.get("value") is not None
+        and count.get("value") == table.get("rowCount")
+    )
+
+
+def _formed_block(context: _Context) -> Optional[DeclaredBlock]:
+    """The block the table's own statistics were formed from."""
+    stage = context.stage
+    blocks = stage.declared if stage.measured is None else stage.measured
+    for plan, block in zip(stage.plans, blocks, strict=True):
+        if plan is context.plan:
+            return block
+    return None
+
+
+def _passes(
+    context: _Context,
+    column: _Tracked,
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+) -> bool:
+    """Whether every count of the column's version table passes the output check.
+
+    One call of the check holds the column's own statistics, as the table's were formed, and the
+    two groupBy histograms of the versions (:func:`_level_tables`), over the column's non-null
+    values. Every group and every cell of both must be published, and the column's own statistics
+    must come out as the table wrote them.
+    """
+    from fluid_build.profiler import runner
+
+    stage = context.stage
+    if not _holds_no_null(context, column):
+        return False
+    formed = runner.column_edge_statistics(
+        _formed_block(context), context.read, stage.backend, column.name
+    )
+    if any(measured.left_out_unread for _, measured in formed):
+        return False
+    table = _version_table(column, stations)
+    grouped = _level_tables(context, column, table)
+    total = runner._column_total(*formed[0]) if formed else table.records
+    name = f"{context.expose_id}.{column.name} versions"
+    decisions = dates.checked(
+        [*formed, *grouped],
+        name=name,
+        total=total,
+        rule=stage.rule,
+        backend=stage.backend,
+        timed=context.timed,
+        what="the history of",
+    )
+    written = runner._edge_decisions(formed, stage.backend, stage.rule)
+    for at in range(len(formed)):
+        now, then = decisions[at], written[at]
+        if dict(now.group_status) != dict(then.group_status) or dict(now.cell_status) != dict(
+            then.cell_status
+        ):
+            return False
+    return all(
+        status == _FREE
+        for decision in decisions[len(formed) :]
+        for status in (
+            *decision.group_status.values(),
+            *(s for each in decision.cell_status.values() for s in each),
+        )
+    )
+
+
+def _withheld_entries(context: _Context, column: _Tracked) -> Dict[str, Any]:
+    """``initial`` and ``transitions`` of *column*, withheld whole: ``D`` with the open band."""
+    levels = list(column.levels)
+    return {
+        "initial": context.withheld("levelHistogram/1", {"levels": levels}, [""]),
+        "transitions": context.withheld(
+            "levelHistogram/1", {"levels": levels, "groupBy": column.name}, levels
+        ),
+    }
+
+
+def _checked_entries(
+    context: _Context,
+    window: Any,
+    column: _Tracked,
+    stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
+) -> Dict[str, Any]:
+    """The ``initial`` and the ``transitions`` of one tracked column, both or neither.
+
+    A column that holds no NULL, as the records and the plan or the document show, is written when
+    every count of its version table passes the output check (:func:`_passes`), each member checked
+    as it always was; otherwise both members are withheld whole. The check decides, not the plan,
+    so no note says why.
+    """
+    if _passes(context, column, stations):
+        tallies = tuple(Counter(each) for each in context.stage.tallies)
+        entries = {
+            "initial": _initial(context, column, stations),
+            "transitions": _transitions(context, window, column, stations),
+        }
+        if all(_written_in_full(entry) for entry in entries.values()):
+            return entries
+        for kept, held in zip(tallies, context.stage.tallies, strict=True):
+            held.clear()
+            held.update(kept)
+    return _withheld_entries(context, column)
 
 
 def _entries(
@@ -1424,11 +1721,15 @@ def _entries(
     column: _Tracked,
     stations: Mapping[Tuple[Any, ...], Sequence[_Version]],
 ) -> Dict[str, Any]:
-    """The ``initial`` and the ``transitions`` of one tracked column."""
-    return {
-        "initial": _initial(context, column, stations),
-        "transitions": _transitions(context, window, column, stations),
-    }
+    """The ``initial`` and the ``transitions`` of one tracked column, both or neither.
+
+    A column that a declared ``endMarker`` or ``currentFlag`` names is withheld whole, a decision
+    of the plan that reads no count and not the marker's value (:func:`_named_by_lifecycle`); any
+    other is written by the output check (:func:`_checked_entries`).
+    """
+    if _named_by_lifecycle(window, column):
+        return _withheld_entries(context, column)
+    return _checked_entries(context, window, column, stations)
 
 
 # ---------------------------------------------------------------------------
@@ -1496,6 +1797,11 @@ def _history(
     notes.extend(prepared.unfollowed)
     notes.extend(_unfollowed_candidates(context, window))
     if tracked:
+        notes.extend(
+            (f"history of {context.expose_id}.{column.name}", _NAMED_BY_LIFECYCLE)
+            for column in tracked
+            if _named_by_lifecycle(window, column)
+        )
         columns = {column.name: _entries(context, window, column, stations) for column in tracked}
         found["columns"] = columns
         if len(tracked) >= 2:

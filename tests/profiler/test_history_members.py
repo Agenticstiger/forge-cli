@@ -16,6 +16,7 @@ the totals), and look for a small cell that the first starts let a reader form.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date, timedelta
 from fractions import Fraction
 from pathlib import Path
@@ -127,10 +128,23 @@ def _cards(
     return rows
 
 
-def _profile(tmp_path: Path, contract: Dict[str, Any], rows: Sequence[Dict[str, Any]]) -> Any:
+#: The default rule, but a cell of no records is not disclosive: a value the contract puts on the
+#: last version alone has no changes, and the version table of its column holds a group of none.
+ZEROS_ALLOWED = replace(RULE, name="zeros-allowed", zeros_disclosive=False)
+
+
+def _profile(
+    tmp_path: Path,
+    contract: Dict[str, Any],
+    rows: Sequence[Dict[str, Any]],
+    rule: Optional[disclosure.DisclosureRule] = None,
+) -> Any:
     path = tmp_path / "cards.ndjson"
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    return profile_exposes(contract, [ExposeSource(TABLE, str(path))], backend=load_backend())
+    options = {} if rule is None else {"rule": rule}
+    return profile_exposes(
+        contract, [ExposeSource(TABLE, str(path))], backend=load_backend(), **options
+    )
 
 
 def _table(result: Any) -> Dict[str, Any]:
@@ -266,27 +280,80 @@ def test_an_end_marker_the_records_break_is_checked_like_any_cell(tmp_path):
     assert group.get("cellStatus", ["F", "F"])[0] == "C" or group["status"] != "F"
 
 
-def test_the_marked_value_has_no_transitions_and_publishes_them_as_zeros(tmp_path):
+def test_a_column_an_end_marker_names_is_withheld_whole_even_where_zeros_are_allowed(tmp_path):
+    # The plan decides it: the marked value is on a last version alone, so its group of changes is
+    # empty by the contract and its column's version table holds a group of none. Both members are
+    # withheld whole whatever the records hold, and one note says so without a count.
     rows = _cards({1: 60, 2: 60, 3: 40}, mark_last=True)
     marked = _contract(lifecycle={"endMarker": {"column": "tier", "value": "closed"}})
-    transitions = _table(_profile(tmp_path, marked, rows))["history"]["columns"]["tier"][
-        "transitions"
-    ]
-    group = _group(transitions, "closed")
-    assert group["status"] == "F"
-    assert _shown(group, "levelCounts") == [0, 0, 0]
+    result = _profile(tmp_path, marked, rows, ZEROS_ALLOWED)
+    entry = _table(result)["history"]["columns"]["tier"]
+    assert [g["status"] for g in entry["initial"]["groups"]] == ["C"]
+    assert _group(entry["transitions"], "closed")["status"] == "C"
+    assert {g["status"] for g in entry["transitions"]["groups"]} == {"C"}
+    said = dict(result.not_measured)
+    assert "endMarker" in said[f"history of {TABLE}.tier"]
+    assert not any(ch.isdigit() for ch in said[f"history of {TABLE}.tier"])
+    # no other column is named: the rule that publishes a column is its own
+    assert f"history of {TABLE}.is_current" not in said
 
 
-def test_a_current_flag_publishes_the_flagged_value_s_transitions_as_zeros(tmp_path):
+def test_the_marker_names_the_column_so_a_group_of_no_versions_is_withheld_under_any_rule(
+    tmp_path,
+):
+    # The marker names the column and its value is not read: under the default rule, as under one
+    # that allows zeros, both members are withheld whole and one note says why.
+    rows = _cards({1: 60, 2: 60, 3: 40}, mark_last=True)
+    marked = _contract(lifecycle={"endMarker": {"column": "tier", "value": "closed"}})
+    result = _profile(tmp_path, marked, rows)
+    entry = _table(result)["history"]["columns"]["tier"]
+    assert [g["status"] for g in entry["initial"]["groups"]] == ["C"]
+    assert [g["status"] for g in entry["transitions"]["groups"]] == ["C", "C", "C"]
+    assert "endMarker" in dict(result.not_measured)[f"history of {TABLE}.tier"]
+
+
+def test_a_column_a_current_flag_names_is_withheld_whole_even_where_zeros_are_allowed(tmp_path):
     rows = _cards({1: 60, 2: 60, 3: 40})
     flagged = _contract(lifecycle={"currentFlag": {"column": "is_current", "value": "Y"}})
-    transitions = _table(_profile(tmp_path, flagged, rows))["history"]["columns"]["is_current"][
-        "transitions"
-    ]
-    assert _shown(_group(transitions, "Y"), "levelCounts") == [0, 0]
-    assert _group(transitions, "N")["status"] == "F"
+    result = _profile(tmp_path, flagged, rows, ZEROS_ALLOWED)
+    entry = _table(result)["history"]["columns"]["is_current"]
+    assert [g["status"] for g in entry["initial"]["groups"]] == ["C"]
+    assert {g["status"] for g in entry["transitions"]["groups"]} == {"C"}
+    assert "currentFlag" in dict(result.not_measured)[f"history of {TABLE}.is_current"]
+    assert f"history of {TABLE}.tier" not in dict(result.not_measured)
+    # without the flag the same column is checked, and the default rule withholds its transitions
     plain = _table(_profile(tmp_path, _contract(), rows))["history"]["columns"]["is_current"]
-    assert all(group["status"] != "F" for group in plain["transitions"]["groups"])
+    assert [group["status"] for group in plain["transitions"]["groups"]] == ["C", "C"]
+
+
+@pytest.mark.parametrize("value", [1, 1.0, "TRUE", True])
+def test_a_flag_spelled_unlike_the_level_still_names_a_boolean_column(tmp_path, value):
+    rows = _cards({1: 60, 2: 60, 3: 40})
+    for row in rows:
+        row["is_current"] = row["is_current"] == "Y"
+    flagged = _contract(lifecycle={"currentFlag": {"column": "is_current", "value": value}})
+    flagged["exposes"][0]["contract"]["schema"][4]["type"] = "boolean"
+    result = _profile(tmp_path, flagged, rows, ZEROS_ALLOWED)
+    entry = _table(result)["history"]["columns"]["is_current"]
+    assert [g["status"] for g in entry["initial"]["groups"]] == ["C"]
+    assert {g["status"] for g in entry["transitions"]["groups"]} == {"C"}
+    assert "currentFlag" in dict(result.not_measured)[f"history of {TABLE}.is_current"]
+
+
+@pytest.mark.parametrize("value", ["2", 2, 2.0])
+def test_an_end_marker_spelled_unlike_the_level_still_names_the_column(tmp_path, value):
+    names = {"basic": "1", "closed": "2", "plus": "3"}
+    rows = _cards({1: 60, 2: 60, 3: 40}, mark_last=True)
+    for row in rows:
+        row["tier"] = names[row["tier"]]
+    marked = _contract(lifecycle={"endMarker": {"column": "tier", "value": value}})
+    marked["exposes"][0]["contract"]["schema"][3]["type"] = "enum('1','2','3')"
+    result = _profile(tmp_path, marked, rows, ZEROS_ALLOWED)
+    entry = _table(result)["history"]["columns"]["tier"]
+    assert [g["status"] for g in entry["initial"]["groups"]] == ["C"]
+    assert {g["status"] for g in entry["transitions"]["groups"]} == {"C"}
+    said = dict(result.not_measured)[f"history of {TABLE}.tier"]
+    assert "endMarker" in said and not any(ch.isdigit() for ch in said)
 
 
 def test_a_few_rows_with_no_member_and_no_end_withhold_the_open_last_versions(tmp_path):
@@ -314,8 +381,9 @@ def test_a_few_rows_with_no_member_and_no_end_withhold_the_open_last_versions(tm
     )
 
 
-def test_a_marked_value_the_records_move_from_is_checked_like_any_group(tmp_path):
-    # Some members hold the marker before their last version: its changes are counted.
+def test_a_marked_value_the_records_move_from_is_withheld_whole_as_any_other(tmp_path):
+    # Some members hold the marker before their last version: the plan withholds the column whole
+    # all the same, and no record decides it.
     rows = _cards({1: 60, 2: 60, 3: 40}, mark_last=True)
     for row in rows:
         if 120 <= row["member_id"] < 160 and row["tier"] == "basic":
@@ -324,8 +392,7 @@ def test_a_marked_value_the_records_move_from_is_checked_like_any_group(tmp_path
     transitions = _table(_profile(tmp_path, marked, rows))["history"]["columns"]["tier"][
         "transitions"
     ]
-    group = _group(transitions, "closed")
-    assert group["status"] != "F" or _shown(group, "levelCounts") != [0, 0, 0]
+    assert {g["status"] for g in transitions["groups"]} == {"C"}
 
 
 # -- first starts beside the start and end columns ----------------------------------------------

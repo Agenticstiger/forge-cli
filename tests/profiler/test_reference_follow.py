@@ -63,6 +63,17 @@ def _twice(members: Sequence[Sequence[Any]]) -> List[List[Any]]:
     return [[*chain, *chain] for chain in members]
 
 
+def _dense(keys: Sequence[Any], extra: Optional[Sequence[int]] = None) -> List[List[Any]]:
+    """Members of two versions, ten for each ordered pair of branches, and ``extra[n]`` more at each
+    pair that starts at branch ``n``: every count of the key's version table is at least ten."""
+    return [
+        [first, second]
+        for n, first in enumerate(keys)
+        for second in keys
+        for _ in range(10 + (0 if extra is None else extra[n]))
+    ]
+
+
 def _spread(keys: Sequence[Any] = BRANCHES, per: int = 20) -> List[List[Any]]:
     return library.spread(keys, [per] * len(keys))
 
@@ -108,35 +119,40 @@ def test_a_key_that_moves_is_counted_by_its_transitions(tmp_path):
 
 def test_the_published_cells_of_a_key_are_its_entities_by_their_first_branch(tmp_path):
     keys = library.keys(12)
-    per = [30, 25, 40, 35, 50, 45, 60, 55, 70, 65, 80, 75]
+    extra = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     result = library.profile(
         tmp_path,
         library.contract(),
         library.branches(keys),
-        library.cards(library.spread(keys, per)),
+        library.cards(_dense(keys, extra)),
     )
     # every key's cell is a floor on its parent's children, and is published as any cell is
     (tmp_path / "kept").mkdir()
     (cells,) = _tracked(result)["branch_id"]["initial"]["groups"]
     assert cells["status"] == "F"
-    for published, true in zip(cells["levelCounts"], per, strict=True):
+    for published, true in zip(
+        cells["levelCounts"], [12 * 10 + 12 * n for n in extra], strict=True
+    ):
         assert published is None or published == round(true / 5) * 5
     # and the relationship that keys it publishes no children per parent, for these same floors
     (relationship,) = result.document["relationships"]
     assert [group["status"] for each in relationship["statistics"] for group in each["groups"]] == [
         "C"
     ]
+    # members with one version each leave the versions after a first one with no group to fill:
+    # the key's two members are withheld whole, and its levels are still the table's keys
     kept, size = library.keys(4), [45, 30, 0, 30]
-    (shown,) = _tracked(
+    shown = _tracked(
         library.profile(
             tmp_path / "kept",
             library.contract(),
             library.branches(kept),
             library.cards(_twice(library.spread(kept, size))),
         )
-    )["branch_id"]["initial"]["groups"]
-    for published, true in zip(shown["levelCounts"], size, strict=True):
-        assert published is None or published == round(true / 5) * 5
+    )["branch_id"]
+    assert [group["status"] for group in shown["initial"]["groups"]] == ["C"]
+    assert [group["status"] for group in shown["transitions"]["groups"]] == ["C"] * 4
+    assert shown["initial"]["levels"] == kept
 
 
 # -- what is not followed -----------------------------------------------------------------------
@@ -153,16 +169,30 @@ def test_a_value_that_is_no_key_is_named_and_the_column_is_not_followed(tmp_path
     assert "zz-missing" not in " ".join(why for _, why in result.not_measured)
 
 
-def test_a_null_foreign_key_is_followed_and_counted_in_no_level(tmp_path):
+def test_a_null_foreign_key_the_contract_calls_required_withholds_the_key_whole(tmp_path):
+    # The contract's word does not show the records: a NULL among them withholds both members.
     keys = library.keys(4)
-    members = _twice(library.spread(keys, [45, 30, 0, 30])) + [[None] for _ in range(15)]
+    members = _dense(keys) + [[None] for _ in range(15)]
+    built = library.contract()
+    for expose in built["exposes"]:
+        for column in expose["contract"]["schema"]:
+            if expose["exposeId"] == "card" and column["name"] == "branch_id":
+                column["required"] = True
+    result = library.profile(tmp_path, built, library.branches(keys), library.cards(members))
+    follow = _tracked(result)["branch_id"]
+    assert [group["status"] for group in follow["initial"]["groups"]] == ["C"]
+    assert [group["status"] for group in follow["transitions"]["groups"]] == ["C"] * 4
+
+
+def test_a_null_foreign_key_the_document_does_not_show_withholds_the_key_whole(tmp_path):
+    keys = library.keys(4)
+    members = _dense(keys) + [[None] for _ in range(15)]
     result = library.profile(
         tmp_path, library.contract(), library.branches(keys), library.cards(members)
     )
     follow = _tracked(result)["branch_id"]
-    (group,) = follow["initial"]["groups"]
-    assert group["status"] == "F"
-    assert group["k"] == 105  # the entities with a branch: the 15 with none are in no level
+    assert [group["status"] for group in follow["initial"]["groups"]] == ["C"]
+    assert [group["status"] for group in follow["transitions"]["groups"]] == ["C"] * 4
 
 
 def test_a_composite_foreign_key_is_not_followed_and_its_table_is_not_published(tmp_path):
@@ -486,7 +516,7 @@ def test_a_request_and_a_private_release_follow_nothing(tmp_path, path):
             assert table["columns"][name]["domain"] == "category"
 
 
-def test_a_small_cell_of_a_whole_number_key_is_withheld_as_a_text_keys_is(tmp_path):
+def test_a_small_cell_of_a_whole_number_key_withholds_both_members_as_a_text_keys_does(tmp_path):
     size = [45, 30, 3, 30]
 
     def follow(kind: str) -> Dict[str, Any]:
@@ -507,7 +537,8 @@ def test_a_small_cell_of_a_whole_number_key_is_withheld_as_a_text_keys_is(tmp_pa
             (each["status"], each.get("levelCounts")) for each in text[part]["groups"]
         ]
     (initial,) = whole["initial"]["groups"]
-    assert initial["levelCounts"][2] is None  # the cell of three entities is not written
+    assert initial["status"] == "C"  # a cell of three entities withholds both members whole
+    assert [each["status"] for each in whole["transitions"]["groups"]] == ["C"] * 4
 
 
 def test_a_table_that_is_not_public_is_not_followed(tmp_path):
@@ -607,23 +638,29 @@ def _sha(entry: Any) -> str:
     return hashlib.sha256(json.dumps(entry, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-#: The sha256 of the key's history entries, over ten branches of ten thousand members.
+#: The sha256 of the key's history entries, over ten branches of ten thousand members. The uniform
+#: draw writes them in full, as it did before the key's members were written by the rule; the
+#: zipf draw has a small count and writes both withheld whole.
 HISTORY_DIGESTS = {
     "uniform": "0316d535b869950120020425db869f5a7c48ea0470162fa10d5ee0187efb8702",  # pragma: allowlist secret
-    "zipf": "d56951e291ec14c496f56023c33938cf45cbdf1cd92ae0f0938ec48e96ba09b5",  # pragma: allowlist secret
+    "zipf": "3ee76292624bb2fd760c43561e2c6d9e36d8d9757288ea91ca468c054dfd69c6",  # pragma: allowlist secret
 }
 
 
 @pytest.mark.parametrize("skew", ["uniform", "zipf"])
-def test_ten_branches_of_ten_thousand_members_publish_the_key_and_withhold_the_relationship(
+def test_ten_branches_of_ten_thousand_members_write_the_key_by_the_rule_and_withhold_the_relationship(
     tmp_path, skew
 ):
     result, _ = _drawn(tmp_path, 10, 10_000, skew)
     follow = _tracked(result)["branch_id"]
     assert set(_statuses(result)) == {"C"}
     assert result.withheld.get("D", 0) >= 1  # tallied as a group withheld beside the key's cells
-    assert [group["status"] for group in follow["initial"]["groups"]] == ["F"]
-    assert [group["status"] for group in follow["transitions"]["groups"]].count("F") >= 9
+    if skew == "uniform":  # every count of the key's version table passes: written in full
+        assert [group["status"] for group in follow["initial"]["groups"]] == ["F"]
+        assert [group["status"] for group in follow["transitions"]["groups"]].count("F") == 10
+    else:  # a skewed table has a small count: both members are withheld whole
+        assert [group["status"] for group in follow["initial"]["groups"]] == ["C"]
+        assert [group["status"] for group in follow["transitions"]["groups"]] == ["C"] * 10
     assert _sha(follow) == HISTORY_DIGESTS[skew]
     assert any(what.startswith("children per parent") for what, _ in result.not_measured)
     (counted,) = result.relationships
@@ -632,11 +669,13 @@ def test_ten_branches_of_ten_thousand_members_publish_the_key_and_withhold_the_r
     load_backend().check_document(result.canonical.decode("utf-8"))
 
 
-def test_thirty_branches_of_a_thousand_members_still_publish_the_first_cells(tmp_path):
+def test_thirty_branches_of_a_thousand_members_withhold_the_key_whole_beside_a_small_count(
+    tmp_path,
+):
     result, _ = _drawn(tmp_path, 30, 1_000, "zipf")
     assert set(_statuses(result)) == {"C"}
-    (initial,) = _tracked(result)["branch_id"]["initial"]["groups"]
-    assert initial["status"] == "F"
+    follow = _tracked(result)["branch_id"]
+    assert [group["status"] for group in follow["initial"]["groups"]] == ["C"]
 
 
 def test_the_note_of_a_withheld_relationship_holds_no_count_and_no_key(tmp_path):
@@ -658,6 +697,44 @@ def test_a_relationship_that_no_history_follows_is_not_withheld_for_it(tmp_path)
         )  # fmt: skip
         said = [what for what, _ in result.not_measured if what.startswith("children per parent")]
         assert bool(said) is withheld
+
+
+@pytest.mark.parametrize("value", [4, 4.0])
+def test_an_end_marker_on_a_followed_key_names_it_whatever_its_spelling(tmp_path, value):
+    # The marker names the column and its value is not read: a whole number written 4.0 names the
+    # key as 4 does, under a rule that allows zeros, and both members are withheld with a note.
+    keys = library.keys(4, kind="integer")
+    members = [[a, b] for a in keys[:-1] for b in keys for _ in range(12)]
+    built = library.contract(key_type="integer")
+    for expose in built["exposes"]:
+        if expose["exposeId"] != library.CARD:
+            continue
+        expose["semantics"]["entities"][0]["lifecycle"] = {
+            "endMarker": {"column": "branch_id", "value": value}
+        }
+        for column in expose["contract"]["schema"]:
+            if column["name"] == "branch_id":
+                column["required"] = True
+    rule = replace(disclosure.ACRO_DEFAULT, name="zeros-allowed", zeros_disclosive=False)
+    result = profile_exposes(
+        built,
+        [
+            ExposeSource(
+                library.BRANCH, library.write(tmp_path / "b.ndjson", library.branches(keys))
+            ),
+            ExposeSource(
+                library.CARD, library.write(tmp_path / "c.ndjson", library.cards(members))
+            ),
+        ],
+        backend=load_backend(),
+        rule=rule,
+    )
+    entry = result.document["tables"][library.CARD]["history"]["columns"]["branch_id"]
+    assert [g["status"] for g in entry["initial"]["groups"]] == ["C"]
+    said = [
+        why for what, why in result.not_measured if what == f"history of {library.CARD}.branch_id"
+    ]
+    assert len(said) == 1 and "endMarker" in said[0]
 
 
 # -- a reader of the document, and the records ---------------------------------------------------
